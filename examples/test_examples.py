@@ -27,21 +27,37 @@ def test_there_are_examples_to_run():
     assert EXAMPLES, "no examples found -- this file would prove nothing"
 
 
+def run_example(example: Path) -> tuple[int, str, str]:
+    """Run an example and decode its output leniently.
+
+    **Not** ``text=True``. `listing.py` prints a filename that is not valid UTF-8, because
+    that is an ordinary thing for a filename to be and the whole point of the example -- and
+    strict decoding here turns the demonstration into a harness crash. The library's own rule,
+    applied to the library's own test: names are bytes, and something else decides how to show
+    them.
+    """
+    finished = subprocess.run(
+        [sys.executable, str(example)],
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    return (
+        finished.returncode,
+        finished.stdout.decode("utf-8", "replace"),
+        finished.stderr.decode("utf-8", "replace"),
+    )
+
+
 @pytest.mark.parametrize("example", EXAMPLES, ids=lambda p: p.stem)
 def test_an_example_runs_clean(example: Path):
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
 
-    finished = subprocess.run(
-        [sys.executable, str(example)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert finished.returncode == 0, f"{example.name} failed:\n{finished.stderr}"
-    assert finished.stdout.strip(), f"{example.name} printed nothing"
-    assert "Traceback" not in finished.stderr
+    returncode, stdout, stderr = run_example(example)
+    assert returncode == 0, f"{example.name} failed:\n{stderr}"
+    assert stdout.strip(), f"{example.name} printed nothing"
+    assert "Traceback" not in stderr
 
 
 def test_the_publish_example_reports_the_mechanism_it_used():
@@ -50,13 +66,21 @@ def test_the_publish_example_reports_the_mechanism_it_used():
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
 
-    finished = subprocess.run(
-        [sys.executable, str(Path(__file__).parent / "atomic_publish.py")],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=True,
-    )
-    assert "mechanism=posix-rename" in finished.stdout
-    assert "durability=fsynced" in finished.stdout
-    assert "mechanism=in-place" in finished.stdout
+    returncode, stdout, _ = run_example(Path(__file__).parent / "atomic_publish.py")
+    assert returncode == 0
+    assert "mechanism=posix-rename" in stdout
+    assert "durability=fsynced" in stdout
+    assert "mechanism=in-place" in stdout
+
+
+def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
+    # The example is only worth having if it demonstrates the awkward case. A directory of
+    # tidy ASCII names would prove nothing that a docstring could not claim.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "listing.py")
+    assert returncode == 0
+    assert "�" in stdout, "the non-UTF-8 name did not survive to the output"
+    assert "directory" in stdout
+    assert "symlink" in stdout

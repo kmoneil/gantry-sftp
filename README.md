@@ -35,8 +35,8 @@ exists today:
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
 - a session with `stat`, `lstat`, `realpath`, `open`/`close`, `remove`, `rename`,
-  `posix_rename`, `fsync`, `supports()`, and pipelined `get()` / `put()`, with typed errors,
-  timeouts on every wait, and a progress callback
+  `posix_rename`, `fsync`, `supports()`, `listdir()`, and pipelined `get()` / `put()`, with
+  typed errors, timeouts on every wait, and a progress callback
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
@@ -64,9 +64,33 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: directory listing, recursive operations, resume, retry, the fsspec adapter,
-`SFTPPath`, or the generated sync API. The names in DESIGN.md's §8 sketch (`connect()`,
-`put_many()`) do not exist yet — `open_session` is the current spelling.
+Not yet: recursive operations, resume, retry, the fsspec adapter, `SFTPPath`, or the
+generated sync API. The names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not
+exist yet — `open_session` is the current spelling.
+
+## Listing
+
+```python
+for entry in await sftp.listdir("/incoming"):
+    print(entry.kind, entry.size, entry.name)   # directory 4096 archive
+```
+
+Three things this does differently from the tools you have used:
+
+- **The attributes come with the listing.** v3 sends ATTRS per entry, so `entry.size` and
+  `entry.kind` cost nothing. Returning bare names forces a `stat` per file, which is a round
+  trip each, and is why listing a large directory is slow in most SFTP tooling.
+- **`entry.kind` can be `unknown`.** A server is not obliged to send permissions, and
+  answering "file" when it did not say is how a recursive walk silently skips every
+  directory on that server. `is_dir` is `False` for `unknown` — the safe way round for a
+  walk — so read `kind` where the difference matters.
+- **`entry.filename` is bytes and `entry.name` is `str` via `surrogateescape`.** A filename
+  on Linux is bytes; a name decoded lossily is a file you can list and cannot open. The two
+  round-trip, so the name you display is the name you can send back.
+
+`.` and `..` are filtered out. `readdir()` gives you the raw batches if you want to see
+exactly what the server sent — one READDIR is not a directory, and the server decides how
+many entries a batch holds (OpenSSH: 100).
 
 ## Atomic publish
 

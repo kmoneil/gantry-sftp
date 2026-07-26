@@ -8,6 +8,7 @@ real server either way; the only thing the local mode skips is `ssh`.
 ```bash
 python examples/download.py                       # pipelined get(), with progress
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
+python examples/listing.py                        # listdir(), and what a listing can't know
 ```
 
 Pass a destination to run the same code against a real server:
@@ -15,6 +16,7 @@ Pass a destination to run the same code against a real server:
 ```bash
 python examples/download.py user@host /remote/data.parquet
 python examples/atomic_publish.py user@host /remote/incoming
+python examples/listing.py user@host /remote/dir
 ```
 
 `test_examples.py` executes each one as a subprocess and fails if it does not exit clean. An
@@ -26,6 +28,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | ------------------- | ---------------------------------------------------------------------------- |
 | `download.py`       | `get()`, the progress callback, and where the pipelining happens              |
 | `atomic_publish.py` | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs |
+| `listing.py`        | `listdir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN`  |
 
 ## What `atomic_publish.py` is actually showing
 

@@ -40,8 +40,10 @@ from gantry_sftp.codec import (
     LStat,
     Name,
     Open,
+    OpenDir,
     OpenFlag,
     PosixRename,
+    ReadDir,
     RealPath,
     Remove,
     Rename,
@@ -74,6 +76,7 @@ from gantry_sftp.session._download import (
     download_handle,
 )
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
+from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry
 from gantry_sftp.session._publish import (
     Durability,
     PublishMechanism,
@@ -366,6 +369,80 @@ class Session:
         if isinstance(reply, Handle):
             return reply.handle
         raise _unexpected(reply, expected="HANDLE", path=encoded)
+
+    async def opendir(self, path: bytes | str) -> bytes:
+        """Open a remote directory and return its handle.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            ServerError: If it is not a directory, or the server refuses.
+        """
+        encoded = _encode_path(path)
+        reply = await self.request(OpenDir(self._next(), encoded))
+        if isinstance(reply, Handle):
+            return reply.handle
+        raise _unexpected(reply, expected="HANDLE", path=encoded)
+
+    async def readdir(self, handle: bytes) -> tuple[DirEntry, ...] | None:
+        """Read one batch of entries, or ``None`` at the end of the directory.
+
+        One READDIR is **not** a whole directory: the server returns as many entries as it
+        feels like -- OpenSSH caps a batch at 100 -- and the caller keeps asking until this
+        answers ``None``. Treating the first batch as the listing is how a client silently
+        loses everything after the hundredth file.
+
+        ``.`` and ``..`` are **not** filtered here. This is the raw batch; the filtering
+        belongs to :meth:`listdir`, and keeping one place that shows what the server actually
+        sent is what makes that filtering testable.
+
+        Returns:
+            The batch, or ``None`` once the server answers ``EOF``.
+
+        Raises:
+            ServerError: If the server refuses.
+        """
+        reply = await self.request(ReadDir(self._next(), handle))
+        if isinstance(reply, Name):
+            return tuple(DirEntry.from_name_entry(entry) for entry in reply.entries)
+        if isinstance(reply, Status):
+            if reply.code is StatusCode.EOF:
+                return None
+            raise_for_status(reply)
+        raise _unexpected(reply, expected="NAME")
+
+    async def listdir(self, path: bytes | str) -> list[DirEntry]:
+        """List a directory, following the batches to the end.
+
+        ``.`` and ``..`` are excluded, because every caller wants them gone and the one who
+        forgets writes a recursion that never terminates. OpenSSH sends both; a server that
+        does not needs no special case.
+
+        The whole listing is accumulated in memory. For an ordinary directory that is what
+        you want; for a directory with millions of entries, or a server willing to answer
+        READDIR forever, it is a memory cost this cannot bound without also breaking the
+        legitimate large case. Streaming lands with ``walk()``; the trade-off is registered
+        rather than hidden.
+
+        Args:
+            path: Remote directory.
+
+        Returns:
+            Entries in the order the server sent them, which is not guaranteed to be sorted.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            ServerError: If it is not a directory, or the server refuses.
+        """
+        handle = await self.opendir(path)
+        entries: list[DirEntry] = []
+        try:
+            while (batch := await self.readdir(handle)) is not None:
+                entries.extend(entry for entry in batch if entry.filename not in DOT_ENTRIES)
+        except BaseException:
+            await self._close_quietly(handle)
+            raise
+        await self.close(handle)
+        return entries
 
     async def close(self, handle: bytes) -> None:
         """Close a remote handle.
