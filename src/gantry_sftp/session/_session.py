@@ -16,7 +16,8 @@ that into real per-file concurrency is registered as deferred work, not pretende
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import override
 
@@ -24,17 +25,24 @@ import anyio
 
 from gantry_sftp.codec import (
     EMPTY_ATTRS,
+    EXTENSION_FSYNC,
+    EXTENSION_POSIX_RENAME,
+    LIMITS_NAME,
     Attrs,
     AttrsReply,
     Close,
     Codec,
     CodecState,
     Completed,
+    Fsync,
     Handle,
     Name,
     Open,
     OpenFlag,
+    PosixRename,
     RealPath,
+    Remove,
+    Rename,
     Request,
     Response,
     Stat,
@@ -48,6 +56,7 @@ from gantry_sftp.codec import (
     ExtendedReply as ExtendedReplyPacket,
 )
 from gantry_sftp.exceptions import (
+    CapabilityError,
     NoSuchFileError,
     PermissionDeniedError,
     ProtocolError,
@@ -63,6 +72,13 @@ from gantry_sftp.session._download import (
     download_handle,
 )
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
+from gantry_sftp.session._publish import (
+    Durability,
+    PublishMechanism,
+    UploadResult,
+    staged_path,
+    staging_token,
+)
 from gantry_sftp.session._upload import upload_handle
 from gantry_sftp.transport import Transport
 
@@ -80,13 +96,34 @@ then never answers a STAT is the exact shape of an unattended job that hangs unt
 notices, which in a scheduled-transfer context can be days.
 """
 
-LIMITS_EXTENSION = b"limits@openssh.com"
+LIMITS_EXTENSION = LIMITS_NAME
+"""Kept as an alias rather than a second bytes literal.
+
+One wire string, spelled once, in the same table the advertisement fixture is checked
+against. Two spellings of an extension name is how a client silently never negotiates it.
+"""
 
 _STATUS_ERRORS = {
     StatusCode.NO_SUCH_FILE: NoSuchFileError,
     StatusCode.PERMISSION_DENIED: PermissionDeniedError,
     StatusCode.OP_UNSUPPORTED: UnsupportedError,
 }
+
+_TRUNCATE_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
+"""Open flags for writing a file in place: create it, or replace what is there."""
+
+_STAGE_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL
+"""Open flags for a staging file, and ``EXCL`` is the load-bearing one.
+
+Without it, a name collision means two publishers writing into one file at different offsets,
+producing a result that is the wrong length or interleaved -- plausible, and wrong, which is
+the failure class this whole module exists to prevent. With it, a collision is an error.
+
+Measured cost: OpenSSH answers ``FAILURE`` for ``CREAT|EXCL`` on an existing file, which is
+the v3 catch-all, so a server that does not implement ``EXCL`` and one whose staging name is
+taken are indistinguishable from the status code alone. The escape hatch for such a server is
+``atomic=False``, and the error says so.
+"""
 
 
 def raise_for_status(status: Status, *, path: bytes | None = None) -> None:
@@ -110,6 +147,40 @@ def raise_for_status(status: Status, *, path: bytes | None = None) -> None:
     if detail:
         summary = f"{summary}: {detail}"
     raise error_class(summary, code=int(status.code), message=bytes(status.message), path=path)
+
+
+class _StagedIsTheOnlyCopyError(Exception):
+    """Internal signal: the destination is gone and the staging file is all that is left.
+
+    Raised only from the ``REMOVE``-then-``RENAME`` fallback, when the remove succeeded and
+    the rename after it did not -- a concurrent writer recreating the destination in between
+    is enough, since v3 ``RENAME`` refuses an existing target. The normal cleanup would then
+    delete the staging file, which at that moment holds the *only* copy of the data, turning a
+    recoverable failure into an unrecoverable one.
+
+    Never escapes the session: it is unwrapped at the boundary and the original refusal is
+    what the caller sees, with a note saying where the file is.
+    """
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__("the destination was removed and the staged file could not replace it")
+        self.failure = failure
+
+
+@dataclass(frozen=True, slots=True)
+class _Upload:
+    """The knobs one ``put`` carries through its helpers.
+
+    A parameter object rather than eight more positional arguments threaded through four
+    methods: the staging path and the destination differ between them, everything here does
+    not.
+    """
+
+    local_path: Path | str
+    fsync: bool
+    require_fsync: bool
+    progress: ProgressCallback | None
+    depth: int | None
 
 
 class Session:
@@ -203,6 +274,38 @@ class Session:
     def _next(self) -> int:
         return self._codec.allocate_request_id()
 
+    async def _expect_status(self, request: Request, *, path: bytes | None = None) -> None:
+        """Send a request whose only useful answer is a STATUS, and raise unless it said OK.
+
+        Raises:
+            ServerError: Or the subclass matching the code, for a non-OK STATUS.
+            ProtocolError: If the server answered with something other than a STATUS. Both
+                ``EXTENDED`` requests this library sends are specified to answer with one and
+                a real ``sftp-server`` does; a reply of another shape is a server we cannot
+                interpret rather than a refusal we can report.
+        """
+        reply = await self.request(request)
+        if isinstance(reply, Status):
+            raise_for_status(reply, path=path)
+            return
+        raise _unexpected(reply, expected="STATUS", path=path)
+
+    # --- capabilities --------------------------------------------------------------------
+
+    def supports(self, extension: bytes | str) -> bool:
+        """Whether the server *advertised* an extension.
+
+        Advertisement only. Absence is not proof: DESIGN.md 4.2 makes capability detection
+        advertisement **plus** an optional probe, because endpoints implement extensions they
+        never list -- and the probe is only ever sent for read-only or idempotent ones, since
+        you do not discover ``posix-rename`` support by renaming something.
+
+        Args:
+            extension: Wire name, as ``bytes`` or as one of the ``EXTENSION_*`` constants.
+        """
+        name = extension.encode("ascii") if isinstance(extension, str) else extension
+        return name in self._codec.extensions
+
     # --- operations ----------------------------------------------------------------------
 
     async def stat(self, path: bytes | str) -> Attrs:
@@ -240,12 +343,72 @@ class Session:
         raise _unexpected(reply, expected="HANDLE", path=encoded)
 
     async def close(self, handle: bytes) -> None:
-        """Close a remote handle."""
-        reply = await self.request(Close(self._next(), handle))
-        if isinstance(reply, Status):
-            raise_for_status(reply)
-            return
-        raise _unexpected(reply, expected="STATUS")
+        """Close a remote handle.
+
+        Not merely bookkeeping: some servers report a write failure here rather than on the
+        WRITE that caused it, so a CLOSE that returns an error is the transfer failing.
+        """
+        await self._expect_status(Close(self._next(), handle))
+
+    async def remove(self, path: bytes | str) -> None:
+        """Delete a file. Not a directory -- that is ``RMDIR``, which does not exist yet.
+
+        Raises:
+            NoSuchFileError: If the path is not there.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(path)
+        await self._expect_status(Remove(self._next(), encoded), path=encoded)
+
+    async def rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
+        """Rename with plain v3 ``RENAME``, which **cannot overwrite**.
+
+        Measured against OpenSSH 10.0p2: renaming onto a path that already exists answers
+        ``FAILURE`` and changes nothing. That is the specification's intent and it is why
+        :meth:`posix_rename` exists. Servers disagree here -- some overwrite, some silently
+        do nothing -- so a caller who needs replacement should ask for it rather than assume
+        this does it.
+
+        Raises:
+            ServerError: If the server refuses, which includes the target already existing.
+        """
+        encoded = _encode_path(new_path)
+        await self._expect_status(
+            Rename(self._next(), _encode_path(old_path), encoded), path=encoded
+        )
+
+    async def posix_rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
+        """Rename with ``posix-rename@openssh.com``, which **does** overwrite, atomically.
+
+        Sent whether or not the server advertised the extension, because advertisement is
+        not the only evidence -- endpoints implement extensions they never list. A server
+        that does not have it answers ``OP_UNSUPPORTED`` and stays perfectly usable, which is
+        measured, not hoped: three unknown extension names in a row on a real ``sftp-server``
+        each returned ``OP_UNSUPPORTED`` and the session survived all three.
+
+        Raises:
+            UnsupportedError: If the server does not implement the extension.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(new_path)
+        request = PosixRename(self._next(), _encode_path(old_path), encoded)
+        await self._expect_status(request.to_extended(), path=encoded)
+
+    async def fsync(self, handle: bytes) -> None:
+        """Flush an open handle to stable storage with ``fsync@openssh.com``.
+
+        Must be sent **before** the ``CLOSE``, and that ordering is measured rather than
+        assumed: the same handle after a close answers ``NO_SUCH_FILE``.
+
+        This covers the file, not the directory entry. SFTP has no way to flush a directory,
+        so a rename that publishes the file is never itself durable -- a limitation to state
+        rather than to imply.
+
+        Raises:
+            UnsupportedError: If the server does not implement the extension.
+            ServerError: For any other refusal, including a handle it does not recognise.
+        """
+        await self._expect_status(Fsync(self._next(), handle).to_extended())
 
     async def get(
         self,
@@ -280,7 +443,7 @@ class Session:
         handle = await self.open(encoded, OpenFlag.READ)
         try:
             async with self._lock:
-                return await download_handle(
+                transferred = await download_handle(
                     self._transport,
                     self._codec,
                     handle,
@@ -292,60 +455,336 @@ class Session:
                     progress=progress,
                     remote_path=encoded,
                 )
-        finally:
-            # Closing is not optional: a leaked handle counts against max-open-handles and
-            # is invisible from this side until the server starts refusing to open anything.
-            await self.close(handle)
+        except BaseException:
+            # Closing is not optional: a leaked handle counts against max-open-handles and is
+            # invisible from this side until the server starts refusing to open anything. It
+            # must not replace the transfer's error with one about the close, though -- the
+            # first error is the diagnosis and the second is housekeeping.
+            await self._close_quietly(handle)
+            raise
+        await self.close(handle)
+        return transferred
 
     async def put(
         self,
         local_path: Path | str,
         remote_path: bytes | str,
         *,
+        atomic: bool = True,
+        fsync: bool = True,
+        require_atomic: bool = False,
+        require_fsync: bool = False,
+        staging_name: bytes | str | None = None,
         progress: ProgressCallback | None = None,
         depth: int | None = None,
-    ) -> int:
-        """Upload ``local_path`` to ``remote_path``, truncating whatever is there.
+    ) -> UploadResult:
+        """Upload ``local_path`` to ``remote_path``, publishing it atomically by default.
 
-        The remote file is written **in place**, so a reader watching the directory can see
-        it half-written. Publishing atomically -- upload to a sibling temp name, fsync,
-        rename over the target -- is the single most common thing production SFTP
-        integrations get wrong, and it is deliberately not silently implied here: it needs
-        ``posix-rename@openssh.com`` or a documented non-atomic fallback, and it lands as its
-        own change rather than as an undocumented side effect of this one.
+        With ``atomic=True`` the bytes go to a hidden sibling staging file, are flushed, and
+        are then renamed over the destination, so a consumer polling the directory sees the
+        old file or the new one and never a partial one. DESIGN.md 6 calls that partial read
+        the single most common bug in production SFTP integrations.
+
+        **Every step of it is an optional extension**, so the result says which mechanism
+        actually ran rather than implying the strongest one --
+        :attr:`~gantry_sftp.session.UploadResult.mechanism` and
+        :attr:`~gantry_sftp.session.UploadResult.durability`, with
+        :attr:`~gantry_sftp.session.UploadResult.atomic` as the one-line answer. A caller who
+        needs the real guarantee passes ``require_atomic=True`` and gets a
+        :class:`~gantry_sftp.exceptions.CapabilityError` instead of a downgrade, because an
+        ``atomic=True`` that quietly was not is worse than one that refused.
 
         Args:
             local_path: Local file to read.
             remote_path: Destination on the server.
+            atomic: Publish via a staging file and a rename. ``False`` writes the destination
+                in place, which is what every other SFTP client does by default and is the
+                behaviour a write-only drop directory may require, since staging needs the
+                right to create *and* rename a second name.
+            fsync: Send ``fsync@openssh.com`` before publishing. Silently unavailable on a
+                server without it, which the result reports as
+                :attr:`~gantry_sftp.session.Durability.UNAVAILABLE`.
+            require_atomic: Fail rather than fall back to a mechanism with a window in which
+                the destination is missing or partial.
+            require_fsync: Fail rather than publish with no durability barrier.
+            staging_name: Override the staging file's name. A bare name is resolved as a
+                sibling of the destination; a value containing ``/`` is used verbatim and must
+                be on the same filesystem. For servers that forbid dot-files or mandate a
+                staging directory.
             progress: Called with ``(transferred, total)`` as writes are acknowledged.
             depth: Requests in flight, overriding the session default. Each one holds a full
                 payload in memory, so this costs more here than on the download side.
 
         Returns:
-            Bytes the server acknowledged.
+            What actually happened, including which publish mechanism was used.
 
         Raises:
+            ValueError: If a ``require_*`` flag contradicts the flag it strengthens.
+            CapabilityError: If a required guarantee is not available on this server.
             PermissionDeniedError: If the server will not create or write the file.
             ServerError: For any other refusal.
             TransferError: If the transfer fails partway.
         """
-        encoded = _encode_path(remote_path)
-        handle = await self.open(encoded, OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC)
+        target = _encode_path(remote_path)
+        _check_publish_flags(
+            atomic=atomic,
+            fsync=fsync,
+            require_atomic=require_atomic,
+            require_fsync=require_fsync,
+        )
+        if require_fsync and not self.supports(EXTENSION_FSYNC):
+            raise CapabilityError(
+                f"require_fsync=True but this server does not advertise {EXTENSION_FSYNC}, "
+                f"so nothing can promise the bytes reached stable storage",
+                feature="durable upload",
+                missing=(EXTENSION_FSYNC,),
+                path=target,
+            )
+
+        upload = _Upload(
+            local_path=local_path,
+            fsync=fsync,
+            require_fsync=require_fsync,
+            progress=progress,
+            depth=depth,
+        )
+        if not atomic:
+            return await self._put_in_place(upload, target)
+        staged = staged_path(target, staging_token(), name=_optional_path(staging_name))
+        return await self._put_atomically(upload, target, staged, require_atomic=require_atomic)
+
+    # --- put, in its two shapes ------------------------------------------------------------
+
+    async def _put_in_place(self, upload: _Upload, target: bytes) -> UploadResult:
+        """Write the destination directly, which a consumer can observe half-written."""
+        handle = await self.open(target, _TRUNCATE_FLAGS)
+        transferred, durability = await self._fill_and_close(upload, handle, target)
+        return UploadResult(transferred, target, PublishMechanism.IN_PLACE, durability)
+
+    async def _put_atomically(
+        self, upload: _Upload, target: bytes, staged: bytes, *, require_atomic: bool
+    ) -> UploadResult:
+        """Stage, flush, then publish -- and clean the staging file up on any failure."""
+        if require_atomic and not self.supports(EXTENSION_POSIX_RENAME):
+            # Cheap pre-flight: find out now, rather than after moving nine gigabytes, that
+            # the only mechanism left cannot replace a file that is already there.
+            await self._refuse_unpublishable(target)
+
+        # A failed OPEN means nothing of ours exists yet, so it must not reach the cleanup
+        # below: EXCL turns a staging-name collision into this error, and deleting the file
+        # would delete whatever the other publisher was in the middle of writing.
+        handle = await self.open(staged, _STAGE_FLAGS)
+        try:
+            transferred, durability = await self._fill_and_close(upload, handle, staged)
+            mechanism = await self._publish(staged, target, require_atomic=require_atomic)
+        except _StagedIsTheOnlyCopyError as lost:
+            # Do NOT clean up. The destination has already been removed and this file is the
+            # only copy of the data; deleting it here would turn a failure someone can undo
+            # by hand into one nobody can.
+            lost.failure.add_note(
+                f"the destination {target!r} was removed and the rename that should have "
+                f"replaced it failed; the uploaded file is intact at {staged!r} and is now the "
+                f"only copy of it"
+            )
+            raise lost.failure from None
+        except BaseException as error:
+            await self._discard(staged, error)
+            raise
+        return UploadResult(transferred, target, mechanism, durability, staged)
+
+    async def _fill_and_close(
+        self, upload: _Upload, handle: bytes, path: bytes
+    ) -> tuple[int, Durability]:
+        """Push the file through an open handle, flush it, and close it.
+
+        The flush happens while the handle is still open, because that is the only time it
+        can: ``fsync@openssh.com`` on a closed handle answers ``NO_SUCH_FILE``.
+        """
         try:
             async with self._lock:
-                return await upload_handle(
+                transferred = await upload_handle(
                     self._transport,
                     self._codec,
                     handle,
-                    local_path,
+                    upload.local_path,
                     write_length=self.sizes_for(handle).write_length,
-                    depth=self._depth if depth is None else depth,
+                    depth=self._depth if upload.depth is None else upload.depth,
                     idle_timeout=self._idle_timeout,
-                    progress=progress,
-                    remote_path=encoded,
+                    progress=upload.progress,
+                    remote_path=path,
                 )
-        finally:
+            # Outside the lock: anyio's Lock is not reentrant and the flush is a request of
+            # its own.
+            durability = await self._flush(upload, handle)
+        except BaseException:
+            # Closing is not optional -- a leaked handle counts against max-open-handles and
+            # is invisible from this side until the server refuses to open anything. But it
+            # must not replace the error that got us here with one about the close.
+            await self._close_quietly(handle)
+            raise
+        await self.close(handle)
+        return transferred, durability
+
+    async def _flush(self, upload: _Upload, handle: bytes) -> Durability:
+        """Flush the handle, reporting what was possible rather than promising what was not."""
+        if not upload.fsync:
+            return Durability.SKIPPED
+        if not self.supports(EXTENSION_FSYNC):
+            return Durability.UNAVAILABLE
+        try:
+            await self.fsync(handle)
+        except ServerError:
+            # Advertised and then refused. The bytes may still be in a cache, which the
+            # result says; a caller who cannot accept that asked for require_fsync.
+            if upload.require_fsync:
+                raise
+            return Durability.UNAVAILABLE
+        return Durability.FSYNCED
+
+    # --- publishing --------------------------------------------------------------------------
+
+    async def _publish(
+        self, staged: bytes, target: bytes, *, require_atomic: bool
+    ) -> PublishMechanism:
+        """Move the staged file onto the destination by the strongest available mechanism."""
+        if self.supports(EXTENSION_POSIX_RENAME):
+            try:
+                await self.posix_rename(staged, target)
+            except UnsupportedError:
+                pass  # Advertised and not implemented. The field is full of these.
+            else:
+                return PublishMechanism.POSIX_RENAME
+        return await self._publish_by_plain_rename(staged, target, require_atomic=require_atomic)
+
+    async def _publish_by_plain_rename(
+        self, staged: bytes, target: bytes, *, require_atomic: bool
+    ) -> PublishMechanism:
+        """Plain ``RENAME``, and the documented non-atomic fallback when that will not do.
+
+        A plain rename onto an absent target *is* atomic -- v3 RENAME cannot overwrite, so a
+        success proves the destination appeared whole. The refusal is the interesting case,
+        and ``FAILURE`` is a v3 catch-all that names nothing: it could be the target being in
+        the way, or the directory being read-only. So the target is STATed before anything is
+        deleted. Removing a good file on the strength of a guess about an error string is a
+        worse outcome than the failure it was trying to recover from.
+
+        Raises:
+            _StagedIsTheOnlyCopyError: If the destination was removed and the rename after it
+                failed, so that the caller knows not to clean the staging file up.
+        """
+        try:
+            await self.rename(staged, target)
+        except ServerError as refusal:
+            if not await self._confirmed_present(target):
+                raise
+            if require_atomic:
+                raise CapabilityError(
+                    f"require_atomic=True but {target!r} already exists and this server does "
+                    f"not advertise {EXTENSION_POSIX_RENAME}; replacing it would mean "
+                    f"removing it first, leaving a window with no file at all",
+                    feature="atomic publish",
+                    missing=(EXTENSION_POSIX_RENAME,),
+                    path=target,
+                ) from refusal
+        else:
+            return PublishMechanism.RENAME
+
+        # The window this rung is named for. Everything after the REMOVE is unwindable only by
+        # hand, so a failure past this point must leave the staged file where it is.
+        await self.remove(target)
+        try:
+            await self.rename(staged, target)
+        except Exception as second_failure:
+            raise _StagedIsTheOnlyCopyError(second_failure) from second_failure
+        return PublishMechanism.REMOVE_RENAME
+
+    async def _refuse_unpublishable(self, target: bytes) -> None:
+        """Refuse before the transfer if the destination cannot be replaced atomically.
+
+        Raises:
+            CapabilityError: If the destination exists and there is no atomic overwrite.
+        """
+        if not await self._confirmed_present(target):
+            return
+        raise CapabilityError(
+            f"require_atomic=True but {target!r} already exists and this server does not "
+            f"advertise {EXTENSION_POSIX_RENAME}, so it cannot be replaced in one step",
+            feature="atomic publish",
+            missing=(EXTENSION_POSIX_RENAME,),
+            path=target,
+        )
+
+    async def _confirmed_present(self, path: bytes) -> bool:
+        """Whether the server *positively reported* that ``path`` is there.
+
+        Three states, and the third one is why this is not called ``_exists``: a STAT can
+        succeed, report ``NO_SUCH_FILE``, or fail for some third reason -- permissions, a
+        server that refuses STAT on the path, a ``FAILURE`` meaning who knows what. Only the
+        first is evidence. Anything else answers ``False``, because this predicate's callers
+        use it to decide whether to *delete* something, and "the server would not tell us" is
+        not a licence to do that.
+        """
+        try:
+            _ = await self.stat(path)
+        except ServerError:
+            return False
+        return True
+
+    # --- cleanup ------------------------------------------------------------------------------
+
+    async def _close_quietly(self, handle: bytes) -> None:
+        """Close a handle during failure handling, shielded and without raising.
+
+        ``Exception`` rather than a precise tuple on purpose. This runs while another error is
+        already on its way up, and *anything* raised here replaces the diagnosis with a
+        housekeeping complaint. Cancellation is not caught -- it derives from
+        ``BaseException`` -- and cannot arrive anyway inside the shield.
+        """
+        with anyio.CancelScope(shield=True), suppress(Exception):
             await self.close(handle)
+
+    async def _discard(self, staged: bytes, error: BaseException) -> None:
+        """Remove a staging file after a failure, and say so if that did not work.
+
+        Shielded from cancellation, because a cancelled nine-gigabyte upload is precisely
+        when a staging file gets left behind, and it is still bounded: every request carries
+        ``request_timeout``, so a dead connection cannot make cleanup hang.
+
+        The failure is recorded as a note on the original exception rather than swallowed or
+        raised. Swallowing it means the caller never learns a file was left on the server;
+        raising it means replacing the real error with a housekeeping one.
+        """
+        with anyio.CancelScope(shield=True):
+            try:
+                await self.remove(staged)
+            except Exception as cleanup_failure:  # see _close_quietly on the breadth
+                error.add_note(
+                    f"the staging file {staged!r} was left on the server: "
+                    f"removing it also failed ({cleanup_failure!r})"
+                )
+
+
+def _check_publish_flags(
+    *, atomic: bool, fsync: bool, require_atomic: bool, require_fsync: bool
+) -> None:
+    """Refuse a pair of flags that contradict each other.
+
+    ``require_atomic=True, atomic=False`` is not a policy this can satisfy by picking one --
+    it is two opposite instructions, and honouring either silently would be guessing about
+    the guarantee the caller cares most about.
+
+    Raises:
+        ValueError: If a ``require_*`` flag strengthens a flag that is switched off.
+    """
+    if require_atomic and not atomic:
+        raise ValueError("require_atomic=True contradicts atomic=False")
+    if require_fsync and not fsync:
+        raise ValueError("require_fsync=True contradicts fsync=False")
+
+
+def _optional_path(path: bytes | str | None) -> bytes | None:
+    """Encode a path that may be absent, keeping ``None`` distinct from an empty name."""
+    return None if path is None else _encode_path(path)
 
 
 def _encode_path(path: bytes | str) -> bytes:

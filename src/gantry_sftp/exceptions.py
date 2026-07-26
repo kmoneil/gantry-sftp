@@ -16,6 +16,7 @@ from typing import override
 
 __all__ = [
     "AuthenticationError",
+    "CapabilityError",
     "ConnectError",
     "HostKeyError",
     "InsecureOptionWarning",
@@ -287,3 +288,51 @@ class UnsupportedError(ServerError):
     Expected rather than exceptional: it is the answer to probing for an extension a server
     does not have, and the whole reason capability detection can be done by asking.
     """
+
+
+class CapabilityError(SFTPError):
+    """A guarantee was demanded that this server cannot provide, so nothing was attempted.
+
+    Deliberately **not** a :class:`ServerError`, which is a refusal the server actually sent
+    as a STATUS. This is our own refusal to silently downgrade: the caller asked for a
+    property -- an atomic publish, a durability barrier -- and the extensions that deliver it
+    are absent, so the operation stops rather than quietly doing something weaker that looks
+    the same from the outside. An ``atomic=True`` that quietly was not is worse than one that
+    refused.
+
+    Distinguishing it from :class:`UnsupportedError` matters because the remedies differ.
+    ``UnsupportedError`` means the server answered ``OP_UNSUPPORTED`` to something we sent;
+    this means we did not send it, and the fix is either a different server or accepting the
+    documented weaker mechanism.
+
+    Attributes:
+        feature: What was being attempted, in the caller's terms.
+        missing: Extension names that would have made it possible. Empty when the obstacle is
+            not an extension -- an existing target with no way to replace it in one step.
+        path: The path concerned, where there was one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        feature: str,
+        missing: tuple[str, ...] = (),
+        path: bytes | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.feature = feature
+        self.missing = missing
+        self.path = path
+
+    @override
+    def __str__(self) -> str:
+        """Render the message with the feature and the extensions that would deliver it."""
+        parts = [super().__str__()]
+        parts.append(f"(feature={self.feature!r}")
+        if self.missing:
+            parts.append(f"missing={', '.join(self.missing)}")
+        parts.append(")")
+        if self.path is not None:
+            parts.append(f"path={self.path!r}")
+        return " ".join(parts).replace(" )", ")")

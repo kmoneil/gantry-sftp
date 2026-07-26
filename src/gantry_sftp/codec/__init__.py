@@ -30,6 +30,9 @@ from __future__ import annotations
 from gantry_sftp.codec._attrs import EMPTY_ATTRS, Attrs, Owner, Times, decode_attrs, encode_attrs
 from gantry_sftp.codec._codec import Codec, CodecState, Completed, Event, Negotiated
 from gantry_sftp.codec._constants import (
+    EXTENSION_FSYNC,
+    EXTENSION_LIMITS,
+    EXTENSION_POSIX_RENAME,
     MAX_STATUS_CODE,
     NO_REQUEST_ID,
     OPENSSH_ADVERTISED_EXTENSIONS,
@@ -38,6 +41,13 @@ from gantry_sftp.codec._constants import (
     OpenFlag,
     PacketType,
     StatusCode,
+)
+from gantry_sftp.codec._extensions import (
+    FSYNC_NAME,
+    LIMITS_NAME,
+    POSIX_RENAME_NAME,
+    Fsync,
+    PosixRename,
 )
 from gantry_sftp.codec._framing import DEFAULT_MAX_FRAME_LENGTH, FrameSplitter
 from gantry_sftp.codec._packets import (
@@ -80,9 +90,15 @@ from gantry_sftp.codec._wire import WireReader, WireWriter
 __all__ = [
     "DEFAULT_MAX_FRAME_LENGTH",
     "EMPTY_ATTRS",
+    "EXTENSION_FSYNC",
+    "EXTENSION_LIMITS",
+    "EXTENSION_POSIX_RENAME",
+    "FSYNC_NAME",
+    "LIMITS_NAME",
     "MAX_STATUS_CODE",
     "NO_REQUEST_ID",
     "OPENSSH_ADVERTISED_EXTENSIONS",
+    "POSIX_RENAME_NAME",
     "PROTOCOL_VERSION",
     "AttrFlag",
     "Attrs",
@@ -98,6 +114,7 @@ __all__ = [
     "FSetStat",
     "FStat",
     "FrameSplitter",
+    "Fsync",
     "Handle",
     "Init",
     "LStat",
@@ -111,6 +128,7 @@ __all__ = [
     "Owner",
     "Packet",
     "PacketType",
+    "PosixRename",
     "Read",
     "ReadDir",
     "ReadLink",

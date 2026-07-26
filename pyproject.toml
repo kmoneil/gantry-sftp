@@ -161,7 +161,10 @@ paths = ["src"]
 # are out of the default run and are invoked explicitly.
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# examples/ is in the default run on purpose: an example that has drifted out of sync with
+# the library is a confident, wrong answer somebody will copy. Each one runs as a subprocess
+# and skips cleanly without openssh-server.
+testpaths = ["tests", "examples"]
 # Setting norecursedirs REPLACES pytest's defaults rather than extending them, so the
 # defaults are restated here. Dropping `.*` makes hypothesis warn that .hypothesis is
 # being collected.

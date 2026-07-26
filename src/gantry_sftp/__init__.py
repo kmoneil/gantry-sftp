@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from gantry_sftp.exceptions import (
     AuthenticationError,
+    CapabilityError,
     ConnectError,
     HostKeyError,
     InsecureOptionWarning,
@@ -29,6 +30,7 @@ from gantry_sftp.exceptions import (
 
 __all__ = [
     "AuthenticationError",
+    "CapabilityError",
     "ConnectError",
     "HostKeyError",
     "InsecureOptionWarning",

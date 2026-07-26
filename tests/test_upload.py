@@ -298,9 +298,9 @@ async def test_uploading_to_a_real_sftp_server(tmp_path: Path):
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        written = await sftp.put(source, str(destination))
+        result = await sftp.put(source, str(destination))
 
-    assert written == len(content)
+    assert result.transferred == len(content)
     assert destination.read_bytes() == content
 
 

@@ -33,6 +33,7 @@ from gantry_sftp.codec import (
     StatusCode,
 )
 from gantry_sftp.exceptions import ConnectError
+from gantry_sftp.session import Durability, PublishMechanism, open_session
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -166,6 +167,38 @@ async def test_realpath_resolves_over_a_real_connection(ssh_server):
         reply = await exchange(transport, codec, RealPath(codec.allocate_request_id(), b"."))
         assert reply.entries
         assert reply.entries[0].filename.startswith(b"/")
+
+
+def staging_files(directory: Path, stem: str) -> list[Path]:
+    """Staging files for ``stem``, as a consumer's glob would see them.
+
+    A plain function so the async test below does no filesystem work in an async frame.
+    """
+    return list(directory.glob(f".{stem}.*.part"))
+
+
+async def test_an_atomic_publish_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
+    """Atomic publish where the server is a subsystem of a real sshd, not a bare pipe.
+
+    Same program, different environment: spawned by ``sshd`` it has that user's HOME, its own
+    working directory and its own umask, so the staging file lands somewhere the bare-pipe
+    lane cannot tell us about. The assertion that matters is that the staging file is gone --
+    a publish that leaves one behind is one a consumer's glob eventually trips over.
+    """
+    payload = os.urandom(300_000)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+    destination = tmp_path / "published.bin"
+    destination.write_bytes(b"the previous version")
+
+    async with connect(ssh_server) as transport, open_session(transport) as sftp:
+        result = await sftp.put(source, str(destination), require_atomic=True, require_fsync=True)
+
+    assert result.mechanism is PublishMechanism.POSIX_RENAME
+    assert result.durability is Durability.FSYNCED
+    assert result.transferred == len(payload)
+    assert destination.read_bytes() == payload
+    assert not staging_files(tmp_path, "published.bin"), "a staging file was left behind"
 
 
 # --- it fails usefully ---------------------------------------------------------------------
