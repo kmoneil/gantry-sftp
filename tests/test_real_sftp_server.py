@@ -52,6 +52,7 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
+from gantry_sftp.session import ServerLimits, negotiate_transfer_sizes
 
 pytestmark = pytest.mark.sftp_server
 
@@ -196,10 +197,71 @@ def test_limits_reserves_framing_headroom_below_the_packet_ceiling(server: Local
     assert max_handles > 0
 
 
-# The "0 means no limit" trap -- min(our_size, 0) yields a zero-length READ, an infinite
-# loop that reads as a hang -- gets its test alongside the clamp, in the scheduler. There is
-# no clamp yet, and a test whose assertion is true by construction is not a placeholder for
-# one.
+def test_the_derived_read_size_is_one_the_server_actually_accepts(
+    server: LocalSftpServer, tmp_path: Path
+):
+    """Close the loop on D-2 against the real thing, not just against our arithmetic.
+
+    Ask the server for its limits, derive a read size from them, then issue a read of
+    *exactly* that size and confirm a full-length DATA comes back. If the derivation were
+    off by even the 1024 bytes of framing headroom, the server would clamp and this would
+    come back short -- which is precisely the silent failure the whole calculation exists to
+    avoid.
+    """
+    reply = server.request(Extended(server.next_id(), b"limits@openssh.com"))
+    assert isinstance(reply, ExtendedReply), reply
+    limits = ServerLimits.from_extended_reply(reply.data)
+
+    target = tmp_path / "big.bin"
+    handle_length = 4  # OpenSSH's handles; asserted below rather than assumed
+
+    sizes = negotiate_transfer_sizes(limits, handle_length=handle_length)
+    target.write_bytes(bytes(sizes.read_length))
+
+    opened = server.request(
+        Open(server.next_id(), str(target).encode(), OpenFlag.READ),
+    )
+    assert isinstance(opened, Handle), opened
+    assert len(opened.handle) == handle_length, "handle length assumption no longer holds"
+
+    data = server.request(Read(server.next_id(), opened.handle, offset=0, length=sizes.read_length))
+    assert isinstance(data, Data), data
+    assert len(data.data) == sizes.read_length, (
+        f"server returned {len(data.data)} bytes for a {sizes.read_length}-byte read; "
+        f"the derived size exceeds what it will actually serve"
+    )
+    server.request(Close(server.next_id(), opened.handle))
+
+
+def test_a_read_one_byte_over_the_derived_size_is_where_the_server_starts_clamping(
+    server: LocalSftpServer, tmp_path: Path
+):
+    """The other side of the boundary, which is what makes the test above mean something.
+
+    A size-boundary test that only checks the accepted side cannot distinguish "we computed
+    the maximum" from "we computed something small enough". Asking for one byte more must
+    come back short.
+    """
+    reply = server.request(Extended(server.next_id(), b"limits@openssh.com"))
+    assert isinstance(reply, ExtendedReply), reply
+    limits = ServerLimits.from_extended_reply(reply.data)
+    sizes = negotiate_transfer_sizes(limits, handle_length=4)
+
+    target = tmp_path / "bigger.bin"
+    target.write_bytes(bytes(sizes.read_length + 1))
+
+    opened = server.request(Open(server.next_id(), str(target).encode(), OpenFlag.READ))
+    assert isinstance(opened, Handle), opened
+
+    data = server.request(
+        Read(server.next_id(), opened.handle, offset=0, length=sizes.read_length + 1)
+    )
+    assert isinstance(data, Data), data
+    assert len(data.data) == sizes.read_length, (
+        "asking for one byte more than the derived size was served in full, so the "
+        "derivation is not at the server's actual ceiling"
+    )
+    server.request(Close(server.next_id(), opened.handle))
 
 
 # --- STATUS -----------------------------------------------------------------------------
