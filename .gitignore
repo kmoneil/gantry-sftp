@@ -1,0 +1,47 @@
+# Plans, scratch, reviews — never committed
+_plans/
+_tmp/
+_reviews/
+_reports/
+# examples/ ships with the package (it's part of the docs) — deliberately NOT ignored.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# Envs & tooling caches
+.venv/
+venv/
+env/
+.venv-mac/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+# mutation lane (mutmut 3.x): the mutants/ working copy + the per-run generated config
+mutants/
+setup.cfg
+.mutmut-cache
+.benchmarks/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# AI Files
+CLAUDE.md
+GEMINI.md
+.claude/

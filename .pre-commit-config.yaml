@@ -1,0 +1,95 @@
+# Python tools are LOCAL hooks calling .venv/bin/*, so their versions track uv.lock rather
+# than a mirror repo that drifts from it. `pre-commit autoupdate` bumps the upstream repos
+# below; the local ones move when `uv lock` moves.
+#
+# Install once:  .venv/bin/pre-commit install
+# Never commit with --no-verify.
+
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      # Golden frames are binary fixtures captured from a real server; they are the point,
+      # not an accident, so they are exempt from the "did you mean to commit this?" check.
+      - id: check-added-large-files
+        args: [--maxkb=512]
+        exclude: ^tests/fixtures/.*\.bin$
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff (lint)
+        entry: .venv/bin/ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff (format)
+        entry: .venv/bin/ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      # mypy and ty are both scoped to `src` by pyproject. Passing filenames would drag in
+      # tests/ and examples/, which are deliberately exempt -- so both run project-wide and
+      # ignore the staged file list.
+      - id: mypy
+        name: mypy --strict (src)
+        entry: .venv/bin/mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
+      - id: ty
+        name: ty (src)
+        entry: .venv/bin/ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
+      - id: complexipy
+        name: complexipy (cognitive complexity <= 15)
+        entry: .venv/bin/complexipy
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
+      - id: uv-lock
+        name: uv lock is in sync with pyproject
+        entry: env UV_CACHE_DIR=/workspace/.uv-cache uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
+      # Invoked via `bash` rather than executed, so the hook that forbids the exec bit does
+      # not need the exec bit itself and does not have to allowlist its own script.
+      - id: forbid-exec-bit
+        name: no executable bit in the git index
+        entry: bash scripts/forbid_exec_bit.sh
+        language: system
+        pass_filenames: false
+
+      # pytest is pre-push only: it is too slow for every commit, and the point of the gate
+      # is that nothing broken leaves the machine. live-tests/ and benchmarks/ need
+      # containers and a shaped link, and are excluded by pyproject's testpaths.
+      - id: pytest
+        name: pytest (unit + real sftp-server)
+        entry: .venv/bin/python -m pytest
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]

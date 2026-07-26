@@ -1,0 +1,193 @@
+[project]
+name = "gantry-sftp"
+version = "0.0.0"
+description = "A modern Python SFTP library that does not implement SSH at all."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+authors = [{ name = "Kevin O'Neil", email = "kevin@oneil.xyz" }]
+keywords = ["sftp", "ssh", "filexfer", "openssh", "file-transfer"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Internet :: File Transfer Protocol (FTP)",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/kevinoneil/gantry-sftp"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gantry_sftp"]
+
+# `session/` will add anyio. The codec layer has no runtime dependencies at all and
+# that is load-bearing, not an accident -- see DESIGN.md 4.1.
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "hypothesis>=6.112",
+  "ruff>=0.14",
+  "mypy>=1.13",
+  "ty>=0.0.1a10",
+  "complexipy>=3.0",
+  "pre-commit>=4.0",
+  "mutmut>=3.2",
+]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",     # pycodestyle
+  "F",          # pyflakes
+  "I",          # isort
+  "N",          # pep8-naming
+  "UP",         # pyupgrade
+  "B",          # bugbear
+  "A",          # builtins shadowing
+  "C4",         # comprehensions
+  "C90",        # mccabe -- distinct ceiling from complexipy's cognitive one
+  "DTZ",        # naive datetimes
+  "T20",        # no print in shipped code
+  "PT",         # pytest style
+  "RET",        # return simplification
+  "SIM",        # simplify
+  "SLF",        # private member access
+  "TID",        # tidy imports
+  "PTH",        # pathlib over os.path
+  "ERA",        # commented-out code
+  "PL",         # pylint
+  "TRY",        # exception antipatterns
+  "RUF",
+  "S",          # bandit
+  "ASYNC",      # async antipatterns
+  "D",          # pydocstyle -- Google convention
+  "ANN",        # annotations required
+]
+ignore = [
+  "D105",    # magic method docstrings
+  "D107",    # __init__ docstring -- documented on the class
+  "TRY003",  # long messages outside exception class: our errors carry state, see DESIGN.md 9
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-pytest-style]
+# PT011 wants a `match=` on broad exception classes. Our convention is stronger and this
+# rule cannot see it: every `pytest.raises` is followed by `exc.value.args[0] == "..."`,
+# which pins the whole message rather than a substring of it. Requiring `match=` as well
+# would mean asserting the same string twice, in two spellings, and mutation survivors
+# cluster on the half nobody updates.
+raises-require-match-for = []
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests, examples, live-tests and benchmarks are exempt from docstring and
+# annotation gates, and from bandit's assert/subprocess rules. They are NOT
+# exempt from correctness lints.
+"tests/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
+"live-tests/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
+"benchmarks/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
+"examples/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
+
+# ---------------------------------------------------------------------------
+# mypy -- stricter of the two type gates, scoped to shipped code
+# ---------------------------------------------------------------------------
+[tool.mypy]
+strict = true
+files = ["src"]
+python_version = "3.13"
+python_executable = ".venv/bin/python"
+warn_unreachable = true
+disallow_any_explicit = false
+enable_error_code = [
+  "redundant-expr",
+  "truthy-bool",
+  "ignore-without-code",
+  "unused-awaitable",
+  "explicit-override",
+]
+
+# ---------------------------------------------------------------------------
+# ty -- second type gate, same scope
+# ---------------------------------------------------------------------------
+[tool.ty.src]
+include = ["src"]
+
+[tool.ty.environment]
+python = ".venv"
+
+# ---------------------------------------------------------------------------
+# complexipy -- cognitive complexity (SonarQube S3776), distinct from mccabe
+# ---------------------------------------------------------------------------
+[tool.complexipy]
+max-complexity-allowed = 15
+paths = ["src"]
+
+# ---------------------------------------------------------------------------
+# pytest -- live-tests and benchmarks need containers and a shaped link, so they
+# are out of the default run and are invoked explicitly.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Setting norecursedirs REPLACES pytest's defaults rather than extending them, so the
+# defaults are restated here. Dropping `.*` makes hypothesis warn that .hypothesis is
+# being collected.
+norecursedirs = [
+  "*.egg",
+  ".*",
+  "_darcs",
+  "build",
+  "CVS",
+  "dist",
+  "node_modules",
+  "venv",
+  "{arch}",
+  "live-tests",
+  "benchmarks",
+  "_plans",
+]
+addopts = "-ra --strict-markers --strict-config"
+xfail_strict = true
+filterwarnings = ["error"]
+markers = [
+  "sftp_server: needs the OpenSSH sftp-server binary (ships in openssh-server)",
+]
+
+# ---------------------------------------------------------------------------
+# pyright / basedpyright -- IDE alignment only. NOT a committed gate.
+# ---------------------------------------------------------------------------
+[tool.pyright]
+include = ["src"]
+exclude = ["tests", "examples", "live-tests", "benchmarks", ".venv"]
+typeCheckingMode = "standard"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+
+# ---------------------------------------------------------------------------
+# mutmut -- codec and correctness layer carry a mutation run
+# ---------------------------------------------------------------------------
+[tool.mutmut]
+paths_to_mutate = ["src/gantry_sftp/codec/"]
+tests_dir = ["tests/"]
