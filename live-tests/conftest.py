@@ -15,11 +15,16 @@ import os
 import socket
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from netem import ShapedLink, release_loopback, shape, unavailable_reason
+
+from gantry_sftp.codec import Codec, CodecState
+from gantry_sftp.transport import Transport, open_ssh_transport
 
 SSHD_CANDIDATES = ("/usr/sbin/sshd", "/usr/local/sbin/sshd")
 SFTP_SERVER_CANDIDATES = (
@@ -55,6 +60,37 @@ def scrubbed_ssh_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in steering}
     env["HOME"] = "/nonexistent-home-for-live-tests"
     return env
+
+
+def connect(server: SSHServer, **overrides):
+    """Open a transport to the test server, with any argument replaceable.
+
+    Defaults are merged rather than passed alongside the overrides, so a test can say
+    ``port=...`` or ``identity_file=...`` without colliding with the value here.
+
+    Lives in the conftest rather than in one test module because two modules need it, and
+    two spellings of "how this suite connects" is how the scrubbed environment ends up
+    applied in one of them and not the other.
+    """
+    options = server.connect_options()
+    options.update(overrides.pop("options", {}))
+    kwargs = {
+        "port": server.port,
+        "identity_file": str(server.identity_file),
+        "config_file": os.devnull,
+        # An agent holding a working key would make the wrong-key test pass for the wrong
+        # reason. IdentitiesOnly already covers it; this is the second, independent defence.
+        "env": scrubbed_ssh_env(),
+    }
+    kwargs.update(overrides)
+    return open_ssh_transport("127.0.0.1", options=options, **kwargs)
+
+
+async def negotiate(transport: Transport, codec: Codec) -> None:
+    """Drive the handshake to READY."""
+    await transport.send(codec.initiate())
+    while codec.state is not CodecState.READY:
+        codec.receive(await transport.receive())
 
 
 def _first_existing(candidates: tuple[str, ...]) -> str | None:
@@ -195,3 +231,52 @@ def ssh_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SSHServer]:
             except subprocess.TimeoutExpired:  # pragma: no cover
                 process.kill()
                 process.wait(timeout=10)
+
+
+ShapeLink = Callable[..., ShapedLink]
+"""Signature of the :func:`shape_link` fixture: ``(*, rtt_ms, loss_percent=0.0)``."""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _loopback_is_left_unshaped() -> Iterator[None]:
+    """Leave the interface the way we found it, even if a test died holding a profile.
+
+    :func:`netem.shape` removes its own qdisc in a ``finally``, which covers every ordinary
+    exit including a failing assertion. This covers the ones that are not ordinary -- a
+    session-scoped fixture erroring during teardown, a ``KeyboardInterrupt`` at the wrong
+    moment -- because the cost of getting it wrong is not a failed test. It is a container
+    whose loopback is still delayed by 200 ms after the run, which every later test silently
+    measures and none of them mention.
+    """
+    yield
+    release_loopback()
+
+
+@pytest.fixture
+def shape_link(ssh_server: SSHServer) -> Iterator[ShapeLink]:
+    """Shape loopback for one test, or skip saying exactly what would fix it.
+
+    Depends on ``ssh_server`` so that ``sshd`` is already listening and its host key already
+    scanned before the link degrades. Starting a server through a 200 ms link would spend the
+    startup budget on key exchange and report it as the server failing to start, which is a
+    diagnosis pointing at the wrong component.
+
+    Yields:
+        A callable taking ``rtt_ms`` and optional ``loss_percent``, returning the measured
+        :class:`~netem.ShapedLink`. Profiles are unshaped when the test ends, in reverse
+        order, so a test may take more than one.
+    """
+    reason = unavailable_reason()
+    if reason is not None:
+        pytest.skip(reason)
+
+    with ExitStack() as stack:
+
+        def _shape(
+            *, rtt_ms: float, loss_percent: float = 0.0, rate_mbit: float | None = None
+        ) -> ShapedLink:
+            return stack.enter_context(
+                shape(rtt_ms=rtt_ms, loss_percent=loss_percent, rate_mbit=rate_mbit)
+            )
+
+        yield _shape

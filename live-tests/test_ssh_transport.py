@@ -18,11 +18,10 @@ from pathlib import Path
 
 import pytest
 
-from conftest import scrubbed_ssh_env
+from conftest import connect, negotiate
 from gantry_sftp.codec import (
     Close,
     Codec,
-    CodecState,
     Data,
     Handle,
     Open,
@@ -39,12 +38,6 @@ from gantry_sftp.transport import open_ssh_transport
 pytestmark = pytest.mark.anyio
 
 
-async def negotiate(transport, codec: Codec) -> None:
-    await transport.send(codec.initiate())
-    while codec.state is not CodecState.READY:
-        codec.receive(await transport.receive())
-
-
 async def exchange(transport, codec: Codec, request):
     await transport.send(codec.send(request))
     while True:
@@ -57,26 +50,6 @@ async def _open_and_close(opener) -> None:
     """Enter and immediately leave a transport context manager."""
     async with opener:
         pass
-
-
-def connect(server, **overrides):
-    """Open a transport to the test server, with any argument replaceable.
-
-    Defaults are merged rather than passed alongside the overrides, so a test can say
-    ``port=...`` or ``identity_file=...`` without colliding with the value here.
-    """
-    options = server.connect_options()
-    options.update(overrides.pop("options", {}))
-    kwargs = {
-        "port": server.port,
-        "identity_file": str(server.identity_file),
-        "config_file": os.devnull,
-        # An agent holding a working key would make the wrong-key test pass for the wrong
-        # reason. IdentitiesOnly already covers it; this is the second, independent defence.
-        "env": scrubbed_ssh_env(),
-    }
-    kwargs.update(overrides)
-    return open_ssh_transport("127.0.0.1", options=options, **kwargs)
 
 
 # --- it works -----------------------------------------------------------------------------
@@ -120,8 +93,9 @@ async def test_reading_a_file_over_a_real_ssh_connection(ssh_server, tmp_path: P
 async def test_pipelined_reads_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
     """Every request out before any reply is read, then reassembled by matched offset.
 
-    Still localhost, so this does not prove behaviour under latency -- that needs the netem
-    lane, which does not exist yet. What it proves is that pipelining survives a real SSH
+    Still localhost, so this does not prove behaviour under latency -- that is
+    ``test_netem_pipelining.py``'s job, and it is a separate file because it needs a shaped
+    link and skips without one. What this proves is that pipelining survives a real SSH
     channel, where flow control and packet boundaries are nothing like a pipe's.
     """
     chunk = 4096

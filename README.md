@@ -43,7 +43,8 @@ exists today:
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
-  no network, no containers — and a `live-tests/` lane that runs a real `sshd`
+  no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
+  `tc netem`-shaped link where the pipelining claims are actually measured
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
@@ -247,8 +248,37 @@ in flight, which caps a 100 ms transatlantic link at roughly 21 MB/s regardless 
 the machine is. That is a scheduling bug, not a crypto bug, and it is invisible on
 localhost, which is why it went unnoticed for two decades.
 
-No throughput claim appears in this README until the benchmark suite produces one, with its
-link profile and server named. An unattributed "10x faster than paramiko" is marketing.
+That formula is now measured rather than argued. On a `tc netem`-shaped loopback link
+against OpenSSH 10.0p2, raising pipeline depth from 1 to 64 at a fixed 32768-byte request
+size transfers the same file **14.7× faster at 5 ms RTT, 18.5× at 50 ms and 10.6× at
+200 ms** — and on an unshaped link the same comparison is noise. At depth 1 the elapsed time
+*is* one round trip per request, within 3%. The lane is `live-tests/test_netem_pipelining.py`
+and it re-measures on every run.
+
+### The ceiling, which is not ours
+
+The same lane found where the formula stops. Throughput follows **bytes in flight** rather
+than depth or request size individually — three different (depth × size) pairs multiplying to
+the same product perform within 4% of each other — and it stops improving at **2 MiB**.
+Going from 0.5 MiB to 2 MiB in flight roughly doubles throughput; going from 2 MiB to 8 MiB
+changes it by about 1%, whether the 8 MiB is reached with deep small requests or shallow
+large ones.
+
+2 MiB is OpenSSH's per-channel flow-control window. It is enforced by the SSH transport, one
+layer below anything this library does, so no amount of pipelining lifts it. Two things
+follow, and they are worth knowing before you tune anything:
+
+- **`sftp(1)`'s defaults are not timid.** `-R 64 -B 32768` is exactly the channel window.
+  What this library fixes is clients that never reach 2 MiB, not `sftp(1)`'s inability to
+  exceed it.
+- **Past 2 MiB the lever is concurrency, not depth.** One window per channel, so moving
+  several files at once is a throughput feature and not only a small-file one. Raising depth
+  beyond the window buys memory consumption and nothing else.
+
+No throughput claim in absolute terms — MB/s, or a comparison against paramiko — appears in
+this README until the benchmark suite produces one with its link profile and server named.
+The ratios above are relative measurements of this library against itself on a stated link,
+which is a different kind of claim; an unattributed "10x faster than paramiko" is marketing.
 
 ## Requirements
 
@@ -280,14 +310,35 @@ finding gets fixed at the source, never silenced with an ignore.
 
 `tests/` and `examples/` need no network and are what the gates above run — every example is
 executed as a subprocess, because an example that has drifted out of sync with the library is
-a confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` on localhost
-and will later need containers and `tc netem` link shaping; `benchmarks/` needs a shaped link.
-Both are excluded from the default run and skip with a reason rather than failing when their
-dependencies are absent:
+a confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` on localhost;
+`benchmarks/` needs a shaped link. Both are excluded from the default run and skip with a
+reason rather than failing when their dependencies are absent:
 
 ```bash
 .venv/bin/python -m pytest live-tests/       # needs openssh-server
 ```
+
+### The netem lane
+
+`live-tests/test_netem_pipelining.py` is where every claim about pipelining is made, because
+it is the only place a pipelining bug is visible: on an unshaped link a lockstep client and a
+deeply pipelined one finish at the same time. It shapes loopback with `tc netem` at 5, 50 and
+200 ms round-trip times, with packet loss, and it takes about 70 seconds.
+
+Shaping needs `CAP_NET_ADMIN`. In a container that means starting it with
+`--cap-add=NET_ADMIN` — capabilities cannot be added to a running container — and, if the
+tests do not run as root, a way for the test user to exercise it (passwordless `sudo`, or
+`setcap cap_net_admin+ep` on the `tc` binary). The lane probes for this by adding a real qdisc
+and removing it again, rather than by reading `/proc/self/status`: a capability can sit in the
+bounding set and be unusable, and be perfectly usable through `sudo` while `CapEff` reads all
+zeros. When it cannot shape, every test in the file skips with the line that would fix it.
+
+Two things to know if you read the numbers it prints. `netem`'s delay applies **per traversal**
+of the interface, so a 200 ms round trip is configured as `delay 100ms` — the module halves it
+for you and then *measures* what the kernel actually did, because a benchmark that reports its
+own configuration has checked nothing. And the profile is held only for the duration of one
+test: shaping `lo` slows down everything else in the container, including the rest of the
+suite.
 
 Every async test runs on both anyio backends, asyncio and trio. That is deliberate: the
 reason for depending on anyio at all is that it costs nothing and buys trio support, and a
