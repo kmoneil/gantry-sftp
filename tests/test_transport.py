@@ -24,7 +24,7 @@ from gantry_sftp.codec import (
     PacketType,
     Read,
 )
-from gantry_sftp.exceptions import ConnectError
+from gantry_sftp.exceptions import ConnectError, flatten_exception_group
 from gantry_sftp.transport import (
     StderrBuffer,
     build_ssh_argv,
@@ -392,3 +392,66 @@ async def test_the_transport_delivers_whole_frames_to_the_codec(tmp_path: Path):
         assert isinstance(negotiated, Negotiated)
         assert any(name == b"limits@openssh.com" for name, _ in negotiated.extensions)
         assert PacketType.VERSION == 2
+
+
+# --- the transport must not leak an ExceptionGroup ----------------------------------------
+#
+# Regression tests for the exception-group leak found while writing examples/connect_errors.py:
+# the stderr drain runs in an anyio task group, and anyio wraps *even a single* exception on
+# the way out of one. So anything the caller's body raised came back as an ExceptionGroup, and
+# `except ConnectError` placed outside the `async with` -- the natural spelling, and the one
+# the README and every example use -- silently never matched. Both tests below fail without
+# the unwrap in `_open_process_transport`.
+
+
+class MarkerError(Exception):
+    """A caller's own exception, to prove the unwrap is not specific to our hierarchy."""
+
+
+async def test_an_exception_from_the_body_escapes_the_transport_unwrapped(tmp_path: Path):
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    with pytest.raises(MarkerError) as exc:
+        async with open_local_server_transport(cwd=tmp_path):
+            raise MarkerError("from the body")
+
+    assert not isinstance(exc.value, BaseExceptionGroup)
+    assert exc.value.args[0] == "from the body"
+
+
+async def test_a_connect_error_is_catchable_outside_the_async_with(tmp_path: Path):
+    """The shape users actually write, and the one that was broken.
+
+    `pytest.raises` *inside* the `async with` passed the whole time, which is why the live
+    tests never caught this -- they all had it inside.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    async def receive_after_closing() -> None:
+        async with open_local_server_transport(cwd=tmp_path) as transport:
+            await transport.aclose()
+            # The transport is now closed, so this raises ConnectError from inside the body
+            # and has to cross the task-group boundary to reach the handler below.
+            _ = await transport.receive()
+
+    with pytest.raises(ConnectError) as exc:
+        await receive_after_closing()
+
+    assert not isinstance(exc.value, BaseExceptionGroup)
+    assert exc.value.args[0] == "transport is closed"
+
+
+async def test_the_group_is_flattened_all_the_way_down():
+    # A task group inside a task group nests the groups, so one level of unwrapping is not
+    # enough. Asserted on the helper directly: constructing the nesting through real
+    # transports would be theatre, and the property is about the unwrapper.
+    inner = ConnectError("the real one")
+    nested = BaseExceptionGroup("outer", [BaseExceptionGroup("inner", [inner])])
+    assert flatten_exception_group(nested) is inner
+
+
+def test_flattening_leaves_a_plain_exception_alone():
+    error = ConnectError("not a group")
+    assert flatten_exception_group(error) is error

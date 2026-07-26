@@ -150,18 +150,35 @@ class ConnectError(SFTPError):
 class AuthenticationError(ConnectError):
     """Authentication was refused.
 
-    Recognising this from OpenSSH's stderr is a job for the quirks layer; nothing raises it
-    yet. It exists because ``except AuthenticationError`` is the question users actually
-    ask, and answering it with a substring search in their own code is worse.
+    Raised when OpenSSH's stderr establishes it -- ``Permission denied`` in any of its
+    variants, or ``Too many authentication failures``. The markers are captured from a real
+    server rather than recalled, and the classifier is
+    :func:`gantry_sftp.transport.classify_failure`.
+
+    It exists because ``except AuthenticationError`` is the question users actually ask, and
+    answering it with a substring search in their own code is worse. A refusal we cannot
+    positively identify stays a plain :class:`ConnectError` with the stderr attached, because a
+    class that sometimes means "we guessed" is worth less than one that always means what it
+    says.
     """
 
 
 class HostKeyError(ConnectError):
     """The server's host key was not accepted.
 
-    Distinguished from :class:`AuthenticationError` because the remedy is completely
-    different -- and because silently downgrading this one is how interception goes
-    unnoticed.
+    Covers both shapes: a host that is not in ``known_hosts`` under strict checking, and a host
+    whose key has *changed* -- which is the one that may be interception, and which OpenSSH
+    escalates to a full warning banner. That banner reaches the caller intact.
+
+    Distinguished from :class:`AuthenticationError` because the remedy is completely different,
+    and because silently downgrading this one is how interception goes unnoticed. The
+    classifier checks host-key markers *first* for exactly that reason: of the two possible
+    misclassifications, only "a changed host key reported as a bad password" actually costs
+    anything.
+
+    Deliberately **not** raised for ``Unable to negotiate ... no matching host key type``. That
+    mentions host keys and is not one -- the remedy is a ``HostKeyAlgorithms`` setting, not a
+    changed identity, and folding it in would make this class mean two different things.
     """
 
 
@@ -379,3 +396,32 @@ class CapabilityError(SFTPError):
         if self.path is not None:
             parts.append(f"path={self.path!r}")
         return " ".join(parts).replace(" )", ")")
+
+
+def flatten_exception_group(error: BaseException) -> BaseException:
+    """Reduce an ``ExceptionGroup`` to the first thing that actually went wrong.
+
+    An anyio task group raises ``ExceptionGroup`` **even for a single failure**, which quietly
+    breaks every ``except ConnectError`` and ``except TransferError`` in calling code: the
+    ladder stops matching and the error surfaces as something nobody catches. CLAUDE.md names
+    this as the default hazard of concurrent fan-out rather than an edge case, so every layer
+    that runs a task group unwraps at its own boundary and callers keep the flat exception they
+    were written against.
+
+    It lives here rather than in either layer because both ``transport/`` and ``session/`` need
+    it and neither imports the other -- and because two copies of this is how one of them ends
+    up not applied, which is precisely the bug it exists to prevent. It was one copy, in
+    ``session/_upload.py``, and the transport did not have it: an ``except ConnectError`` placed
+    outside ``async with open_ssh_transport(...)`` -- the natural spelling, and the one the
+    README documents -- never matched.
+
+    Args:
+        error: The exception to unwrap. Anything that is not a group is returned unchanged.
+
+    Returns:
+        The first leaf exception, or ``error`` itself if it is not a group. Nesting is followed
+        all the way down, since a task group inside a task group nests the groups too.
+    """
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    return error

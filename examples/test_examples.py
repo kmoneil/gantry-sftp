@@ -84,3 +84,20 @@ def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
     assert "�" in stdout, "the non-UTF-8 name did not survive to the output"
     assert "directory" in stdout
     assert "symlink" in stdout
+
+
+def test_the_connect_errors_example_classifies_rather_than_guesses():
+    # The example exists to show that the failure reaches you as a *class*. With no arguments
+    # it connects to a closed port, which is deliberately one of the cases we refuse to
+    # classify -- so what it must demonstrate is the honest base class plus OpenSSH's own
+    # words, not a guess dressed up as a diagnosis.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "connect_errors.py")
+    assert returncode == 0
+    assert "class:    ConnectError" in stdout
+    assert "Connection refused" in stdout, "OpenSSH's own diagnosis did not reach the output"
+    # And it must not have claimed to know more than it does.
+    assert "AuthenticationError" not in stdout
+    assert "HostKeyError" not in stdout

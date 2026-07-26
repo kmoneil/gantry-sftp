@@ -22,6 +22,15 @@ fidelity, `ControlMaster` multiplexing, post-quantum key exchange, FIDO keys, ho
 certificates, and every CVE fix without shipping a release. **There is zero cryptography in
 this package.** What remains is a protocol codec, a scheduler, and an ergonomics layer.
 
+**The goal is a better SFTP library — safer, more maintainable, more honest about what it is
+doing. Being faster is a consequence of being purpose-built for SFTP scheduling, not the
+point.** That distinction decides real trade-offs here: a security or correctness gap outranks
+a throughput feature, and a performance win is never a reason to ship something less safe. What
+the architecture actually buys is surface area nobody here has to own — no crypto to get wrong,
+no `ssh_config` to reimplement badly, no SSHv2 stack to maintain — plus the correctness features
+the field genuinely needs and no existing option ships: atomic publish, a zip-slip defence,
+errors that carry state, and extension fallbacks that are tested rather than assumed.
+
 ## Status
 
 **Pre-alpha, and honest about it.** Nothing is published and the API will change. What
@@ -50,11 +59,12 @@ exists today:
   performance number here, including the two that do not flatter us
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
-The thesis is proven end to end and now measured against the alternatives: SFTP runs over a
-real SSH connection, with key exchange, host-key verification and public-key authentication
-all done by OpenSSH and no cryptography in this package, and on a shaped link it downloads
-**1.6–2.6× faster than paramiko** and 1.1–1.4× faster than asyncssh. It is *slower* to
-connect, and it wins nothing on CPU — see below for both. It moves files:
+The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
+host-key verification and public-key authentication all done by OpenSSH, and no cryptography in
+this package. It is also now measured against the alternatives — on a shaped link it downloads
+1.6–2.6× faster than paramiko and 1.1–1.4× faster than asyncssh, it is *slower* to connect, and
+it wins nothing on CPU. All three of those are below, including the two that do not flatter it.
+It moves files:
 
 ```python
 import anyio
@@ -240,7 +250,48 @@ rather than remembered.
 `_plans/DESIGN.md` is canonical for intent and `_plans/progress.md` for what is actually
 built. Neither is committed.
 
+## When the connection fails
+
+```python
+from gantry_sftp.exceptions import AuthenticationError, ConnectError, HostKeyError
+
+try:
+    async with open_ssh_transport("example.com", user="bob") as t, open_session(t) as sftp:
+        ...
+except AuthenticationError as e:
+    ...   # credentials refused
+except HostKeyError as e:
+    ...   # the server's identity was not accepted -- do not retry blindly
+except ConnectError as e:
+    print(e.stderr)   # OpenSSH's own words, verbatim
+```
+
+paramiko answers this question with `Error reading SSH protocol banner`. OpenSSH knew exactly
+what went wrong and said so; `ConnectError.stderr` carries that text untouched, and the two
+questions people actually ask — "was that my key?" and "has the host changed?" — are answered
+by `except` rather than by string matching in your own code.
+
+Three things about that ladder are deliberate:
+
+- **Unrecognised failures stay `ConnectError`.** A refused connection, a name that will not
+  resolve, a cipher mismatch — none of them are guessed into a more specific class. One that
+  sometimes means "we guessed" is worth less than one that always means what it says.
+- **Host keys are checked before credentials.** Of the two possible misclassifications only one
+  costs anything: reporting a *changed* host key as a bad password tells you to check your
+  credentials when what happened may be interception. OpenSSH prints a server-supplied banner to
+  stderr, so a hostile server can put `Permission denied` in it — it cannot remove the host-key
+  line `ssh` itself writes.
+- **Every marker was captured from a real server**, not written from memory. A marker that is
+  subtly wrong does not fail loudly; it silently stops matching and the class quietly goes back
+  to being decorative.
+
+`examples/connect_errors.py` runs this with no arguments.
+
 ## Why it is faster, and where it is not
+
+Speed is not the objective — see above — but it is measurable, and a claim about it should
+either be evidenced or dropped. This section is the evidence, including the parts that go the
+wrong way.
 
 Sustained SFTP throughput is bounded by bytes in flight, not by cryptography:
 

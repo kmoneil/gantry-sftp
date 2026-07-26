@@ -11,6 +11,7 @@ python examples/atomic_publish.py                 # put(), and what "atomic" act
 python examples/listing.py                        # listdir(), and what a listing can't know
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
+python examples/connect_errors.py                  # why the connection failed, as a class
 ```
 
 Pass a destination to run the same code against a real server:
@@ -21,6 +22,7 @@ python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
+python examples/connect_errors.py user@host
 ```
 
 `test_examples.py` executes each one as a subprocess and fails if it does not exit clean. An
@@ -35,6 +37,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `listing.py`        | `listdir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN`  |
 | `recursive_download.py` | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused |
 | `recursive_upload.py` | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
+| `connect_errors.py` | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim |
 
 ## What `atomic_publish.py` is actually showing
 

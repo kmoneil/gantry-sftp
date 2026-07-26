@@ -22,6 +22,11 @@ from gantry_sftp.transport._argv import (
     resolve_ssh_executable,
 )
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE, Transport
+from gantry_sftp.transport._diagnosis import (
+    AUTH_MARKERS,
+    HOST_KEY_MARKERS,
+    classify_failure,
+)
 from gantry_sftp.transport._subprocess import (
     SFTP_SERVER_CANDIDATES,
     StderrBuffer,
@@ -32,14 +37,17 @@ from gantry_sftp.transport._subprocess import (
 )
 
 __all__ = [
+    "AUTH_MARKERS",
     "DEFAULT_RECEIVE_SIZE",
     "DEFAULT_SSH_OPTIONS",
     "DEFAULT_SUBSYSTEM",
+    "HOST_KEY_MARKERS",
     "SFTP_SERVER_CANDIDATES",
     "StderrBuffer",
     "SubprocessTransport",
     "Transport",
     "build_ssh_argv",
+    "classify_failure",
     "find_sftp_server",
     "open_local_server_transport",
     "open_ssh_transport",

@@ -28,9 +28,10 @@ from typing import override
 import anyio
 from anyio.abc import Process
 
-from gantry_sftp.exceptions import ConnectError
+from gantry_sftp.exceptions import ConnectError, flatten_exception_group
 from gantry_sftp.transport._argv import DEFAULT_SUBSYSTEM, build_ssh_argv
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
+from gantry_sftp.transport._diagnosis import classify_failure
 
 __all__ = [
     "SFTP_SERVER_CANDIDATES",
@@ -167,9 +168,17 @@ class SubprocessTransport:
         return f"<SubprocessTransport {self._argv[0]!r} pid={self._process.pid} {state}>"
 
     def _connection_lost(self, what: str) -> ConnectError:
-        return ConnectError(
+        """Build the error for a dead connection, typed by what ``ssh`` said on the way out.
+
+        Every failure that reaches a caller comes through here, so classifying in one place is
+        what makes ``except AuthenticationError`` mean something. The base class is still the
+        answer whenever the stderr does not establish a more specific one -- see
+        :mod:`gantry_sftp.transport._diagnosis`.
+        """
+        stderr = self.stderr_text
+        return classify_failure(stderr)(
             what,
-            stderr=self.stderr_text,
+            stderr=stderr,
             argv=self._argv,
             returncode=self._process.returncode,
         )
@@ -288,15 +297,24 @@ async def _open_process_transport(
 
     transport = SubprocessTransport(process, argv, stderr)
     try:
-        async with anyio.create_task_group() as task_group:
-            # The handle is deliberately discarded: the drain runs until the pipe ends
-            # and is torn down with the task group, so there is nothing to await.
-            _ = task_group.start_soon(_drain_stderr, process, stderr)
-            try:
-                yield transport
-            finally:
-                await transport.aclose()
-                task_group.cancel_scope.cancel()
+        try:
+            async with anyio.create_task_group() as task_group:
+                # The handle is deliberately discarded: the drain runs until the pipe ends
+                # and is torn down with the task group, so there is nothing to await.
+                _ = task_group.start_soon(_drain_stderr, process, stderr)
+                try:
+                    yield transport
+                finally:
+                    await transport.aclose()
+                    task_group.cancel_scope.cancel()
+        except BaseExceptionGroup as group:
+            # The stderr drain runs in a task group, so *anything* the caller's body raises
+            # comes back out of it wrapped -- anyio wraps even a single exception. Without
+            # this, an `except ConnectError` placed outside `async with open_ssh_transport()`
+            # never matches, which is the natural spelling and the one the README documents.
+            # Re-raising the flattened exception is safe with @asynccontextmanager: it is the
+            # same object contextlib threw in, so the `async with` propagates it normally.
+            raise flatten_exception_group(group) from None
     finally:
         # The task group cannot outlive the process object, and a failure anywhere above
         # must not leave a child running.

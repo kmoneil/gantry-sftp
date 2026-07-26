@@ -48,7 +48,12 @@ import anyio
 from anyio.to_thread import run_sync
 
 from gantry_sftp.codec import Codec, Completed, Status, StatusCode, Write
-from gantry_sftp.exceptions import ProtocolError, TransferError, TransferTimeoutError
+from gantry_sftp.exceptions import (
+    ProtocolError,
+    TransferError,
+    TransferTimeoutError,
+    flatten_exception_group,
+)
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
@@ -63,20 +68,6 @@ __all__ = ["upload_handle"]
 class _Chunk:
     offset: int
     length: int
-
-
-def _flatten(error: BaseException) -> BaseException:
-    """Reduce an ``ExceptionGroup`` to the first thing that actually went wrong.
-
-    A task group raises ``ExceptionGroup`` even for a single failure, which quietly breaks
-    every ``except TransferError`` in calling code -- the ladder stops matching and the error
-    surfaces as something nobody catches. CLAUDE.md calls this out as the default hazard of
-    concurrent fan-out rather than an edge case, so the group is unwrapped here, at the
-    boundary, and callers keep the flat exception they were written against.
-    """
-    while isinstance(error, BaseExceptionGroup) and error.exceptions:
-        error = error.exceptions[0]
-    return error
 
 
 class _Uploader:
@@ -205,7 +196,7 @@ class _Uploader:
                 await self._finished.wait()
                 task_group.cancel_scope.cancel()
         except BaseExceptionGroup as group:
-            raise _flatten(group) from None
+            raise flatten_exception_group(group) from None
 
         if self._progress is not None:
             self._progress(self._acknowledged, self._size)

@@ -31,7 +31,7 @@ from gantry_sftp.codec import (
     Status,
     StatusCode,
 )
-from gantry_sftp.exceptions import ConnectError
+from gantry_sftp.exceptions import AuthenticationError, ConnectError, HostKeyError
 from gantry_sftp.session import Durability, PublishMechanism, SkipReason, open_session
 from gantry_sftp.transport import open_ssh_transport
 
@@ -216,7 +216,9 @@ async def test_authentication_failure_carries_opensshs_own_words(ssh_server):
     """
     async with connect(ssh_server, identity_file=str(ssh_server.wrong_identity_file)) as transport:
         codec = Codec()
-        with pytest.raises(ConnectError) as exc:
+        # Caught as the *specific* class, which is the whole point of D-11: a user asking
+        # "was that my key?" gets an answer instead of a substring search.
+        with pytest.raises(AuthenticationError) as exc:
             await negotiate(transport, codec)
 
     stderr = exc.value.stderr
@@ -225,6 +227,9 @@ async def test_authentication_failure_carries_opensshs_own_words(ssh_server):
     # The rendered exception is enough on its own -- no need to reach for `.stderr`.
     assert "Permission denied" in str(exc.value)
     assert exc.value.returncode == 255
+    # The old spelling must still work: making an error more specific must not stop anyone's
+    # existing `except ConnectError` from catching it.
+    assert isinstance(exc.value, ConnectError)
 
 
 async def test_host_key_verification_failure_is_reported_not_silently_accepted(ssh_server):
@@ -239,12 +244,72 @@ async def test_host_key_verification_failure_is_reported_not_silently_accepted(s
         options={"UserKnownHostsFile": str(ssh_server.empty_known_hosts)},
     ) as transport:
         codec = Codec()
-        with pytest.raises(ConnectError) as exc:
+        with pytest.raises(HostKeyError) as exc:
             await negotiate(transport, codec)
 
     stderr = exc.value.stderr
     assert stderr, "a host-key failure produced no stderr at all"
     assert "Host key verification failed" in stderr, stderr
+    assert isinstance(exc.value, ConnectError)
+    # Not the other one. Reporting a rejected host identity as a rejected credential is the
+    # misclassification that actually costs something.
+    assert not isinstance(exc.value, AuthenticationError)
+
+
+async def test_a_changed_host_key_raises_HostKeyError_with_opensshs_warning(  # noqa: N802
+    ssh_server, tmp_path: Path
+):
+    """The machine-in-the-middle case, which is different from an unknown host.
+
+    An unknown host is a first connection; a *changed* host key means the identity moved under
+    a client that had already pinned it, and OpenSSH escalates to a full warning banner rather
+    than a one-line refusal. It is the single most security-relevant thing this transport can
+    report, and until this test the suite had never produced one -- only the milder unknown-host
+    case, whose stderr happens to end in the same summary line.
+    """
+    wrong_public_key = ssh_server.wrong_identity_file.with_suffix(".pub").read_text().split()
+    planted = tmp_path / "known_hosts_with_the_wrong_key"
+    planted.write_text(
+        f"[127.0.0.1]:{ssh_server.port} {wrong_public_key[0]} {wrong_public_key[1]}\n"
+    )
+
+    async with connect(
+        ssh_server,
+        options={"UserKnownHostsFile": str(planted), "StrictHostKeyChecking": "yes"},
+    ) as transport:
+        codec = Codec()
+        with pytest.raises(HostKeyError) as exc:
+            await negotiate(transport, codec)
+
+    stderr = exc.value.stderr
+    assert "REMOTE HOST IDENTIFICATION HAS CHANGED" in stderr, stderr
+    assert "man-in-the-middle attack" in stderr, stderr
+    # The banner reaches the user without being summarised into something calmer.
+    assert "REMOTE HOST IDENTIFICATION HAS CHANGED" in str(exc.value)
+
+
+async def test_an_authentication_failure_is_catchable_outside_the_async_with(ssh_server):
+    """The spelling users actually write, over a real ssh connection.
+
+    Every other failure test in this file puts `pytest.raises` *inside* the `async with`, and
+    that is exactly why none of them caught the exception-group leak: the transport's stderr
+    drain runs in an anyio task group, which wraps even a single exception on the way out, so
+    a handler placed outside the block never matched. Regression test for that, on the path
+    that matters most -- an `except AuthenticationError` that silently never fires is worse
+    than not having the class.
+    """
+
+    async def connect_with_the_wrong_key() -> None:
+        async with connect(
+            ssh_server, identity_file=str(ssh_server.wrong_identity_file)
+        ) as transport:
+            await negotiate(transport, Codec())
+
+    with pytest.raises(AuthenticationError) as exc:
+        await connect_with_the_wrong_key()
+
+    assert not isinstance(exc.value, BaseExceptionGroup)
+    assert "Permission denied" in exc.value.stderr
 
 
 async def test_connecting_to_a_closed_port_reports_the_refusal(ssh_server):
@@ -253,6 +318,9 @@ async def test_connecting_to_a_closed_port_reports_the_refusal(ssh_server):
         with pytest.raises(ConnectError) as exc:
             await negotiate(transport, codec)
     assert "Connection refused" in exc.value.stderr, exc.value.stderr
+    # Deliberately *not* classified. A refused connection is neither an authentication failure
+    # nor a host-key failure, and guessing it into one would make both classes meaningless.
+    assert type(exc.value) is ConnectError
 
 
 def _closed_port() -> int:

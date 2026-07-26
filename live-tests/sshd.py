@@ -170,21 +170,63 @@ def _wait_until_listening(port: int, process: subprocess.Popen[bytes], log: Path
     raise ServerUnavailableError(f"sshd did not start listening within {STARTUP_TIMEOUT_SECONDS}s")
 
 
-def _write_config(root: Path, *, host_key: Path, authorized_keys: Path, sftp_server: str) -> Path:
-    config = root / "sshd_config"
-    config.write_text(
-        f"ListenAddress 127.0.0.1\n"
-        f"HostKey {host_key}\n"
-        f"PidFile {root / 'sshd.pid'}\n"
-        f"AuthorizedKeysFile {authorized_keys}\n"
-        f"StrictModes no\n"
-        f"UsePAM no\n"
-        f"PasswordAuthentication no\n"
-        f"KbdInteractiveAuthentication no\n"
-        f"PermitRootLogin no\n"
-        f"Subsystem sftp {sftp_server}\n"
-        f"LogLevel VERBOSE\n"
+OPTIONAL_DIRECTIVES = ("PerSourcePenalties no",)
+"""Directives that help but do not exist on every sshd, so they are probed before being used.
+
+``PerSourcePenalties`` arrived in **OpenSSH 9.8** and 10.x ships it *on*, with defaults
+``authfail:5 noauth:1 ... min:15``. Every deliberately-failed authentication earns the source
+address a timed penalty, and once one is active sshd drops the **next** connection from that
+address during key exchange -- ``kex_exchange_identification: read: Connection reset by peer``,
+which reads like a client bug and is not one.
+
+This suite fails authentication on purpose (wrong key, unknown host key, changed host key), so
+it accrues penalties and then breaks a later, unrelated test. It sat just under the threshold
+until a third failure case was added, which is the worst way to discover a latent limit.
+
+Turning it off is correct here and would be wrong anywhere else: the penalty is a real defence
+against password-guessing, and nothing shipped touches sshd configuration. An older sshd rejects
+the directive outright and refuses to start, so the config is validated with ``sshd -t`` and the
+line dropped if it is not understood -- probed rather than inferred from a version string, the
+same rule the netem lane follows.
+"""
+
+
+def _config_is_valid(sshd: str, config: Path, host_key: Path) -> bool:
+    """Whether this sshd accepts the config, via its own ``-t`` syntax check."""
+    result = subprocess.run(
+        [sshd, "-t", "-f", str(config), "-h", str(host_key)],
+        capture_output=True,
+        text=True,
+        timeout=_KEYSCAN_TIMEOUT,
+        check=False,
     )
+    return result.returncode == 0
+
+
+def _write_config(
+    root: Path, *, sshd: str, host_key: Path, authorized_keys: Path, sftp_server: str
+) -> Path:
+    """Write an sshd config, dropping optional directives this sshd does not understand."""
+    base = (
+        "ListenAddress 127.0.0.1",
+        f"HostKey {host_key}",
+        f"PidFile {root / 'sshd.pid'}",
+        f"AuthorizedKeysFile {authorized_keys}",
+        "StrictModes no",
+        "UsePAM no",
+        "PasswordAuthentication no",
+        "KbdInteractiveAuthentication no",
+        "PermitRootLogin no",
+        f"Subsystem sftp {sftp_server}",
+        "LogLevel VERBOSE",
+    )
+    config = root / "sshd_config"
+    for extras in (OPTIONAL_DIRECTIVES, ()):
+        config.write_text("\n".join((*base, *extras)) + "\n")
+        if _config_is_valid(sshd, config, host_key):
+            return config
+    # Neither spelling validated: leave the plain one and let startup report the real reason,
+    # which will be more specific than anything guessed here.
     return config
 
 
@@ -239,7 +281,11 @@ def running_sshd(root: Path) -> Iterator[SSHServer]:
 
     port = free_port()
     config = _write_config(
-        root, host_key=host_key, authorized_keys=authorized_keys, sftp_server=sftp_server
+        root,
+        sshd=sshd,
+        host_key=host_key,
+        authorized_keys=authorized_keys,
+        sftp_server=sftp_server,
     )
 
     log = root / "sshd.log"
