@@ -322,12 +322,20 @@ def shape(
         loss_percent: Packet loss to inject, as a percentage. Applies in both directions,
             since both traverse the shaped interface.
         rate_mbit: Bandwidth ceiling in megabits per second, or ``None`` to leave the link
-            unrated. Measured on this sandbox: **without a rate, latency alone does not make
-            the pipeline window the binding constraint.** Loopback has effectively unbounded
-            bandwidth, so TCP's own congestion window is what limits a deep transfer, and the
-            SFTP-level request size becomes invisible -- 64x32768 and 64x261120 finished a
-            16 MiB transfer at 200 ms RTT within 1% of each other. A rate limit is what gives
-            the link a bandwidth-delay product for the window to be measured against.
+            unrated. Measured on this sandbox: **without a rate, the SFTP-level request size
+            stops being visible past a point** -- 64x32768 and 64x261120 finished a 16 MiB
+            transfer at 200 ms RTT within 1% of each other.
+
+            The reason is not TCP, which is what this docstring claimed before the depth
+            experiments were run against it. Both of those configurations are clamped to the
+            same place by **OpenSSH's 2 MiB per-channel window** (DESIGN.md 5.1): 64x32768 is
+            exactly 2 MiB, and 64x261120 asks for 16 MiB and is given 2 MiB. Two settings that
+            agree because they hit the same ceiling are not evidence that the knob does
+            nothing.
+
+            A rate limit is still what gives the link a bandwidth-delay product, which is what
+            the size-clamped-server case in DESIGN.md 5 needs and what ``benchmarks/`` uses to
+            measure a bandwidth-bound profile rather than a latency-bound one.
 
     Yields:
         The link, carrying its measured RTT.

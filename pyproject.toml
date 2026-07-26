@@ -30,9 +30,20 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/gantry_sftp"]
 
-# `session/` will add anyio. The codec layer has no runtime dependencies at all and
-# that is load-bearing, not an accident -- see DESIGN.md 4.1.
+# The shipped dependency is anyio and nothing else. The codec layer has no runtime
+# dependencies at all and that is load-bearing, not an accident -- see DESIGN.md 4.1.
+#
+# `bench` is the comparison libraries and it is deliberately NOT in dev, and deliberately
+# not in `[tool.uv] default-groups` either. paramiko and asyncssh drag in `cryptography`,
+# `pynacl` and `bcrypt` -- Python cryptography is precisely the thing this project exists
+# not to need, and a default `uv sync` that installed it would make the claim harder to
+# check than it should be. `uv sync --group bench` when you want to run `benchmarks/`;
+# without it, those rows skip with that exact line as the reason.
 [dependency-groups]
+bench = [
+    "asyncssh>=2.19",
+    "paramiko>=3.5",
+]
 dev = [
   "pytest>=8.3",
   "hypothesis>=6.112",

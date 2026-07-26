@@ -45,11 +45,16 @@ exists today:
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
+- a `benchmarks/` lane that runs this library, paramiko and asyncssh against the same server
+  over that shaped link, reporting wall clock **and** CPU — the source of truth for every
+  performance number here, including the two that do not flatter us
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
-The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
-host-key verification and public-key authentication all done by OpenSSH, and no
-cryptography in this package. It moves files:
+The thesis is proven end to end and now measured against the alternatives: SFTP runs over a
+real SSH connection, with key exchange, host-key verification and public-key authentication
+all done by OpenSSH and no cryptography in this package, and on a shaped link it downloads
+**1.6–2.6× faster than paramiko** and 1.1–1.4× faster than asyncssh. It is *slower* to
+connect, and it wins nothing on CPU — see below for both. It moves files:
 
 ```python
 import anyio
@@ -235,7 +240,7 @@ rather than remembered.
 `_plans/DESIGN.md` is canonical for intent and `_plans/progress.md` for what is actually
 built. Neither is committed.
 
-## Why it should be faster
+## Why it is faster, and where it is not
 
 Sustained SFTP throughput is bounded by bytes in flight, not by cryptography:
 
@@ -265,7 +270,7 @@ changes it by about 1%, whether the 8 MiB is reached with deep small requests or
 large ones.
 
 2 MiB is OpenSSH's per-channel flow-control window. It is enforced by the SSH transport, one
-layer below anything this library does, so no amount of pipelining lifts it. Two things
+layer below anything this library does, so no amount of pipelining lifts it. Three things
 follow, and they are worth knowing before you tune anything:
 
 - **`sftp(1)`'s defaults are not timid.** `-R 64 -B 32768` is exactly the channel window.
@@ -274,11 +279,58 @@ follow, and they are worth knowing before you tune anything:
 - **Past 2 MiB the lever is concurrency, not depth.** One window per channel, so moving
   several files at once is a throughput feature and not only a small-file one. Raising depth
   beyond the window buys memory consumption and nothing else.
+- **It is not OpenSSH's idiosyncrasy — it is the ecosystem's default.** Read off the sources
+  while building the benchmark: `paramiko.transport.DEFAULT_WINDOW_SIZE` is 2097152 with a
+  32768 max packet, and `asyncssh.connection._DEFAULT_WINDOW` is `2*1024*1024` with the same
+  packet size. The same two constants three times. Nobody is past 2 MiB today — but paramiko
+  and asyncssh implement SSH and could raise their own window, and we cannot raise OpenSSH's,
+  because not implementing SSH is the whole point. That is a real cost of this architecture and
+  it is written down here rather than left for someone to discover with a tuned paramiko.
 
-No throughput claim in absolute terms — MB/s, or a comparison against paramiko — appears in
-this README until the benchmark suite produces one with its link profile and server named.
-The ratios above are relative measurements of this library against itself on a stated link,
-which is a different kind of claim; an unattributed "10x faster than paramiko" is marketing.
+### Measured against paramiko and asyncssh
+
+`benchmarks/` now exists, so the comparison is a measurement rather than a promise. Three
+libraries, one uniform interface, the same `sshd`, five link profiles, every scenario verifying
+the bytes it moved. Against **paramiko 5.0.0** and **asyncssh 2.24.0** on OpenSSH 10.0p2 over
+`tc netem`-shaped loopback:
+
+| scenario | vs paramiko | vs asyncssh |
+| -------- | ----------- | ----------- |
+| download 16 MiB | **1.6–2.6× faster** | 1.1–1.4× faster |
+| upload 16 MiB | 1.2–1.5× faster | up to 1.2×, level on the rate-limited profile |
+| 100 × 8 KiB sequential | ~1.5× faster | **a tie** |
+| connect and close | **1.2–1.4× slower** | **1.2–2.1× slower** |
+| CPU per MiB, download | about the same | **1.2–1.6× worse** |
+| CPU per MiB, upload | 1.1–1.6× better | mixed, 0.7–1.4× |
+
+Ratios across 5, 50 and 200 ms RTT plus a 100 Mbit/s rate-limited profile, taken as the
+**union of two full runs** rather than the best one. That widening is not padding: the first
+run put the download range at 1.9–2.6× and the second at 1.6–2.3×, because paramiko's 200 ms
+row is genuinely noisy (its spread column reached 2.06 while ours stayed near 1.1). A range
+that only one run reproduces is a number with an expiry date on it. Absolute figures, the exact
+host and the full caveats are in the report the suite writes; re-run it with
+`pytest benchmarks/ -s` and it re-derives all of them.
+
+Two of those rows are not the ones a pitch would choose, and they are the interesting ones.
+
+**"No cryptography in Python" does not become a CPU win.** `cryptography` is OpenSSL and
+OpenSSL uses the CPU's AES instructions, so the expensive part was never interpreted in either
+design. What moves out of Python is per-packet framing work, and we pay a pipe copy for it. The
+thesis in §5 was always that this is a *scheduling* win rather than a crypto one — the wall
+clock column says that is right, and the CPU column is what stops the softer claim being
+written down.
+
+**Connecting is our weak spot, and it is structural.** Spawning `ssh` costs a fork, an exec and
+OpenSSH's own configuration parsing before a packet moves — 0.5–0.9 s extra per connection at
+200 ms RTT, and 1.5–3.9× the CPU of an in-process handshake. The gap is widest where latency is
+lowest (2.1× against asyncssh at 5 ms, 1.2× at 200 ms), which is the signature of a fixed
+process-startup cost rather than an extra round trip. For connection-heavy workloads
+`ControlMaster` is not an optimisation, it is the fix.
+
+The ratios in the section above are this library measured against *itself*, which is a weaker
+kind of claim and is labelled as one. Nothing here is an unattributed "10× faster than
+paramiko": every figure names its link, its server, its versions and the benchmark that
+produced it, and that benchmark re-runs.
 
 ## Requirements
 
@@ -311,12 +363,20 @@ finding gets fixed at the source, never silenced with an ignore.
 `tests/` and `examples/` need no network and are what the gates above run — every example is
 executed as a subprocess, because an example that has drifted out of sync with the library is
 a confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` on localhost;
-`benchmarks/` needs a shaped link. Both are excluded from the default run and skip with a
-reason rather than failing when their dependencies are absent:
+`benchmarks/` needs that plus a shaped link and the comparison libraries. Both are excluded
+from the default run and skip with a reason rather than failing when their dependencies are
+absent:
 
 ```bash
 .venv/bin/python -m pytest live-tests/       # needs openssh-server
+uv sync --group bench                        # paramiko and asyncssh
+.venv/bin/python -m pytest benchmarks/ -s    # needs the above plus tc netem
 ```
+
+The comparison libraries are a separate dependency group and are deliberately not installed by
+default. They pull in `cryptography`, `pynacl` and `bcrypt` — Python cryptography is precisely
+what this project exists not to need, and a `uv sync` that installed it would make that claim
+harder to check than it should be.
 
 ### The netem lane
 
@@ -344,6 +404,33 @@ Every async test runs on both anyio backends, asyncio and trio. That is delibera
 reason for depending on anyio at all is that it costs nothing and buys trio support, and a
 codebase that has only ever run on asyncio is one accidental `asyncio.Queue` away from not
 having it.
+
+### The benchmark lane
+
+`benchmarks/` is the source of truth for every performance number in this repository. It reuses
+the netem shaping and the `sshd` harness from `live-tests/` rather than copying them — two
+spellings of "how this suite connects" is how the scrubbed `ssh` environment ends up applied in
+one of them and not the other, and a benchmark that quietly read your `ssh_config` would report
+your `Compression yes` as a change in the library.
+
+It reports **wall clock and CPU side by side**, because on a latency-bound link all three
+clients hit the same 2 MiB channel window and wall clock alone cannot see the architecture. CPU
+comes from `getrusage(RUSAGE_SELF) + RUSAGE_CHILDREN`, which is the only counter that can see
+an `ssh` subprocess at all — and because `RUSAGE_CHILDREN` accounts only for children that have
+been *reaped*, the CPU window necessarily spans connect through close rather than the transfer
+alone. The `connect` scenario measures that half separately so it can be subtracted, and every
+client is measured through the same wider window. That mechanism has its own test in `tests/`,
+because a counter silently returning only this process's time would fail nothing and publish a
+number saying the thesis is free.
+
+Repeats are few, so every row carries a **spread** (slowest ÷ fastest) and a ratio drawn from
+overlapping sample ranges is printed with `(overlapping)` beside it. With three samples a
+*p*-value would be theatre; non-overlapping ranges is something you can check by eye.
+
+The fairness rules — best default API per library, host keys verified by all three, no agent or
+`ssh_config` for any of them, our own atomic publish switched off in the comparison row and
+measured separately — are in `benchmarks/README.md`, one written line per decision that could
+have gone the other way.
 
 ### The mutation lane
 
