@@ -19,12 +19,16 @@ __all__ = [
     "ConnectError",
     "HostKeyError",
     "InsecureOptionWarning",
+    "NoSuchFileError",
+    "PermissionDeniedError",
     "ProtocolError",
     "SFTPError",
     "SFTPWarning",
+    "ServerError",
     "StateError",
     "TransferError",
     "TransferTimeoutError",
+    "UnsupportedError",
 ]
 
 
@@ -224,4 +228,62 @@ class TransferTimeoutError(TransferError):
 
     Separate from a plain :class:`TransferError` because the remedy differs: a refusal means
     stop, a timeout means the far end went quiet and retrying may well work.
+    """
+
+
+class ServerError(SFTPError):
+    """The server refused an operation, and said so with a STATUS.
+
+    This is the *server* declining, not a protocol violation and not our mistake -- the
+    request was well-formed and the answer was no.
+
+    Attributes:
+        code: The numeric ``SSH_FX_*`` status.
+        message: The server's own explanation, verbatim and undecoded. Servers are not
+            required to send one and many do not, so this is frequently empty.
+        path: The path the request concerned, where there was one.
+
+    ``FAILURE`` is a v3 catch-all meaning nothing more than "no", which is why this class
+    exists rather than a subclass per code: turning ``FAILURE`` into something actionable
+    means reading ``message``, and ``message`` is exactly the field a server is free to omit.
+    The subclasses below cover the codes that *are* unambiguous.
+    """
+
+    def __init__(
+        self,
+        message_text: str,
+        *,
+        code: int,
+        message: bytes = b"",
+        path: bytes | None = None,
+    ) -> None:
+        super().__init__(message_text)
+        self.code = code
+        self.message = message
+        self.path = path
+
+    @override
+    def __str__(self) -> str:
+        """Render our summary with the server's own words, where it supplied any."""
+        parts = [super().__str__()]
+        if self.path is not None:
+            parts.append(f"path={self.path!r}")
+        if self.message:
+            parts.append(f"server said: {self.message.decode('utf-8', 'replace')!r}")
+        return " ".join(parts)
+
+
+class NoSuchFileError(ServerError):
+    """``SSH_FX_NO_SUCH_FILE``. The path does not exist."""
+
+
+class PermissionDeniedError(ServerError):
+    """``SSH_FX_PERMISSION_DENIED``. The path exists and you may not have it."""
+
+
+class UnsupportedError(ServerError):
+    """``SSH_FX_OP_UNSUPPORTED``. The server does not implement this operation.
+
+    Expected rather than exceptional: it is the answer to probing for an extension a server
+    does not have, and the whole reason capability detection can be done by asking.
     """

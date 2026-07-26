@@ -15,12 +15,16 @@ from gantry_sftp.exceptions import (
     ConnectError,
     HostKeyError,
     InsecureOptionWarning,
+    NoSuchFileError,
+    PermissionDeniedError,
     ProtocolError,
+    ServerError,
     SFTPError,
     SFTPWarning,
     StateError,
     TransferError,
     TransferTimeoutError,
+    UnsupportedError,
 )
 
 __all__ = [
@@ -28,12 +32,16 @@ __all__ = [
     "ConnectError",
     "HostKeyError",
     "InsecureOptionWarning",
+    "NoSuchFileError",
+    "PermissionDeniedError",
     "ProtocolError",
     "SFTPError",
     "SFTPWarning",
+    "ServerError",
     "StateError",
     "TransferError",
     "TransferTimeoutError",
+    "UnsupportedError",
     "__version__",
 ]
 

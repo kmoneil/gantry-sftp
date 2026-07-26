@@ -26,18 +26,30 @@ from gantry_sftp.session._limits import (
     read_request_overhead,
     write_request_overhead,
 )
+from gantry_sftp.session._session import (
+    DEFAULT_REQUEST_TIMEOUT,
+    LIMITS_EXTENSION,
+    Session,
+    open_session,
+    raise_for_status,
+)
 
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_MAX_PACKET_LENGTH",
     "DEFAULT_PIPELINE_DEPTH",
+    "DEFAULT_REQUEST_TIMEOUT",
+    "LIMITS_EXTENSION",
     "PREFERRED_READ_LENGTH",
     "PREFERRED_WRITE_LENGTH",
     "ProgressCallback",
     "ServerLimits",
+    "Session",
     "TransferSizes",
     "download_handle",
     "negotiate_transfer_sizes",
+    "open_session",
+    "raise_for_status",
     "read_request_overhead",
     "write_request_overhead",
 ]

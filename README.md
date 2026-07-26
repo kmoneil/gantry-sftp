@@ -37,12 +37,31 @@ yet. What exists today:
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`
 
+- a session with `stat`, `realpath`, `open`/`close` and a pipelined `get()`, with typed
+  errors, timeouts on every wait, and a progress callback
+
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
 host-key verification and public-key authentication all done by OpenSSH, and no
-cryptography in this package.
+cryptography in this package. It downloads files:
 
-Not yet: the session layer or a public API. There is no `get()` or `put()`, so you cannot
-transfer a file with this yet.
+```python
+import anyio
+from gantry_sftp.session import open_session
+from gantry_sftp.transport import open_ssh_transport
+
+async def main():
+    async with (
+        open_ssh_transport("example.com", user="bob") as transport,
+        open_session(transport) as sftp,
+    ):
+        await sftp.get("/remote/data.parquet", "data.parquet")
+
+anyio.run(main)
+```
+
+Not yet: `put()`, directory listing, recursive operations, resume, atomic writes, the
+fsspec adapter, `SFTPPath`, or the generated sync API. The names in DESIGN.md's §8 sketch
+(`connect()`, `put_many()`) do not exist yet — `open_session` is the current spelling.
 
 One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
 opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends
