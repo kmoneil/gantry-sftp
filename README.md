@@ -34,11 +34,12 @@ exists today:
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
-- a session with `stat`, `lstat`, `realpath`, `open`/`close`, `mkdir`, `remove`, `rename`,
-  `posix_rename`, `fsync`, `supports()`, `listdir()`, and pipelined `get()` / `put()`, with
-  typed errors, timeouts on every wait, and a progress callback
-- **recursive download**: `walk()` and `get_tree()`, with the zip-slip defence that makes a
-  hostile server's filenames safe to write
+- a session with `stat`, `lstat`, `realpath`, `open`/`close`, `mkdir`, `rmdir`, `remove`,
+  `rename`, `posix_rename`, `fsync`, `supports()`, `listdir()`, and pipelined `get()` /
+  `put()`, with typed errors, timeouts on every wait, and a progress callback
+- **recursive transfer both ways**: `walk()` and `get_tree()`, with the zip-slip defence that
+  makes a hostile server's filenames safe to write, plus `put_tree()` and `rmtree()` — trees
+  go up as well as down, and come back off again
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
@@ -66,9 +67,9 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: recursive *upload*, `rmtree`, `glob`, resume, retry, the fsspec adapter, `SFTPPath`,
-or the generated sync API. The names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not
-exist yet — `open_session` is the current spelling.
+Not yet: `glob`, resume, retry, the fsspec adapter, `SFTPPath`, or the generated sync API. The
+names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not exist yet — `open_session` is
+the current spelling.
 
 ## Listing
 
@@ -131,6 +132,42 @@ async with aclosing(sftp.walk("/incoming")) as walker:
 
 `max_depth` bounds the descent, which is the only defence against a tree that is infinite
 because the server says it is.
+
+## Recursive upload, and removal
+
+```python
+result = await sftp.put_tree("outgoing/", "/incoming/batch-1")
+result.files, result.directories, result.transferred
+
+removed = await sftp.rmtree("/incoming/batch-1")
+```
+
+**The upload direction is not the download direction with the arrows reversed.** Every name
+here comes from the local filesystem, so the zip-slip machinery does not apply — the
+attacker-controlled input is gone. What replaces it is specific: **symlinks are still not
+followed**, in this direction because a link in the tree pointing at `/etc/shadow` would
+otherwise copy it to the server under an innocent name. Links are reported in `skipped`,
+exactly as the download reports them. `walk_local()` is the walk on its own, and it needs no
+connection at all.
+
+Missing parents of the destination are created, and that costs an extra round trip only when
+a level is genuinely absent: v3 answers a failed `MKDIR` with the catch-all `FAILURE`, so
+"already there" and "the parent is missing" can only be told apart by looking.
+
+**`atomic` is per file, not per tree, and the distinction is the honest part.** Each file is
+staged and renamed, so no consumer ever sees a partial *file*. Nothing makes the *tree* appear
+in one step — that would mean renaming a staging directory over the destination, and `rename`
+onto a non-empty directory fails on every POSIX server, so it could only ever work for a
+destination that does not exist yet. A flag that delivered the guarantee sometimes would be
+worse than not having it.
+
+`rmtree()` goes bottom up and **descends only into what the walk positively established is a
+directory**. Everything else — files, symlinks, fifos, and entries the server declines to
+describe — is removed with `REMOVE`, which is `unlink(2)`: it deletes the *name*, so a symlink
+goes and what it points at does not, and a directory is refused rather than emptied. That
+refusal is the safety net, and it means a wrong guess can only fail in the direction that
+raises. There is no `max_depth`, because a depth-limited recursive delete leaves the deepest
+directories populated and their parents unremovable.
 
 ## Atomic publish
 

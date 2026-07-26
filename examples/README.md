@@ -10,6 +10,7 @@ python examples/download.py                       # pipelined get(), with progre
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
 python examples/listing.py                        # listdir(), and what a listing can't know
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
+python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
 ```
 
 Pass a destination to run the same code against a real server:
@@ -19,6 +20,7 @@ python examples/download.py user@host /remote/data.parquet
 python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
+python examples/recursive_upload.py user@host /remote/dir
 ```
 
 `test_examples.py` executes each one as a subprocess and fails if it does not exit clean. An
@@ -32,6 +34,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `atomic_publish.py` | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs |
 | `listing.py`        | `listdir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN`  |
 | `recursive_download.py` | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused |
+| `recursive_upload.py` | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
 
 ## What `atomic_publish.py` is actually showing
 

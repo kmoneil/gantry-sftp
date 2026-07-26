@@ -51,6 +51,7 @@ from gantry_sftp.codec import (
     Rename,
     Request,
     Response,
+    RmDir,
     Stat,
     Status,
     StatusCode,
@@ -81,10 +82,12 @@ from gantry_sftp.session._download import (
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
 from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
 from gantry_sftp.session._localpath import check_contained, local_child
+from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._publish import (
     Durability,
     PublishMechanism,
     UploadResult,
+    split_parent,
     staged_path,
     staging_token,
 )
@@ -501,14 +504,32 @@ class Session:
         return entry_kind(attributes) is EntryKind.DIRECTORY
 
     async def remove(self, path: bytes | str) -> None:
-        """Delete a file. Not a directory -- that is ``RMDIR``, which does not exist yet.
+        """Delete a file, a symlink, or any other non-directory entry.
+
+        ``REMOVE`` is ``unlink(2)``: it deletes the *name*, so a symlink is removed rather
+        than what it points at, and a directory is refused rather than emptied. That refusal
+        is load-bearing for :meth:`rmtree`, which is the only recursive delete here.
 
         Raises:
             NoSuchFileError: If the path is not there.
-            ServerError: For any other refusal.
+            ServerError: For any other refusal, including the path being a directory.
         """
         encoded = _encode_path(path)
         await self._expect_status(Remove(self._next(), encoded), path=encoded)
+
+    async def rmdir(self, path: bytes | str) -> None:
+        """Delete an **empty** directory.
+
+        ``RMDIR`` is ``rmdir(2)`` and does not recurse. A directory with anything left in it
+        is refused, which is what makes a bottom-up :meth:`rmtree` self-checking: if anything
+        was missed, the parent's removal fails rather than the tree quietly half-disappearing.
+
+        Raises:
+            NoSuchFileError: If the path is not there.
+            ServerError: For any other refusal, including the directory not being empty.
+        """
+        encoded = _encode_path(path)
+        await self._expect_status(RmDir(self._next(), encoded), path=encoded)
 
     async def rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
         """Rename with plain v3 ``RENAME``, which **cannot overwrite**.
@@ -1146,6 +1167,166 @@ class Session:
             return False
         return True
 
+    # --- trees, the other way ------------------------------------------------------------------
+
+    async def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = None,
+        atomic: bool = True,
+        fsync: bool = True,
+        require_atomic: bool = False,
+        require_fsync: bool = False,
+        progress: ProgressCallback | None = None,
+    ) -> TreeResult:
+        """Upload a local tree into ``remote_path``, creating directories as it goes.
+
+        The mirror of :meth:`get_tree`, with the untrusted input on the other side. Every name
+        here comes from the local filesystem, so the zip-slip machinery a download needs does
+        not apply -- but **symlinks are still not followed**, in this direction because a link
+        in the tree pointing at ``/etc/shadow`` would otherwise copy it to the server under an
+        innocent name. Links are reported in ``skipped``, exactly as the download reports them.
+
+        **``atomic`` here is per file, not per tree, and that distinction is the honest part.**
+        Each file is staged and renamed, so no consumer ever sees a partial *file*. Nothing
+        makes the *tree* appear in one step: that would mean uploading to a staging directory
+        and renaming it over the destination, and ``rename`` onto a non-empty directory fails
+        on every POSIX server -- so it could only ever work for a destination that does not
+        exist yet, which is not the mirroring case anyone has. A flag that delivered the
+        guarantee sometimes would be worse than not having it. See DESIGN.md 6.
+
+        Missing parents of ``remote_path`` are created. That costs one extra round trip only
+        when a level is actually absent, because v3 answers a failed ``MKDIR`` with the
+        catch-all ``FAILURE`` and "it is already there" has to be distinguished by looking.
+
+        Transfers are sequential, for the same reason :meth:`get_tree`'s are: a session
+        serialises, so there is nothing yet to gain from issuing them concurrently.
+
+        Args:
+            local_path: Local directory to copy. Followed if it is itself a symlink, because
+                the caller named it; nothing inside it is.
+            remote_path: Remote destination. Created, with any missing parents, if absent.
+            max_depth: Levels below the root to descend, or ``None`` for no limit.
+            atomic: Publish each file via a staging file and a rename. See :meth:`put`.
+            fsync: Send ``fsync@openssh.com`` before publishing each file.
+            require_atomic: Fail rather than fall back to a mechanism with a window.
+            require_fsync: Fail rather than publish with no durability barrier.
+            progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
+                each one. A tree-wide total would need the whole walk up front.
+
+        Returns:
+            Counts, bytes, and every entry that was skipped with the reason it was.
+
+        Raises:
+            UnsafePathError: If a local name could not be a remote path component.
+            OSError: If a local directory or file cannot be read.
+            CapabilityError: If a required guarantee is not available on this server.
+            ServerError: If the server refuses a directory or a file.
+            TransferError: If a transfer fails partway.
+        """
+        root = _encode_path(remote_path)
+        await self._mkdir_parents(root)
+        files = directories = transferred = 0
+        skipped: list[Skipped] = []
+
+        for entry in walk_local(Path(local_path), max_depth=max_depth):
+            remote_directory = _remote_directory(root, entry.relative)
+            if entry.relative:
+                await self.mkdir(remote_directory, exist_ok=True)
+                directories += 1
+            skipped.extend(entry.skipped)
+            for name in entry.files:
+                result = await self.put(
+                    entry.path / os.fsdecode(name),
+                    join_remote(remote_directory, remote_component(name)),
+                    atomic=atomic,
+                    fsync=fsync,
+                    require_atomic=require_atomic,
+                    require_fsync=require_fsync,
+                    progress=progress,
+                )
+                transferred += result.transferred
+                files += 1
+
+        return TreeResult(files, directories, transferred, tuple(skipped))
+
+    async def _mkdir_parents(self, path: bytes) -> None:
+        """Create ``path`` and any missing ancestors, cheaply in the common case.
+
+        One ``MKDIR`` when the directory is already there or its parent is, and a walk up the
+        path only when a level is genuinely absent. The alternative -- creating every ancestor
+        unconditionally -- is a round trip per level of the destination on every call, paid by
+        every caller to help the one whose destination was three levels missing.
+        """
+        try:
+            await self.mkdir(path, exist_ok=True)
+        except ServerError:
+            parent, _ = split_parent(path)
+            stripped = parent.rstrip(b"/")
+            if not stripped or stripped == path:
+                raise
+            await self._mkdir_parents(stripped)
+            await self.mkdir(path, exist_ok=True)
+
+    async def rmtree(self, path: bytes | str) -> TreeResult:
+        """Remove a remote tree, including ``path`` itself.
+
+        **Bottom-up, and it descends only into what the walk positively established is a
+        directory.** That is the whole safety argument. :meth:`walk` classifies an entry from
+        the attributes the listing carried, falls back to one ``LSTAT`` when the server sent
+        none, and reports anything it still cannot settle rather than guessing -- so nothing
+        here recurses into something that might be a file, and nothing renames or follows a
+        symlink out of the tree.
+
+        Everything that is *not* a directory -- files, symlinks, sockets, fifos, and entries
+        whose kind the server would not report -- is removed with ``REMOVE``, which is
+        ``unlink(2)``. That is deliberate and it is not the dangerous guess: unlink refuses a
+        directory, so an unclassifiable entry either was not one and is gone, or was one and
+        the server said so. Either way the blast radius is bounded by the tree the caller
+        named, because a single ``REMOVE`` of a name inside it cannot reach outside it.
+
+        There is no ``max_depth``. A depth-limited recursive delete leaves the deepest
+        directories populated and their parents unremovable, so it would fail having done
+        half the work.
+
+        The walk is collected before anything is deleted, because children have to go before
+        their parents. That holds one entry per name in memory -- the same bound
+        :meth:`listdir` has, and for the same reason.
+
+        Args:
+            path: Remote directory to remove.
+
+        Returns:
+            How many files and directories were removed, and anything skipped. ``transferred``
+            is always ``0``: nothing moves.
+
+        Raises:
+            NoSuchFileError: If the tree does not exist.
+            ServerError: If the server refuses a removal -- including refusing to unlink an
+                entry that turned out to be a directory, which names that exact path.
+        """
+        root = _encode_path(path)
+        entries: list[WalkEntry] = []
+        async with aclosing(self.walk(root)) as walker:
+            async for entry in walker:
+                entries.append(entry)
+
+        files = directories = 0
+        # Reversed: walk yields top down, and a directory cannot go before its contents.
+        for entry in reversed(entries):
+            for name in [child.filename for child in entry.files]:
+                await self.remove(join_remote(entry.path, name))
+                files += 1
+            for skip in entry.skipped:
+                await self.remove(skip.path)
+                files += 1
+            await self.rmdir(entry.path)
+            directories += 1
+
+        return TreeResult(files, directories, 0, ())
+
     # --- cleanup ------------------------------------------------------------------------------
 
     async def _close_quietly(self, handle: bytes) -> None:
@@ -1189,6 +1370,19 @@ def _ensure_directory(path: Path, *, parents: bool = False) -> Path:
     """
     path.mkdir(parents=parents, exist_ok=True)
     return path
+
+
+def _remote_directory(root: bytes, relative: tuple[bytes, ...]) -> bytes:
+    """Build the remote directory for a walked local position, validating every component.
+
+    The counterpart of :func:`_local_directory`, and it checks each name for the same reason
+    even though the names are ours: one component at a time is what catches a bug in our own
+    joining, and a joined path has already lost which name was the problem.
+    """
+    remote = root
+    for name in relative:
+        remote = join_remote(remote, remote_component(name))
+    return remote
 
 
 def _local_directory(destination: Path, relative: tuple[bytes, ...]) -> Path:

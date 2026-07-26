@@ -41,6 +41,12 @@ from gantry_sftp.session._localpath import (
     local_child,
     unsafe_reason,
 )
+from gantry_sftp.session._localtree import (
+    LocalWalkEntry,
+    local_dir_entry,
+    remote_component,
+    walk_local,
+)
 from gantry_sftp.session._publish import (
     MAX_STAGED_NAME_LENGTH,
     Durability,
@@ -81,6 +87,7 @@ __all__ = [
     "DirEntry",
     "Durability",
     "EntryKind",
+    "LocalWalkEntry",
     "ProgressCallback",
     "PublishMechanism",
     "ServerLimits",
@@ -98,14 +105,17 @@ __all__ = [
     "entry_kind",
     "join_remote",
     "local_child",
+    "local_dir_entry",
     "negotiate_transfer_sizes",
     "open_session",
     "raise_for_status",
     "read_request_overhead",
+    "remote_component",
     "split_parent",
     "staged_path",
     "staging_token",
     "unsafe_reason",
     "upload_handle",
+    "walk_local",
     "write_request_overhead",
 ]

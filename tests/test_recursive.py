@@ -30,6 +30,8 @@ from gantry_sftp.codec import (
     OpenDir,
     Read,
     ReadDir,
+    Remove,
+    RmDir,
     Stat,
     Status,
     StatusCode,
@@ -37,7 +39,7 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.exceptions import NoSuchFileError, UnsafePathError
+from gantry_sftp.exceptions import NoSuchFileError, ServerError, UnsafePathError
 from gantry_sftp.session import (
     EntryKind,
     SkipReason,
@@ -97,10 +99,19 @@ class TreeServer:
         tree: dict[bytes, tuple[NameEntry, ...]],
         files: dict[bytes, bytes] | None = None,
         refuse: dict[str, StatusCode] | None = None,
+        others: set[bytes] | None = None,
+        opaque: set[bytes] | None = None,
     ) -> None:
-        self.tree = tree
+        self.tree = dict(tree)
         self.files = dict(files or {})
         self.refuse = dict(refuse or {})
+        # Paths that exist and are not regular files: symlinks, fifos, and entries the
+        # server declines to describe. REMOVE unlinks them; nothing may descend into one.
+        self.others = set(others or ())
+        # Paths this server will not describe: STAT and LSTAT answer with no permissions at
+        # all, whatever the entry really is. The shape that makes UNKNOWN more than a
+        # theoretical member of the enum.
+        self.opaque = set(opaque or ())
 
         self.seen: list[object] = []
         self.open_handles: set[bytes] = set()
@@ -139,11 +150,25 @@ class TreeServer:
         return handle
 
     def _attrs_for(self, path: bytes) -> Attrs | None:
+        if path in self.opaque:
+            return Attrs()
         if path in self.tree:
             return Attrs(size=4096, permissions=DIRECTORY)
         if path in self.files:
             return Attrs(size=len(self.files[path]), permissions=REGULAR)
         return None
+
+    def _forget(self, path: bytes) -> None:
+        """Drop ``path`` from its parent's listing, so a later READDIR agrees it is gone.
+
+        Without this the fake could not falsify anything: a removal in the wrong order would
+        still leave every parent reporting itself empty, and the bottom-up guarantee would be
+        asserted only against the client's own idea of what it did.
+        """
+        parent, _, name = path.rpartition(b"/")
+        parent = parent or b"/"
+        if parent in self.tree:
+            self.tree[parent] = tuple(e for e in self.tree[parent] if e.filename != name)
 
     def _dispatch(self, packet) -> None:
         self.seen.append(packet)
@@ -156,6 +181,8 @@ class TreeServer:
             Close: self._on_close,
             Stat: self._on_stat,
             LStat: self._on_stat,
+            Remove: self._on_remove,
+            RmDir: self._on_rmdir,
         }
         handler = handlers.get(type(packet))
         if handler is None:
@@ -207,6 +234,37 @@ class TreeServer:
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
         else:
             self._reply(AttrsReply(packet.request_id, attrs))
+
+    def _on_remove(self, packet: Remove) -> None:
+        """``unlink(2)``: deletes a name, and refuses a directory.
+
+        The refusal is the behaviour ``rmtree``'s safety argument rests on, so the fake
+        implements it rather than accepting everything.
+        """
+        if packet.path in self.tree:
+            self._reply(Status(packet.request_id, StatusCode.FAILURE, b"Is a directory"))
+            return
+        if packet.path in self.files:
+            del self.files[packet.path]
+        elif packet.path in self.others:
+            self.others.discard(packet.path)
+        else:
+            self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
+            return
+        self._forget(packet.path)
+        self._reply(Status(packet.request_id, StatusCode.OK))
+
+    def _on_rmdir(self, packet: RmDir) -> None:
+        """``rmdir(2)``: refuses anything still holding entries."""
+        if packet.path not in self.tree:
+            self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
+            return
+        if self.tree[packet.path]:
+            self._reply(Status(packet.request_id, StatusCode.FAILURE, b"Directory not empty"))
+            return
+        del self.tree[packet.path]
+        self._forget(packet.path)
+        self._reply(Status(packet.request_id, StatusCode.OK))
 
 
 async def first_entry(sftp, root: bytes = b"/root"):
@@ -512,6 +570,118 @@ async def test_no_follow_refuses_a_single_get_through_a_local_symlink(tmp_path: 
     assert secret.read_bytes() == b"aaa"
 
 
+# --- recursive removal -----------------------------------------------------------------------
+
+
+def removals(server: TreeServer) -> list[tuple[str, bytes]]:
+    """Every removal the server was asked for, in order and with its kind."""
+    return [
+        (type(packet).__name__, packet.path)
+        for packet in server.seen
+        if isinstance(packet, (Remove, RmDir))
+    ]
+
+
+async def test_rmtree_removes_children_before_their_parents():
+    # The whole ordering requirement, and the fake can falsify it: RMDIR on a directory that
+    # still holds entries is refused, exactly as rmdir(2) refuses one.
+    server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES, others={b"/root/link"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.rmtree(b"/root")
+
+    assert removals(server) == [
+        ("Remove", b"/root/sub/deeper/c.csv"),
+        ("RmDir", b"/root/sub/deeper"),
+        ("Remove", b"/root/sub/b.csv"),
+        ("RmDir", b"/root/sub"),
+        ("Remove", b"/root/a.csv"),
+        ("Remove", b"/root/link"),
+        ("RmDir", b"/root"),
+    ]
+    assert server.tree == {}
+    assert result.files == 4
+    assert result.directories == 3
+    assert result.transferred == 0
+    assert result.complete
+
+
+async def test_rmtree_unlinks_a_symlink_rather_than_descending_into_it():
+    # A symlink is what a walk *skips*; a removal has to delete it or the parent will not go.
+    # Deleting the link and not what it points at is REMOVE's semantics, and it is why a
+    # recursive delete cannot reach outside the tree it was given.
+    server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES, others={b"/root/link"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        await sftp.rmtree(b"/root")
+
+    assert ("Remove", b"/root/link") in removals(server)
+    assert not any(
+        isinstance(packet, OpenDir) and packet.path == b"/root/link" for packet in server.seen
+    )
+
+
+async def test_rmtree_unlinks_an_entry_the_server_would_not_describe():
+    # Attributes absent and the LSTAT refused. The walk refuses to call it a directory, so
+    # nothing descends into it -- and REMOVE is safe on it precisely because unlink refuses a
+    # directory, so the guess can only fail in the direction that raises.
+    tree = {b"/root": (named(b"a.csv", REGULAR, 3), named(b"mystery", None))}
+    server = TreeServer(tree=tree, files={b"/root/a.csv": b"aaa"}, others={b"/root/mystery"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.rmtree(b"/root")
+
+    assert removals(server) == [
+        ("Remove", b"/root/a.csv"),
+        ("Remove", b"/root/mystery"),
+        ("RmDir", b"/root"),
+    ]
+    assert result.files == 2
+
+
+async def test_an_unknown_entry_that_is_really_a_directory_stops_the_removal():
+    # The safety net stated as a test: a server that will not describe an entry which is in
+    # fact a directory gets a REMOVE, and unlink refuses it. Nothing was descended into and
+    # nothing below it was touched -- the failure names the exact path.
+    tree = {
+        b"/root": (named(b"liar", None),),
+        b"/root/liar": (named(b"hidden.csv", REGULAR, 1),),
+    }
+    server = TreeServer(tree=tree, files={b"/root/liar/hidden.csv": b"h"}, opaque={b"/root/liar"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as exc:
+            await sftp.rmtree(b"/root")
+
+    assert exc.value.path == b"/root/liar"
+    assert not any(
+        isinstance(packet, OpenDir) and packet.path == b"/root/liar" for packet in server.seen
+    ), "nothing descended into an entry the server would not call a directory"
+    assert exc.value.args[0] == "server returned FAILURE: Is a directory"
+    assert server.files == {b"/root/liar/hidden.csv": b"h"}, "nothing below it was touched"
+
+
+async def test_rmtree_removes_a_single_empty_directory():
+    server = TreeServer(tree={b"/root": ()})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.rmtree(b"/root")
+
+    assert removals(server) == [("RmDir", b"/root")]
+    assert (result.files, result.directories) == (0, 1)
+
+
+async def test_rmtree_on_a_missing_tree_raises_rather_than_reporting_nothing():
+    server = TreeServer(tree={b"/root": ()})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(NoSuchFileError):
+            await sftp.rmtree(b"/absent")
+
+
+async def test_rmdir_refuses_a_directory_that_is_not_empty():
+    server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as exc:
+            await sftp.rmdir(b"/root")
+    assert exc.value.args[0] == "server returned FAILURE: Directory not empty"
+    assert exc.value.path == b"/root"
+
+
 # --- against a real server -----------------------------------------------------------------------
 
 
@@ -623,3 +793,192 @@ async def test_mkdir_on_a_real_server(tmp_path: Path):
         (tmp_path / "afile").write_bytes(b"x")
         with pytest.raises(Exception):  # noqa: B017 -- any refusal, and it must refuse
             await sftp.mkdir(str(tmp_path / "afile"), exist_ok=True)
+
+
+async def test_uploading_a_real_tree(tmp_path: Path):
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "local"
+    source.mkdir()
+    build_tree(source)
+    destination = tmp_path / "remote"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.put_tree(source, str(destination))
+
+    assert (destination / "top.csv").read_bytes() == b"top"
+    assert (destination / "sub" / "nested.bin").read_bytes() == (
+        source / "sub" / "nested.bin"
+    ).read_bytes()
+    assert (destination / "sub" / "deeper" / "leaf.txt").read_bytes() == b"leaf"
+    assert (destination / os.fsdecode(b"caf\xe9.bin")).read_bytes() == b"\xe9\xe9"
+
+    assert result.files == 4
+    assert result.directories == 2
+    assert result.transferred == 200_000 + len(b"top") + len(b"leaf") + 2
+    # The symlink is reported rather than followed and copied -- the exfiltration shape,
+    # going this way: a link to /etc/shadow would otherwise arrive under an innocent name.
+    assert [Path(os.fsdecode(skip.path)).name for skip in result.skipped] == ["link.csv"]
+    assert not (destination / "sub" / "link.csv").exists()
+    assert not result.complete
+
+
+async def test_uploading_creates_missing_parents_of_the_destination(tmp_path: Path):
+    # v3 answers a MKDIR whose parent is absent with the same catch-all FAILURE it answers
+    # everything else with, so "create the missing levels" cannot be told from "refused"
+    # without looking. Three levels, none of which exist.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "local"
+    source.mkdir()
+    (source / "only.txt").write_bytes(b"only")
+    destination = tmp_path / "a" / "b" / "c"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.put_tree(source, str(destination))
+
+    assert (destination / "only.txt").read_bytes() == b"only"
+    assert result.files == 1
+
+
+async def test_uploading_a_real_tree_twice_converges_rather_than_accumulating(tmp_path: Path):
+    # The mirroring case. The second pass rewrites the same files over the top, and mkdir
+    # must not fail on directories that are already there.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "local"
+    source.mkdir()
+    build_tree(source)
+    destination = tmp_path / "remote"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        first = await sftp.put_tree(source, str(destination))
+        second = await sftp.put_tree(source, str(destination))
+
+    assert (first.files, first.transferred) == (second.files, second.transferred)
+    assert (destination / "sub" / "deeper" / "leaf.txt").read_bytes() == b"leaf"
+    # No staging file survived either pass: every one was renamed onto its destination.
+    assert not list(destination.glob(".*.part"))
+
+
+async def test_uploading_without_atomic_leaves_no_staging_file_either(tmp_path: Path):
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "local"
+    source.mkdir()
+    (source / "plain.txt").write_bytes(b"plain")
+    destination = tmp_path / "remote"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.put_tree(source, str(destination), atomic=False)
+
+    assert (destination / "plain.txt").read_bytes() == b"plain"
+    assert sorted(item.name for item in destination.iterdir()) == ["plain.txt"]
+    assert result.files == 1
+
+
+async def test_a_real_round_trip_up_then_down_is_byte_identical(tmp_path: Path):
+    # The mirroring workload end to end, and the only test that proves the two directions
+    # agree with each other rather than each agreeing with its own idea of the tree.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "local"
+    source.mkdir()
+    build_tree(source)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        await sftp.put_tree(source, str(tmp_path / "remote"))
+        await sftp.get_tree(str(tmp_path / "remote"), tmp_path / "back")
+
+    # The non-UTF-8 name spelled the way the filesystem holds it, not as a str literal:
+    # "caf\xe9.bin" is U+00E9 and encodes to two bytes, which is a different file.
+    for relative in (
+        "top.csv",
+        "sub/nested.bin",
+        "sub/deeper/leaf.txt",
+        os.fsdecode(b"caf\xe9.bin"),
+    ):
+        assert (tmp_path / "back" / relative).read_bytes() == (source / relative).read_bytes()
+
+
+async def test_removing_a_real_tree(tmp_path: Path):
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    build_tree(doomed)
+    # A file outside the tree that the symlink inside it points at: rmtree must unlink the
+    # link and leave the target alone, which is the difference between REMOVE and following.
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"untouched")
+    (doomed / "sub" / "escape").symlink_to(outside)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.rmtree(str(doomed))
+
+    assert not doomed.exists()
+    assert outside.read_bytes() == b"untouched", "rmtree followed a link out of the tree"
+    assert result.directories == 3
+    assert result.files == 6
+    assert result.transferred == 0
+
+
+async def test_rmtree_of_a_real_empty_directory(tmp_path: Path):
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    (tmp_path / "empty").mkdir()
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.rmtree(str(tmp_path / "empty"))
+
+    assert not (tmp_path / "empty").exists()
+    assert (result.files, result.directories) == (0, 1)
+
+
+async def test_rmdir_on_a_real_server_refuses_a_populated_directory(tmp_path: Path):
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    root = tmp_path / "populated"
+    root.mkdir()
+    (root / "a.txt").write_bytes(b"a")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(ServerError) as exc:
+            await sftp.rmdir(str(root))
+        assert exc.value.code == int(StatusCode.FAILURE)
+        assert root.is_dir(), "a refused rmdir must have changed nothing"
+
+        (root / "a.txt").unlink()
+        await sftp.rmdir(str(root))
+    assert not root.exists()
