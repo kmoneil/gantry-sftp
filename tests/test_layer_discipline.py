@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-CODEC_ROOT = Path(__file__).resolve().parent.parent / "src" / "gantry_sftp" / "codec"
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "src" / "gantry_sftp"
+CODEC_ROOT = PACKAGE_ROOT / "codec"
 
 FORBIDDEN_IMPORTS = frozenset(
     {
@@ -109,6 +110,46 @@ def test_codec_module_has_no_async(module: Path) -> None:
         f"{module.name} contains async constructs; the codec is synchronous and pure: "
         + ", ".join(f"{what} (line {line})" for line, what in offenders)
     )
+
+
+def package_modules() -> list[Path]:
+    return sorted(PACKAGE_ROOT.rglob("*.py"))
+
+
+def imported_roots(module: Path) -> list[tuple[int, str]]:
+    """Every top-level module name imported by ``module``, with its line number."""
+    tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend((node.lineno, alias.name.split(".")[0]) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            found.append((node.lineno, node.module.split(".")[0]))
+    return found
+
+
+@pytest.mark.parametrize("module", package_modules(), ids=lambda p: str(p.name))
+def test_no_shipped_module_imports_asyncio_directly(module: Path) -> None:
+    """Async is anyio, everywhere, with no exceptions.
+
+    ``asyncio.Queue``, ``asyncio.wait_for`` and ``loop.*`` are not merely unidiomatic here:
+    each one silently costs trio support, which is the entire reason for the anyio
+    dependency. The rule is worth nothing unless something checks it, because a single
+    convenient ``import asyncio`` in a hurry is all it takes.
+
+    Note ``subprocess`` is deliberately *not* banned -- ``subprocess.PIPE`` is a plain
+    integer constant that anyio's process API expects, and it involves no event loop.
+    """
+    offenders = [(line, name) for line, name in imported_roots(module) if name == "asyncio"]
+    assert not offenders, (
+        f"{module.name} imports asyncio directly; use anyio so trio keeps working: "
+        + ", ".join(f"line {line}" for line, _ in offenders)
+    )
+
+
+def test_the_package_root_scan_is_not_vacuous() -> None:
+    modules = package_modules()
+    assert len(modules) > len(codec_modules()), "package scan found no modules outside codec/"
 
 
 def test_codec_imports_only_itself_and_the_exception_module() -> None:

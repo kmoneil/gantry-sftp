@@ -12,6 +12,19 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(params=["asyncio", "trio"])
+def anyio_backend(request: pytest.FixtureRequest) -> str:
+    """Run every async test on both anyio backends.
+
+    The entire reason this library uses anyio rather than asyncio is that it costs nothing
+    and buys trio support. Running the async suite on trio too is what turns that from a
+    claim into a fact -- an anyio-shaped codebase that has only ever run on asyncio is one
+    accidental ``asyncio.Queue`` away from not supporting trio at all.
+    """
+    return str(request.param)
+
+
 # sftp-server ships in openssh-server, not openssh-client, and distributions disagree about
 # where it lives. These are the three locations in the wild.
 SFTP_SERVER_CANDIDATES = (

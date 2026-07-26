@@ -1,0 +1,326 @@
+"""Transports backed by a child process.
+
+Two of them, sharing everything but the argv:
+
+* :func:`open_ssh_transport` spawns ``ssh -s sftp`` and is the whole thesis -- OpenSSH does
+  the cryptography, key exchange, ``ssh_config`` handling and host-key checking, and hands
+  back a plaintext framed SFTP stream. No cryptography happens in this package.
+* :func:`open_local_server_transport` spawns ``sftp-server`` directly, with no ``ssh``, no
+  keys and no network. This is what ``sftp(1) -D`` does. It exists because a fake only ever
+  confirms what its author already believed, and this gives us the *real* OpenSSH server
+  implementation in unit-test time.
+
+Both capture stderr on a background task and attach it verbatim to any failure. That is not
+a nicety. ``Error reading SSH protocol banner`` is what paramiko reports when OpenSSH said
+``Permission denied (publickey)`` or ``Host key verification failed``; the diagnosis existed
+and was discarded. Here it is the first thing in the exception.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from typing import override
+
+import anyio
+from anyio.abc import Process
+
+from gantry_sftp.exceptions import ConnectError
+from gantry_sftp.transport._argv import DEFAULT_SUBSYSTEM, build_ssh_argv
+from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
+
+__all__ = [
+    "SFTP_SERVER_CANDIDATES",
+    "SubprocessTransport",
+    "find_sftp_server",
+    "open_local_server_transport",
+    "open_ssh_transport",
+]
+
+_TERMINATE_GRACE_SECONDS = 5.0
+
+SFTP_SERVER_CANDIDATES = (
+    "/usr/lib/openssh/sftp-server",
+    "/usr/libexec/sftp-server",
+    "/usr/lib/ssh/sftp-server",
+    "/usr/libexec/openssh/sftp-server",
+)
+"""Where distributions put ``sftp-server``. It ships in ``openssh-server``, not the client."""
+
+
+def find_sftp_server() -> str | None:
+    """Locate the OpenSSH ``sftp-server`` binary, or return ``None`` if it is not installed."""
+    for candidate in SFTP_SERVER_CANDIDATES:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+class SubprocessTransport:
+    """A byte stream over a child process's stdin and stdout.
+
+    Built by :func:`open_ssh_transport` or :func:`open_local_server_transport` rather than
+    directly: the stderr drain is a background task, and a task needs a scope to live in.
+    """
+
+    __slots__ = ("_argv", "_closed", "_process", "_stderr")
+
+    def __init__(self, process: Process, argv: Sequence[str], stderr: bytearray) -> None:
+        self._process = process
+        self._argv = tuple(argv)
+        self._stderr = stderr
+        self._closed = False
+
+    @property
+    def argv(self) -> tuple[str, ...]:
+        """The exact command that was spawned. No shell was involved."""
+        return self._argv
+
+    @property
+    def stderr_text(self) -> str:
+        """Whatever the child has written to stderr so far, decoded leniently.
+
+        ``errors="replace"`` because this is a diagnostic: a server that emits a stray
+        non-UTF-8 byte in its banner should not turn an authentication failure into a
+        ``UnicodeDecodeError`` about the message that was trying to explain it.
+        """
+        return bytes(self._stderr).decode("utf-8", errors="replace")
+
+    @property
+    def returncode(self) -> int | None:
+        """Child exit status, or ``None`` while it is still running."""
+        return self._process.returncode
+
+    @override
+    def __repr__(self) -> str:
+        """Identify the child without dumping its whole command line."""
+        state = "closed" if self._closed else "open"
+        return f"<SubprocessTransport {self._argv[0]!r} pid={self._process.pid} {state}>"
+
+    def _connection_lost(self, what: str) -> ConnectError:
+        return ConnectError(
+            what,
+            stderr=self.stderr_text,
+            argv=self._argv,
+            returncode=self._process.returncode,
+        )
+
+    async def send(self, data: bytes | memoryview) -> None:
+        """Write ``data`` to the child's stdin, in full."""
+        if self._closed:
+            raise self._connection_lost("transport is closed")
+        stdin = self._process.stdin
+        if stdin is None:  # pragma: no cover -- always piped by the openers here
+            raise self._connection_lost("transport has no stdin")
+        try:
+            await stdin.send(bytes(data))
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError) as exc:
+            raise self._connection_lost("ssh exited while we were writing to it") from exc
+
+    async def receive(self, max_bytes: int = DEFAULT_RECEIVE_SIZE) -> bytes:
+        """Read up to ``max_bytes`` from the child's stdout.
+
+        Raises:
+            ConnectError: On end of stream, carrying the child's stderr and exit status.
+                This is the good path for diagnosing a failed connection: ``ssh`` writes
+                its reason to stderr and then closes stdout, so the two arrive together.
+        """
+        if self._closed:
+            raise self._connection_lost("transport is closed")
+        stdout = self._process.stdout
+        if stdout is None:  # pragma: no cover -- always piped by the openers here
+            raise self._connection_lost("transport has no stdout")
+        try:
+            return await stdout.receive(max_bytes)
+        except anyio.EndOfStream as exc:
+            # Wait briefly for the child so the exit status and the last of stderr are in
+            # the exception rather than arriving after it.
+            with anyio.CancelScope(shield=True), anyio.move_on_after(_TERMINATE_GRACE_SECONDS):
+                await self._process.wait()
+            raise self._connection_lost("connection closed by the remote end") from exc
+        except anyio.ClosedResourceError as exc:
+            raise self._connection_lost("transport is closed") from exc
+
+    async def aclose(self) -> None:
+        """Close stdin and make sure the child is gone.
+
+        Shielded from cancellation throughout. A cancelled transfer must still reap its
+        child -- "cancellation obviously works" is a claim about a subprocess, a pipe and a
+        task group, and it is three places for a process to be left behind.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        with anyio.CancelScope(shield=True):
+            await self._close_stdin()
+            await self._reap()
+
+    async def _close_stdin(self) -> None:
+        """Closing stdin is how a well-behaved sftp server is told to exit."""
+        if self._process.stdin is None:  # pragma: no cover
+            return
+        with suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
+            await self._process.stdin.aclose()
+
+    async def _reap(self) -> None:
+        """Wait, then escalate. Politeness first, but never indefinitely."""
+        with anyio.move_on_after(_TERMINATE_GRACE_SECONDS):
+            await self._process.wait()
+            return
+
+        self._process.terminate()
+        with anyio.move_on_after(_TERMINATE_GRACE_SECONDS):
+            await self._process.wait()
+            return
+
+        self._process.kill()
+        await self._process.wait()
+
+
+async def _drain_stderr(process: Process, into: bytearray) -> None:
+    """Read the child's stderr until it ends, accumulating it for diagnostics.
+
+    A background task rather than a read-on-failure, because a pipe nobody drains fills up
+    and blocks the writer. ``ssh -vvv`` produces far more than a pipe buffer holds, and a
+    client that deadlocks when you turn on debugging is a client that cannot be debugged.
+    """
+    if process.stderr is None:  # pragma: no cover
+        return
+    try:
+        async for chunk in process.stderr:
+            into.extend(chunk)
+    except (anyio.EndOfStream, anyio.ClosedResourceError):  # pragma: no cover
+        pass
+
+
+@asynccontextmanager
+async def _open_process_transport(
+    argv: Sequence[str],
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AsyncIterator[SubprocessTransport]:
+    """Spawn ``argv``, wire up the stderr drain, and guarantee the child is reaped."""
+    stderr = bytearray()
+    try:
+        process = await anyio.open_process(
+            list(argv),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+        )
+    except OSError as exc:
+        raise ConnectError(
+            f"could not run {argv[0]!r}: {exc.strerror or exc}",
+            argv=tuple(argv),
+        ) from exc
+
+    transport = SubprocessTransport(process, argv, stderr)
+    try:
+        async with anyio.create_task_group() as task_group:
+            # The handle is deliberately discarded: the drain runs until the pipe ends
+            # and is torn down with the task group, so there is nothing to await.
+            _ = task_group.start_soon(_drain_stderr, process, stderr)
+            try:
+                yield transport
+            finally:
+                await transport.aclose()
+                task_group.cancel_scope.cancel()
+    finally:
+        # The task group cannot outlive the process object, and a failure anywhere above
+        # must not leave a child running.
+        with anyio.CancelScope(shield=True):
+            await transport.aclose()
+
+
+@asynccontextmanager
+async def open_ssh_transport(
+    host: str,
+    *,
+    user: str | None = None,
+    port: int | None = None,
+    config_file: str | os.PathLike[str] | None = None,
+    identity_file: str | os.PathLike[str] | None = None,
+    options: Mapping[str, str] | None = None,
+    subsystem: str = DEFAULT_SUBSYSTEM,
+    ssh_executable: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AsyncIterator[SubprocessTransport]:
+    """Open an SFTP byte stream by spawning ``ssh -s sftp``.
+
+    Arguments are validated and assembled by
+    :func:`~gantry_sftp.transport.build_ssh_argv`; see it for what is rejected and why.
+
+    Args:
+        host: Hostname or ``ssh_config`` alias.
+        user: Remote username.
+        port: Remote port.
+        config_file: ``-F``. Pass ``os.devnull`` to ignore the user's ``ssh_config``.
+        identity_file: ``-i``.
+        options: ``-o`` options, overriding the defaults by name.
+        subsystem: Subsystem name, or a path for a server with no subsystem configured.
+        ssh_executable: Which ``ssh`` to run.
+        env: Environment for the child. ``None`` inherits.
+
+    Yields:
+        A connected transport. Note that ``ssh`` is spawned immediately but authentication
+        happens asynchronously, so a failure usually surfaces on the first
+        :meth:`~SubprocessTransport.receive` -- with OpenSSH's stderr attached, which is
+        where the real explanation always was.
+
+    Raises:
+        ValueError: If any argument could be misread as an ``ssh`` option.
+        ConnectError: If ``ssh`` cannot be executed at all.
+    """
+    argv = build_ssh_argv(
+        host,
+        user=user,
+        port=port,
+        config_file=config_file,
+        identity_file=identity_file,
+        options=options,
+        subsystem=subsystem,
+        ssh_executable=ssh_executable,
+    )
+    async with _open_process_transport(argv, env=env) as transport:
+        yield transport
+
+
+@asynccontextmanager
+async def open_local_server_transport(
+    *,
+    server_path: str | os.PathLike[str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AsyncIterator[SubprocessTransport]:
+    """Open an SFTP byte stream by spawning ``sftp-server`` directly. No ``ssh``, no network.
+
+    The equivalent of ``sftp(1) -D``. Everything runs as the current user with no
+    authentication, so this is for testing and for local use, never for reaching another
+    machine.
+
+    Args:
+        server_path: Path to ``sftp-server``. Located automatically when omitted.
+        cwd: Working directory for the child, which is what relative paths resolve against.
+        env: Environment for the child. ``None`` inherits.
+
+    Yields:
+        A connected transport.
+
+    Raises:
+        ConnectError: If ``sftp-server`` cannot be found or executed. It ships in
+            ``openssh-server``; having only ``openssh-client`` is the usual reason.
+    """
+    resolved = os.fspath(server_path) if server_path is not None else find_sftp_server()
+    if resolved is None:
+        raise ConnectError(
+            "sftp-server not found; it ships in the openssh-server package, not "
+            f"openssh-client (looked in {', '.join(SFTP_SERVER_CANDIDATES)})"
+        )
+    async with _open_process_transport([resolved], cwd=cwd, env=env) as transport:
+        yield transport

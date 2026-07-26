@@ -14,7 +14,16 @@ from __future__ import annotations
 
 from typing import override
 
-__all__ = ["ProtocolError", "SFTPError", "StateError"]
+__all__ = [
+    "AuthenticationError",
+    "ConnectError",
+    "HostKeyError",
+    "InsecureOptionWarning",
+    "ProtocolError",
+    "SFTPError",
+    "SFTPWarning",
+    "StateError",
+]
 
 
 class SFTPError(Exception):
@@ -81,3 +90,85 @@ class ProtocolError(SFTPError):
         if self.raw_frame is not None:
             parts.append(f"raw_frame={self.raw_frame!r}")
         return " ".join(parts)
+
+
+class ConnectError(SFTPError):
+    """The transport could not be established, or died.
+
+    Named ``ConnectError`` rather than ``ConnectionError`` on purpose. ``ConnectionError``
+    is a builtin, and a user who writes ``from gantry_sftp import ConnectionError`` would
+    silently stop catching the builtin one everywhere else in that module -- including the
+    ``OSError`` subclasses their socket code depends on. Shadowing a builtin exception in a
+    library that people will ``import *`` from is a trap, and DESIGN.md 9 is amended to
+    match.
+
+    Attributes:
+        stderr: OpenSSH's standard error, **verbatim and untruncated**. This is the whole
+            point of the class. ``Error reading SSH protocol banner`` is what paramiko
+            tells you when the real message was ``Permission denied (publickey)`` or
+            ``Host key verification failed`` -- the diagnosis was always there, and it was
+            thrown away. It is not parsed here either, because parsing it would mean
+            guessing, and the raw text is worth more than our guess about it.
+        argv: The exact command that was run, with no shell involved. Useful in a bug
+            report and safe to show: credentials never appear in argv (see
+            ``SSH_ASKPASS``), which is itself a design constraint rather than a habit.
+        returncode: Exit status of the ``ssh`` process, if it exited.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stderr: str = "",
+        argv: tuple[str, ...] = (),
+        returncode: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stderr = stderr
+        self.argv = argv
+        self.returncode = returncode
+
+    @override
+    def __str__(self) -> str:
+        """Render the message with the subprocess's own diagnosis appended."""
+        parts = [super().__str__()]
+        if self.returncode is not None:
+            parts.append(f"(exit status {self.returncode})")
+        if self.stderr:
+            parts.append(f"\nssh stderr:\n{self.stderr.rstrip()}")
+        return " ".join(parts)
+
+
+class AuthenticationError(ConnectError):
+    """Authentication was refused.
+
+    Recognising this from OpenSSH's stderr is a job for the quirks layer; nothing raises it
+    yet. It exists because ``except AuthenticationError`` is the question users actually
+    ask, and answering it with a substring search in their own code is worse.
+    """
+
+
+class HostKeyError(ConnectError):
+    """The server's host key was not accepted.
+
+    Distinguished from :class:`AuthenticationError` because the remedy is completely
+    different -- and because silently downgrading this one is how interception goes
+    unnoticed.
+    """
+
+
+class SFTPWarning(UserWarning):
+    """Base for warnings this library emits.
+
+    A distinct category so callers can escalate ours to errors, or silence ours alone,
+    without touching every other warning in their process.
+    """
+
+
+class InsecureOptionWarning(SFTPWarning):
+    """A setting was chosen that weakens a security guarantee.
+
+    Emitted rather than raised because these are legitimate choices in some environments --
+    a throwaway container, a host key that genuinely rotates. "Overridable, loudly" means
+    the override works and leaves a record; it does not mean it is a good idea.
+    """

@@ -10,8 +10,27 @@ The public surface is still being built. See ``_plans/DESIGN.md`` for what is co
 
 from __future__ import annotations
 
-from gantry_sftp.exceptions import ProtocolError, SFTPError, StateError
+from gantry_sftp.exceptions import (
+    AuthenticationError,
+    ConnectError,
+    HostKeyError,
+    InsecureOptionWarning,
+    ProtocolError,
+    SFTPError,
+    SFTPWarning,
+    StateError,
+)
 
-__all__ = ["ProtocolError", "SFTPError", "StateError", "__version__"]
+__all__ = [
+    "AuthenticationError",
+    "ConnectError",
+    "HostKeyError",
+    "InsecureOptionWarning",
+    "ProtocolError",
+    "SFTPError",
+    "SFTPWarning",
+    "StateError",
+    "__version__",
+]
 
 __version__ = "0.0.0"

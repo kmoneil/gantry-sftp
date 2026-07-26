@@ -16,7 +16,9 @@ classifiers = [
   "Topic :: Internet :: File Transfer Protocol (FTP)",
   "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "anyio>=4.14.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/kevinoneil/gantry-sftp"
@@ -40,6 +42,7 @@ dev = [
   "complexipy>=3.0",
   "pre-commit>=4.0",
   "mutmut>=3.2",
+  "trio>=0.33.0",
 ]
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,15 @@ ignore = [
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.ruff.lint.pylint]
+# PLR0913's default of 5 assumes positional arguments, where arity really is a complexity
+# signal. Our connection entry points are keyword-only pass-throughs over independent ssh
+# concepts -- host, user, port, config file, identity file, options, subsystem, executable,
+# environment -- and bundling them into a parameter object would move the same fields
+# somewhere else rather than remove any. 10 is a project-wide policy, not a per-function
+# exemption; a function that wants more than that is genuinely doing too much.
+max-args = 10
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

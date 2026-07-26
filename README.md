@@ -33,11 +33,16 @@ yet. What exists today:
 - wire primitives and an incremental frame splitter — no frame payload is ever copied
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
+- transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
-  no network, no containers
+  no network, no containers — and a `live-tests/` lane that runs a real `sshd`
 
-Not yet: any transport, the session layer, or a public API. You cannot transfer a file with
-this yet.
+The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
+host-key verification and public-key authentication all done by OpenSSH, and no
+cryptography in this package.
+
+Not yet: the session layer or a public API. There is no `get()` or `put()`, so you cannot
+transfer a file with this yet.
 
 One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
 opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends
@@ -92,9 +97,19 @@ The gates, all of which must pass before anything lands:
 Type checking is deliberately two-tool: mypy is stricter and catches gaps ty misses. A
 finding gets fixed at the source, never silenced with an ignore.
 
-`tests/` needs no network. `live-tests/` needs containers and `tc netem` link shaping, and
-`benchmarks/` needs a shaped link; both are excluded from the default run and skip with a
-reason rather than failing when their dependencies are absent.
+`tests/` needs no network and is what the gates above run. `live-tests/` starts a real
+`sshd` on localhost and will later need containers and `tc netem` link shaping;
+`benchmarks/` needs a shaped link. Both are excluded from the default run and skip with a
+reason rather than failing when their dependencies are absent:
+
+```bash
+.venv/bin/python -m pytest live-tests/       # needs openssh-server
+```
+
+Every async test runs on both anyio backends, asyncio and trio. That is deliberate: the
+reason for depending on anyio at all is that it costs nothing and buys trio support, and a
+codebase that has only ever run on asyncio is one accidental `asyncio.Queue` away from not
+having it.
 
 ## License
 
