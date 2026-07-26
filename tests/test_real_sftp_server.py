@@ -27,6 +27,9 @@ from gantry_sftp.codec import (
     OPENSSH_ADVERTISED_EXTENSIONS,
     PROTOCOL_VERSION,
     Close,
+    Codec,
+    CodecState,
+    Completed,
     Data,
     Extended,
     ExtendedReply,
@@ -35,6 +38,7 @@ from gantry_sftp.codec import (
     Init,
     LStat,
     Name,
+    Negotiated,
     Open,
     OpenFlag,
     Packet,
@@ -346,3 +350,133 @@ def test_realpath_longname_is_the_path_not_an_ls_line(server: LocalSftpServer):
     assert isinstance(reply, Name), reply
     (entry,) = reply.entries
     assert entry.longname == entry.filename
+
+
+# --- the state machine, end to end ------------------------------------------------------
+
+
+class CodecDrivenServer:
+    """Drives sftp-server through the full :class:`Codec`, not just encode/decode.
+
+    The handshake, id allocation and correlation are the codec's; this only moves bytes.
+    """
+
+    def __init__(self, binary: Path, cwd: Path) -> None:
+        self._proc = subprocess.Popen(
+            [str(binary)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=cwd,
+        )
+        self.codec = Codec()
+
+    def write(self, data: bytes) -> None:
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(data)
+        self._proc.stdin.flush()
+
+    def pump(self, count: int) -> list[Completed | Negotiated]:
+        """Read until the codec has reported ``count`` events."""
+        assert self._proc.stdout is not None
+        events: list[Completed | Negotiated] = []
+        while len(events) < count:
+            events.extend(self.codec.receive(self._proc.stdout.read(1)))
+        return events
+
+    def close(self) -> None:
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+        try:
+            self._proc.stdin.close()
+            self._proc.wait(timeout=10)
+        finally:
+            self._proc.stdout.close()
+
+
+@pytest.fixture
+def driven(sftp_server_binary: Path, tmp_path: Path) -> Iterator[CodecDrivenServer]:
+    s = CodecDrivenServer(sftp_server_binary, tmp_path)
+    yield s
+    s.close()
+
+
+def test_the_codec_negotiates_with_a_real_server(driven: CodecDrivenServer):
+    driven.write(driven.codec.initiate())
+    (event,) = driven.pump(1)
+    assert isinstance(event, Negotiated)
+    assert event.version == PROTOCOL_VERSION
+    assert driven.codec.state is CodecState.READY
+    assert driven.codec.extensions[b"limits@openssh.com"] == b"1"
+
+
+def test_pipelined_reads_correlate_against_a_real_server(driven: CodecDrivenServer, tmp_path: Path):
+    """Issue every READ before reading any reply, then check each landed on its own offset.
+
+    This is the property the whole library is for. Localhost will not reorder these, so
+    passing here does not prove the scheduler is right under latency -- that is what the
+    netem lane is for. What it does prove is that correlation survives contact with a real
+    server rather than only with our own encoder.
+    """
+    codec = driven.codec
+    driven.write(codec.initiate())
+    driven.pump(1)
+
+    chunk_size = 4
+    contents = b"".join(bytes([65 + n]) * chunk_size for n in range(8))  # AAAA BBBB CCCC ...
+    target = tmp_path / "pipelined.bin"
+    target.write_bytes(contents)
+
+    open_id = codec.allocate_request_id()
+    driven.write(codec.send(Open(open_id, str(target).encode(), OpenFlag.READ)))
+    (opened,) = driven.pump(1)
+    assert isinstance(opened, Completed)
+    assert isinstance(opened.response, Handle)
+    handle = opened.response.handle
+
+    # Every request goes out before any reply is read.
+    offsets = [n * chunk_size for n in range(8)]
+    for offset in offsets:
+        request_id = codec.allocate_request_id()
+        driven.write(codec.send(Read(request_id, handle, offset=offset, length=chunk_size)))
+    assert codec.outstanding == len(offsets)
+
+    events = driven.pump(len(offsets))
+    assert codec.outstanding == 0
+
+    # Each reply is matched back to the request that asked for it, so the offset comes from
+    # the request rather than from arrival order. Reassembling by arrival order is the bug
+    # this design exists to make impossible.
+    reassembled = bytearray(len(contents))
+    for event in events:
+        assert isinstance(event, Completed)
+        assert isinstance(event.request, Read)
+        assert isinstance(event.response, Data)
+        offset = event.request.offset
+        payload = bytes(event.response.data)
+        reassembled[offset : offset + len(payload)] = payload
+
+    assert bytes(reassembled) == contents
+
+    close_id = codec.allocate_request_id()
+    driven.write(codec.send(Close(close_id, handle)))
+    driven.pump(1)
+
+
+def test_a_real_servers_error_completes_the_request_that_caused_it(
+    driven: CodecDrivenServer, tmp_path: Path
+):
+    codec = driven.codec
+    driven.write(codec.initiate())
+    driven.pump(1)
+
+    request_id = codec.allocate_request_id()
+    request = Open(request_id, str(tmp_path / "absent").encode(), OpenFlag.READ)
+    driven.write(codec.send(request))
+    (event,) = driven.pump(1)
+
+    assert isinstance(event, Completed)
+    assert event.request is request
+    assert isinstance(event.response, Status)
+    assert event.response.code == StatusCode.NO_SUCH_FILE
+    assert codec.outstanding == 0

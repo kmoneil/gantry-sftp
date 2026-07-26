@@ -31,11 +31,13 @@ yet. What exists today:
   checked against `draft-ietf-secsh-filexfer-02`, OpenSSH's `sftp.h`, and frames captured
   from a real server
 - wire primitives and an incremental frame splitter — no frame payload is ever copied
+- the client state machine: handshake, deterministic request-id allocation, and
+  request/response correlation that survives out-of-order replies
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers
 
-Not yet: request-id correlation, any transport, the session layer, or a public API. You
-cannot transfer a file with this yet.
+Not yet: any transport, the session layer, or a public API. You cannot transfer a file with
+this yet.
 
 One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
 opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends

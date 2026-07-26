@@ -10,8 +10,8 @@ The public surface is still being built. See ``_plans/DESIGN.md`` for what is co
 
 from __future__ import annotations
 
-from gantry_sftp.exceptions import ProtocolError, SFTPError
+from gantry_sftp.exceptions import ProtocolError, SFTPError, StateError
 
-__all__ = ["ProtocolError", "SFTPError", "__version__"]
+__all__ = ["ProtocolError", "SFTPError", "StateError", "__version__"]
 
 __version__ = "0.0.0"

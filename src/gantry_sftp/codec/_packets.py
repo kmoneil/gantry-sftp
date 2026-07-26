@@ -54,6 +54,8 @@ __all__ = [
     "RealPath",
     "Remove",
     "Rename",
+    "Request",
+    "Response",
     "RmDir",
     "SetStat",
     "Stat",
@@ -717,6 +719,42 @@ class ExtendedReply:
 
 
 # --- the union and the dispatch table ----------------------------------------------------
+
+Request = (
+    Open
+    | Close
+    | Read
+    | Write
+    | LStat
+    | FStat
+    | SetStat
+    | FSetStat
+    | OpenDir
+    | ReadDir
+    | Remove
+    | MkDir
+    | RmDir
+    | RealPath
+    | Stat
+    | Rename
+    | ReadLink
+    | SymLink
+    | Extended
+)
+"""A client-to-server packet that carries a request id and expects exactly one reply.
+
+``INIT`` is excluded deliberately: it has no request id, its reply is ``VERSION``, and it
+happens once before any of these are legal.
+"""
+
+Response = Status | Handle | Data | Name | AttrsReply | ExtendedReply
+"""A server-to-client packet that answers a :data:`Request`.
+
+Which of these answers which request is not fixed: an OPEN yields a HANDLE *or* a STATUS,
+and a READDIR yields a NAME *or* a STATUS at end of directory. Correlation is by request id
+alone -- deciding whether a given reply makes sense for a given request is a judgement about
+server behaviour, and belongs where server behaviour is modelled.
+"""
 
 Packet = (
     Init

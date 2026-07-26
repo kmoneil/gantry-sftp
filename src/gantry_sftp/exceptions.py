@@ -14,13 +14,27 @@ from __future__ import annotations
 
 from typing import override
 
-__all__ = ["ProtocolError", "SFTPError"]
+__all__ = ["ProtocolError", "SFTPError", "StateError"]
 
 
 class SFTPError(Exception):
     """Base for every error this library raises.
 
     Catching this catches everything from the library and nothing from anywhere else.
+    """
+
+
+class StateError(SFTPError):
+    """The library was asked to do something illegal in its current state.
+
+    This is a **caller** error, and it is deliberately not a
+    :class:`ProtocolError`: nothing was written to the wire, the peer never saw it, and the
+    connection is still perfectly usable. Sending a request before the handshake finishes,
+    or reusing a request id that is still in flight, raises this and changes nothing else.
+
+    Keeping the two apart matters because the recovery differs. A ``ProtocolError`` means
+    the stream can no longer be trusted and the connection is finished. A ``StateError``
+    means fix the call.
     """
 
 

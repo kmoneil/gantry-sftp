@@ -8,21 +8,27 @@ network, and reusable for a server implementation later. It is enforced by
 ``tests/test_layer_discipline.py``, not by everyone remembering -- a codec that needs the
 wall clock is a codec with a bug, and the test says so out loud.
 
-Typical use::
+Typical use is through :class:`Codec`, which owns the handshake, request-id allocation and
+request/response correlation together::
 
-    splitter = FrameSplitter()
-    transport.send(encode(Init()))
-    for frame in splitter.feed(transport.recv()):
-        packet = decode(frame)
+    codec = Codec()
+    transport.send(codec.initiate())
 
-Request-id allocation and request/response correlation are not here yet. They arrive with
-the state machine that owns both together; a counter designed in isolation from the
-correlation table it feeds is a counter with the wrong interface.
+    request_id = codec.allocate_request_id()
+    transport.send(codec.send(RealPath(request_id, b".")))
+
+    for event in codec.receive(transport.recv()):
+        ...
+
+:class:`FrameSplitter`, :func:`encode` and :func:`decode` are the layer underneath and stay
+public: they are what a debug frame dumper, a fuzz harness, or a future server
+implementation needs, and none of those want a client's state machine attached.
 """
 
 from __future__ import annotations
 
 from gantry_sftp.codec._attrs import EMPTY_ATTRS, Attrs, Owner, Times, decode_attrs, encode_attrs
+from gantry_sftp.codec._codec import Codec, CodecState, Completed, Event, Negotiated
 from gantry_sftp.codec._constants import (
     MAX_STATUS_CODE,
     NO_REQUEST_ID,
@@ -57,6 +63,8 @@ from gantry_sftp.codec._packets import (
     RealPath,
     Remove,
     Rename,
+    Request,
+    Response,
     RmDir,
     SetStat,
     Stat,
@@ -80,7 +88,11 @@ __all__ = [
     "Attrs",
     "AttrsReply",
     "Close",
+    "Codec",
+    "CodecState",
+    "Completed",
     "Data",
+    "Event",
     "Extended",
     "ExtendedReply",
     "FSetStat",
@@ -92,6 +104,7 @@ __all__ = [
     "MkDir",
     "Name",
     "NameEntry",
+    "Negotiated",
     "Open",
     "OpenDir",
     "OpenFlag",
@@ -104,6 +117,8 @@ __all__ = [
     "RealPath",
     "Remove",
     "Rename",
+    "Request",
+    "Response",
     "RmDir",
     "SetStat",
     "Stat",
