@@ -27,6 +27,7 @@ from gantry_sftp.codec import (
     Status,
     StatusCode,
     Version,
+    _codec,
     encode,
 )
 from gantry_sftp.codec._codec import _MAX_REQUEST_ID
@@ -207,6 +208,31 @@ def test_wrapping_skips_ids_still_in_flight():
 
     assert codec.allocate_request_id() == _MAX_REQUEST_ID
     assert codec.allocate_request_id() == 3, "wrap handed back an id already in flight"
+
+
+def test_exhaustion_is_refused_rather_than_spun_on(monkeypatch: pytest.MonkeyPatch):
+    # Four billion concurrent requests is not reachable in a test, and the guard is not
+    # decoration: it is the only thing standing between a full table and the wrap loop
+    # below spinning forever. Shrinking the id space is the only way to make the exhausted
+    # case a fact rather than a comment, so the constants are patched before the codec is
+    # built -- `__init__` reads `_MIN_REQUEST_ID` to seed the counter.
+    monkeypatch.setattr(_codec, "_MIN_REQUEST_ID", 1)
+    monkeypatch.setattr(_codec, "_MAX_REQUEST_ID", 4)
+    codec = negotiated_codec()
+
+    for _ in range(3):
+        codec.send(Stat(codec.allocate_request_id(), b"/a"))
+
+    # Three of the four in flight is not exhaustion. The comparison is `>`, not `>=`: the
+    # last free id must still be handed out, or the usable space is one short of the space.
+    last = codec.allocate_request_id()
+    assert last == 4
+    codec.send(Stat(last, b"/a"))
+
+    with pytest.raises(StateError) as exc:
+        codec.allocate_request_id()
+    assert exc.value.args[0] == "every request id is in flight; cannot allocate another"
+    assert codec.state is CodecState.READY, "a caller-side refusal must not fail the codec"
 
 
 def test_an_id_is_reusable_once_its_reply_arrives():

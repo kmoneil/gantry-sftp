@@ -257,6 +257,29 @@ reason for depending on anyio at all is that it costs nothing and buys trio supp
 codebase that has only ever run on asyncio is one accidental `asyncio.Queue` away from not
 having it.
 
+### The mutation lane
+
+Coverage says a line ran. It does not say an assertion would have noticed the line being
+wrong. For frame parsing and offset arithmetic that distinction is the whole game, so the
+codec carries a `mutmut` run:
+
+```bash
+.venv/bin/mutmut run          # ~4 minutes; scoped to codec/ by pyproject.toml
+.venv/bin/mutmut browse       # inspect survivors
+.venv/bin/mutmut results      # non-interactive list
+```
+
+It is a lane, not a pre-commit gate — it takes minutes, not seconds. A surviving mutant in
+`codec/` is a missing test, not a curiosity, and the survivors that are genuinely
+*equivalent* (no test can distinguish them) are listed with their reasons in
+`_plans/deferred.md` rather than suppressed, so a future run has a baseline to diff against
+instead of a triage to redo.
+
+`mutmut` mutates only functions the tests call, and it mutates the copy of the library it
+writes into `mutants/`. Test selection is `tests/` alone: `examples/` runs each example as a
+subprocess, which imports the *installed* library rather than the mutated copy, so those
+tests cannot kill a mutant and would only add wall-clock.
+
 ## License
 
 Apache-2.0.

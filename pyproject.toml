@@ -194,7 +194,7 @@ markers = [
 # ---------------------------------------------------------------------------
 [tool.pyright]
 include = ["src"]
-exclude = ["tests", "examples", "live-tests", "benchmarks", ".venv"]
+exclude = ["tests", "examples", "live-tests", "benchmarks", ".venv", "**/__pycache__"]
 typeCheckingMode = "standard"
 pythonVersion = "3.13"
 venvPath = "."
@@ -202,7 +202,20 @@ venv = ".venv"
 
 # ---------------------------------------------------------------------------
 # mutmut -- codec and correctness layer carry a mutation run
+#
+# `source_paths` is the whole package, not just codec/, and that is load-bearing:
+# mutmut copies source_paths into `mutants/` and then *removes* the real src/ from
+# sys.path. Pointing it at `src/gantry_sftp/codec/` alone produced a mutants/ tree
+# with no `gantry_sftp/__init__.py`, so `gantry_sftp` resolved as a namespace
+# package containing only `codec` and every other import failed. Copy the package,
+# restrict the mutation to codec/ with `only_mutate`.
+#
+# Test selection is `tests/` and deliberately excludes `examples/`: each example
+# runs as a subprocess, which imports the *installed* library rather than the
+# mutated copy on the parent's sys.path. Those tests cannot kill a mutant, so
+# including them would only add wall-clock.
 # ---------------------------------------------------------------------------
 [tool.mutmut]
-paths_to_mutate = ["src/gantry_sftp/codec/"]
-tests_dir = ["tests/"]
+source_paths = ["src/"]
+only_mutate = ["src/gantry_sftp/codec/*"]
+pytest_add_cli_args_test_selection = ["tests/"]

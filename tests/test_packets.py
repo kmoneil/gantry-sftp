@@ -278,6 +278,10 @@ def test_unknown_packet_type_is_rejected():
         decode_frame(b"\x00\x00\x00\x05\x7f\x00\x00\x00\x01")
     assert exc.value.args[0].startswith("unknown packet type 127; filexfer v3 defines")
     assert exc.value.packet_type == 127
+    # The frame is carried, not described. An unknown type byte is the signature of a
+    # server we have never met, and a bug report holding its actual bytes is the difference
+    # between adding support for it and guessing at it.
+    assert exc.value.raw_frame == b"\x7f\x00\x00\x00\x01"
 
 
 def test_trailing_bytes_after_a_complete_packet_are_rejected():
@@ -287,12 +291,19 @@ def test_trailing_bytes_after_a_complete_packet_are_rejected():
     with pytest.raises(ProtocolError) as exc:
         decode_frame(wire)
     assert exc.value.args[0] == ("HANDLE frame has 3 trailing bytes after a complete packet")
+    assert exc.value.packet_type == int(PacketType.HANDLE)
+    assert exc.value.raw_frame == b"\x66\x00\x00\x00\x04\x00\x00\x00\x04abcdXYZ"
 
 
 def test_a_truncated_body_is_rejected():
     wire = b"\x00\x00\x00\x07\x05\x00\x00\x00\x02\x00\x00"
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ProtocolError) as exc:
         decode_frame(wire)
+    # The reader is handed the packet type precisely so a truncation *inside* a body names
+    # which packet ran short, rather than reporting a bare offset into an anonymous frame.
+    assert exc.value.args[0] == "truncated frame: need 4 more bytes at offset 5, 2 available"
+    assert exc.value.packet_type == int(PacketType.READ)
+    assert exc.value.raw_frame == b"\x05\x00\x00\x00\x02\x00\x00"
 
 
 def test_a_frame_with_only_a_type_byte_is_rejected():

@@ -218,6 +218,28 @@ def test_read_remaining_on_an_exhausted_reader_is_empty_not_an_error():
     assert bytes(r.read_remaining()) == b""
 
 
+def test_read_bytes_takes_exactly_n_as_a_view_without_copying():
+    # `read_bytes` has no caller inside the library yet -- the fixed-width payloads that
+    # want it are the `check-file*@openssh.com` digests -- but it is a method on a public
+    # class, and an untested one is a promise nobody has checked.
+    r = WireReader(b"\x01\xde\xad\xbe\xeftail")
+    assert r.read_uint8() == 1
+    chunk = r.read_bytes(4)
+    assert isinstance(chunk, memoryview)
+    assert bytes(chunk) == b"\xde\xad\xbe\xef"
+    assert (r.position, r.remaining) == (5, 4)
+
+
+def test_read_bytes_past_the_end_is_a_protocol_error_not_a_short_read():
+    # A short read that returns fewer bytes than asked for is how a truncated frame becomes
+    # silently wrong data one layer up. The bound is checked before anything is handed back.
+    r = WireReader(b"\x00\x01\x02")
+    with pytest.raises(ProtocolError) as exc:
+        r.read_bytes(4)
+    assert exc.value.args[0] == "truncated frame: need 4 more bytes at offset 0, 3 available"
+    assert r.position == 0, "a refused read must not consume anything"
+
+
 def test_reader_accepts_a_memoryview_without_rewrapping_it():
     mv = memoryview(b"\x00\x00\x00\x09")
     assert WireReader(mv).read_uint32() == 9

@@ -163,6 +163,7 @@ def test_a_body_named_for_another_extension_is_refused():
     )
     assert exc.value.request_id == 4
     assert exc.value.packet_type == int(PacketType.EXTENDED)
+    assert exc.value.raw_frame == b"\x00\x00\x00\x04\x00\x00\x00\x01"
 
 
 def test_a_truncated_posix_rename_body_is_refused():
@@ -170,12 +171,19 @@ def test_a_truncated_posix_rename_body_is_refused():
     with pytest.raises(ProtocolError) as exc:
         _ = PosixRename.from_extended(truncated)
     assert exc.value.args[0] == "truncated frame: need 4 more bytes at offset 18, 0 available"
+    # The reader over an extension body is built with the packet type and the request id
+    # for exactly this error: EXTENDED bodies all look alike on the wire, so an offset with
+    # no packet and no id names nothing a caller can act on.
+    assert exc.value.packet_type == int(PacketType.EXTENDED)
+    assert exc.value.request_id == 5
 
 
 def test_a_truncated_fsync_body_is_refused():
     with pytest.raises(ProtocolError) as exc:
         _ = Fsync.from_extended(Extended(6, FSYNC_NAME, b"\x00\x00"))
     assert exc.value.args[0] == "truncated frame: need 4 more bytes at offset 0, 2 available"
+    assert exc.value.packet_type == int(PacketType.EXTENDED)
+    assert exc.value.request_id == 6
 
 
 def test_trailing_bytes_are_tolerated_rather_than_rejected():

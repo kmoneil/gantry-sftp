@@ -100,6 +100,21 @@ def test_frame_one_over_the_ceiling_is_rejected():
         s.feed(framed(bytes(17)))
 
 
+def test_a_max_frame_length_of_one_is_the_smallest_legal_ceiling():
+    # The bound is `< 1`, not `<= 1` or `< 2`: a one-byte frame is a legal frame -- a type
+    # byte with an empty body, which is what a v3 packet with no fields looks like -- so one
+    # has to be accepted. Rejecting it would refuse valid traffic at the smallest setting.
+    s = FrameSplitter(max_frame_length=1)
+    assert s.max_frame_length == 1
+    assert [bytes(f) for f in s.feed(framed(b"\x02"))] == [b"\x02"]
+
+    with pytest.raises(ProtocolError) as exc:
+        s.feed(framed(b"\x02x"))
+    assert exc.value.args[0] == (
+        "frame declares length 2, above the 1-byte ceiling; refusing to buffer it"
+    )
+
+
 def test_max_frame_length_must_be_positive():
     with pytest.raises(ValueError) as exc:
         FrameSplitter(max_frame_length=0)
@@ -277,6 +292,29 @@ def test_streaming_reclaims_consumed_bytes(chunk: int):
     assert high_water < _COMPACT_THRESHOLD + 512
     assert s.feed(b"") == []
     assert len(s._buf) == 0, "the deferred reclaim never ran"  # noqa: SLF001
+
+
+def test_compaction_fires_at_the_threshold_rather_than_one_byte_past_it():
+    # `>=`, not `>`. The boundary is the whole of the contract, and getting it wrong is
+    # invisible: nothing fails, no frame is corrupted -- a stream whose frames happen to
+    # land exactly on the threshold just never reclaims, and the buffer grows until the
+    # `_start == len(_buf)` fast path happens to catch it. The two branches are tested
+    # apart here so neither can stand in for the other.
+    s = FrameSplitter()
+    body = b"\x02" + bytes(_COMPACT_THRESHOLD - 5)
+    wire = framed(body)
+    assert len(wire) == _COMPACT_THRESHOLD, "the consumed prefix must land on the threshold"
+
+    # Three trailing bytes: not enough for a length prefix, so the frame is consumed but
+    # the buffer is not empty -- which is what stops the `_start == len(_buf)` branch from
+    # doing the reclaim and hiding the threshold comparison.
+    frames = s.feed(wire + b"\x00\x00\x00")
+    assert [bytes(f) for f in frames] == [body]
+    del frames  # no view is live, so the reclaim is free to compact in place
+
+    assert s.feed(b"") == []
+    assert s.buffered == 3
+    assert len(s._buf) == 3, "the consumed prefix was not reclaimed at the threshold"  # noqa: SLF001
 
 
 def test_a_trailing_partial_frame_bounds_the_buffer_rather_than_leaking():
