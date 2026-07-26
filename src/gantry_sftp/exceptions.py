@@ -23,6 +23,8 @@ __all__ = [
     "SFTPError",
     "SFTPWarning",
     "StateError",
+    "TransferError",
+    "TransferTimeoutError",
 ]
 
 
@@ -171,4 +173,55 @@ class InsecureOptionWarning(SFTPWarning):
     Emitted rather than raised because these are legitimate choices in some environments --
     a throwaway container, a host key that genuinely rotates. "Overridable, loudly" means
     the override works and leaves a record; it does not mean it is a good idea.
+    """
+
+
+class TransferError(SFTPError):
+    """A transfer failed partway through.
+
+    Attributes:
+        transferred: Bytes successfully moved before the failure. Partial progress is a fact
+            the caller needs -- it is the difference between resuming and restarting, and
+            discarding it is why so much SFTP tooling restarts a nine-gigabyte file from
+            zero.
+        offset: File offset the failing request covered.
+        remote_path: The remote file, if known.
+        local_path: The local file, if known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        transferred: int = 0,
+        offset: int | None = None,
+        remote_path: bytes | None = None,
+        local_path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.transferred = transferred
+        self.offset = offset
+        self.remote_path = remote_path
+        self.local_path = local_path
+
+    @override
+    def __str__(self) -> str:
+        """Render the message with the progress and location it happened at."""
+        parts = [super().__str__()]
+        parts.append(f"(after {self.transferred} bytes")
+        if self.offset is not None:
+            parts.append(f"at offset {self.offset}")
+        parts.append(")")
+        if self.remote_path is not None:
+            parts.append(f"remote={self.remote_path!r}")
+        if self.local_path is not None:
+            parts.append(f"local={self.local_path!r}")
+        return " ".join(parts).replace(" )", ")")
+
+
+class TransferTimeoutError(TransferError):
+    """The peer stopped responding while requests were outstanding.
+
+    Separate from a plain :class:`TransferError` because the remedy differs: a refusal means
+    stop, a timeout means the far end went quiet and retrying may well work.
     """
