@@ -31,7 +31,6 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 import anyio
@@ -50,9 +49,21 @@ from gantry_sftp.transport import Transport
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_PIPELINE_DEPTH",
+    "NO_FOLLOW",
     "ProgressCallback",
     "download_handle",
 ]
+
+_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+
+NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
+"""``O_NOFOLLOW`` where the platform has it, and ``0`` where it does not.
+
+Windows has no equivalent, so the flag silently becomes nothing there rather than the open
+failing. That is a documented weakness rather than a hidden one: on Windows the containment
+check in ``_localpath`` is the whole defence, and it is checked before the open rather than
+enforced by it.
+"""
 
 DEFAULT_PIPELINE_DEPTH = 64
 """Requests in flight per file.
@@ -265,7 +276,7 @@ async def download_handle(
     transport: Transport,
     codec: Codec,
     handle: bytes,
-    destination: Path | str,
+    fd: int,
     *,
     size: int | None,
     read_length: int,
@@ -274,16 +285,20 @@ async def download_handle(
     progress: ProgressCallback | None = None,
     remote_path: bytes | None = None,
 ) -> int:
-    """Download an already-open remote file into ``destination``.
+    """Download an already-open remote file into an already-open local one.
 
-    Takes a handle rather than a path because opening, stat-ing and closing are the
-    session's business; this is the scheduler and nothing else.
+    Takes a handle and a file descriptor rather than two paths, because opening, stat-ing and
+    closing are the session's business; this is the scheduler and nothing else. That is not
+    just tidiness -- the flags the destination is opened with are a *safety* decision
+    (``O_NOFOLLOW``, the mode) that belongs with the layer that knows where the file is
+    allowed to be, and a scheduler with an fd can just as well write into a pipe.
 
     Args:
         transport: Connected transport.
         codec: Negotiated codec.
         handle: An open remote file handle.
-        destination: Local path. Created or truncated.
+        fd: Writable file descriptor. Written at explicit offsets, never seeked, and not
+            closed here -- whoever opened it owns it.
         size: Expected size, from a stat. ``None`` reads until EOF, which costs one extra
             round trip at the end and is the only option when the server will not say.
         read_length: Payload bytes per request, from
@@ -306,23 +321,19 @@ async def download_handle(
     if read_length < 1:
         raise ValueError(f"read_length must be at least 1, got {read_length}")
 
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        downloader = _Downloader(
-            transport,
-            codec,
-            handle,
-            fd,
-            size=size,
-            read_length=read_length,
-            depth=depth,
-            idle_timeout=idle_timeout,
-            progress=progress,
-            remote_path=remote_path,
-        )
-        return await downloader.run()
-    finally:
-        os.close(fd)
+    downloader = _Downloader(
+        transport,
+        codec,
+        handle,
+        fd,
+        size=size,
+        read_length=read_length,
+        depth=depth,
+        idle_timeout=idle_timeout,
+        progress=progress,
+        remote_path=remote_path,
+    )
+    return await downloader.run()
 
 
 ProgressReporter = Callable[[int, int | None], None]

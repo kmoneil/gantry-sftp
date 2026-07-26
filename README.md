@@ -34,9 +34,11 @@ exists today:
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
-- a session with `stat`, `lstat`, `realpath`, `open`/`close`, `remove`, `rename`,
+- a session with `stat`, `lstat`, `realpath`, `open`/`close`, `mkdir`, `remove`, `rename`,
   `posix_rename`, `fsync`, `supports()`, `listdir()`, and pipelined `get()` / `put()`, with
   typed errors, timeouts on every wait, and a progress callback
+- **recursive download**: `walk()` and `get_tree()`, with the zip-slip defence that makes a
+  hostile server's filenames safe to write
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
@@ -64,8 +66,8 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: recursive operations, resume, retry, the fsspec adapter, `SFTPPath`, or the
-generated sync API. The names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not
+Not yet: recursive *upload*, `rmtree`, `glob`, resume, retry, the fsspec adapter, `SFTPPath`,
+or the generated sync API. The names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not
 exist yet — `open_session` is the current spelling.
 
 ## Listing
@@ -91,6 +93,44 @@ Three things this does differently from the tools you have used:
 `.` and `..` are filtered out. `readdir()` gives you the raw batches if you want to see
 exactly what the server sent — one READDIR is not a directory, and the server decides how
 many entries a batch holds (OpenSSH: 100).
+
+## Walking and recursive download
+
+```python
+result = await sftp.get_tree("/incoming", "downloads/")
+result.files, result.directories, result.transferred   # 3 2 2520
+result.complete                                        # False -- read result.skipped
+```
+
+**Every name the server supplies is validated before it becomes a local path**, and the
+finished path is re-checked against the destination once symlinks are resolved. A server
+answering `../../etc/cron.d/x` gets an `UnsafePathError` and nothing is written. This is the
+zip-slip class, and it is a genuine, exploited vulnerability pattern in file-transfer clients
+rather than a theoretical one. Two layers, because either alone has a hole:
+
+| Layer                | Catches                                                                |
+| -------------------- | ---------------------------------------------------------------------- |
+| Component validation | `..`, separators, the empty name, NUL — and on Windows `:` streams, `C:` drive-relative names, `CON`/`LPT1` devices, trailing dots |
+| Containment          | a destination subdirectory that is *already* a local symlink pointing elsewhere — every component innocent, the finished path outside |
+
+The rules follow the platform being written to, because a backslash is an ordinary character
+in a POSIX filename and a separator on Windows. Refusing the union everywhere would refuse
+files that are legal where they live.
+
+`walk()` yields one entry per directory and **never follows symlinks** — they are reported so
+you can decide. Nothing server-side is held between yields, so stopping early leaks nothing;
+close the generator with `aclosing` rather than dropping it:
+
+```python
+from contextlib import aclosing
+
+async with aclosing(sftp.walk("/incoming")) as walker:
+    async for entry in walker:
+        print(entry.path, len(entry.files), [s.reason for s in entry.skipped])
+```
+
+`max_depth` bounds the descent, which is the only defence against a tree that is infinite
+because the server says it is.
 
 ## Atomic publish
 

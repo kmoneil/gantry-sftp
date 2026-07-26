@@ -128,15 +128,21 @@ async def negotiated(server: ScriptedServer) -> Codec:
 
 async def fetch(server: ScriptedServer, destination: Path, **kwargs) -> int:
     codec = await negotiated(server)
-    return await download_handle(
-        server,  # type: ignore[arg-type]
-        codec,
-        HANDLE,
-        destination,
-        size=kwargs.pop("size", len(server.content)),
-        read_length=kwargs.pop("read_length", 64),
-        **kwargs,
-    )
+    # download_handle takes a descriptor, not a path: opening the destination is the
+    # session's job, because the flags are a safety decision rather than a scheduling one.
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        return await download_handle(
+            server,  # type: ignore[arg-type]
+            codec,
+            HANDLE,
+            fd,
+            size=kwargs.pop("size", len(server.content)),
+            read_length=kwargs.pop("read_length", 64),
+            **kwargs,
+        )
+    finally:
+        os.close(fd)
 
 
 # --- the happy path -----------------------------------------------------------------------
@@ -358,15 +364,19 @@ async def test_downloading_from_a_real_sftp_server(tmp_path: Path):
         assert isinstance(opened, Handle), opened
 
         sizes = negotiate_transfer_sizes(ServerLimits.unknown(), handle_length=len(opened.handle))
-        written = await download_handle(
-            transport,
-            codec,
-            opened.handle,
-            destination,
-            size=len(content),
-            read_length=sizes.read_length,
-            depth=DEFAULT_PIPELINE_DEPTH,
-        )
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            written = await download_handle(
+                transport,
+                codec,
+                opened.handle,
+                fd,
+                size=len(content),
+                read_length=sizes.read_length,
+                depth=DEFAULT_PIPELINE_DEPTH,
+            )
+        finally:
+            os.close(fd)
         await transport.send(codec.send(Close(codec.allocate_request_id(), opened.handle)))
 
     assert written == len(content)

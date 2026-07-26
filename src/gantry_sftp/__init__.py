@@ -25,6 +25,7 @@ from gantry_sftp.exceptions import (
     StateError,
     TransferError,
     TransferTimeoutError,
+    UnsafePathError,
     UnsupportedError,
 )
 
@@ -43,6 +44,7 @@ __all__ = [
     "StateError",
     "TransferError",
     "TransferTimeoutError",
+    "UnsafePathError",
     "UnsupportedError",
     "__version__",
 ]

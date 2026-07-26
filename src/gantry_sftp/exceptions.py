@@ -29,6 +29,7 @@ __all__ = [
     "StateError",
     "TransferError",
     "TransferTimeoutError",
+    "UnsafePathError",
     "UnsupportedError",
 ]
 
@@ -162,6 +163,48 @@ class HostKeyError(ConnectError):
     different -- and because silently downgrading this one is how interception goes
     unnoticed.
     """
+
+
+class UnsafePathError(SFTPError):
+    """A server-supplied name was refused rather than written to the filesystem.
+
+    Names from ``READDIR`` and ``READLINK`` are chosen by the far end. A server answering with
+    ``../../etc/cron.d/x`` during a recursive download is the zip-slip pattern, and it is a
+    real and exploited vulnerability class in file-transfer clients rather than a theoretical
+    one. This is raised **before** anything is opened, so nothing was written.
+
+    Not a :class:`ServerError`: the server did not refuse anything, and the request was not
+    even sent. It is closer to a protocol violation than to a refusal, but it is not that
+    either -- a name containing ``..`` is legal SFTP, and it is only dangerous because of what
+    we were about to do with it.
+
+    Attributes:
+        name: The offending name, verbatim and undecoded. Bytes, because a name that could not
+            be decoded is exactly the kind that gets mishandled.
+        reason: Short phrase naming what is wrong with it.
+        destination: The directory the write was confined to, where there was one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        name: bytes,
+        reason: str,
+        destination: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.name = name
+        self.reason = reason
+        self.destination = destination
+
+    @override
+    def __str__(self) -> str:
+        """Render the message with the name and the boundary it would have crossed."""
+        parts = [super().__str__()]
+        if self.destination is not None:
+            parts.append(f"destination={self.destination!r}")
+        return " ".join(parts)
 
 
 class SFTPWarning(UserWarning):

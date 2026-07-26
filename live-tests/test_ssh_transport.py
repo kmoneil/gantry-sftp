@@ -33,7 +33,7 @@ from gantry_sftp.codec import (
     StatusCode,
 )
 from gantry_sftp.exceptions import ConnectError
-from gantry_sftp.session import Durability, PublishMechanism, open_session
+from gantry_sftp.session import Durability, PublishMechanism, SkipReason, open_session
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -167,6 +167,35 @@ async def test_realpath_resolves_over_a_real_connection(ssh_server):
         reply = await exchange(transport, codec, RealPath(codec.allocate_request_id(), b"."))
         assert reply.entries
         assert reply.entries[0].filename.startswith(b"/")
+
+
+async def test_a_recursive_download_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
+    """A tree, over a real SSH channel, with the destination boundary enforced.
+
+    The bare-pipe lane cannot show this: `sshd` spawns the subsystem with its own working
+    directory, its own umask, and a HOME that is not this one, so the paths a walk builds are
+    resolved by a server in a different place from the client.
+    """
+    source = tmp_path / "remote"
+    (source / "daily" / "archive").mkdir(parents=True)
+    (source / "top.csv").write_bytes(b"top")
+    (source / "daily" / "today.bin").write_bytes(os.urandom(120_000))
+    (source / "daily" / "archive" / "old.csv").write_bytes(b"old")
+    (source / "daily" / "latest.csv").symlink_to(source / "top.csv")
+    destination = tmp_path / "local"
+
+    async with connect(ssh_server) as transport, open_session(transport) as sftp:
+        result = await sftp.get_tree(str(source), destination)
+
+    assert result.files == 3
+    assert result.directories == 2
+    assert (destination / "daily" / "archive" / "old.csv").read_bytes() == b"old"
+    assert (destination / "daily" / "today.bin").read_bytes() == (
+        source / "daily" / "today.bin"
+    ).read_bytes()
+    # Symlinks are reported rather than followed or copied, over ssh as over a pipe.
+    assert [skip.reason for skip in result.skipped] == [SkipReason.SYMLINK]
+    assert not (destination / "daily" / "latest.csv").exists()
 
 
 def staging_files(directory: Path, stem: str) -> list[Path]:

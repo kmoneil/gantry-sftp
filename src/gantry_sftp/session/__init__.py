@@ -33,6 +33,14 @@ from gantry_sftp.session._listing import (
     decode_name,
     entry_kind,
 )
+from gantry_sftp.session._localpath import (
+    WINDOWS_FORBIDDEN_CHARACTERS,
+    WINDOWS_RESERVED_NAMES,
+    check_component,
+    check_contained,
+    local_child,
+    unsafe_reason,
+)
 from gantry_sftp.session._publish import (
     MAX_STAGED_NAME_LENGTH,
     Durability,
@@ -41,6 +49,13 @@ from gantry_sftp.session._publish import (
     split_parent,
     staged_path,
     staging_token,
+)
+from gantry_sftp.session._recursive import (
+    Skipped,
+    SkipReason,
+    TreeResult,
+    WalkEntry,
+    join_remote,
 )
 from gantry_sftp.session._session import (
     DEFAULT_REQUEST_TIMEOUT,
@@ -61,6 +76,8 @@ __all__ = [
     "MAX_STAGED_NAME_LENGTH",
     "PREFERRED_READ_LENGTH",
     "PREFERRED_WRITE_LENGTH",
+    "WINDOWS_FORBIDDEN_CHARACTERS",
+    "WINDOWS_RESERVED_NAMES",
     "DirEntry",
     "Durability",
     "EntryKind",
@@ -68,11 +85,19 @@ __all__ = [
     "PublishMechanism",
     "ServerLimits",
     "Session",
+    "SkipReason",
+    "Skipped",
     "TransferSizes",
+    "TreeResult",
     "UploadResult",
+    "WalkEntry",
+    "check_component",
+    "check_contained",
     "decode_name",
     "download_handle",
     "entry_kind",
+    "join_remote",
+    "local_child",
     "negotiate_transfer_sizes",
     "open_session",
     "raise_for_status",
@@ -80,6 +105,7 @@ __all__ = [
     "split_parent",
     "staged_path",
     "staging_token",
+    "unsafe_reason",
     "upload_handle",
     "write_request_overhead",
 ]

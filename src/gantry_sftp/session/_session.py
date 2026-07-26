@@ -15,8 +15,9 @@ that into real per-file concurrency is registered as deferred work, not pretende
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager, suppress
+import os
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import override
@@ -38,6 +39,7 @@ from gantry_sftp.codec import (
     Fsync,
     Handle,
     LStat,
+    MkDir,
     Name,
     Open,
     OpenDir,
@@ -72,17 +74,26 @@ from gantry_sftp.exceptions import (
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
+    NO_FOLLOW,
     ProgressCallback,
     download_handle,
 )
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
-from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry
+from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
+from gantry_sftp.session._localpath import check_contained, local_child
 from gantry_sftp.session._publish import (
     Durability,
     PublishMechanism,
     UploadResult,
     staged_path,
     staging_token,
+)
+from gantry_sftp.session._recursive import (
+    Skipped,
+    SkipReason,
+    TreeResult,
+    WalkEntry,
+    join_remote,
 )
 from gantry_sftp.session._upload import upload_handle
 from gantry_sftp.transport import Transport
@@ -113,6 +124,9 @@ _STATUS_ERRORS = {
     StatusCode.PERMISSION_DENIED: PermissionDeniedError,
     StatusCode.OP_UNSUPPORTED: UnsupportedError,
 }
+
+_LOCAL_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+"""How a downloaded file is opened locally, before any safety flags are added."""
 
 _TRUNCATE_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
 """Open flags for writing a file in place: create it, or replace what is there."""
@@ -452,6 +466,40 @@ class Session:
         """
         await self._expect_status(Close(self._next(), handle))
 
+    async def mkdir(self, path: bytes | str, *, exist_ok: bool = False) -> None:
+        """Create a directory.
+
+        ``exist_ok`` costs a round trip when it fires, and it has to: v3 answers a failed
+        MKDIR with ``FAILURE``, the catch-all that means nothing, so "it is already there" is
+        indistinguishable from "the parent is read-only" by status code. The only honest way
+        to tell them apart is to look, which is what this does -- and it checks the path is a
+        *directory*, since a file of the same name is a different problem wearing the same
+        status.
+
+        Raises:
+            ServerError: If the server refuses, and ``exist_ok`` does not excuse it.
+        """
+        encoded = _encode_path(path)
+        try:
+            await self._expect_status(MkDir(self._next(), encoded, EMPTY_ATTRS), path=encoded)
+        except ServerError:
+            if not exist_ok or not await self._is_directory(encoded):
+                raise
+
+    async def _is_directory(self, path: bytes) -> bool:
+        """Whether the server positively reports ``path`` as a directory.
+
+        ``LSTAT``, so a symlink is not mistaken for what it points at, and every failure --
+        including a server that sends no permissions at all -- answers ``False``. Used to
+        decide whether a refusal can be excused, and "the server would not say" is not an
+        excuse.
+        """
+        try:
+            attributes = await self.lstat(path)
+        except ServerError:
+            return False
+        return entry_kind(attributes) is EntryKind.DIRECTORY
+
     async def remove(self, path: bytes | str) -> None:
         """Delete a file. Not a directory -- that is ``RMDIR``, which does not exist yet.
 
@@ -519,6 +567,7 @@ class Session:
         *,
         progress: ProgressCallback | None = None,
         depth: int | None = None,
+        no_follow: bool = False,
     ) -> int:
         """Download ``remote_path`` to ``local_path``.
 
@@ -531,6 +580,10 @@ class Session:
             local_path: Local destination. Created or truncated.
             progress: Called with ``(transferred, total)`` as data arrives.
             depth: Requests in flight, overriding the session default.
+            no_follow: Refuse to write through a local symlink at ``local_path``. Off by
+                default, because pointing a download at a link you made yourself is a
+                legitimate thing to do; on for every file in a recursive download, where a
+                link in the destination tree is the last step of a path traversal.
 
         Returns:
             Bytes written.
@@ -545,17 +598,14 @@ class Session:
         handle = await self.open(encoded, OpenFlag.READ)
         try:
             async with self._lock:
-                transferred = await download_handle(
-                    self._transport,
-                    self._codec,
-                    handle,
+                transferred = await self._download_into(
                     local_path,
+                    handle,
                     size=attributes.size,
-                    read_length=self.sizes_for(handle).read_length,
-                    depth=self._depth if depth is None else depth,
-                    idle_timeout=self._idle_timeout,
+                    depth=depth,
                     progress=progress,
                     remote_path=encoded,
+                    no_follow=no_follow,
                 )
         except BaseException:
             # Closing is not optional: a leaked handle counts against max-open-handles and is
@@ -566,6 +616,197 @@ class Session:
             raise
         await self.close(handle)
         return transferred
+
+    async def _download_into(
+        self,
+        local_path: Path | str,
+        handle: bytes,
+        *,
+        size: int | None,
+        depth: int | None,
+        progress: ProgressCallback | None,
+        remote_path: bytes,
+        no_follow: bool,
+    ) -> int:
+        """Open the local destination and let the scheduler fill it.
+
+        The open lives here rather than in the scheduler because the flags are a safety
+        decision: ``O_NOFOLLOW`` where a recursive download must not write through a link
+        somebody planted in the destination tree, and mode 0600 so a file is never briefly
+        world-readable while it is being written.
+        """
+        fd = os.open(local_path, _LOCAL_WRITE_FLAGS | (NO_FOLLOW if no_follow else 0), 0o600)
+        try:
+            return await download_handle(
+                self._transport,
+                self._codec,
+                handle,
+                fd,
+                size=size,
+                read_length=self.sizes_for(handle).read_length,
+                depth=self._depth if depth is None else depth,
+                idle_timeout=self._idle_timeout,
+                progress=progress,
+                remote_path=remote_path,
+            )
+        finally:
+            os.close(fd)
+
+    # --- walking a tree ---------------------------------------------------------------------
+
+    async def walk(
+        self, path: bytes | str, *, max_depth: int | None = None
+    ) -> AsyncGenerator[WalkEntry]:
+        """Walk a remote tree, top down, yielding one entry per directory.
+
+        Symlinks are **reported and never followed**. Following them needs loop detection,
+        which needs a ``REALPATH`` per directory to defend against something only a hostile or
+        misconfigured server does; it is deliberately absent rather than half-built, and the
+        entries are surfaced so a caller can decide for themselves.
+
+        **Nothing server-side is held between yields** -- each directory's handle is opened
+        and closed inside a single :meth:`listdir` -- so stopping early, which is the natural
+        way to use a walk, leaks nothing on the server. It is still an async generator, so
+        close it rather than dropping it::
+
+            async with aclosing(sftp.walk(b"/incoming")) as walker:
+                async for entry in walker:
+                    ...
+
+        That is not decoration. Abandoning a suspended async generator leaves it to the
+        garbage collector, and trio will not finalise one for you -- it surfaces as
+        ``Exception ignored in: <async_generator object Session.walk>`` at some unrelated
+        point later. Found by the trio lane, which is what the trio lane is for.
+
+        Args:
+            path: Root of the walk. Reported first, with an empty ``relative``.
+            max_depth: How many levels below the root to descend, or ``None`` for no limit.
+                ``0`` lists the root and nothing else. The bound exists because an infinite
+                tree is something a hostile server can simply answer with.
+
+        Yields:
+            One :class:`~gantry_sftp.session.WalkEntry` per directory visited.
+
+        Raises:
+            NoSuchFileError: If the root does not exist. Note this is *also* what the server
+                answers for a path that exists and is not a directory.
+            ServerError: If the server refuses a listing.
+        """
+        root = _encode_path(path)
+        pending: list[tuple[bytes, tuple[bytes, ...]]] = [(root, ())]
+        while pending:
+            directory, relative = pending.pop()
+            entry = await self._walk_one(directory, relative, max_depth=max_depth)
+            yield entry
+            # Reversed so the traversal comes out in listing order rather than mirrored,
+            # which matters only to whoever reads the output, which is everyone.
+            pending.extend(
+                (join_remote(directory, child.filename), (*relative, child.filename))
+                for child in reversed(entry.directories)
+            )
+
+    async def _walk_one(
+        self, directory: bytes, relative: tuple[bytes, ...], *, max_depth: int | None
+    ) -> WalkEntry:
+        """List one directory and sort its entries into descend / transfer / skip."""
+        directories: list[DirEntry] = []
+        files: list[DirEntry] = []
+        skipped: list[Skipped] = []
+        at_limit = max_depth is not None and len(relative) >= max_depth
+
+        for child in await self.listdir(directory):
+            path = join_remote(directory, child.filename)
+            kind = await self._settle_kind(path, child)
+            if kind is EntryKind.DIRECTORY and at_limit:
+                skipped.append(Skipped(path, child, SkipReason.TOO_DEEP))
+            elif kind is EntryKind.DIRECTORY:
+                directories.append(child)
+            elif kind is EntryKind.FILE:
+                files.append(child)
+            else:
+                skipped.append(Skipped(path, child, _skip_reason(kind)))
+
+        return WalkEntry(directory, relative, tuple(directories), tuple(files), tuple(skipped))
+
+    async def _settle_kind(self, path: bytes, entry: DirEntry) -> EntryKind:
+        """Resolve an entry whose kind the listing did not report.
+
+        One ``LSTAT``, and only for the entries that need it -- so a server that sends
+        attributes (all the common ones) pays nothing, and a server that does not gets a
+        correct walk rather than a fast wrong one. ``LSTAT`` because a symlink must stay a
+        symlink here; if that still settles nothing, the entry is skipped with a reason rather
+        than guessed at.
+        """
+        if entry.kind is not EntryKind.UNKNOWN:
+            return entry.kind
+        try:
+            return entry_kind(await self.lstat(path))
+        except ServerError:
+            return EntryKind.UNKNOWN
+
+    async def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> TreeResult:
+        """Download a remote tree into ``local_path``, refusing to escape it.
+
+        **Every name the server supplies is validated before it becomes a path**, and the
+        finished path is re-checked against the destination after symlinks are resolved. A
+        server answering ``../../etc/cron.d/x`` gets an
+        :class:`~gantry_sftp.exceptions.UnsafePathError` and nothing is written -- this is the
+        zip-slip class, and it is a real and exploited pattern in file-transfer clients.
+
+        Transfers are sequential. A session serialises its operations, so there is nothing to
+        gain from issuing them concurrently yet; per-file concurrency is what the single-reader
+        rework unlocks, and it is registered rather than implied.
+
+        Args:
+            remote_path: Remote directory to copy.
+            local_path: Local destination. Created if absent, and everything is confined to it.
+            max_depth: Levels below the root to descend, or ``None`` for no limit.
+            progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
+                each one. A tree-wide total would need the whole walk up front.
+
+        Returns:
+            Counts, bytes, and every entry that was skipped with the reason it was.
+
+        Raises:
+            UnsafePathError: If a server-supplied name would escape the destination.
+            NoSuchFileError: If the remote directory does not exist.
+            ServerError: If the server refuses.
+            TransferError: If a transfer fails partway.
+        """
+        destination = _ensure_directory(Path(local_path), parents=True)
+        files = directories = transferred = 0
+        skipped: list[Skipped] = []
+
+        # aclosing, because the common exit from this loop is an exception -- a refused name,
+        # a failed transfer -- and a suspended async generator that is merely dropped is left
+        # to the garbage collector, which trio will not finalise for it.
+        async with aclosing(self.walk(remote_path, max_depth=max_depth)) as walker:
+            async for entry in walker:
+                local_directory = _local_directory(destination, entry.relative)
+                if entry.relative:
+                    _ = _ensure_directory(local_directory)
+                    directories += 1
+                skipped.extend(entry.skipped)
+                for child in entry.files:
+                    target = check_contained(
+                        destination, local_child(local_directory, child.filename)
+                    )
+                    transferred += await self.get(
+                        join_remote(entry.path, child.filename),
+                        target,
+                        progress=progress,
+                        no_follow=True,
+                    )
+                    files += 1
+
+        return TreeResult(files, directories, transferred, tuple(skipped))
 
     async def put(
         self,
@@ -937,6 +1178,39 @@ class Session:
                     f"the staging file {staged!r} was left on the server: "
                     f"removing it also failed ({cleanup_failure!r})"
                 )
+
+
+def _ensure_directory(path: Path, *, parents: bool = False) -> Path:
+    """Create a local directory if it is not there, from outside an async frame.
+
+    A plain function because ASYNC240 is right: filesystem calls block the event loop. These
+    are metadata operations on a local disk rather than a transfer, so they are not worth a
+    thread -- but they are worth keeping out of the coroutine where the rule can see them.
+    """
+    path.mkdir(parents=parents, exist_ok=True)
+    return path
+
+
+def _local_directory(destination: Path, relative: tuple[bytes, ...]) -> Path:
+    """Build the local directory for a walked position, validating every component.
+
+    Each name is checked and joined one at a time rather than joined and then checked: a
+    single ``..`` in the middle of an otherwise innocent chain is exactly the shape of the
+    attack, and a joined path has already lost which component was the problem.
+    """
+    local = destination
+    for name in relative:
+        local = local_child(local, name)
+    return check_contained(destination, local)
+
+
+def _skip_reason(kind: EntryKind) -> str:
+    """Name why a walk passed over an entry of this kind."""
+    if kind is EntryKind.SYMLINK:
+        return SkipReason.SYMLINK
+    if kind is EntryKind.UNKNOWN:
+        return SkipReason.UNKNOWN_KIND
+    return SkipReason.NOT_A_FILE
 
 
 def _check_publish_flags(
