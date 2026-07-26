@@ -27,11 +27,21 @@ this package.** What remains is a protocol codec, a scheduler, and an ergonomics
 **Pre-alpha, and honest about it.** Nothing is published and the public API does not exist
 yet. What exists today:
 
-- filexfer v3 constants, checked against `draft-ietf-secsh-filexfer-02`, OpenSSH's
-  `sftp.h`, and a `VERSION` frame captured from a real server
-- wire primitives and an incremental frame splitter, zero-copy through the data path
+- a complete filexfer v3 codec: all 27 packet types plus ATTRS, encoding and decoding,
+  checked against `draft-ietf-secsh-filexfer-02`, OpenSSH's `sftp.h`, and frames captured
+  from a real server
+- wire primitives and an incremental frame splitter — no frame payload is ever copied
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers
+
+Not yet: request-id correlation, any transport, the session layer, or a public API. You
+cannot transfer a file with this yet.
+
+One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
+opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends
+and expects `targetpath, linkpath`. We follow OpenSSH, because OpenSSH is what is deployed.
+Both orders are run against a live server in the test suite so the claim stays measured
+rather than remembered.
 
 `_plans/DESIGN.md` is canonical for intent and `_plans/progress.md` for what is actually
 built. Neither is committed.

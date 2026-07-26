@@ -5,23 +5,30 @@ hands us whatever the pipe gave it -- a partial header, three frames and a fragm
 single byte -- so splitting is a resumable state machine and never a parse of a whole
 message.
 
-Zero-copy contract
-------------------
-:meth:`FrameSplitter.feed` returns views into an internal buffer, and those views stay
-valid **until the next call to feed**, which explicitly releases them.
+Zero-copy, without a lifetime rule to remember
+----------------------------------------------
+:meth:`FrameSplitter.feed` returns views into an internal buffer. A frame stays valid for
+as long as you hold it, and holding one never corrupts anything or stalls the stream.
 
-Explicitly, rather than by relying on the caller to drop their reference, because the
-obvious loop does not drop it::
+That is a stronger guarantee than it first looks, and getting to it took two attempts.
+Requiring frames to be dropped before the next ``feed`` is unworkable in practice: the most
+natural loop in the language, ``for frame in splitter.feed(data):``, leaves the name bound
+after the loop, and a decoded ``DATA`` packet holds a *slice* of its frame, which nothing
+here can reach to release. Either of those turns a correct program into a usage error.
 
-    for frame in splitter.feed(data):   # `frame` is still bound out here
-        handle(frame)
+So the buffer is never mutated while views into it are alive. CPython refuses to resize a
+``bytearray`` with live exports, and that refusal is the signal: when it happens, the
+splitter moves the unparsed remainder into a fresh buffer and carries on, leaving the old
+one to the caller for as long as they want it. Safety is structural rather than
+contractual -- a held view cannot see recycled bytes, because bytes are never recycled
+underneath it.
 
-Leaving that dangling reference to block the next feed would make the most natural spelling
-in the language a usage error. So the splitter releases what it issued, and a caller who
-kept one gets ``ValueError: operation forbidden on released memoryview object`` at the
-point of use -- naming the mistake where it happens, instead of surfacing it as a stalled
-stream one call later. Callers that need a frame to outlive the next feed copy it, and pay
-for the copy where it is visible.
+That path is the common one, not an exceptional one: the loop above leaves a view alive, so
+most feeds take it. It is cheap on purpose. Both paths copy the incoming ``data`` into the
+buffer and both move the unparsed remainder -- compaction relocates it just as a fresh
+buffer does -- so the difference is an allocation, not a copy of anything large. **No frame
+payload is ever copied by this module**, which is the property that actually matters: a
+quarter-megabyte READ arrives once and is handed onward as a view.
 """
 
 from __future__ import annotations
@@ -62,7 +69,7 @@ class FrameSplitter:
             :data:`DEFAULT_MAX_FRAME_LENGTH`.
     """
 
-    __slots__ = ("_buf", "_issued", "_max_frame_length", "_start")
+    __slots__ = ("_buf", "_max_frame_length", "_start")
 
     def __init__(self, *, max_frame_length: int = DEFAULT_MAX_FRAME_LENGTH) -> None:
         if max_frame_length < 1:
@@ -70,7 +77,6 @@ class FrameSplitter:
         self._buf = bytearray()
         self._start = 0
         self._max_frame_length = max_frame_length
-        self._issued: list[memoryview] = []
 
     @property
     def buffered(self) -> int:
@@ -90,42 +96,40 @@ class FrameSplitter:
                 a frame, may contain several frames.
 
         Returns:
-            Frame bodies in wire order, each a view valid until the next call to this
-            method. Empty if ``data`` did not complete a frame.
+            Frame bodies in wire order, each a view into the splitter's buffer that stays
+            valid for as long as it is referenced. Empty if ``data`` did not complete a
+            frame.
 
         Raises:
             ProtocolError: If a frame claims a length of zero, or a length above
                 ``max_frame_length``. Both mean the stream is not filexfer, and neither is
                 recoverable by reading more bytes.
-            RuntimeError: If a view *derived* from a previous frame -- a slice of it, say --
-                is still alive. Releasing the frames we issued cannot reach those.
         """
-        # Frames from the previous call are invalidated here, before anything resizes the
-        # buffer. Order matters: a live export makes both the compaction and the append
-        # raise BufferError.
-        for issued in self._issued:
-            issued.release()
-        self._issued.clear()
+        self._absorb(data)
 
-        try:
-            self._reclaim()
-            self._buf += data
-        except BufferError as exc:
-            raise RuntimeError(
-                "a view derived from a previous frame is still alive, so the buffer "
-                "cannot be reused; copy any frame data you need to keep beyond the next "
-                "feed()"
-            ) from exc
-
+        frames: list[memoryview] = []
         view = memoryview(self._buf)
         try:
             while (frame := self._next_frame(view)) is not None:
-                self._issued.append(frame)
+                frames.append(frame)
         finally:
-            # Release our own export so the issued frames are the only thing holding the
-            # buffer. Slices survive their parent's release.
+            # Release our own export so it is not the thing blocking the next reclaim.
+            # Slices survive their parent's release.
             view.release()
-        return list(self._issued)
+        return frames
+
+    def _absorb(self, data: bytes | memoryview) -> None:
+        """Take ``data`` into the buffer, without ever mutating one that is still in use."""
+        try:
+            self._reclaim()
+            self._buf += data
+        except BufferError:
+            # Frames from an earlier feed are still referenced, so this buffer belongs to
+            # the caller now. Move the unparsed remainder into a fresh one and leave theirs
+            # intact -- their views keep working, and the stream keeps moving.
+            self._buf = bytearray(self._buf[self._start :])
+            self._start = 0
+            self._buf += data
 
     def _next_frame(self, view: memoryview) -> memoryview | None:
         """Pull one complete frame from the buffer, or ``None`` if none is complete."""
@@ -154,8 +158,9 @@ class FrameSplitter:
         """Drop consumed bytes, if enough have accumulated to be worth the move.
 
         Raises:
-            BufferError: If a previously returned frame is still referenced. Translated by
-                the caller into an explanation of the zero-copy contract.
+            BufferError: If a previously returned frame is still referenced. Handled by
+                :meth:`_absorb`, which starts a fresh buffer rather than disturbing one the
+                caller is still reading.
         """
         if self._start == 0:
             return

@@ -6,11 +6,13 @@ in the fast lane on every commit.
 
 The distinction it exists to enforce: a fake proves the codec agrees with our idea of a
 server. This proves it agrees with the server everyone else's client is tested against.
-Both are necessary and neither substitutes for the other.
+Both are necessary and neither substitutes for the other. Everything below goes through
+``encode``/``decode`` rather than hand-rolled struct calls, so what is under test is the
+shipped codec and not a second implementation that happens to live in the test file.
 
 Values that vary by OpenSSH build are asserted as invariants rather than as numbers -- the
-1024-byte gap between ``max-packet-length`` and ``max-read-length`` is the finding, not the
-particular 261120 this machine reports.
+gap between ``max-packet-length`` and ``max-read-length`` is the finding, not the particular
+261120 this machine reports.
 """
 
 from __future__ import annotations
@@ -24,19 +26,34 @@ import pytest
 from gantry_sftp.codec import (
     OPENSSH_ADVERTISED_EXTENSIONS,
     PROTOCOL_VERSION,
+    Close,
+    Data,
+    Extended,
+    ExtendedReply,
     FrameSplitter,
+    Handle,
+    Init,
+    LStat,
+    Name,
+    Open,
     OpenFlag,
-    PacketType,
+    Packet,
+    Read,
+    RealPath,
+    Status,
     StatusCode,
+    SymLink,
+    Version,
     WireReader,
-    WireWriter,
+    decode,
+    encode,
 )
 
 pytestmark = pytest.mark.sftp_server
 
 
 class LocalSftpServer:
-    """Drives a real sftp-server subprocess through the codec's own framing."""
+    """Drives a real sftp-server subprocess through the shipped codec."""
 
     def __init__(self, binary: Path, cwd: Path) -> None:
         self._proc = subprocess.Popen(
@@ -49,52 +66,39 @@ class LocalSftpServer:
         self._splitter = FrameSplitter()
         self._request_id = 0
 
-    def _send(self, packet_type: PacketType, body: bytes) -> None:
-        frame = bytes([packet_type]) + body
+    def send(self, packet: Packet) -> None:
         assert self._proc.stdin is not None
-        self._proc.stdin.write(len(frame).to_bytes(4, "big") + frame)
+        self._proc.stdin.write(encode(packet))
         self._proc.stdin.flush()
 
-    def _recv(self) -> bytes:
-        """Read until the splitter yields exactly one frame, then copy it out.
+    def recv(self) -> Packet:
+        """Read until one complete frame arrives, then decode it.
 
-        The copy is the zero-copy contract being honoured rather than violated: the frame
-        has to outlive the next feed, so it is copied explicitly and visibly.
+        A byte at a time because a pipe will not tell us how much is available without
+        blocking. Slow, and irrelevant at this scale.
         """
         assert self._proc.stdout is not None
         while True:
             frames = self._splitter.feed(self._proc.stdout.read(1))
             if frames:
                 assert len(frames) == 1
-                return bytes(frames[0])
+                return decode(frames[0])
 
-    def init(self) -> tuple[int, list[tuple[str, str]]]:
-        w = WireWriter()
-        w.write_uint32(PROTOCOL_VERSION)
-        self._send(PacketType.INIT, w.getvalue())
-        r = WireReader(self._recv())
-        assert r.read_uint8() == PacketType.VERSION
-        version = r.read_uint32()
-        extensions = []
-        while not r.at_end:
-            name = bytes(r.read_string()).decode("ascii")
-            value = bytes(r.read_string()).decode("ascii")
-            extensions.append((name, value))
-        return version, extensions
-
-    def request(self, packet_type: PacketType, body: bytes) -> tuple[PacketType, WireReader]:
+    def next_id(self) -> int:
         self._request_id += 1
-        w = WireWriter()
-        w.write_uint32(self._request_id)
-        w.write_bytes(body)
-        self._send(packet_type, w.getvalue())
+        return self._request_id
 
-        r = WireReader(self._recv())
-        reply_type = PacketType(r.read_uint8())
-        request_id = r.read_uint32()
-        assert request_id == self._request_id, "reply correlated to the wrong request"
-        r.set_request_id(request_id)
-        return reply_type, r
+    def init(self) -> Version:
+        self.send(Init())
+        reply = self.recv()
+        assert isinstance(reply, Version)
+        return reply
+
+    def request(self, packet: Packet) -> Packet:
+        self.send(packet)
+        reply = self.recv()
+        assert reply.request_id == packet.request_id, "reply correlated to the wrong request"
+        return reply
 
     def close(self) -> None:
         # Closing stdin is what tells sftp-server to exit; closing stdout is what stops the
@@ -117,18 +121,19 @@ def server(sftp_server_binary: Path, tmp_path: Path) -> Iterator[LocalSftpServer
     s.close()
 
 
-def string(value: bytes) -> bytes:
-    return len(value).to_bytes(4, "big") + value
+def open_file(server: LocalSftpServer, path: Path, pflags: OpenFlag = OpenFlag.READ) -> bytes:
+    reply = server.request(Open(server.next_id(), str(path).encode(), pflags))
+    assert isinstance(reply, Handle), reply
+    return reply.handle
 
 
-# --- VERSION ---------------------------------------------------------------------------
+# --- VERSION ----------------------------------------------------------------------------
 
 
 def test_init_negotiates_version_3(sftp_server_binary: Path, tmp_path: Path):
     s = LocalSftpServer(sftp_server_binary, tmp_path)
     try:
-        version, _ = s.init()
-        assert version == PROTOCOL_VERSION
+        assert s.init().version == PROTOCOL_VERSION
     finally:
         s.close()
 
@@ -136,24 +141,42 @@ def test_init_negotiates_version_3(sftp_server_binary: Path, tmp_path: Path):
 def test_live_extension_advertisement_matches_the_committed_constant(
     sftp_server_binary: Path, tmp_path: Path
 ):
-    # The committed tuple and the fixture both came from a server. This checks them
+    # The committed tuple and the golden fixture both came from a server. This checks them
     # against *this* machine's server, so a version bump that changes the set is caught
     # here rather than by a confusing failure much later.
     s = LocalSftpServer(sftp_server_binary, tmp_path)
     try:
-        _, extensions = s.init()
+        version = s.init()
     finally:
         s.close()
-    assert tuple(extensions) == OPENSSH_ADVERTISED_EXTENSIONS
+    decoded = tuple((name.decode(), value.decode()) for name, value in version.extensions)
+    assert decoded == OPENSSH_ADVERTISED_EXTENSIONS
 
 
-# --- limits ----------------------------------------------------------------------------
+def test_the_committed_golden_frame_decodes_to_what_the_live_server_sends(
+    sftp_server_binary: Path, tmp_path: Path
+):
+    # Ties the on-disk fixture to the live server. If they ever disagree, the fixture is
+    # stale and the constants derived from it are suspect.
+    fixture = (Path(__file__).parent / "fixtures" / "openssh_version_frame.bin").read_bytes()
+    from_fixture = decode(fixture)
+
+    s = LocalSftpServer(sftp_server_binary, tmp_path)
+    try:
+        from_server = s.init()
+    finally:
+        s.close()
+    assert from_fixture == from_server
+
+
+# --- limits -----------------------------------------------------------------------------
 
 
 def test_limits_reserves_framing_headroom_below_the_packet_ceiling(server: LocalSftpServer):
-    reply_type, r = server.request(PacketType.EXTENDED, string(b"limits@openssh.com"))
-    assert reply_type == PacketType.EXTENDED_REPLY
+    reply = server.request(Extended(server.next_id(), b"limits@openssh.com"))
+    assert isinstance(reply, ExtendedReply), reply
 
+    r = WireReader(reply.data)
     max_packet = r.read_uint64()
     max_read = r.read_uint64()
     max_write = r.read_uint64()
@@ -162,8 +185,8 @@ def test_limits_reserves_framing_headroom_below_the_packet_ceiling(server: Local
 
     # The finding: the payload ceiling sits *below* the packet ceiling, because the packet
     # also carries type, request id, handle and offset. So a request size of exactly
-    # max-packet-length is never achievable, and defaulting to the round number means every
-    # request is silently clamped forever.
+    # max-packet-length is never achievable, and defaulting to that round number means
+    # every request is silently clamped, forever.
     assert 0 < max_read < max_packet
     assert 0 < max_write < max_packet
     assert max_handles > 0
@@ -175,97 +198,128 @@ def test_limits_reserves_framing_headroom_below_the_packet_ceiling(server: Local
 # one.
 
 
-# --- STATUS ----------------------------------------------------------------------------
+# --- STATUS -----------------------------------------------------------------------------
 
 
 def test_status_carries_a_message_and_an_empty_language_tag(server: LocalSftpServer):
-    reply_type, r = server.request(PacketType.LSTAT, string(b"/nonexistent/definitely/not/here"))
-    assert reply_type == PacketType.STATUS
-    assert StatusCode(r.read_uint32()) == StatusCode.NO_SUCH_FILE
-
-    message = bytes(r.read_string())
-    language = bytes(r.read_string())
-    assert message  # OpenSSH does send one; some servers send nothing at all
+    reply = server.request(LStat(server.next_id(), b"/nonexistent/definitely/not/here"))
+    assert isinstance(reply, Status), reply
+    assert reply.code == StatusCode.NO_SUCH_FILE
+    assert reply.message  # OpenSSH does send one; some servers send nothing at all
     # The tag is empty, not "en". A decoder demanding a well-formed RFC-1766 tag rejects
     # every error the reference server sends.
-    assert language == b""
-    assert r.at_end
+    assert reply.language == b""
 
 
-# --- handles ---------------------------------------------------------------------------
+# --- handles ----------------------------------------------------------------------------
 
 
 def test_handles_are_opaque_binary_and_need_not_be_text(server: LocalSftpServer, tmp_path: Path):
     target = tmp_path / "handle.txt"
     target.write_bytes(b"x")
-
-    reply_type, r = server.request(
-        PacketType.OPEN,
-        string(str(target).encode()) + OpenFlag.READ.to_bytes(4, "big") + (0).to_bytes(4, "big"),
-    )
-    assert reply_type == PacketType.HANDLE
-    handle = bytes(r.read_string())
+    handle = open_file(server, target)
 
     # OpenSSH's first handle is four NUL bytes -- a packed integer, not a string. Typing
     # handles as str would corrupt this the moment anyone decoded it.
     assert isinstance(handle, bytes)
     assert not handle.isascii() or b"\x00" in handle
+    server.request(Close(server.next_id(), handle))
 
-    server.request(PacketType.CLOSE, string(handle))
 
-
-# --- reads: success, legally-partial, and EOF ------------------------------------------
+# --- reads: success, legally-partial, and EOF -------------------------------------------
 
 
 def test_a_short_read_is_data_and_eof_is_a_status(server: LocalSftpServer, tmp_path: Path):
     # The classic bug in this protocol: treat a short DATA as end-of-file and every
     # pipelined transfer truncates at the first partial response, silently, producing a
-    # file that is plausible and wrong. They are different frame types and this proves it
+    # file that is plausible and wrong. They are different frame types, and this proves it
     # against the real server rather than against our idea of one.
     target = tmp_path / "ten.bin"
     target.write_bytes(b"0123456789")
+    handle = open_file(server, target)
 
-    reply_type, r = server.request(
-        PacketType.OPEN,
-        string(str(target).encode()) + OpenFlag.READ.to_bytes(4, "big") + (0).to_bytes(4, "big"),
-    )
-    assert reply_type == PacketType.HANDLE
-    handle = bytes(r.read_string())
-
-    # Full read.
-    reply_type, r = server.request(
-        PacketType.READ, string(handle) + (0).to_bytes(8, "big") + (4).to_bytes(4, "big")
-    )
-    assert reply_type == PacketType.DATA
-    assert bytes(r.read_string()) == b"0123"
+    full = server.request(Read(server.next_id(), handle, offset=0, length=4))
+    assert isinstance(full, Data), full
+    assert bytes(full.data) == b"0123"
 
     # Asking for 100 bytes starting at 8 of a 10-byte file: a legal short read.
-    reply_type, r = server.request(
-        PacketType.READ, string(handle) + (8).to_bytes(8, "big") + (100).to_bytes(4, "big")
-    )
-    assert reply_type == PacketType.DATA, "a short read must not arrive as EOF"
-    assert bytes(r.read_string()) == b"89"
+    short = server.request(Read(server.next_id(), handle, offset=8, length=100))
+    assert isinstance(short, Data), "a short read must not arrive as EOF"
+    assert bytes(short.data) == b"89"
 
     # Reading at the end: EOF, as a STATUS.
-    reply_type, r = server.request(
-        PacketType.READ, string(handle) + (10).to_bytes(8, "big") + (4).to_bytes(4, "big")
+    end = server.request(Read(server.next_id(), handle, offset=10, length=4))
+    assert isinstance(end, Status), end
+    assert end.code == StatusCode.EOF
+
+    server.request(Close(server.next_id(), handle))
+
+
+def test_a_read_payload_stays_valid_while_later_replies_arrive(
+    server: LocalSftpServer, tmp_path: Path
+):
+    # Zero-copy DATA is only usable if a payload survives the reads that follow it, because
+    # a pipelined session has several in flight at once.
+    target = tmp_path / "chunks.bin"
+    target.write_bytes(b"AAAABBBBCCCC")
+    handle = open_file(server, target)
+
+    payloads = [
+        server.request(Read(server.next_id(), handle, offset=off, length=4)) for off in (0, 4, 8)
+    ]
+    for packet in payloads:
+        assert isinstance(packet, Data)
+    server.request(Close(server.next_id(), handle))
+
+    assert [bytes(p.data) for p in payloads] == [b"AAAA", b"BBBB", b"CCCC"]
+
+
+# --- SYMLINK: the field order that contradicts the specification ------------------------
+
+
+def test_symlink_uses_openssh_field_order_and_the_draft_order_fails(
+    server: LocalSftpServer, tmp_path: Path
+):
+    """draft-ietf-secsh-filexfer-02 and OpenSSH disagree, and OpenSSH wins.
+
+    The draft specifies ``string linkpath, string targetpath``. OpenSSH sends and expects
+    the reverse. Both orders are exercised here so the claim is a measurement rather than a
+    comment: the draft order fails and creates nothing, ours succeeds and creates the link.
+    If a future OpenSSH ever changed its mind, the first assertion is what would notice.
+    """
+    target = tmp_path / "TARGET.txt"
+    target.write_bytes(b"payload\n")
+
+    # Draft order, spelled out positionally: field one is the link, field two the target.
+    draft_order = SymLink(
+        server.next_id(),
+        targetpath=str(tmp_path / "DRAFT_LINK").encode(),  # goes out first
+        linkpath=str(target).encode(),  # goes out second
     )
-    assert reply_type == PacketType.STATUS
-    assert StatusCode(r.read_uint32()) == StatusCode.EOF
+    reply = server.request(draft_order)
+    assert isinstance(reply, Status)
+    assert reply.code == StatusCode.FAILURE, "the draft's field order unexpectedly worked"
+    assert not (tmp_path / "DRAFT_LINK").exists()
 
-    server.request(PacketType.CLOSE, string(handle))
+    # Our order: targetpath first, linkpath second.
+    link = tmp_path / "LINK"
+    reply = server.request(
+        SymLink(server.next_id(), targetpath=str(target).encode(), linkpath=str(link).encode())
+    )
+    assert isinstance(reply, Status)
+    assert reply.code == StatusCode.OK
+    assert link.is_symlink()
+    assert link.readlink() == target
 
 
-# --- capability probing ----------------------------------------------------------------
+# --- capability probing -----------------------------------------------------------------
 
 
 @pytest.mark.parametrize("name", [b"check-file@openssh.com", b"check-file", b"check-file-name"])
 def test_check_file_is_unsupported_under_every_spelling(server: LocalSftpServer, name: bytes):
-    reply_type, r = server.request(
-        PacketType.EXTENDED, string(name) + string(b"/etc/hostname") + string(b"md5")
-    )
-    assert reply_type == PacketType.STATUS
-    assert StatusCode(r.read_uint32()) == StatusCode.OP_UNSUPPORTED
+    reply = server.request(Extended(server.next_id(), name, data=b"\x00\x00\x00\x00"))
+    assert isinstance(reply, Status), reply
+    assert reply.code == StatusCode.OP_UNSUPPORTED
 
 
 def test_probing_an_unknown_extension_leaves_the_session_usable(server: LocalSftpServer):
@@ -273,26 +327,22 @@ def test_probing_an_unknown_extension_leaves_the_session_usable(server: LocalSft
     # relies on it: an EXTENDED with an unknown name is a question, not a protocol
     # violation. If a server ever answered by closing the connection, capability probing
     # would have to be abandoned -- so the property is asserted, not assumed.
-    reply_type, r = server.request(
-        PacketType.EXTENDED, string(b"no-such-extension@example.invalid")
-    )
-    assert reply_type == PacketType.STATUS
-    assert StatusCode(r.read_uint32()) == StatusCode.OP_UNSUPPORTED
+    reply = server.request(Extended(server.next_id(), b"no-such-extension@example.invalid"))
+    assert isinstance(reply, Status), reply
+    assert reply.code == StatusCode.OP_UNSUPPORTED
 
-    reply_type, r = server.request(PacketType.REALPATH, string(b"."))
-    assert reply_type == PacketType.NAME
-    assert r.read_uint32() == 1
+    still_working = server.request(RealPath(server.next_id(), b"."))
+    assert isinstance(still_working, Name)
+    assert len(still_working.entries) == 1
 
 
-# --- NAME ------------------------------------------------------------------------------
+# --- NAME -------------------------------------------------------------------------------
 
 
 def test_realpath_longname_is_the_path_not_an_ls_line(server: LocalSftpServer):
     # longname's shape depends on which request produced it: an ls -l line from READDIR,
     # the bare path from REALPATH. That is the argument for never parsing it.
-    reply_type, r = server.request(PacketType.REALPATH, string(b"."))
-    assert reply_type == PacketType.NAME
-    assert r.read_uint32() == 1
-    filename = bytes(r.read_string())
-    longname = bytes(r.read_string())
-    assert longname == filename
+    reply = server.request(RealPath(server.next_id(), b"."))
+    assert isinstance(reply, Name), reply
+    (entry,) = reply.entries
+    assert entry.longname == entry.filename

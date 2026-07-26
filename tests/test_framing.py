@@ -128,44 +128,87 @@ def test_frames_are_views_into_the_splitters_own_buffer_not_copies():
     assert frame.obj is s._buf  # noqa: SLF001
 
 
-def test_using_a_frame_after_the_next_feed_raises_at_the_point_of_use():
-    # The failure mode this prevents is silent: a retained frame would otherwise quietly
-    # start pointing at unrelated later bytes. Releasing it means the mistake is reported
-    # where it is made, rather than as a stalled stream one call later.
+def test_a_retained_frame_stays_valid_across_later_feeds():
+    # The guarantee: holding a frame is always safe. It neither corrupts nor stalls.
     s = FrameSplitter()
     (frame,) = s.feed(framed(b"\x02keepme"))
     assert bytes(frame) == b"\x02keepme"
 
-    s.feed(framed(b"\x02next"))
+    for _ in range(5):
+        s.feed(framed(b"\x02next"))
 
-    with pytest.raises(ValueError) as exc:
-        bytes(frame)
-    assert exc.value.args[0] == "operation forbidden on released memoryview object"
+    assert bytes(frame) == b"\x02keepme", "a retained frame saw recycled bytes"
 
 
 def test_the_idiomatic_loop_leaves_a_binding_and_still_works():
     # `for frame in ...` leaves `frame` bound after the loop. That is the most natural
-    # spelling in the language, so it must not be a usage error -- this is the exact case
-    # that made the splitter release issued frames instead of waiting for the caller to.
+    # spelling in the language, so it must not be a usage error.
     s = FrameSplitter()
     for frame in s.feed(framed(b"\x02first")):
         assert bytes(frame) == b"\x02first"
     assert [bytes(f) for f in s.feed(framed(b"\x02second"))] == [b"\x02second"]
 
 
-def test_a_slice_of_a_frame_kept_alive_is_reported_rather_than_corrupted():
-    # Releasing what we issued cannot reach a view the caller derived from it. That case
-    # still has to fail loudly rather than hand back recycled bytes.
+def test_a_slice_of_a_frame_kept_alive_is_also_safe():
+    # This is the case that a release-based contract could not cover: nothing here can
+    # reach a view the caller derived. A decoded DATA payload is exactly this shape, so it
+    # has to work rather than merely fail loudly.
     s = FrameSplitter()
     (frame,) = s.feed(framed(b"\x02" + bytes(_COMPACT_THRESHOLD)))
     derived = frame[1:]
-    with pytest.raises(RuntimeError) as exc:
-        s.feed(framed(b"\x02next"))
-    assert exc.value.args[0] == (
-        "a view derived from a previous frame is still alive, so the buffer cannot be "
-        "reused; copy any frame data you need to keep beyond the next feed()"
-    )
-    derived.release()
+    s.feed(framed(b"\x02next"))
+    assert len(derived) == _COMPACT_THRESHOLD
+    assert bytes(derived) == bytes(_COMPACT_THRESHOLD)
+
+
+def test_retaining_a_frame_does_not_stall_the_stream():
+    s = FrameSplitter()
+    (held,) = s.feed(framed(b"\x02held"))
+    out = []
+    for n in range(20):
+        out.extend(bytes(f) for f in s.feed(framed(bytes([2]) + str(n).encode())))
+    assert out == [b"\x02" + str(n).encode() for n in range(20)]
+    assert bytes(held) == b"\x02held"
+
+
+def test_a_fresh_buffer_is_started_when_the_old_one_is_still_referenced():
+    # The mechanism behind the guarantee: the splitter never mutates a buffer with live
+    # exports, it moves to a new one. Reaching in confirms it actually switched rather than
+    # got lucky.
+    s = FrameSplitter()
+    (held,) = s.feed(framed(b"\x02held"))
+    first_buffer = s._buf  # noqa: SLF001
+    s.feed(framed(b"\x02next"))
+    assert s._buf is not first_buffer, "buffer was reused while a frame was still held"  # noqa: SLF001
+    assert bytes(held) == b"\x02held"
+
+
+def test_the_buffer_is_reused_when_no_view_is_outstanding():
+    # The fast path still exists -- it is just rarer than it looks, because the idiomatic
+    # loop leaves its variable bound. Releasing every view reaches it.
+    s = FrameSplitter()
+    frames = s.feed(framed(b"\x02one"))
+    for frame in frames:
+        bytes(frame)
+        frame.release()
+    frames.clear()
+
+    buffer_before = s._buf  # noqa: SLF001
+    for frame in s.feed(framed(b"\x02two")):
+        bytes(frame)
+    assert s._buf is buffer_before, "buffer was needlessly replaced"  # noqa: SLF001
+
+
+def test_holding_a_frame_never_copies_the_payload():
+    # The property that actually matters. Whichever buffer path a feed takes, the frame the
+    # caller receives is a view -- a 256 KiB READ is not memcpy'd on its way through.
+    s = FrameSplitter()
+    payload = bytes(256 * 1024)
+    (held,) = s.feed(framed(b"\x02" + payload))
+    assert held.obj is s._buf  # noqa: SLF001
+    (second,) = s.feed(framed(b"\x02" + payload))
+    assert second.obj is s._buf  # noqa: SLF001
+    assert bytes(held[1:]) == payload
 
 
 def test_copying_a_frame_lets_it_outlive_the_next_feed():
