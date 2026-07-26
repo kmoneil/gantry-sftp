@@ -28,6 +28,7 @@ from gantry_sftp.codec import (
     EXTENSION_FSYNC,
     EXTENSION_POSIX_RENAME,
     LIMITS_NAME,
+    POSIX_RENAME_NAME,
     Attrs,
     AttrsReply,
     Close,
@@ -36,6 +37,7 @@ from gantry_sftp.codec import (
     Completed,
     Fsync,
     Handle,
+    LStat,
     Name,
     Open,
     OpenFlag,
@@ -207,6 +209,11 @@ class Session:
         self._idle_timeout = idle_timeout
         self._depth = depth
         self._lock = anyio.Lock()
+        self._unsupported: set[bytes] = set()
+        """Extensions this server answered ``OP_UNSUPPORTED`` for, so we stop asking.
+
+        Only definitive answers go in here. A server that refuses for some other reason has
+        told us about one request, not about its capabilities."""
 
     @property
     def limits(self) -> ServerLimits:
@@ -317,6 +324,24 @@ class Session:
         """
         encoded = _encode_path(path)
         reply = await self.request(Stat(self._next(), encoded))
+        if isinstance(reply, AttrsReply):
+            return reply.attrs
+        raise _unexpected(reply, expected="ATTRS", path=encoded)
+
+    async def lstat(self, path: bytes | str) -> Attrs:
+        """Attributes of ``path`` itself, **not** following symlinks.
+
+        The difference is not academic where this is used: ``stat`` on a symlink whose target
+        is gone reports ``NO_SUCH_FILE``, so it answers "is there a file at the end of this
+        name" while ``lstat`` answers "is this name taken". Publishing needs the second
+        question.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(path)
+        reply = await self.request(LStat(self._next(), encoded))
         if isinstance(reply, AttrsReply):
             return reply.attrs
         raise _unexpected(reply, expected="ATTRS", path=encoded)
@@ -500,7 +525,9 @@ class Session:
             atomic: Publish via a staging file and a rename. ``False`` writes the destination
                 in place, which is what every other SFTP client does by default and is the
                 behaviour a write-only drop directory may require, since staging needs the
-                right to create *and* rename a second name.
+                right to create *and* rename a second name. In place also means a failure
+                leaves the destination truncated: there is no copy to fall back to, which is
+                the other half of what atomic publish buys.
             fsync: Send ``fsync@openssh.com`` before publishing. Silently unavailable on a
                 server without it, which the result reports as
                 :attr:`~gantry_sftp.session.Durability.UNAVAILABLE`.
@@ -556,7 +583,13 @@ class Session:
     # --- put, in its two shapes ------------------------------------------------------------
 
     async def _put_in_place(self, upload: _Upload, target: bytes) -> UploadResult:
-        """Write the destination directly, which a consumer can observe half-written."""
+        """Write the destination directly, which a consumer can observe half-written.
+
+        Nothing is cleaned up on failure, and that is not an oversight: the destination *is*
+        the file being written, so there is nothing to remove that would not be deleting the
+        caller's data. A failed in-place write leaves a truncated destination, which is what
+        ``atomic=False`` means.
+        """
         handle = await self.open(target, _TRUNCATE_FLAGS)
         transferred, durability = await self._fill_and_close(upload, handle, target)
         return UploadResult(transferred, target, PublishMechanism.IN_PLACE, durability)
@@ -564,16 +597,21 @@ class Session:
     async def _put_atomically(
         self, upload: _Upload, target: bytes, staged: bytes, *, require_atomic: bool
     ) -> UploadResult:
-        """Stage, flush, then publish -- and clean the staging file up on any failure."""
+        """Stage, flush, then publish -- and clean the staging file up on any failure.
+
+        ``require_atomic`` is answered from what the server *advertised*, deliberately, even
+        though :meth:`_try_posix_rename` will attempt the extension regardless. A demand for a
+        guarantee should not be answered by an experiment that costs a nine-gigabyte upload
+        first. The opportunistic attempt belongs on the path where the fallback is acceptable;
+        the strict path gets a cheap, deterministic answer, and the cost of that choice is a
+        false refusal against a server that both under-advertises *and* has a destination
+        already in place. Such a caller drops ``require_atomic`` and reads
+        :attr:`~gantry_sftp.session.UploadResult.mechanism` instead.
+        """
         if require_atomic and not self.supports(EXTENSION_POSIX_RENAME):
-            # Cheap pre-flight: find out now, rather than after moving nine gigabytes, that
-            # the only mechanism left cannot replace a file that is already there.
             await self._refuse_unpublishable(target)
 
-        # A failed OPEN means nothing of ours exists yet, so it must not reach the cleanup
-        # below: EXCL turns a staging-name collision into this error, and deleting the file
-        # would delete whatever the other publisher was in the middle of writing.
-        handle = await self.open(staged, _STAGE_FLAGS)
+        handle = await self._open_staging_file(staged, target)
         try:
             transferred, durability = await self._fill_and_close(upload, handle, staged)
             mechanism = await self._publish(staged, target, require_atomic=require_atomic)
@@ -591,6 +629,29 @@ class Session:
             await self._discard(staged, error)
             raise
         return UploadResult(transferred, target, mechanism, durability, staged)
+
+    async def _open_staging_file(self, staged: bytes, target: bytes) -> bytes:
+        """Create the staging file, or fail in a way that names what to do about it.
+
+        Kept separate because **a failed OPEN must not reach the cleanup path**: nothing of
+        ours exists yet, and the most likely reason for `EXCL` to refuse is that somebody else
+        is publishing to the same destination. Removing the file in the way would destroy the
+        upload they are in the middle of.
+
+        The note matters more than it looks. This is the first failure a user meets when the
+        new default does not suit their server, and without it the message names a dot-file
+        they never typed, in answer to a call about a path they did.
+        """
+        try:
+            return await self.open(staged, _STAGE_FLAGS)
+        except SFTPError as refusal:
+            refusal.add_note(
+                f"{staged!r} is the staging file for {target!r}. Publishing atomically needs "
+                f"the right to create and rename a second name in that directory, and a name "
+                f"that is not already taken -- pass atomic=False to write the destination "
+                f"directly instead, or staging_name= to put the staging file elsewhere."
+            )
+            raise
 
     async def _fill_and_close(
         self, upload: _Upload, handle: bytes, path: bytes
@@ -647,14 +708,46 @@ class Session:
         self, staged: bytes, target: bytes, *, require_atomic: bool
     ) -> PublishMechanism:
         """Move the staged file onto the destination by the strongest available mechanism."""
-        if self.supports(EXTENSION_POSIX_RENAME):
-            try:
-                await self.posix_rename(staged, target)
-            except UnsupportedError:
-                pass  # Advertised and not implemented. The field is full of these.
-            else:
-                return PublishMechanism.POSIX_RENAME
+        if await self._try_posix_rename(staged, target):
+            return PublishMechanism.POSIX_RENAME
         return await self._publish_by_plain_rename(staged, target, require_atomic=require_atomic)
+
+    async def _try_posix_rename(self, staged: bytes, target: bytes) -> bool:
+        """Attempt the one-step publish, answering whether this server could do it.
+
+        **Sent whether or not the extension was advertised**, which looks like it contradicts
+        DESIGN.md 4.2's rule that probes are only for read-only or idempotent extensions. It
+        does not: this is not a probe. It is the operation we came here to perform, and the
+        only question is whether the server answers ``OP_UNSUPPORTED`` instead of doing it.
+        The rule exists to forbid *discovering* a capability by mutating something unrelated.
+
+        This matters because endpoints under-advertise. A server that implements
+        ``posix-rename`` and never lists it would otherwise be pushed onto the
+        ``REMOVE``-then-``RENAME`` path -- a window with no file at all -- for no reason but
+        its own reticence. The cost when the answer really is no is one round trip, and only
+        the first time: ``OP_UNSUPPORTED`` is a definitive answer and is remembered for the
+        session.
+
+        A refusal that is *not* ``OP_UNSUPPORTED`` is treated differently depending on what
+        the server claimed. If it advertised the extension, the refusal is about this
+        operation -- permissions, a read-only directory -- and propagates, because falling
+        through to a fallback that will fail the same way only obscures it. If it did not, we
+        have no idea what we just asked of it, so the fallback stands. That answer is *not*
+        cached: it was not definitive.
+        """
+        if POSIX_RENAME_NAME in self._unsupported:
+            return False
+        advertised = self.supports(EXTENSION_POSIX_RENAME)
+        try:
+            await self.posix_rename(staged, target)
+        except UnsupportedError:
+            self._unsupported.add(POSIX_RENAME_NAME)
+            return False
+        except ServerError:
+            if advertised:
+                raise
+            return False
+        return True
 
     async def _publish_by_plain_rename(
         self, staged: bytes, target: bytes, *, require_atomic: bool
@@ -715,17 +808,22 @@ class Session:
         )
 
     async def _confirmed_present(self, path: bytes) -> bool:
-        """Whether the server *positively reported* that ``path`` is there.
+        """Whether the server *positively reported* that the name ``path`` is taken.
 
-        Three states, and the third one is why this is not called ``_exists``: a STAT can
+        Three states, and the third one is why this is not called ``_exists``: the request can
         succeed, report ``NO_SUCH_FILE``, or fail for some third reason -- permissions, a
-        server that refuses STAT on the path, a ``FAILURE`` meaning who knows what. Only the
+        server that refuses to stat that path, a ``FAILURE`` meaning who knows what. Only the
         first is evidence. Anything else answers ``False``, because this predicate's callers
         use it to decide whether to *delete* something, and "the server would not tell us" is
         not a licence to do that.
+
+        ``LSTAT`` rather than ``STAT``, because the question is whether the *name* is in the
+        way. A destination that is a symlink whose target has been rotated away is still a
+        name a rename cannot land on, and ``STAT`` would call it absent -- leaving the publish
+        to fail with the rename's uninformative ``FAILURE`` and no fallback attempted.
         """
         try:
-            _ = await self.stat(path)
+            _ = await self.lstat(path)
         except ServerError:
             return False
         return True

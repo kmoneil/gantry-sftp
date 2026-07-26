@@ -34,8 +34,9 @@ exists today:
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
-- a session with `stat`, `realpath`, `open`/`close`, `remove`, `rename`, and pipelined
-  `get()` / `put()`, with typed errors, timeouts on every wait, and a progress callback
+- a session with `stat`, `lstat`, `realpath`, `open`/`close`, `remove`, `rename`,
+  `posix_rename`, `fsync`, `supports()`, and pipelined `get()` / `put()`, with typed errors,
+  timeouts on every wait, and a progress callback
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
@@ -91,10 +92,16 @@ result.staged_at     # b'/incoming/.report.csv.20b59c88.part'
 
 | Mechanism       | When                                                      | Atomic                          |
 | --------------- | --------------------------------------------------------- | ------------------------------- |
-| `posix-rename`  | `posix-rename@openssh.com` advertised                     | Yes, even over an existing file |
+| `posix-rename`  | The server implements `posix-rename@openssh.com`          | Yes, even over an existing file |
 | `rename`        | No extension, and the destination did not exist           | Yes — v3 `RENAME` cannot overwrite, so success means it appeared whole |
 | `remove-rename` | No extension, and the destination existed                 | **No** — a window with no file  |
 | `in-place`      | You passed `atomic=False`                                 | **No** — the classic behaviour  |
+
+`posix-rename` is attempted whether or not the server advertised it, because endpoints
+under-advertise and the cost of asking is one round trip — `OP_UNSUPPORTED` is a definitive
+answer and is remembered for the session. `require_atomic` is the exception: it is answered
+from what the server advertised, because a demand for a guarantee should not be answered by an
+experiment that costs a nine-gigabyte upload first.
 
 Refusing to downgrade is one flag, and it fails before moving any bytes where it can:
 

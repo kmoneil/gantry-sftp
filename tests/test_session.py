@@ -407,6 +407,32 @@ async def test_a_session_against_a_real_sftp_server(tmp_path: Path):
     assert destination.read_bytes() == content
 
 
+async def test_lstat_and_stat_disagree_about_a_dangling_symlink_on_a_real_server(tmp_path: Path):
+    """Two different questions, and the publish path needs the second one.
+
+    ``stat`` asks whether there is a file at the end of the name and follows the link to find
+    out; ``lstat`` asks whether the name is taken. A ``latest.csv`` whose target was rotated
+    away answers no to the first and yes to the second, and it is the second that decides
+    whether a rename can land there.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    link = tmp_path / "latest.csv"
+    link.symlink_to(tmp_path / "rotated-away.csv")
+    assert not link.exists(), "the fixture is meant to be a dangling symlink"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(NoSuchFileError):
+            await sftp.stat(str(link))
+        attributes = await sftp.lstat(str(link))
+
+    assert attributes.size is not None
+
+
 async def test_a_real_server_reports_a_missing_file_as_no_such_file(tmp_path: Path):
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")

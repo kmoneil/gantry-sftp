@@ -30,6 +30,7 @@ from gantry_sftp.codec import (
     Fsync,
     Handle,
     Init,
+    LStat,
     Open,
     OpenFlag,
     PosixRename,
@@ -195,28 +196,24 @@ class PublishingServer:
         self,
         *,
         extensions: tuple[bytes, ...] = (POSIX_RENAME_NAME, FSYNC_NAME),
+        implements: tuple[bytes, ...] | None = None,
         files: dict[bytes, bytes] | None = None,
-        open_status: StatusCode | None = None,
-        write_status: StatusCode | None = None,
-        close_status: StatusCode | None = None,
-        rename_status: StatusCode | None = None,
-        posix_rename_status: StatusCode | None = None,
-        remove_status: StatusCode | None = None,
-        stat_status: StatusCode | None = None,
-        fsync_status: StatusCode | None = None,
+        dangling: tuple[bytes, ...] = (),
+        refuse: dict[str, StatusCode] | None = None,
     ) -> None:
         self.files: dict[bytes, bytearray] = {
             name: bytearray(content) for name, content in (files or {}).items()
         }
+        # Symlinks whose target is gone: the name is taken, and STAT still says NO_SUCH_FILE.
+        self.dangling: set[bytes] = set(dangling)
         self.extensions = extensions
-        self.open_status = open_status
-        self.write_status = write_status
-        self.close_status = close_status
-        self.rename_status = rename_status
-        self.posix_rename_status = posix_rename_status
-        self.remove_status = remove_status
-        self.stat_status = stat_status
-        self.fsync_status = fsync_status
+        # Advertising and implementing are different things in both directions, and the
+        # publish ladder now depends on that: a server can implement an extension it never
+        # lists. Default is the honest majority case -- it implements exactly what it says.
+        self.implements = extensions if implements is None else implements
+        # One mapping rather than eight flags: every operation refuses the same way, and a
+        # ninth operation should not mean a ninth constructor argument.
+        self.refuse = dict(refuse or {})
 
         self.seen: list[object] = []
         self.handles: dict[bytes, bytes] = {}
@@ -260,6 +257,7 @@ class PublishingServer:
             Write: self._on_write,
             Close: self._on_close,
             Stat: self._on_stat,
+            LStat: self._on_lstat,
             Remove: self._on_remove,
             Rename: self._on_rename,
             Extended: self._on_extended,
@@ -276,8 +274,8 @@ class PublishingServer:
     # --- operations ----------------------------------------------------------------------
 
     def _on_open(self, packet: Open) -> None:
-        if self.open_status is not None:
-            self._refuse(packet, self.open_status)
+        if (refusal := self.refuse.get("open")) is not None:
+            self._refuse(packet, refusal)
             return
         if packet.pflags & OpenFlag.EXCL and packet.filename in self.files:
             self._refuse(packet, StatusCode.FAILURE)
@@ -290,8 +288,8 @@ class PublishingServer:
         self._reply(Handle(packet.request_id, handle))
 
     def _on_write(self, packet: Write) -> None:
-        if self.write_status is not None:
-            self._refuse(packet, self.write_status)
+        if (refusal := self.refuse.get("write")) is not None:
+            self._refuse(packet, refusal)
             return
         stored = self.files[self.handles[packet.handle]]
         end = packet.offset + len(packet.data)
@@ -302,31 +300,47 @@ class PublishingServer:
 
     def _on_close(self, packet: Close) -> None:
         _ = self.handles.pop(packet.handle, None)
-        if self.close_status is not None:
-            self._refuse(packet, self.close_status)
+        if (refusal := self.refuse.get("close")) is not None:
+            self._refuse(packet, refusal)
             return
         self._reply(Status(packet.request_id, StatusCode.OK))
 
     def _on_stat(self, packet) -> None:
-        if self.stat_status is not None:
-            self._refuse(packet, self.stat_status)
+        # Follows symlinks, so a dangling one is NO_SUCH_FILE here and present under LSTAT.
+        # That difference is the whole reason the publish path asks with LSTAT.
+        if (refusal := self.refuse.get("stat")) is not None:
+            self._refuse(packet, refusal)
         elif packet.path in self.files:
             self._reply(AttrsReply(packet.request_id, Attrs(size=len(self.files[packet.path]))))
         else:
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
 
+    def _on_lstat(self, packet) -> None:
+        if (refusal := self.refuse.get("stat")) is not None:
+            self._refuse(packet, refusal)
+        elif packet.path in self.files or packet.path in self.dangling:
+            self._reply(AttrsReply(packet.request_id, Attrs(size=0)))
+        else:
+            self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
+
+    def _taken(self, path: bytes) -> bool:
+        """Whether the name is occupied, symlink or not -- what a rename collides with."""
+        return path in self.files or path in self.dangling
+
     def _on_remove(self, packet: Remove) -> None:
-        if self.remove_status is not None:
-            self._refuse(packet, self.remove_status)
-        elif self.files.pop(packet.path, None) is None:
+        if (refusal := self.refuse.get("remove")) is not None:
+            self._refuse(packet, refusal)
+        elif not self._taken(packet.path):
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
         else:
+            _ = self.files.pop(packet.path, None)
+            self.dangling.discard(packet.path)
             self._reply(Status(packet.request_id, StatusCode.OK))
 
     def _on_rename(self, packet: Rename) -> None:
-        if self.rename_status is not None:
-            self._refuse(packet, self.rename_status)
-        elif packet.newpath in self.files:
+        if (refusal := self.refuse.get("rename")) is not None:
+            self._refuse(packet, refusal)
+        elif self._taken(packet.newpath):
             # v3 RENAME cannot overwrite, and this is the measured behaviour of a real server.
             self._refuse(packet, StatusCode.FAILURE)
         elif packet.oldpath not in self.files:
@@ -336,7 +350,9 @@ class PublishingServer:
             self._reply(Status(packet.request_id, StatusCode.OK))
 
     def _on_extended(self, packet: Extended) -> None:
-        if packet.name == POSIX_RENAME_NAME:
+        if packet.name not in self.implements:
+            self._refuse(packet, StatusCode.OP_UNSUPPORTED)
+        elif packet.name == POSIX_RENAME_NAME:
             self._on_posix_rename(PosixRename.from_extended(packet))
         elif packet.name == FSYNC_NAME:
             self._on_fsync(Fsync.from_extended(packet))
@@ -344,8 +360,8 @@ class PublishingServer:
             self._refuse(packet, StatusCode.OP_UNSUPPORTED)
 
     def _on_posix_rename(self, packet: PosixRename) -> None:
-        if self.posix_rename_status is not None:
-            self._refuse(packet, self.posix_rename_status)
+        if (refusal := self.refuse.get("posix-rename")) is not None:
+            self._refuse(packet, refusal)
         elif packet.oldpath not in self.files:
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
         else:
@@ -357,8 +373,8 @@ class PublishingServer:
             # What a real server answers for a handle it has already closed, which is what
             # makes flush-before-close a tested ordering rather than a comment.
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
-        elif self.fsync_status is not None:
-            self._refuse(packet, self.fsync_status)
+        elif (refusal := self.refuse.get("fsync")) is not None:
+            self._refuse(packet, refusal)
         else:
             self.fsynced.append(self.handles[packet.handle])
             self._reply(Status(packet.request_id, StatusCode.OK))
@@ -492,14 +508,85 @@ async def test_a_server_without_posix_rename_uses_a_plain_rename(source: Path):
 
     assert result.mechanism is PublishMechanism.RENAME
     assert result.atomic
-    assert "posix-rename@openssh.com" not in server.kinds()
     assert bytes(server.files[TARGET]) == b"id,total\n1,42\n"
+
+
+async def test_posix_rename_is_attempted_even_when_it_was_never_advertised(source: Path):
+    """Endpoints under-advertise, and the cost of asking is one round trip.
+
+    This is not the probe DESIGN.md 4.2 forbids for mutating extensions -- it is the operation
+    we came here to perform. A server that implements ``posix-rename`` and never lists it would
+    otherwise be pushed onto the remove-then-rename path, and lose the guarantee, for no reason
+    but its own reticence.
+    """
+
+    # Implements it, advertises nothing.
+    server = PublishingServer(
+        extensions=(), implements=(POSIX_RENAME_NAME,), files={TARGET: b"yesterday"}
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert not sftp.supports(EXTENSION_POSIX_RENAME)
+        result = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert result.mechanism is PublishMechanism.POSIX_RENAME
+    assert result.atomic
+    assert "Remove" not in server.kinds()
+    assert bytes(server.files[TARGET]) == b"id,total\n1,42\n"
+
+
+async def test_an_unsupported_answer_is_remembered_for_the_session(source: Path):
+    # OP_UNSUPPORTED is a definitive answer, so asking twice is a wasted round trip on every
+    # subsequent publish -- and publishing is something jobs do in a loop.
+    server = PublishingServer(extensions=())
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await sftp.put(source, TARGET, staging_name=STAGED)
+        _ = await sftp.put(source, b"/incoming/second.csv", staging_name=b"/incoming/.second.part")
+
+    assert server.kinds().count("posix-rename@openssh.com") == 1
+
+
+async def test_a_refusal_that_is_not_unsupported_is_not_remembered(source: Path):
+    """Only a definitive answer is cached.
+
+    A server that refused one rename has told us about that request, not about its
+    capabilities -- and an unadvertised extension refusing for some other reason leaves us
+    knowing nothing at all, so the fallback stands and the question stays open.
+    """
+    server = PublishingServer(
+        extensions=(),
+        implements=(POSIX_RENAME_NAME,),
+        refuse={"posix-rename": StatusCode.FAILURE},
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        assert result.mechanism is PublishMechanism.RENAME
+        result = await sftp.put(source, b"/incoming/second.csv", staging_name=b"/incoming/.two")
+
+    assert result.mechanism is PublishMechanism.RENAME
+    assert server.kinds().count("posix-rename@openssh.com") == 2
+
+
+async def test_an_advertised_extension_refusing_for_another_reason_propagates(source: Path):
+    """Advertised and then refused with something that is not OP_UNSUPPORTED.
+
+    The server said it has this and then declined *this operation* -- permissions, a read-only
+    directory. Falling through to a fallback that will fail the same way only replaces a
+    precise error with a vaguer one.
+    """
+    server = PublishingServer(refuse={"posix-rename": StatusCode.PERMISSION_DENIED})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(PermissionDeniedError) as exc:
+            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert exc.value.path == TARGET
+    assert "Rename" not in server.kinds(), "fell through to a fallback that cannot help"
+    assert STAGED not in server.files, "the staging file was left behind"
 
 
 async def test_an_advertised_extension_that_answers_unsupported_falls_through(source: Path):
     # Advertising and then refusing is a server contradicting itself, and it happens. The
     # fallback must be the tested path, not the theoretical one.
-    server = PublishingServer(posix_rename_status=StatusCode.OP_UNSUPPORTED)
+    server = PublishingServer(refuse={"posix-rename": StatusCode.OP_UNSUPPORTED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         result = await sftp.put(source, TARGET, staging_name=STAGED)
 
@@ -526,8 +613,9 @@ async def test_without_posix_rename_an_existing_target_costs_a_remove_first(sour
         "Open",
         "Write",
         "Close",
+        "posix-rename@openssh.com",
         "Rename",
-        "Stat",
+        "LStat",
         "Remove",
         "Rename",
     ]
@@ -542,7 +630,7 @@ async def test_a_rename_that_fails_for_another_reason_deletes_nothing(source: Pa
     destroy a good file to recover from a failure that was never about it -- so the target is
     STATed first, and its absence means the original refusal stands.
     """
-    server = PublishingServer(extensions=(), rename_status=StatusCode.FAILURE)
+    server = PublishingServer(extensions=(), refuse={"rename": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED)
@@ -565,17 +653,18 @@ async def test_losing_the_race_inside_the_window_keeps_the_only_copy_of_the_data
     """
 
     class LosesTheRace(PublishingServer):
-        renames = 0
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.renames = 0
 
         def _on_rename(self, packet: Rename) -> None:
-            LosesTheRace.renames += 1
-            if LosesTheRace.renames == 2:
+            self.renames += 1
+            if self.renames == 2:
                 # Somebody else got there in the window.
                 self.files[TARGET] = bytearray(b"a concurrent writer's file")
             super()._on_rename(packet)
 
-    LosesTheRace.renames = 0
-    server = LosesTheRace(extensions=(), files={TARGET: b"yesterday"})
+    server = LosesTheRace(extensions=(), implements=(), files={TARGET: b"yesterday"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED)
@@ -589,14 +678,31 @@ async def test_losing_the_race_inside_the_window_keeps_the_only_copy_of_the_data
     )
 
 
+async def test_a_destination_that_is_a_dangling_symlink_still_counts_as_in_the_way(source: Path):
+    """The question is whether the *name* is taken, which is LSTAT's question, not STAT's.
+
+    A ``latest.csv`` symlink whose target was rotated away is a name a rename cannot land on
+    and a file STAT calls absent. Asking with STAT would conclude the destination is free,
+    take the rename's uninformative FAILURE as final, and never try the fallback -- so the
+    publish would fail on a case the fallback handles perfectly well.
+    """
+    server = PublishingServer(extensions=(), implements=(), dangling=(TARGET,))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert result.mechanism is PublishMechanism.REMOVE_RENAME
+    assert "LStat" in server.kinds()
+    assert bytes(server.files[TARGET]) == b"id,total\n1,42\n"
+    assert TARGET not in server.dangling, "the symlink should have been replaced"
+
+
 async def test_a_stat_that_errors_is_not_evidence_the_target_is_absent(source: Path):
     # Three states, and the third one decided explicitly: a STAT that fails for some reason
     # other than NO_SUCH_FILE tells us nothing, and "the server would not say" is not a
     # licence to delete anything.
     server = PublishingServer(
         extensions=(),
-        rename_status=StatusCode.FAILURE,
-        stat_status=StatusCode.PERMISSION_DENIED,
+        refuse={"rename": StatusCode.FAILURE, "stat": StatusCode.PERMISSION_DENIED},
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
@@ -715,7 +821,7 @@ async def test_fsync_can_be_switched_off_and_says_it_was_skipped(source: Path):
 async def test_a_refused_flush_is_recorded_rather_than_fatal(source: Path):
     # fsync defaults to on, so a server whose filesystem cannot flush must not fail every
     # upload. The caller who cannot accept that has require_fsync.
-    server = PublishingServer(fsync_status=StatusCode.FAILURE)
+    server = PublishingServer(refuse={"fsync": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         result = await sftp.put(source, TARGET, staging_name=STAGED)
 
@@ -724,7 +830,7 @@ async def test_a_refused_flush_is_recorded_rather_than_fatal(source: Path):
 
 
 async def test_require_fsync_turns_a_refused_flush_into_a_failure(source: Path):
-    server = PublishingServer(fsync_status=StatusCode.FAILURE)
+    server = PublishingServer(refuse={"fsync": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED, require_fsync=True)
@@ -787,7 +893,7 @@ async def test_an_in_place_write_truncates_what_was_there(source: Path):
 async def test_a_failed_transfer_removes_the_staging_file(source: Path):
     # Otherwise every failed run leaves litter in the directory a consumer is watching, which
     # is how people end up writing the cleanup cron job that deletes the wrong thing.
-    server = PublishingServer(write_status=StatusCode.PERMISSION_DENIED)
+    server = PublishingServer(refuse={"write": StatusCode.PERMISSION_DENIED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED)
@@ -808,18 +914,28 @@ async def test_a_staging_name_already_taken_deletes_nothing(source: Path):
     """
     server = PublishingServer(files={STAGED: b"another publisher's work in progress"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        with pytest.raises(ServerError):
+        with pytest.raises(ServerError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED)
 
     assert bytes(server.files[STAGED]) == b"another publisher's work in progress"
     assert "Remove" not in server.kinds()
+    # And the error names a dot-file the caller never typed, so it says whose it is and what
+    # to do instead. This is the first failure anyone meets when the new default does not suit
+    # their server.
+    assert exc.value.__notes__[0] == (
+        "b'/incoming/.report.csv.deadbeef.part' is the staging file for "
+        "b'/incoming/report.csv'. Publishing atomically needs the right to create and rename "
+        "a second name in that directory, and a name that is not already taken -- pass "
+        "atomic=False to write the destination directly instead, or staging_name= to put the "
+        "staging file elsewhere."
+    )
 
 
 async def test_a_cleanup_that_also_fails_is_reported_on_the_original_error(source: Path):
     # Swallowing it means the caller never learns a file was left on the server. Raising it
     # means replacing the real error with a housekeeping one.
     server = PublishingServer(
-        write_status=StatusCode.PERMISSION_DENIED, remove_status=StatusCode.PERMISSION_DENIED
+        refuse={"write": StatusCode.PERMISSION_DENIED, "remove": StatusCode.PERMISSION_DENIED}
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
@@ -840,7 +956,7 @@ async def test_a_failing_close_does_not_replace_the_error_that_caused_it(source:
     was denied, and the offset and byte count that would let them resume are gone with it.
     """
     server = PublishingServer(
-        write_status=StatusCode.PERMISSION_DENIED, close_status=StatusCode.FAILURE
+        refuse={"write": StatusCode.PERMISSION_DENIED, "close": StatusCode.FAILURE}
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
@@ -856,7 +972,7 @@ async def test_a_close_that_fails_on_the_success_path_fails_the_transfer(source:
     # Some servers only discover a write failed when the file is closed -- NFS-backed ones
     # especially. A CLOSE that returns an error is the transfer failing, so it must not be
     # swallowed, and nothing may be published on the strength of it.
-    server = PublishingServer(close_status=StatusCode.FAILURE)
+    server = PublishingServer(refuse={"close": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED)
@@ -870,7 +986,7 @@ async def test_a_failing_close_on_a_download_does_not_replace_the_error_either(
     source: Path, tmp_path: Path
 ):
     # Same shape on the read side, which had the same `finally`.
-    server = PublishingServer(files={TARGET: b"content"}, close_status=StatusCode.FAILURE)
+    server = PublishingServer(files={TARGET: b"content"}, refuse={"close": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
             _ = await sftp.get(TARGET, tmp_path / "out.bin")
@@ -884,7 +1000,7 @@ async def test_a_failing_close_on_a_download_does_not_replace_the_error_either(
 
 
 async def test_a_refused_open_of_the_destination_is_not_dressed_up(source: Path):
-    server = PublishingServer(open_status=StatusCode.PERMISSION_DENIED)
+    server = PublishingServer(refuse={"open": StatusCode.PERMISSION_DENIED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(PermissionDeniedError) as exc:
             _ = await sftp.put(source, TARGET, staging_name=STAGED)
