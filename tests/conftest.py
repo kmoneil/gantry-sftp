@@ -57,16 +57,8 @@ def sftp_server_binary() -> Path:
     return path
 
 
-@pytest.fixture
-def clean_ssh_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
-    """An environment with every variable that steers ``ssh`` removed.
-
-    ``HOME``, ``SSH_AUTH_SOCK``, ``SSH_ASKPASS`` and ``SSH_ASKPASS_REQUIRE`` all change
-    what ``ssh`` does, and ``HOME`` drags in ``~/.ssh/config`` with it. A test that reads
-    the developer's real config passes on their machine and proves nothing -- this repo has
-    already watched an unguarded probe surface a macOS-only ``UseKeychain`` key on Linux.
-    """
-    for name in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("HOME", "/nonexistent-home-for-tests")
-    return {"HOME": "/nonexistent-home-for-tests"}
+# The environment-scrubbing helper that used to live here moved to live-tests/conftest.py,
+# where something actually spawns ssh against a server that can authenticate it. Nothing in
+# tests/ reaches an ssh_config -- every ssh here either passes `config_file=os.devnull` or
+# fails before a connection is attempted -- so keeping a fixture nobody used was decoration
+# that looked like a safeguard.

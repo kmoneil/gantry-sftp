@@ -11,6 +11,7 @@ Nothing here is allowed to *fail* because a dependency is missing. It skips, wit
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import time
@@ -33,6 +34,27 @@ _STARTUP_TIMEOUT_SECONDS = 15.0
 @pytest.fixture(params=["asyncio", "trio"])
 def anyio_backend(request: pytest.FixtureRequest) -> str:
     return str(request.param)
+
+
+def scrubbed_ssh_env() -> dict[str, str]:
+    """An environment with everything that steers ``ssh`` removed.
+
+    ``SSH_AUTH_SOCK`` is the one that actually bites here. If the developer is running an
+    agent, ``ssh`` may offer the keys it holds -- so a test that means to fail with the
+    *wrong* key can quietly succeed with the right one, and the assertion that we surface
+    ``Permission denied`` verifies nothing at all. ``IdentitiesOnly=yes`` already covers
+    this, which is exactly why removing the variable too is worth doing: two independent
+    defences, and this one costs a dict comprehension.
+
+    ``HOME`` is redirected for the same reason it always is -- it drags ``~/.ssh/config``
+    along with it, and a test that reads the developer's real config passes on their machine
+    and proves nothing. This repo has already watched an unguarded probe surface a
+    macOS-only ``UseKeychain`` key on Linux.
+    """
+    steering = {"SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "SSH_AGENT_PID"}
+    env = {k: v for k, v in os.environ.items() if k not in steering}
+    env["HOME"] = "/nonexistent-home-for-live-tests"
+    return env
 
 
 def _first_existing(candidates: tuple[str, ...]) -> str | None:

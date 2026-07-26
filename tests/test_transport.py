@@ -26,6 +26,7 @@ from gantry_sftp.codec import (
 )
 from gantry_sftp.exceptions import ConnectError
 from gantry_sftp.transport import (
+    StderrBuffer,
     build_ssh_argv,
     find_sftp_server,
     open_local_server_transport,
@@ -180,6 +181,82 @@ async def test_end_of_stream_reports_the_children_stderr(tmp_path: Path):
             await _receive_until_closed(transport)
         assert exc.value.args[0] == "connection closed by the remote end"
         assert exc.value.returncode is not None
+
+
+# --- stderr is captured, but not without limit -------------------------------------------
+
+
+def test_stderr_under_the_cap_is_kept_exactly():
+    buffer = StderrBuffer(head_limit=16, tail_limit=16)
+    buffer.extend(b"Permission denied\n")
+    assert buffer.text() == "Permission denied\n"
+    assert buffer.dropped == 0
+
+
+def test_stderr_beyond_the_cap_keeps_both_ends():
+    # OpenSSH puts the decisive line last and the banner first, so a buffer that keeps only
+    # one end throws away either the answer or the context.
+    buffer = StderrBuffer(head_limit=10, tail_limit=10)
+    buffer.extend(b"HEAD______" + b"x" * 500 + b"______TAIL")
+    text = buffer.text()
+    assert text.startswith("HEAD______")
+    assert text.endswith("______TAIL")
+    assert buffer.dropped == 500
+
+
+def test_the_omission_is_announced_rather_than_silent():
+    # Silently truncated diagnostics are how people conclude the tool is lying to them.
+    buffer = StderrBuffer(head_limit=4, tail_limit=4)
+    buffer.extend(b"AAAA" + b"m" * 20 + b"ZZZZ")
+    assert "[20 bytes of stderr omitted]" in buffer.text()
+
+
+def test_stderr_stays_bounded_however_much_arrives():
+    # `ssh -vvv` on a transfer that runs for hours is the trigger this exists for.
+    buffer = StderrBuffer(head_limit=1024, tail_limit=1024)
+    for _ in range(2000):
+        buffer.extend(b"debug1: a line of quite verbose ssh debugging output\n")
+    assert len(buffer.text()) < 4096
+    assert buffer.dropped > 0
+
+
+def test_stderr_arriving_one_byte_at_a_time_is_reassembled():
+    buffer = StderrBuffer(head_limit=8, tail_limit=8)
+    for byte in b"0123456789ABCDEF":
+        buffer.extend(bytes([byte]))
+    assert buffer.text() == "0123456789ABCDEF"
+
+
+def test_stderr_that_is_not_utf8_does_not_raise():
+    # A stray byte in a banner must not turn an authentication failure into a
+    # UnicodeDecodeError about the message that was explaining it.
+    buffer = StderrBuffer()
+    buffer.extend(b"Permission denied \xff\xfe\n")
+    assert "Permission denied" in buffer.text()
+
+
+async def test_a_chatty_child_does_not_grow_the_transport_without_bound(tmp_path: Path):
+    noisy = tmp_path / "noisy.py"
+    noisy.write_text(
+        "import sys\n"
+        "for n in range(20000):\n"
+        "    sys.stderr.write('debug1: chatter %d\\n' % n)\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(3)\n"
+    )
+    launcher = tmp_path / "noisy-ssh"
+    launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{noisy}" "$@"\n')
+    launcher.chmod(0o755)
+
+    async with open_ssh_transport("example.com", ssh_executable=str(launcher)) as transport:
+        with pytest.raises(ConnectError) as exc:
+            await _receive_until_closed(transport)
+
+    # Well under what the child actually wrote, and still containing both ends.
+    assert len(exc.value.stderr) < 128 * 1024
+    assert "debug1: chatter 0\n" in exc.value.stderr
+    assert "debug1: chatter 19999" in exc.value.stderr
+    assert "bytes of stderr omitted" in exc.value.stderr
 
 
 # --- ssh failures carry OpenSSH's own diagnosis ------------------------------------------

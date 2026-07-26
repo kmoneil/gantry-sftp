@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import scrubbed_ssh_env
 from gantry_sftp.codec import (
     Close,
     Codec,
@@ -69,6 +70,9 @@ def connect(server, **overrides):
         "port": server.port,
         "identity_file": str(server.identity_file),
         "config_file": os.devnull,
+        # An agent holding a working key would make the wrong-key test pass for the wrong
+        # reason. IdentitiesOnly already covers it; this is the second, independent defence.
+        "env": scrubbed_ssh_env(),
     }
     kwargs.update(overrides)
     return open_ssh_transport("127.0.0.1", options=options, **kwargs)

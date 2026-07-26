@@ -34,6 +34,7 @@ from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
 
 __all__ = [
     "SFTP_SERVER_CANDIDATES",
+    "StderrBuffer",
     "SubprocessTransport",
     "find_sftp_server",
     "open_local_server_transport",
@@ -41,6 +42,72 @@ __all__ = [
 ]
 
 _TERMINATE_GRACE_SECONDS = 5.0
+
+_STDERR_HEAD_BYTES = 8 * 1024
+_STDERR_TAIL_BYTES = 56 * 1024
+
+
+class StderrBuffer:
+    """Accumulates a child's stderr under a hard cap, keeping the head and the tail.
+
+    An unbounded buffer here is a memory leak with a trigger someone will eventually pull:
+    ``ssh -vvv`` on a long-lived connection emits debug output continuously, and a transfer
+    that runs for hours would grow this forever. Truncating is not optional.
+
+    *Which* bytes to keep is the interesting part, and both ends matter. OpenSSH puts the
+    decisive line last -- ``Permission denied``, ``Host key verification failed`` -- so a
+    head-only buffer discards the answer. But the banner and the early key-exchange lines
+    are at the front, and a tail-only buffer discards the context. So both ends are kept and
+    the middle is dropped, with a marker saying how much went, because silently truncated
+    diagnostics are how people conclude the tool is lying to them.
+    """
+
+    __slots__ = ("_dropped", "_head", "_head_limit", "_tail", "_tail_limit")
+
+    def __init__(
+        self,
+        head_limit: int = _STDERR_HEAD_BYTES,
+        tail_limit: int = _STDERR_TAIL_BYTES,
+    ) -> None:
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._dropped = 0
+        self._head_limit = head_limit
+        self._tail_limit = tail_limit
+
+    def extend(self, chunk: bytes) -> None:
+        """Add received stderr bytes, discarding from the middle if over the cap."""
+        if len(self._head) < self._head_limit:
+            room = self._head_limit - len(self._head)
+            self._head += chunk[:room]
+            chunk = chunk[room:]
+        if not chunk:
+            return
+
+        self._tail += chunk
+        excess = len(self._tail) - self._tail_limit
+        if excess > 0:
+            del self._tail[:excess]
+            self._dropped += excess
+
+    @property
+    def dropped(self) -> int:
+        """Bytes discarded from the middle."""
+        return self._dropped
+
+    def text(self) -> str:
+        """The captured stderr, decoded leniently, with any gap marked.
+
+        ``errors="replace"`` because this is a diagnostic: a server emitting one stray
+        non-UTF-8 byte in its banner must not turn an authentication failure into a
+        ``UnicodeDecodeError`` about the message that was explaining it.
+        """
+        head = bytes(self._head).decode("utf-8", errors="replace")
+        if not self._dropped:
+            return head + bytes(self._tail).decode("utf-8", errors="replace")
+        tail = bytes(self._tail).decode("utf-8", errors="replace")
+        return f"{head}\n... [{self._dropped} bytes of stderr omitted] ...\n{tail}"
+
 
 SFTP_SERVER_CANDIDATES = (
     "/usr/lib/openssh/sftp-server",
@@ -68,7 +135,7 @@ class SubprocessTransport:
 
     __slots__ = ("_argv", "_closed", "_process", "_stderr")
 
-    def __init__(self, process: Process, argv: Sequence[str], stderr: bytearray) -> None:
+    def __init__(self, process: Process, argv: Sequence[str], stderr: StderrBuffer) -> None:
         self._process = process
         self._argv = tuple(argv)
         self._stderr = stderr
@@ -81,13 +148,12 @@ class SubprocessTransport:
 
     @property
     def stderr_text(self) -> str:
-        """Whatever the child has written to stderr so far, decoded leniently.
+        """Whatever the child has written to stderr so far.
 
-        ``errors="replace"`` because this is a diagnostic: a server that emits a stray
-        non-UTF-8 byte in its banner should not turn an authentication failure into a
-        ``UnicodeDecodeError`` about the message that was trying to explain it.
+        Bounded -- see :class:`StderrBuffer` for what is kept when a chatty child overflows
+        the cap, and why both ends are kept rather than one.
         """
-        return bytes(self._stderr).decode("utf-8", errors="replace")
+        return self._stderr.text()
 
     @property
     def returncode(self) -> int | None:
@@ -180,7 +246,7 @@ class SubprocessTransport:
         await self._process.wait()
 
 
-async def _drain_stderr(process: Process, into: bytearray) -> None:
+async def _drain_stderr(process: Process, into: StderrBuffer) -> None:
     """Read the child's stderr until it ends, accumulating it for diagnostics.
 
     A background task rather than a read-on-failure, because a pipe nobody drains fills up
@@ -204,7 +270,7 @@ async def _open_process_transport(
     env: Mapping[str, str] | None = None,
 ) -> AsyncIterator[SubprocessTransport]:
     """Spawn ``argv``, wire up the stderr drain, and guarantee the child is reaped."""
-    stderr = bytearray()
+    stderr = StderrBuffer()
     try:
         process = await anyio.open_process(
             list(argv),

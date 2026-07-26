@@ -24,6 +24,7 @@ from gantry_sftp.transport._argv import (
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE, Transport
 from gantry_sftp.transport._subprocess import (
     SFTP_SERVER_CANDIDATES,
+    StderrBuffer,
     SubprocessTransport,
     find_sftp_server,
     open_local_server_transport,
@@ -35,6 +36,7 @@ __all__ = [
     "DEFAULT_SSH_OPTIONS",
     "DEFAULT_SUBSYSTEM",
     "SFTP_SERVER_CANDIDATES",
+    "StderrBuffer",
     "SubprocessTransport",
     "Transport",
     "build_ssh_argv",
