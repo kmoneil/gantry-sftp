@@ -33,6 +33,7 @@ from gantry_sftp.session._session import (
     open_session,
     raise_for_status,
 )
+from gantry_sftp.session._upload import upload_handle
 
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
@@ -51,5 +52,6 @@ __all__ = [
     "open_session",
     "raise_for_status",
     "read_request_overhead",
+    "upload_handle",
     "write_request_overhead",
 ]

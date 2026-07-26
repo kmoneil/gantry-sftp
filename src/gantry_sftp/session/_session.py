@@ -63,6 +63,7 @@ from gantry_sftp.session._download import (
     download_handle,
 )
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
+from gantry_sftp.session._upload import upload_handle
 from gantry_sftp.transport import Transport
 
 __all__ = ["DEFAULT_REQUEST_TIMEOUT", "LIMITS_EXTENSION", "Session", "open_session"]
@@ -294,6 +295,56 @@ class Session:
         finally:
             # Closing is not optional: a leaked handle counts against max-open-handles and
             # is invisible from this side until the server starts refusing to open anything.
+            await self.close(handle)
+
+    async def put(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        progress: ProgressCallback | None = None,
+        depth: int | None = None,
+    ) -> int:
+        """Upload ``local_path`` to ``remote_path``, truncating whatever is there.
+
+        The remote file is written **in place**, so a reader watching the directory can see
+        it half-written. Publishing atomically -- upload to a sibling temp name, fsync,
+        rename over the target -- is the single most common thing production SFTP
+        integrations get wrong, and it is deliberately not silently implied here: it needs
+        ``posix-rename@openssh.com`` or a documented non-atomic fallback, and it lands as its
+        own change rather than as an undocumented side effect of this one.
+
+        Args:
+            local_path: Local file to read.
+            remote_path: Destination on the server.
+            progress: Called with ``(transferred, total)`` as writes are acknowledged.
+            depth: Requests in flight, overriding the session default. Each one holds a full
+                payload in memory, so this costs more here than on the download side.
+
+        Returns:
+            Bytes the server acknowledged.
+
+        Raises:
+            PermissionDeniedError: If the server will not create or write the file.
+            ServerError: For any other refusal.
+            TransferError: If the transfer fails partway.
+        """
+        encoded = _encode_path(remote_path)
+        handle = await self.open(encoded, OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC)
+        try:
+            async with self._lock:
+                return await upload_handle(
+                    self._transport,
+                    self._codec,
+                    handle,
+                    local_path,
+                    write_length=self.sizes_for(handle).write_length,
+                    depth=self._depth if depth is None else depth,
+                    idle_timeout=self._idle_timeout,
+                    progress=progress,
+                    remote_path=encoded,
+                )
+        finally:
             await self.close(handle)
 
 

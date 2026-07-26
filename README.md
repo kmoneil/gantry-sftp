@@ -24,8 +24,8 @@ this package.** What remains is a protocol codec, a scheduler, and an ergonomics
 
 ## Status
 
-**Pre-alpha, and honest about it.** Nothing is published and the public API does not exist
-yet. What exists today:
+**Pre-alpha, and honest about it.** Nothing is published and the API will change. What
+exists today:
 
 - a complete filexfer v3 codec: all 27 packet types plus ATTRS, encoding and decoding,
   checked against `draft-ietf-secsh-filexfer-02`, OpenSSH's `sftp.h`, and frames captured
@@ -34,15 +34,14 @@ yet. What exists today:
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
+- a session with `stat`, `realpath`, `open`/`close` and pipelined `get()` / `put()`, with
+  typed errors, timeouts on every wait, and a progress callback
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`
 
-- a session with `stat`, `realpath`, `open`/`close` and a pipelined `get()`, with typed
-  errors, timeouts on every wait, and a progress callback
-
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
 host-key verification and public-key authentication all done by OpenSSH, and no
-cryptography in this package. It downloads files:
+cryptography in this package. It moves files:
 
 ```python
 import anyio
@@ -55,13 +54,19 @@ async def main():
         open_session(transport) as sftp,
     ):
         await sftp.get("/remote/data.parquet", "data.parquet")
+        await sftp.put("report.csv", "/remote/report.csv")
 
 anyio.run(main)
 ```
 
-Not yet: `put()`, directory listing, recursive operations, resume, atomic writes, the
-fsspec adapter, `SFTPPath`, or the generated sync API. The names in DESIGN.md's §8 sketch
-(`connect()`, `put_many()`) do not exist yet — `open_session` is the current spelling.
+Not yet: directory listing, recursive operations, resume, retry, the fsspec adapter,
+`SFTPPath`, or the generated sync API. The names in DESIGN.md's §8 sketch (`connect()`,
+`put_many()`) do not exist yet — `open_session` is the current spelling.
+
+**`put()` is not atomic.** It writes the remote file in place, so a consumer polling the
+directory can observe it half-written. Publishing via a temp name and rename needs
+`posix-rename@openssh.com`, and it is the next thing being built — the docstring says so
+rather than leaving you to find out.
 
 One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
 opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends
