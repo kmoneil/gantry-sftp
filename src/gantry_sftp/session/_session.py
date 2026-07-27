@@ -3,14 +3,31 @@
 Ties a transport and a codec together, performs the handshake, probes what the server can
 do, and exposes operations in terms of paths and files rather than packets and request ids.
 
-Concurrency, honestly
----------------------
-A session serialises its operations behind a lock. SFTP multiplexes fine over one channel --
-that is what request ids are for -- but exploiting it needs a single reader task dispatching
-replies to per-request waiters, and the downloader currently drives its own receive loop.
-Serialising is the honest intermediate: two coroutines calling this session get correct
-results in some order, rather than two receive loops stealing each other's frames. Turning
-that into real per-file concurrency is registered as deferred work, not pretended away.
+Concurrency
+-----------
+**A session multiplexes.** Several tasks may share one -- transfers included -- and their
+requests interleave over the single channel the way request ids were designed for::
+
+    async with anyio.create_task_group() as group:
+        for name in names:
+            group.start_soon(sftp.get, f"/incoming/{name}", local / name)
+
+This used to be a lock. The obstacle was never the protocol: it was that a scheduler calling
+``transport.receive()`` itself owns the connection while it runs, so a second one beside it
+would decode the first one's frames. :mod:`gantry_sftp.session._dispatch` moves that single
+read into one reader task and hands every operation an exchange to wait on, which is what
+turns "correct results in some order" into overlap.
+
+Two things it does not do. It does not bound how many operations run at once -- that is the
+caller's task group, because the right number is a fact about the far end rather than about
+this layer. And it does not make a *single* operation safe to drive from two tasks: one
+``get`` is one exchange with one consumer.
+
+One thing it does not buy, stated so it is not read in: **more bytes in flight than the
+channel allows.** ``ssh -s sftp`` runs the subsystem on one SSH channel, so one transport is
+one 2 MiB window and everything multiplexed onto this session shares it. Concurrency reaches
+that ceiling where a single small file cannot, and removes the round trips a file-at-a-time
+loop leaves the link idle for; passing it needs a second transport (DESIGN.md 5.1).
 """
 
 from __future__ import annotations
@@ -71,7 +88,9 @@ from gantry_sftp.exceptions import (
     SFTPError,
     TransferTimeoutError,
     UnsupportedError,
+    flatten_exception_group,
 )
+from gantry_sftp.session._dispatch import Dispatcher
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
@@ -208,27 +227,34 @@ class _Upload:
 class Session:
     """An SFTP conversation with one server.
 
-    Built by :func:`open_session`, which owns the handshake and makes sure the connection is
-    torn down.
+    Built by :func:`open_session`, which owns the handshake, starts the reader task every
+    operation depends on, and makes sure the connection is torn down. Constructing one
+    directly is not supported: a session without a running reader accepts requests and never
+    answers them.
+
+    Args:
+        dispatcher: The connection's single reader, already running.
+        limits: What the server said it would accept, or all-``None``.
+        request_timeout: Seconds for one one-shot request.
+        idle_timeout: Seconds of silence during a bulk transfer.
+        depth: Default requests in flight per transfer.
     """
 
     def __init__(
         self,
-        transport: Transport,
-        codec: Codec,
+        dispatcher: Dispatcher,
         limits: ServerLimits,
         *,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
         depth: int = DEFAULT_PIPELINE_DEPTH,
     ) -> None:
-        self._transport = transport
-        self._codec = codec
+        self._dispatcher = dispatcher
+        self._codec = dispatcher.codec
         self._limits = limits
         self._request_timeout = request_timeout
         self._idle_timeout = idle_timeout
         self._depth = depth
-        self._lock = anyio.Lock()
         self._unsupported: set[bytes] = set()
         """Extensions this server answered ``OP_UNSUPPORTED`` for, so we stop asking.
 
@@ -252,10 +278,16 @@ class Session:
 
     @override
     def __repr__(self) -> str:
-        """Report the tunables a slow transfer would make you want to check."""
+        """Report the tunables a slow transfer would make you want to check.
+
+        ``outstanding`` is here because a session is no longer one operation at a time: a
+        number that stays pinned at the pipeline depth while nothing finishes is a stalled
+        transfer, and one that is unexpectedly large is more concurrency than intended.
+        """
         return (
             f"<Session version={self._codec.server_version} "
             f"extensions={len(self._codec.extensions)} depth={self._depth} "
+            f"outstanding={self._codec.outstanding} "
             f"request_timeout={self._request_timeout} idle_timeout={self._idle_timeout}>"
         )
 
@@ -269,16 +301,14 @@ class Session:
 
     # --- one round trip ------------------------------------------------------------------
 
-    async def _round_trip(self, request: Request) -> Response:
-        """Send one request and wait for the reply that matches it."""
-        await self._transport.send(self._codec.send(request))
-        while True:
-            for event in self._codec.receive(await self._transport.receive()):
-                if isinstance(event, Completed) and event.request.request_id == request.request_id:
-                    return event.response
-
     async def request(self, request: Request) -> Response:
-        """Send a request and return its reply, serialised against other operations.
+        """Send a request and return its reply.
+
+        Safe to call from several tasks at once: each gets its own exchange, and the reader
+        routes each reply to the request it answers. The version of this that read the
+        transport itself had to hold a lock for exactly that reason -- it discarded every
+        reply that was not the one it was waiting for, which is fine alone and is theft with
+        company.
 
         The deadline covers the whole round trip rather than each chunk of it. Per-chunk
         would let a server dribble a byte at a time and never time out, which is a hang
@@ -287,16 +317,15 @@ class Session:
         Raises:
             TransferTimeoutError: If the reply does not arrive in ``request_timeout``.
         """
-        async with self._lock:
-            if self._request_timeout is None:
-                return await self._round_trip(request)
-            try:
-                with anyio.fail_after(self._request_timeout):
-                    return await self._round_trip(request)
-            except TimeoutError as exc:
-                raise TransferTimeoutError(
-                    f"{type(request).__name__} was not answered within {self._request_timeout}s"
-                ) from exc
+        if self._request_timeout is None:
+            return (await self._dispatcher.round_trip(request)).response
+        try:
+            with anyio.fail_after(self._request_timeout):
+                return (await self._dispatcher.round_trip(request)).response
+        except TimeoutError as exc:
+            raise TransferTimeoutError(
+                f"{type(request).__name__} was not answered within {self._request_timeout}s"
+            ) from exc
 
     def _next(self) -> int:
         return self._codec.allocate_request_id()
@@ -618,16 +647,15 @@ class Session:
         attributes = await self.stat(encoded)
         handle = await self.open(encoded, OpenFlag.READ)
         try:
-            async with self._lock:
-                transferred = await self._download_into(
-                    local_path,
-                    handle,
-                    size=attributes.size,
-                    depth=depth,
-                    progress=progress,
-                    remote_path=encoded,
-                    no_follow=no_follow,
-                )
+            transferred = await self._download_into(
+                local_path,
+                handle,
+                size=attributes.size,
+                depth=depth,
+                progress=progress,
+                remote_path=encoded,
+                no_follow=no_follow,
+            )
         except BaseException:
             # Closing is not optional: a leaked handle counts against max-open-handles and is
             # invisible from this side until the server starts refusing to open anything. It
@@ -659,8 +687,7 @@ class Session:
         fd = os.open(local_path, _LOCAL_WRITE_FLAGS | (NO_FOLLOW if no_follow else 0), 0o600)
         try:
             return await download_handle(
-                self._transport,
-                self._codec,
+                self._dispatcher,
                 handle,
                 fd,
                 size=size,
@@ -781,9 +808,12 @@ class Session:
         :class:`~gantry_sftp.exceptions.UnsafePathError` and nothing is written -- this is the
         zip-slip class, and it is a real and exploited pattern in file-transfer clients.
 
-        Transfers are sequential. A session serialises its operations, so there is nothing to
-        gain from issuing them concurrently yet; per-file concurrency is what the single-reader
-        rework unlocks, and it is registered rather than implied.
+        Transfers are sequential **here**, which is no longer a property of the session. The
+        session multiplexes, so a caller who wants files to overlap can fan out over
+        :meth:`get` with a task group today. What this method does not yet have is a
+        ``concurrency`` parameter of its own, because a walk that runs ahead of its transfers
+        needs bounded back-pressure, and a progress callback reporting per file means little
+        when several files report at once. Registered rather than implied.
 
         Args:
             remote_path: Remote directory to copy.
@@ -1001,20 +1031,16 @@ class Session:
         can: ``fsync@openssh.com`` on a closed handle answers ``NO_SUCH_FILE``.
         """
         try:
-            async with self._lock:
-                transferred = await upload_handle(
-                    self._transport,
-                    self._codec,
-                    handle,
-                    upload.local_path,
-                    write_length=self.sizes_for(handle).write_length,
-                    depth=self._depth if upload.depth is None else upload.depth,
-                    idle_timeout=self._idle_timeout,
-                    progress=upload.progress,
-                    remote_path=path,
-                )
-            # Outside the lock: anyio's Lock is not reentrant and the flush is a request of
-            # its own.
+            transferred = await upload_handle(
+                self._dispatcher,
+                handle,
+                upload.local_path,
+                write_length=self.sizes_for(handle).write_length,
+                depth=self._depth if upload.depth is None else upload.depth,
+                idle_timeout=self._idle_timeout,
+                progress=upload.progress,
+                remote_path=path,
+            )
             durability = await self._flush(upload, handle)
         except BaseException:
             # Closing is not optional -- a leaked handle counts against max-open-handles and
@@ -1201,8 +1227,8 @@ class Session:
         when a level is actually absent, because v3 answers a failed ``MKDIR`` with the
         catch-all ``FAILURE`` and "it is already there" has to be distinguished by looking.
 
-        Transfers are sequential, for the same reason :meth:`get_tree`'s are: a session
-        serialises, so there is nothing yet to gain from issuing them concurrently.
+        Transfers are sequential here, for the same reason :meth:`get_tree`'s are -- and with
+        the same escape, a task group over :meth:`put`.
 
         Args:
             local_path: Local directory to copy. Followed if it is itself a symlink, because
@@ -1503,7 +1529,17 @@ async def open_session(
     idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
     depth: int = DEFAULT_PIPELINE_DEPTH,
 ) -> AsyncGenerator[Session]:
-    """Perform the handshake over ``transport`` and yield a ready session.
+    """Perform the handshake over ``transport``, start the reader, and yield a ready session.
+
+    The handshake runs first and drives the transport directly, because VERSION is not a
+    reply to anything -- it has no request id to route. Only once the connection is
+    negotiated does the reader take ownership of ``receive``, and from then on nothing else
+    calls it.
+
+    The reader lives in a task group that ends with this block, so leaving it stops the
+    reader whether the body returned or raised. Its exceptions are flattened on the way out:
+    an anyio task group wraps even a single failure in an ``ExceptionGroup``, and a caller
+    who wrote ``except NoSuchFileError`` around this line would otherwise stop matching.
 
     Args:
         transport: A connected transport. Its lifetime is the caller's; this only drives it.
@@ -1512,7 +1548,7 @@ async def open_session(
         depth: Default requests in flight per transfer.
 
     Yields:
-        A negotiated session.
+        A negotiated session, usable from several tasks at once.
 
     Raises:
         TransferTimeoutError: If the server never sends VERSION.
@@ -1522,14 +1558,27 @@ async def open_session(
     await transport.send(codec.initiate())
     await _await_version(transport, codec, request_timeout)
     limits = await _probe_limits(transport, codec, request_timeout)
-    yield Session(
-        transport,
-        codec,
-        limits,
-        request_timeout=request_timeout,
-        idle_timeout=idle_timeout,
-        depth=depth,
-    )
+
+    dispatcher = Dispatcher(transport, codec)
+    try:
+        async with anyio.create_task_group() as reader:
+            _ = reader.start_soon(dispatcher.run)
+            try:
+                yield Session(
+                    dispatcher,
+                    limits,
+                    request_timeout=request_timeout,
+                    idle_timeout=idle_timeout,
+                    depth=depth,
+                )
+            finally:
+                # Cancelling is the only way to stop a task parked in `transport.receive()`.
+                # `close()` first so that anything still trying to send during teardown gets
+                # a StateError naming the reason rather than hanging on a dead reader.
+                dispatcher.close()
+                reader.cancel_scope.cancel()
+    except BaseExceptionGroup as group:
+        raise flatten_exception_group(group) from None
 
 
 async def _read_version(transport: Transport, codec: Codec) -> None:

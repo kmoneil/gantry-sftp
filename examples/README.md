@@ -11,7 +11,8 @@ python examples/atomic_publish.py                 # put(), and what "atomic" act
 python examples/listing.py                        # listdir(), and what a listing can't know
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
-python examples/connect_errors.py                  # why the connection failed, as a class
+python examples/concurrent_transfers.py           # many transfers over one session
+python examples/connect_errors.py                 # why the connection failed, as a class
 ```
 
 Pass a destination to run the same code against a real server:
@@ -22,6 +23,7 @@ python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
+python examples/concurrent_transfers.py user@host /remote/dir
 python examples/connect_errors.py user@host
 ```
 
@@ -30,14 +32,15 @@ example that has drifted out of sync with the library is a confident, wrong answ
 will copy, so they are tested rather than trusted. They skip with a reason when
 `openssh-server` is not installed.
 
-| Example             | Shows                                                                        |
-| ------------------- | ---------------------------------------------------------------------------- |
-| `download.py`       | `get()`, the progress callback, and where the pipelining happens              |
-| `atomic_publish.py` | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs |
-| `listing.py`        | `listdir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN`  |
-| `recursive_download.py` | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused |
-| `recursive_upload.py` | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
-| `connect_errors.py` | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim |
+| Example                   | Shows                                                                                                  |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `download.py`             | `get()`, the progress callback, and where the pipelining happens                                       |
+| `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
+| `listing.py`              | `listdir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN`                          |
+| `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused                   |
+| `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
+| `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
+| `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
 
 ## What `atomic_publish.py` is actually showing
 

@@ -86,6 +86,23 @@ def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
     assert "symlink" in stdout
 
 
+def test_the_concurrency_example_shows_transfers_actually_overlapping():
+    # The example is only worth having if it demonstrates overlap rather than asserting it,
+    # and wall clock over a local pipe demonstrates nothing -- there is no round-trip time to
+    # win back. What must appear is the peak number of transfers open at the same instant,
+    # which is 1 on a session that serialises no matter how fast it is.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "concurrent_transfers.py")
+    assert returncode == 0
+    assert "transfers open at once, at the peak: 12 of 12" in stdout
+    assert "byte-identical" in stdout
+    # And the error section has to keep telling the truth about where the exception lands.
+    assert "one call, on its own:  NoSuchFileError" in stdout
+    assert "inside your task group: NoSuchFileError" in stdout
+
+
 def test_the_connect_errors_example_classifies_rather_than_guesses():
     # The example exists to show that the failure reaches you as a *class*. With no arguments
     # it connects to a closed port, which is deliberately one of the cases we refuse to

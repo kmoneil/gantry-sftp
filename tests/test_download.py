@@ -13,7 +13,9 @@ import os
 from pathlib import Path
 
 import anyio
+import anyio.lowlevel
 import pytest
+from tests.conftest import negotiate, running_dispatcher
 
 from gantry_sftp.codec import (
     Close,
@@ -71,14 +73,22 @@ class ScriptedServer:
         self._splitter = Splitter()
         self._pending: list[bytes] = []
         self._outbox = bytearray()
+        self._has_output = anyio.Event()
 
     async def send(self, data: bytes | memoryview) -> None:
         for frame in self._splitter.feed(data):
             self._handle(decode(frame))
 
+    def _queue(self, frame: bytes) -> None:
+        # Waking a waiter rather than letting `receive` find the frame on its next call: the
+        # client no longer drives this server turn by turn. A reader task owns `receive` and
+        # is already parked in it before the first request is ever sent.
+        self._pending.append(frame)
+        self._has_output.set()
+
     def _handle(self, packet: object) -> None:
         if isinstance(packet, Init):
-            self._pending.append(encode(Version(3)))
+            self._queue(encode(Version(3)))
             return
         if not isinstance(packet, Read):
             raise TypeError(f"scripted server got an unexpected {type(packet).__name__}")
@@ -92,20 +102,22 @@ class ScriptedServer:
             return
 
         if offset >= len(self.content):
-            self._pending.append(encode(Status(packet.request_id, StatusCode.EOF)))
+            self._queue(encode(Status(packet.request_id, StatusCode.EOF)))
             return
 
         available = self.content[offset : offset + length]
         if offset in self.short_at and len(available) > 1:
             available = available[: len(available) // 2]
-        self._pending.append(encode(Data(packet.request_id, memoryview(available))))
+        self._queue(encode(Data(packet.request_id, memoryview(available))))
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
-        if not self._outbox:
-            if not self._pending:
-                await anyio.sleep_forever()
+        while not self._outbox:
+            await self._has_output.wait()
+            if self.reverse:
+                await self._let_the_window_fill()
             batch = self._pending
             self._pending = []
+            self._has_output = anyio.Event()
             if self.reverse:
                 batch = list(reversed(batch))
             for frame in batch:
@@ -114,33 +126,37 @@ class ScriptedServer:
         del self._outbox[:max_bytes]
         return chunk
 
+    async def _let_the_window_fill(self) -> None:
+        """Answer nothing until the client has stopped issuing reads.
+
+        Reversing a batch only demonstrates anything if there is more than one reply in it,
+        and with a reader task of its own the client would otherwise be answered one read at
+        a time -- in perfect order, proving the opposite of what the test is for.
+        """
+        queued = -1
+        while queued != len(self._pending):
+            queued = len(self._pending)
+            await anyio.lowlevel.checkpoint()
+
     async def aclose(self) -> None:
         return
 
 
-async def negotiated(server: ScriptedServer) -> Codec:
-    codec = Codec()
-    await server.send(codec.initiate())
-    while codec.state.name != "READY":
-        codec.receive(await server.receive())
-    return codec
-
-
 async def fetch(server: ScriptedServer, destination: Path, **kwargs) -> int:
-    codec = await negotiated(server)
+    codec = await negotiate(server)  # type: ignore[arg-type]
     # download_handle takes a descriptor, not a path: opening the destination is the
     # session's job, because the flags are a safety decision rather than a scheduling one.
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        return await download_handle(
-            server,  # type: ignore[arg-type]
-            codec,
-            HANDLE,
-            fd,
-            size=kwargs.pop("size", len(server.content)),
-            read_length=kwargs.pop("read_length", 64),
-            **kwargs,
-        )
+        async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+            return await download_handle(
+                dispatcher,
+                HANDLE,
+                fd,
+                size=kwargs.pop("size", len(server.content)),
+                read_length=kwargs.pop("read_length", 64),
+                **kwargs,
+            )
     finally:
         os.close(fd)
 
@@ -250,9 +266,8 @@ async def test_a_refused_read_reports_how_far_it_got(tmp_path: Path):
     class Refusing(ScriptedServer):
         def _handle(self, packet: object) -> None:
             if isinstance(packet, Read) and packet.offset >= 64:
-                self._pending.append(
-                    encode(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"nope"))
-                )
+                refusal = Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"nope")
+                self._queue(encode(refusal))
                 return
             super()._handle(packet)
 
@@ -366,15 +381,15 @@ async def test_downloading_from_a_real_sftp_server(tmp_path: Path):
         sizes = negotiate_transfer_sizes(ServerLimits.unknown(), handle_length=len(opened.handle))
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            written = await download_handle(
-                transport,
-                codec,
-                opened.handle,
-                fd,
-                size=len(content),
-                read_length=sizes.read_length,
-                depth=DEFAULT_PIPELINE_DEPTH,
-            )
+            async with running_dispatcher(transport, codec) as dispatcher:
+                written = await download_handle(
+                    dispatcher,
+                    opened.handle,
+                    fd,
+                    size=len(content),
+                    read_length=sizes.read_length,
+                    depth=DEFAULT_PIPELINE_DEPTH,
+                )
         finally:
             os.close(fd)
         await transport.send(codec.send(Close(codec.allocate_request_id(), opened.handle)))

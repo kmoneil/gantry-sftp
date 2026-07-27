@@ -10,6 +10,7 @@ Async here means **anyio**, never bare ``asyncio``.
 
 from __future__ import annotations
 
+from gantry_sftp.session._dispatch import Dispatcher, Exchange
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
@@ -85,8 +86,10 @@ __all__ = [
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
     "DirEntry",
+    "Dispatcher",
     "Durability",
     "EntryKind",
+    "Exchange",
     "LocalWalkEntry",
     "ProgressCallback",
     "PublishMechanism",

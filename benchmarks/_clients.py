@@ -170,6 +170,40 @@ class GantryClient(Client):
             elapsed = time.perf_counter() - started
         return elapsed, moved
 
+    async def download_many_concurrently(
+        self, remotes: Sequence[Path], into: Path, *, concurrency: int
+    ) -> tuple[float, int]:
+        """The same files over the same one connection, overlapping.
+
+        Not part of :class:`Client`, and that is a fairness decision rather than an oversight.
+        paramiko and asyncssh can both be driven concurrently too -- with a thread per transfer
+        and with a task group respectively -- so a row comparing our concurrent number against
+        their sequential one would be measuring a feature gap while looking like a speed gap,
+        which is the exact trap the sequential row's caveat already names. This is us against
+        us, like the atomic-publish row: what our own multiplexing is worth on this link.
+        """
+        moved: list[int] = []
+        limit = anyio.Semaphore(concurrency)
+
+        async with self._transport() as transport, open_session(transport) as sftp:
+
+            async def fetch(remote: Path) -> None:
+                async with limit:
+                    got = await sftp.get(str(remote), into / remote.name)
+                # Appended, not `total += await ...`. Augmented assignment loads the target
+                # *before* evaluating the right-hand side, so with the await on that side every
+                # concurrent task adds to a value it read before the others finished -- a lost
+                # update that understates the byte count and, since MiB/s is derived from it,
+                # reports the fastest row as the slowest.
+                moved.append(got)
+
+            started = time.perf_counter()
+            async with anyio.create_task_group() as group:
+                for remote in remotes:
+                    group.start_soon(fetch, remote)
+            elapsed = time.perf_counter() - started
+        return elapsed, sum(moved)
+
 
 class ParamikoClient(Client):
     """paramiko: SSH implemented in Python, which is what every other library wraps.

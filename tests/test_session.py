@@ -44,6 +44,7 @@ from gantry_sftp.exceptions import (
 )
 from gantry_sftp.session import (
     LIMITS_EXTENSION,
+    Dispatcher,
     ServerLimits,
     Session,
     open_session,
@@ -450,6 +451,11 @@ async def test_a_real_server_reports_a_missing_file_as_no_such_file(tmp_path: Pa
 def test_session_is_constructible_without_the_context_manager():
     # open_session owns the handshake, but Session itself must stay plain enough to build in
     # a test or a REPL without one.
-    session = Session(FakeServer(), Codec(), ServerLimits.unknown())  # type: ignore[arg-type]
+    #
+    # The constructor takes a Dispatcher rather than (transport, codec) as of the multiplexing
+    # change, and that break is deliberate: a session whose reader is not running would accept
+    # requests and never answer them, so the object that owns the reader is the honest
+    # dependency. open_session is and was the documented way in.
+    session = Session(Dispatcher(FakeServer(), Codec()), ServerLimits.unknown())  # type: ignore[arg-type]
     assert session.limits == ServerLimits.unknown()
     assert session.sizes_for(b"\x00\x00\x00\x00").read_length > 0

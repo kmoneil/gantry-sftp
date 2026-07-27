@@ -36,6 +36,14 @@ REPEATS = 3
 exactly why :attr:`_harness.Measurement.spread` is printed beside every row and why a ratio
 drawn from overlapping samples is marked rather than asserted."""
 
+SMALL_FILE_CONCURRENCY = 8
+"""Transfers in flight in the concurrent small-file row.
+
+A number chosen for this bench and not a library default -- there isn't one, deliberately. It
+is small enough to stay well inside OpenSSH's per-connection open-handle allowance and large
+enough that the round trips it overlaps are visible on a 50 ms link.
+"""
+
 RTT_TOLERANCE = 0.35
 """How far the measured round trip may sit from the requested one before the run is refused.
 
@@ -80,9 +88,15 @@ CAVEATS = (
     "CPU is measured over **connect through close**, not over the transfer alone -- "
     "`getrusage(RUSAGE_CHILDREN)` cannot see the `ssh` child until it is reaped. The "
     "`connect` scenario measures that half on its own so it can be subtracted.",
-    "The small-file scenario is **sequential for all three clients**, because this library "
-    "cannot yet overlap files (deferred as D-12). It measures round trips per file, not the "
-    "concurrency the other two could have used.",
+    "The cross-library small-file scenario is **sequential for all three clients**. This "
+    "library can overlap files as of the multiplexing change, and so can the other two -- "
+    "paramiko with a thread per transfer, asyncssh with a task group. Racing our concurrent "
+    "path against their sequential one would measure a feature gap while looking like a speed "
+    "gap, so the comparison row stays sequential and the concurrency gain is measured "
+    "separately, against ourselves.",
+    "The `concurrent` small-file row is **gantry-sftp against gantry-sftp**, like the atomic "
+    "publish row: same files, same one connection, sequential versus overlapped. It is not a "
+    "claim about the other two libraries.",
     "Our upload row is `atomic=False, fsync=False`, which is the work the other two do. What "
     "our default costs is the separate `atomic publish` scenario.",
 )
@@ -221,6 +235,57 @@ async def _scenario_small_files(
     return measurements
 
 
+async def _scenario_small_files_concurrent(
+    clients: Sequence[Client], sources: Sequence[Path], workdir: Path, count: int
+) -> list[Measurement]:
+    """What multiplexing is worth on this link, measured against ourselves.
+
+    Us against us, for the same reason the atomic-publish row is: the other two libraries can
+    be driven concurrently as well, so a row pitting our task group against their `for` loop
+    would be a feature gap dressed as a speed gap. The cross-library row above stays
+    sequential and honest; this one answers the separate question of what the change bought.
+
+    The sequential half is re-measured here rather than reused from that row, because the two
+    would otherwise be comparable only if nothing about the link had drifted in between.
+    """
+    gantry = next((c for c in clients if isinstance(c, GantryClient)), None)
+    if gantry is None:  # pragma: no cover - gantry_sftp is always importable here
+        return []
+    chosen = list(sources[:count])
+    scenario = f"download {count} x 8 KiB, one connection"
+
+    one_at_a_time = workdir / "gantry-seq"
+    all_at_once = workdir / "gantry-conc"
+    one_at_a_time.mkdir(exist_ok=True)
+    all_at_once.mkdir(exist_ok=True)
+
+    measurements = [
+        await take_samples(
+            lambda: gantry.download_many(chosen, one_at_a_time),
+            scenario=scenario,
+            client="gantry-sftp (sequential)",
+            repeats=REPEATS,
+        ),
+        await take_samples(
+            lambda: gantry.download_many_concurrently(
+                chosen, all_at_once, concurrency=SMALL_FILE_CONCURRENCY
+            ),
+            scenario=scenario,
+            client=f"gantry-sftp ({SMALL_FILE_CONCURRENCY} at once)",
+            repeats=REPEATS,
+        ),
+    ]
+    # Both halves verified, not just the interesting one. A concurrent path that quietly
+    # dropped or interleaved bytes would report a speedup for work it did not do -- and
+    # out-of-order reassembly across several transfers is exactly where that would happen.
+    for into in (one_at_a_time, all_at_once):
+        for source in chosen:
+            assert _identical(into / source.name, source), (
+                f"{into.name} produced the wrong bytes for {source.name}"
+            )
+    return measurements
+
+
 async def _scenario_atomic(
     clients: Sequence[Client], source: Path, upload_dir: Path
 ) -> list[Measurement]:
@@ -327,6 +392,17 @@ async def test_benchmark_profile(
                 baseline_client=BASELINE,
             )
         )
+        overlapped = await _scenario_small_files_concurrent(
+            clients, small, tmp_path, profile.small_files
+        )
+        if overlapped:
+            sections.append(
+                render_scenario(
+                    f"download {profile.small_files} x 8 KiB, one connection",
+                    overlapped,
+                    baseline_client="gantry-sftp (sequential)",
+                )
+            )
     atomic = await _scenario_atomic(clients, upload_source, upload_dir)
     if atomic:
         sections.append(

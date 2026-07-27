@@ -12,9 +12,10 @@ Nothing here is allowed to *fail* because a dependency is missing. It skips, wit
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack
+from collections.abc import AsyncGenerator, Callable, Iterator
+from contextlib import ExitStack, asynccontextmanager
 
+import anyio
 import pytest
 from netem import ShapedLink, release_loopback, shape, unavailable_reason
 from sshd import (
@@ -26,9 +27,17 @@ from sshd import (
 )
 
 from gantry_sftp.codec import Codec, CodecState
+from gantry_sftp.exceptions import flatten_exception_group
+from gantry_sftp.session import Dispatcher
 from gantry_sftp.transport import Transport, open_ssh_transport
 
-__all__ = ["SSHServer", "connect", "negotiate", "scrubbed_ssh_env"]
+__all__ = [
+    "SSHServer",
+    "connect",
+    "negotiate",
+    "running_dispatcher",
+    "scrubbed_ssh_env",
+]
 
 
 def connect(server: SSHServer, **overrides):
@@ -45,6 +54,29 @@ async def negotiate(transport: Transport, codec: Codec) -> None:
     await transport.send(codec.initiate())
     while codec.state is not CodecState.READY:
         codec.receive(await transport.receive())
+
+
+@asynccontextmanager
+async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerator[Dispatcher]:
+    """A dispatcher with its reader task running, stopped when the block ends.
+
+    What `open_session` does, minus the handshake, for the lanes that drive `download_handle`
+    directly because they need knobs the session deliberately does not expose. The flatten
+    mirrors production for the reason `flatten_exception_group` exists: a task group wraps
+    even a single failure, and a lane whose assertions stopped matching would report a link
+    problem as a nameless `ExceptionGroup`.
+    """
+    dispatcher = Dispatcher(transport, codec)
+    try:
+        async with anyio.create_task_group() as reader:
+            reader.start_soon(dispatcher.run)
+            try:
+                yield dispatcher
+            finally:
+                dispatcher.close()
+                reader.cancel_scope.cancel()
+    except BaseExceptionGroup as group:
+        raise flatten_exception_group(group) from None
 
 
 @pytest.fixture(params=["asyncio", "trio"])

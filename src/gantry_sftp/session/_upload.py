@@ -54,12 +54,12 @@ from gantry_sftp.exceptions import (
     TransferTimeoutError,
     flatten_exception_group,
 )
+from gantry_sftp.session._dispatch import Dispatcher, Exchange
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
     ProgressCallback,
 )
-from gantry_sftp.transport import Transport
 
 __all__ = ["upload_handle"]
 
@@ -75,8 +75,8 @@ class _Uploader:
 
     def __init__(
         self,
-        transport: Transport,
         codec: Codec,
+        exchange: Exchange,
         handle: bytes,
         fd: int,
         *,
@@ -87,8 +87,8 @@ class _Uploader:
         progress: ProgressCallback | None,
         remote_path: bytes | None,
     ) -> None:
-        self._transport = transport
         self._codec = codec
+        self._exchange = exchange
         self._handle = handle
         self._fd = fd
         self._size = size
@@ -122,11 +122,14 @@ class _Uploader:
                 break
 
             await self._window.acquire()
+            # Recorded before the send, not after it. The drain task runs concurrently, so a
+            # reply can be delivered the moment the write lands -- while this coroutine is
+            # still suspended inside `send` and has not reached the assignment. Registering
+            # afterwards left a window in which a perfectly good acknowledgement looked like
+            # a reply to a write we never sent.
             request_id = self._codec.allocate_request_id()
-            await self._transport.send(
-                self._codec.send(Write(request_id, self._handle, offset, payload))
-            )
             self._outstanding[request_id] = _Chunk(offset, len(payload))
+            await self._exchange.send(Write(request_id, self._handle, offset, payload))
             offset += len(payload)
 
         self._all_sent = True
@@ -134,18 +137,16 @@ class _Uploader:
 
     async def _receive_replies(self) -> None:
         while not self._finished.is_set():
-            for event in self._codec.receive(await self._receive_chunk()):
-                if isinstance(event, Completed):
-                    self._acknowledge(event)
+            self._acknowledge(await self._next_reply())
             if self._progress is not None:
                 self._progress(self._acknowledged, self._size)
 
-    async def _receive_chunk(self) -> bytes:
+    async def _next_reply(self) -> Completed:
         if self._idle_timeout is None:
-            return await self._transport.receive()
+            return await self._exchange.receive()
         try:
             with anyio.fail_after(self._idle_timeout):
-                return await self._transport.receive()
+                return await self._exchange.receive()
         except TimeoutError as exc:
             raise TransferTimeoutError(
                 f"no response from the server for {self._idle_timeout}s with "
@@ -204,8 +205,7 @@ class _Uploader:
 
 
 async def upload_handle(
-    transport: Transport,
-    codec: Codec,
+    dispatcher: Dispatcher,
     handle: bytes,
     source: Path | str,
     *,
@@ -218,8 +218,8 @@ async def upload_handle(
     """Upload ``source`` into an already-open remote file.
 
     Args:
-        transport: Connected transport.
-        codec: Negotiated codec.
+        dispatcher: The session's reader. One exchange is opened for this transfer and
+            retired when it ends, so several of these can run over one connection.
         handle: An open remote file handle, writable.
         source: Local file to read.
         write_length: Payload bytes per request, from
@@ -246,18 +246,19 @@ async def upload_handle(
     fd = os.open(source, os.O_RDONLY)
     try:
         size = os.fstat(fd).st_size
-        uploader = _Uploader(
-            transport,
-            codec,
-            handle,
-            fd,
-            size=size,
-            write_length=write_length,
-            depth=depth,
-            idle_timeout=idle_timeout,
-            progress=progress,
-            remote_path=remote_path,
-        )
-        return await uploader.run()
+        with dispatcher.exchange() as exchange:
+            uploader = _Uploader(
+                dispatcher.codec,
+                exchange,
+                handle,
+                fd,
+                size=size,
+                write_length=write_length,
+                depth=depth,
+                idle_timeout=idle_timeout,
+                progress=progress,
+                remote_path=remote_path,
+            )
+            return await uploader.run()
     finally:
         os.close(fd)

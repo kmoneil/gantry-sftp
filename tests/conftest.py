@@ -8,9 +8,49 @@ packages installed is a test that reports the machine, not the code.
 from __future__ import annotations
 
 import shutil
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 import pytest
+
+from gantry_sftp.codec import Codec
+from gantry_sftp.exceptions import flatten_exception_group
+from gantry_sftp.session import Dispatcher
+from gantry_sftp.transport import Transport
+
+
+@asynccontextmanager
+async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerator[Dispatcher]:
+    """A dispatcher with its reader task running, stopped when the block ends.
+
+    What `open_session` does, minus the handshake, for the tests that drive `download_handle`
+    and `upload_handle` directly. The flatten is not decoration: an anyio task group wraps
+    even a single failure in an `ExceptionGroup`, so without it every
+    `pytest.raises(TransferError)` in this suite would stop matching -- and the ones asserting
+    on a message would fail with a group instead of proving anything.
+    """
+    dispatcher = Dispatcher(transport, codec)
+    try:
+        async with anyio.create_task_group() as reader:
+            reader.start_soon(dispatcher.run)
+            try:
+                yield dispatcher
+            finally:
+                dispatcher.close()
+                reader.cancel_scope.cancel()
+    except BaseExceptionGroup as group:
+        raise flatten_exception_group(group) from None
+
+
+async def negotiate(transport: Transport) -> Codec:
+    """Drive the handshake over an in-process fake and hand back the ready codec."""
+    codec = Codec()
+    await transport.send(codec.initiate())
+    while codec.state.name != "READY":
+        codec.receive(await transport.receive())
+    return codec
 
 
 @pytest.fixture(params=["asyncio", "trio"])

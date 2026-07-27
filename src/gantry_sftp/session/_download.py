@@ -23,6 +23,14 @@ A READ can come back three ways and each needs a decision:
   is re-queued as a fresh read of the missing range, never a restart.
 * **EOF** -- a STATUS, a different frame type entirely. The file ended earlier than its size
   said, which happens when it is being written concurrently.
+
+A consumer, not a driver
+------------------------
+This reads its replies from an :class:`~gantry_sftp.session._dispatch.Exchange` rather than
+from the transport. That is the difference between one download at a time and several: a
+scheduler that calls ``transport.receive()`` itself owns the connection for the duration, and
+a second one running beside it would decode the first one's frames. Here the only thing this
+owns is its own window.
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ from gantry_sftp.codec import (
     StatusCode,
 )
 from gantry_sftp.exceptions import ProtocolError, TransferError, TransferTimeoutError
-from gantry_sftp.transport import Transport
+from gantry_sftp.session._dispatch import Dispatcher, Exchange
 
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
@@ -53,8 +61,6 @@ __all__ = [
     "ProgressCallback",
     "download_handle",
 ]
-
-_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
 
 NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
 """``O_NOFOLLOW`` where the platform has it, and ``0`` where it does not.
@@ -111,16 +117,19 @@ class _Downloader:
     """Drives one file's worth of pipelined reads.
 
     A single task, not a task group: SFTP is request/response over one stream, so there is
-    nothing to run concurrently. Requests are tiny -- around thirty bytes -- so filling the
-    window cannot fill the pipe and deadlock against a server waiting for us to read. That
-    reasoning does *not* carry over to uploads, where the payload travels in the request,
-    and the upload path will need its own answer.
+    nothing *within* one file to run concurrently. Requests are tiny -- around thirty bytes
+    -- so filling the window cannot fill the pipe and deadlock against a server waiting for
+    us to read. That reasoning does *not* carry over to uploads, where the payload travels in
+    the request, and the upload path has its own answer.
+
+    Concurrency across files is a level up: several of these share one connection through the
+    dispatcher, each with its own window and its own exchange.
     """
 
     def __init__(
         self,
-        transport: Transport,
         codec: Codec,
+        exchange: Exchange,
         handle: bytes,
         fd: int,
         *,
@@ -131,8 +140,8 @@ class _Downloader:
         progress: ProgressCallback | None,
         remote_path: bytes | None,
     ) -> None:
-        self._transport = transport
         self._codec = codec
+        self._exchange = exchange
         self._handle = handle
         self._fd = fd
         self._size = size
@@ -173,25 +182,29 @@ class _Downloader:
     async def _fill_window(self) -> None:
         while len(self._outstanding) < self._depth and self._more_to_issue():
             issued = self._next_range()
+            # Allocation and send with no await between them: an id is only reserved once
+            # the codec records it, so a yield here would let a concurrent transfer take
+            # the same one.
             request_id = self._codec.allocate_request_id()
-            await self._transport.send(
-                self._codec.send(Read(request_id, self._handle, issued.offset, issued.length))
-            )
             self._outstanding[request_id] = issued
+            await self._exchange.send(Read(request_id, self._handle, issued.offset, issued.length))
 
-    async def _receive(self) -> list[Completed]:
-        """Read one chunk from the transport and decode whatever it completed.
+    async def _next_reply(self) -> Completed:
+        """Wait for the next reply to one of *our* reads.
+
+        The idle timeout is per transfer rather than per connection, which is what makes it
+        mean the right thing when several transfers share one: a file whose server has
+        stopped answering fails, and its neighbours -- still receiving -- do not.
 
         Raises:
-            TransferTimeout: If nothing arrives within the idle timeout while requests are
-                outstanding.
+            TransferTimeoutError: If nothing arrives within the idle timeout while requests
+                are outstanding.
         """
         try:
             if self._idle_timeout is None:
-                chunk = await self._transport.receive()
-            else:
-                with anyio.fail_after(self._idle_timeout):
-                    chunk = await self._transport.receive()
+                return await self._exchange.receive()
+            with anyio.fail_after(self._idle_timeout):
+                return await self._exchange.receive()
         except TimeoutError as exc:
             raise TransferTimeoutError(
                 f"no response from the server for {self._idle_timeout}s with "
@@ -199,9 +212,6 @@ class _Downloader:
                 transferred=self._written,
                 remote_path=self._remote_path,
             ) from exc
-        # Only Completed events can occur here: the handshake is long finished, and a
-        # second VERSION would have been refused by the codec.
-        return [event for event in self._codec.receive(chunk) if isinstance(event, Completed)]
 
     def _write_at(self, offset: int, payload: memoryview) -> int:
         """Write ``payload`` at an explicit offset, looping over short writes.
@@ -264,8 +274,7 @@ class _Downloader:
             await self._fill_window()
             if not self._outstanding:
                 break
-            for event in await self._receive():
-                self._dispatch(event)
+            self._dispatch(await self._next_reply())
             if self._progress is not None:
                 self._progress(self._written, self._size)
 
@@ -273,8 +282,7 @@ class _Downloader:
 
 
 async def download_handle(
-    transport: Transport,
-    codec: Codec,
+    dispatcher: Dispatcher,
     handle: bytes,
     fd: int,
     *,
@@ -294,8 +302,8 @@ async def download_handle(
     allowed to be, and a scheduler with an fd can just as well write into a pipe.
 
     Args:
-        transport: Connected transport.
-        codec: Negotiated codec.
+        dispatcher: The session's reader. One exchange is opened for this transfer and
+            retired when it ends, so several of these can run over one connection.
         handle: An open remote file handle.
         fd: Writable file descriptor. Written at explicit offsets, never seeked, and not
             closed here -- whoever opened it owns it.
@@ -321,19 +329,20 @@ async def download_handle(
     if read_length < 1:
         raise ValueError(f"read_length must be at least 1, got {read_length}")
 
-    downloader = _Downloader(
-        transport,
-        codec,
-        handle,
-        fd,
-        size=size,
-        read_length=read_length,
-        depth=depth,
-        idle_timeout=idle_timeout,
-        progress=progress,
-        remote_path=remote_path,
-    )
-    return await downloader.run()
+    with dispatcher.exchange() as exchange:
+        downloader = _Downloader(
+            dispatcher.codec,
+            exchange,
+            handle,
+            fd,
+            size=size,
+            read_length=read_length,
+            depth=depth,
+            idle_timeout=idle_timeout,
+            progress=progress,
+            remote_path=remote_path,
+        )
+        return await downloader.run()
 
 
 ProgressReporter = Callable[[int, int | None], None]

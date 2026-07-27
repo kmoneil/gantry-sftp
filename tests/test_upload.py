@@ -7,10 +7,10 @@ from pathlib import Path
 
 import anyio
 import pytest
+from tests.conftest import negotiate, running_dispatcher
 
 from gantry_sftp.codec import (
     Close,
-    Codec,
     FrameSplitter,
     Handle,
     Init,
@@ -110,24 +110,16 @@ class WritableServer:
         return
 
 
-async def negotiated(server: WritableServer) -> Codec:
-    codec = Codec()
-    await server.send(codec.initiate())
-    while codec.state.name != "READY":
-        codec.receive(await server.receive())
-    return codec
-
-
 async def push(server: WritableServer, source: Path, **kwargs) -> int:
-    codec = await negotiated(server)
-    return await upload_handle(
-        server,  # type: ignore[arg-type]
-        codec,
-        HANDLE,
-        source,
-        write_length=kwargs.pop("write_length", 64),
-        **kwargs,
-    )
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+        return await upload_handle(
+            dispatcher,
+            HANDLE,
+            source,
+            write_length=kwargs.pop("write_length", 64),
+            **kwargs,
+        )
 
 
 # --- the happy path -----------------------------------------------------------------------

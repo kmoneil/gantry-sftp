@@ -41,7 +41,7 @@ from pathlib import Path
 import pytest
 from netem import measure_rtt_ms, shape
 
-from conftest import connect, negotiate
+from conftest import connect, negotiate, running_dispatcher
 from gantry_sftp.codec import Close, Codec, Handle, Open, OpenFlag
 from gantry_sftp.session import (
     DEFAULT_PIPELINE_DEPTH,
@@ -132,15 +132,15 @@ async def timed_download(
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         started = time.perf_counter()
         try:
-            written = await download_handle(
-                transport,
-                codec,
-                opened.handle,
-                fd,
-                size=size,
-                read_length=read_length,
-                depth=depth,
-            )
+            async with running_dispatcher(transport, codec) as dispatcher:
+                written = await download_handle(
+                    dispatcher,
+                    opened.handle,
+                    fd,
+                    size=size,
+                    read_length=read_length,
+                    depth=depth,
+                )
         finally:
             os.close(fd)
         elapsed = time.perf_counter() - started

@@ -51,6 +51,9 @@ exists today:
   go up as well as down, and come back off again
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
+- **one session, many transfers at once**: a single reader task routes each reply to whichever
+  operation asked for it, so `get`/`put` overlap over one channel instead of queueing behind
+  a lock
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
@@ -62,7 +65,7 @@ exists today:
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
 host-key verification and public-key authentication all done by OpenSSH, and no cryptography in
 this package. It is also now measured against the alternatives — on a shaped link it downloads
-1.6–2.6× faster than paramiko and 1.1–1.4× faster than asyncssh, it is *slower* to connect, and
+1.6–3.2× faster than paramiko and 1.1–1.4× faster than asyncssh, it is *slower* to connect, and
 it wins nothing on CPU. All three of those are below, including the two that do not flatter it.
 It moves files:
 
@@ -71,6 +74,7 @@ import anyio
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import open_ssh_transport
 
+
 async def main():
     async with (
         open_ssh_transport("example.com", user="bob") as transport,
@@ -78,20 +82,56 @@ async def main():
     ):
         await sftp.get("/remote/data.parquet", "data.parquet")
         result = await sftp.put("report.csv", "/remote/report.csv")
-        print(result.mechanism, result.atomic)   # posix-rename True
+        print(result.mechanism, result.atomic)  # posix-rename True
+
 
 anyio.run(main)
 ```
 
 Not yet: `glob`, resume, retry, the fsspec adapter, `SFTPPath`, or the generated sync API. The
 names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not exist yet — `open_session` is
-the current spelling.
+the current spelling, and concurrency is spelled with your own task group rather than a
+`concurrency=` argument.
+
+## Many transfers, one connection
+
+```python
+async with anyio.create_task_group() as group:
+    for name in names:
+        group.start_soon(sftp.get, f"/incoming/{name}", local / name)
+```
+
+SFTP correlates replies by request id, so one channel carries as many operations as you care
+to start. This library reads that channel in exactly one task and hands each reply to the
+operation that asked for it, which is what makes the above safe. There is no `concurrency=`
+knob: how many transfers to have in flight is a decision about the far end — its handle
+limits, its patience, its disks — and a task group already expresses it.
+
+Three things worth knowing before you fan out:
+
+- **It reaches the window; it does not lift it.** `ssh -s sftp` runs the subsystem on one SSH
+  channel, so one session is one 2 MiB window (measured — below) shared by everything on it.
+  What concurrency buys is getting *to* that ceiling: a 64 KiB file has 64 KiB to put in
+  flight and a hundred of them have more, and the round trips of a sequential
+  `OPEN`/`READ`/`CLOSE` per file are time the link spends idle. Going past 2 MiB needs a
+  second transport — another `ssh` child, another channel — which is not built.
+- **A task group you open wraps its errors, and that is anyio's contract, not a bug.** One
+  `await sftp.get(...)` raises `NoSuchFileError` flat, because the library unwraps the groups
+  it runs internally. Fan out with your own group and you catch with `except*`. `examples/`
+  shows both.
+- **One operation is one consumer.** Two tasks may each run a `get`; two tasks driving *the
+  same* `get` is not a thing.
+
+`get_tree()` and `put_tree()` still transfer sequentially inside themselves — a walk that
+runs ahead of its transfers needs bounded back-pressure, and a per-file progress callback
+means little when several files report at once. Both are follow-on work; fan out over `get`
+and `put` in the meantime.
 
 ## Listing
 
 ```python
 for entry in await sftp.listdir("/incoming"):
-    print(entry.kind, entry.size, entry.name)   # directory 4096 archive
+    print(entry.kind, entry.size, entry.name)  # directory 4096 archive
 ```
 
 Three things this does differently from the tools you have used:
@@ -115,8 +155,8 @@ many entries a batch holds (OpenSSH: 100).
 
 ```python
 result = await sftp.get_tree("/incoming", "downloads/")
-result.files, result.directories, result.transferred   # 3 2 2520
-result.complete                                        # False -- read result.skipped
+result.files, result.directories, result.transferred  # 3 2 2520
+result.complete  # False -- read result.skipped
 ```
 
 **Every name the server supplies is validated before it becomes a local path**, and the
@@ -199,12 +239,12 @@ happened.
 ```python
 result = await sftp.put("report.csv", "/incoming/report.csv")
 
-result.transferred   # 41310
-result.mechanism     # posix-rename | rename | remove-rename | in-place
-result.durability    # fsynced | unavailable | skipped
-result.atomic        # True — no consumer could observe a partial destination
-result.durable       # True — the bytes reached stable storage before the rename
-result.staged_at     # b'/incoming/.report.csv.20b59c88.part'
+result.transferred  # 41310
+result.mechanism  # posix-rename | rename | remove-rename | in-place
+result.durability  # fsynced | unavailable | skipped
+result.atomic  # True — no consumer could observe a partial destination
+result.durable  # True — the bytes reached stable storage before the rename
+result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
 ```
 
 | Mechanism       | When                                                      | Atomic                          |
@@ -223,12 +263,12 @@ experiment that costs a nine-gigabyte upload first.
 Refusing to downgrade is one flag, and it fails before moving any bytes where it can:
 
 ```python
-await sftp.put(src, dst, require_atomic=True)   # CapabilityError rather than remove-rename
-await sftp.put(src, dst, require_fsync=True)    # CapabilityError rather than no durability
-await sftp.put(src, dst, atomic=False)          # in place, for a write-only drop directory
-await sftp.put(src, dst, staging_name=b"x.tmp") # servers that forbid dot-files, or mandate a
-                                                # staging directory (same filesystem, or the
-                                                # rename fails)
+await sftp.put(src, dst, require_atomic=True)  # CapabilityError rather than remove-rename
+await sftp.put(src, dst, require_fsync=True)  # CapabilityError rather than no durability
+await sftp.put(src, dst, atomic=False)  # in place, for a write-only drop directory
+await sftp.put(src, dst, staging_name=b"x.tmp")  # servers that forbid dot-files, or mandate a
+# staging directory (same filesystem, or the
+# rename fails)
 ```
 
 Three limits stated rather than implied. `fsync@openssh.com` flushes the *file*; SFTP has no
@@ -259,11 +299,11 @@ try:
     async with open_ssh_transport("example.com", user="bob") as t, open_session(t) as sftp:
         ...
 except AuthenticationError as e:
-    ...   # credentials refused
+    ...  # credentials refused
 except HostKeyError as e:
-    ...   # the server's identity was not accepted -- do not retry blindly
+    ...  # the server's identity was not accepted -- do not retry blindly
 except ConnectError as e:
-    print(e.stderr)   # OpenSSH's own words, verbatim
+    print(e.stderr)  # OpenSSH's own words, verbatim
 ```
 
 paramiko answers this question with `Error reading SSH protocol banner`. OpenSSH knew exactly
@@ -327,9 +367,11 @@ follow, and they are worth knowing before you tune anything:
 - **`sftp(1)`'s defaults are not timid.** `-R 64 -B 32768` is exactly the channel window.
   What this library fixes is clients that never reach 2 MiB, not `sftp(1)`'s inability to
   exceed it.
-- **Past 2 MiB the lever is concurrency, not depth.** One window per channel, so moving
-  several files at once is a throughput feature and not only a small-file one. Raising depth
-  beyond the window buys memory consumption and nothing else.
+- **Past 2 MiB the lever is more channels, not more depth.** Raising depth beyond the window
+  buys memory consumption and nothing else. Concurrent transfers over one session now work,
+  and they help by *reaching* the window rather than exceeding it — one `ssh` child is one
+  channel is one window. A second connection is what gets a second window, and this library
+  does not manage a pool of them yet.
 - **It is not OpenSSH's idiosyncrasy — it is the ecosystem's default.** Read off the sources
   while building the benchmark: `paramiko.transport.DEFAULT_WINDOW_SIZE` is 2097152 with a
   32768 max packet, and `asyncssh.connection._DEFAULT_WINDOW` is `2*1024*1024` with the same
@@ -347,20 +389,29 @@ the bytes it moved. Against **paramiko 5.0.0** and **asyncssh 2.24.0** on OpenSS
 
 | scenario | vs paramiko | vs asyncssh |
 | -------- | ----------- | ----------- |
-| download 16 MiB | **1.6–2.6× faster** | 1.1–1.4× faster |
-| upload 16 MiB | 1.2–1.5× faster | up to 1.2×, level on the rate-limited profile |
+| download 16 MiB | **1.6–3.2× faster** | 1.1–1.4× faster |
+| upload 16 MiB | 1.2–1.5× faster | up to 1.5×, level on the rate-limited profile |
 | 100 × 8 KiB sequential | ~1.5× faster | **a tie** |
 | connect and close | **1.2–1.4× slower** | **1.2–2.1× slower** |
 | CPU per MiB, download | about the same | **1.2–1.6× worse** |
 | CPU per MiB, upload | 1.1–1.6× better | mixed, 0.7–1.4× |
 
 Ratios across 5, 50 and 200 ms RTT plus a 100 Mbit/s rate-limited profile, taken as the
-**union of two full runs** rather than the best one. That widening is not padding: the first
-run put the download range at 1.9–2.6× and the second at 1.6–2.3×, because paramiko's 200 ms
-row is genuinely noisy (its spread column reached 2.06 while ours stayed near 1.1). A range
-that only one run reproduces is a number with an expiry date on it. Absolute figures, the exact
-host and the full caveats are in the report the suite writes; re-run it with
-`pytest benchmarks/ -s` and it re-derives all of them.
+**union of three full runs** rather than the best one. That widening is not padding: the runs
+put the download range at 1.9–2.6×, then 1.6–2.3×, then 1.6–3.2×, because paramiko's 200 ms row
+is genuinely noisy — its spread column has reached 3.67 across those runs while ours stayed near
+1.1. A range that only one run reproduces is a number with an expiry date on it, and the widest
+ratio in that table is drawn from the least stable row. Absolute figures, the exact host and the
+full caveats are in the report the suite writes; re-run it with `pytest benchmarks/ -s` and it
+re-derives all of them.
+
+**Concurrency, measured against ourselves.** The same small-file corpus over one connection,
+eight transfers at a time against one at a time: **3.1× on unshaped loopback, 9.1× at 5 ms RTT
+and 8.0× at 50 ms**, with CPU per MiB *lower* rather than higher. Us against us, deliberately —
+paramiko and asyncssh can be driven concurrently too, so racing our task group against their
+`for` loop would measure a feature gap while looking like a speed gap, and the cross-library row
+above stays sequential for all three. The gain is round trips, which is why it grows with
+latency and why the unshaped number is the smallest one here.
 
 Two of those rows are not the ones a pitch would choose, and they are the interesting ones.
 
