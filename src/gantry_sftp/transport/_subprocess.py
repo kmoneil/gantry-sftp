@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import override
@@ -43,6 +43,11 @@ __all__ = [
 ]
 
 _TERMINATE_GRACE_SECONDS = 5.0
+
+# Named once because every exit from a closed transport must read identically: the message
+# is asserted verbatim by the tests, and three hand-written copies are three chances for one
+# of them to drift into a message no `except` clause and no test is looking for.
+_CLOSED_MESSAGE = "transport is closed"
 
 _STDERR_HEAD_BYTES = 8 * 1024
 _STDERR_TAIL_BYTES = 56 * 1024
@@ -186,7 +191,7 @@ class SubprocessTransport:
     async def send(self, data: bytes | memoryview) -> None:
         """Write ``data`` to the child's stdin, in full."""
         if self._closed:
-            raise self._connection_lost("transport is closed")
+            raise self._connection_lost(_CLOSED_MESSAGE)
         stdin = self._process.stdin
         if stdin is None:  # pragma: no cover -- always piped by the openers here
             raise self._connection_lost("transport has no stdin")
@@ -204,7 +209,7 @@ class SubprocessTransport:
                 its reason to stderr and then closes stdout, so the two arrive together.
         """
         if self._closed:
-            raise self._connection_lost("transport is closed")
+            raise self._connection_lost(_CLOSED_MESSAGE)
         stdout = self._process.stdout
         if stdout is None:  # pragma: no cover -- always piped by the openers here
             raise self._connection_lost("transport has no stdout")
@@ -217,7 +222,7 @@ class SubprocessTransport:
                 await self._process.wait()
             raise self._connection_lost("connection closed by the remote end") from exc
         except anyio.ClosedResourceError as exc:
-            raise self._connection_lost("transport is closed") from exc
+            raise self._connection_lost(_CLOSED_MESSAGE) from exc
 
     async def aclose(self) -> None:
         """Close stdin and make sure the child is gone.
@@ -277,7 +282,7 @@ async def _open_process_transport(
     *,
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
-) -> AsyncIterator[SubprocessTransport]:
+) -> AsyncGenerator[SubprocessTransport]:
     """Spawn ``argv``, wire up the stderr drain, and guarantee the child is reaped."""
     stderr = StderrBuffer()
     try:
@@ -334,7 +339,7 @@ async def open_ssh_transport(
     subsystem: str = DEFAULT_SUBSYSTEM,
     ssh_executable: str | None = None,
     env: Mapping[str, str] | None = None,
-) -> AsyncIterator[SubprocessTransport]:
+) -> AsyncGenerator[SubprocessTransport]:
     """Open an SFTP byte stream by spawning ``ssh -s sftp``.
 
     Arguments are validated and assembled by
@@ -381,7 +386,7 @@ async def open_local_server_transport(
     server_path: str | os.PathLike[str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
-) -> AsyncIterator[SubprocessTransport]:
+) -> AsyncGenerator[SubprocessTransport]:
     """Open an SFTP byte stream by spawning ``sftp-server`` directly. No ``ssh``, no network.
 
     The equivalent of ``sftp(1) -D``. Everything runs as the current user with no

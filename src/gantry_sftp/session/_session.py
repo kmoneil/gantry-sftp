@@ -16,7 +16,7 @@ that into real per-file concurrency is registered as deferred work, not pretende
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -1502,7 +1502,7 @@ async def open_session(
     request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
     depth: int = DEFAULT_PIPELINE_DEPTH,
-) -> AsyncIterator[Session]:
+) -> AsyncGenerator[Session]:
     """Perform the handshake over ``transport`` and yield a ready session.
 
     Args:

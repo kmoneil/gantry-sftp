@@ -48,6 +48,10 @@ __all__ = [
 
 DEFAULT_SUBSYSTEM = "sftp"
 
+# The bare Windows executable name, used both as the PATH-resolved fallback and as the leaf
+# of the absolute candidates below.
+_WINDOWS_SSH_EXE = "ssh.exe"
+
 DEFAULT_SSH_OPTIONS: Mapping[str, str] = {
     # No prompting. A hung transfer waiting on an invisible password prompt is the single
     # most common way an automated SFTP job fails silently.
@@ -181,16 +185,16 @@ def resolve_ssh_executable(
     environ = os.environ if environ is None else environ
     system_root = environ.get("SystemRoot") or environ.get("SYSTEMROOT")
     if not system_root:
-        return "ssh.exe"
+        return _WINDOWS_SSH_EXE
 
     # A 32-bit process gets SysWOW64 when it asks for System32; SysNative is the alias that
     # reaches the real one. A 64-bit process has no SysNative, so it is not a valid guess
     # there -- hence checking rather than assuming.
     for directory in ("SysNative", "System32"):
-        candidate = Path(system_root) / directory / "OpenSSH" / "ssh.exe"
+        candidate = Path(system_root) / directory / "OpenSSH" / _WINDOWS_SSH_EXE
         if candidate.exists():
             return str(candidate)
-    return "ssh.exe"
+    return _WINDOWS_SSH_EXE
 
 
 def build_ssh_argv(
