@@ -251,16 +251,35 @@ class Codec:
         Returns:
             Events in wire order. Empty if ``data`` did not finish a frame.
 
+            **Events decoded before a failing frame in the same chunk are discarded with the
+            error**, and that is a decision rather than an oversight. One call cannot return
+            a value and raise, the connection is terminal either way, and the discard costs
+            an operation that really did complete being reported as failed -- which is the
+            safe direction. Reporting the reverse is what this class exists to prevent.
+
         Raises:
-            ProtocolError: On a malformed frame, a packet illegal in the current state, or
-                a reply that matches no outstanding request. All are terminal.
+            ProtocolError: On a malformed frame, a packet illegal in the current state, or a
+                reply that matches no outstanding request. All are terminal: the codec moves
+                to :attr:`CodecState.FAILED` and every later call raises.
         """
         if self._state is CodecState.FAILED:
             raise ProtocolError("codec is in a failed state; the connection is not recoverable")
 
         events: list[Event] = []
-        for frame in self._splitter.feed(data):
-            events.append(self._handle(decode(frame)))
+        try:
+            for frame in self._splitter.feed(data):
+                events.append(self._handle(decode(frame)))
+        except ProtocolError:
+            # Three sources, one consequence. `_handle` fails the codec for the cases it owns
+            # -- a reply nobody asked for, a second VERSION, a server-sent request -- and
+            # until 0.8 the other two were not covered at all: a length the splitter rejects
+            # and a body the decoder cannot parse both left the state at READY, so the next
+            # `receive()` carried on reading a stream whose frame boundaries are no longer
+            # known. That does not surface as an error; it surfaces as replies correlated to
+            # the wrong requests, which is a DATA payload written at another request's offset
+            # -- a file of exactly the right length with the wrong contents.
+            self._state = CodecState.FAILED
+            raise
         return events
 
     def _handle(self, packet: object) -> Event:

@@ -331,6 +331,7 @@ result = await sftp.put("report.csv", "/incoming/report.csv")
 result.transferred  # 41310
 result.mechanism  # posix-rename | rename | remove-rename | in-place
 result.durability  # fsynced | unavailable | skipped
+result.size_check  # matched | unavailable — rung 3, below
 result.atomic  # True — no consumer could observe a partial destination
 result.durable  # True — the bytes reached stable storage before the rename
 result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
@@ -428,6 +429,31 @@ Three rungs, and the library is explicit about which one you actually got:
 **Rung 3 is what you get by default, everywhere**, because OpenSSH does not implement
 `check-file` — it answers `OP_UNSUPPORTED` under all three spellings. Calling a size
 comparison a "verified transfer" is the sort of thing this library exists to stop doing.
+
+Rung 3 is not free of decisions, so here is what it actually does:
+
+| | `get()` | `put()` |
+| --- | --- | --- |
+| what it compares | bytes that arrived vs. the size the `STAT` reported | the local file's length vs. what the server says it holds |
+| when | after the transfer | **before the rename**, against the staging file, so a short upload never becomes the destination — in place, necessarily after |
+| cost | nothing; `get` already makes that `STAT` | one extra `STAT` |
+| on mismatch | `TransferError` carrying both paths and the offset | `TransferError`; the staging file is removed and the destination is left alone |
+| server won't report a size | check skipped, download still succeeds | `result.size_check` is `unavailable` |
+| turning it off | `get(..., verify_size=False)` | no flag — see below |
+
+```python
+result = await sftp.put("report.csv", "/incoming/report.csv")
+result.size_check  # matched | unavailable
+```
+
+An early `EOF` and a short `DATA` are both *legal*, so nothing below `get()` is entitled to
+treat one as an error — which is exactly why a truncating server used to produce a short file
+and a successful call. `verify_size=False` exists for reading something that is genuinely
+changing size underneath you, and makes the result a snapshot of unknown completeness.
+
+There is no matching flag on `put()`: we control the source there, so a length disagreement is
+wrong every time, and `SizeCheck` has no `skipped` value as a result. The cost is one `STAT`
+per upload.
 
 ```python
 handle = await sftp.open("/incoming/big.iso")

@@ -34,6 +34,7 @@ __all__ = [
     "MAX_STAGED_NAME_LENGTH",
     "Durability",
     "PublishMechanism",
+    "SizeCheck",
     "UploadResult",
     "split_parent",
     "staged_path",
@@ -99,6 +100,46 @@ class Durability(StrEnum):
     """Not attempted, because the caller passed ``fsync=False``."""
 
 
+class SizeCheck(StrEnum):
+    """Whether the published file's length was confirmed against the local file's.
+
+    This is rung 3 of DESIGN.md 6's verification ladder, the one that section says runs
+    *always*. Until 0.8 it ran nowhere, so a truncated upload published successfully and a
+    short download returned successfully -- while four documents said a size check had
+    happened. Two values rather than a boolean because "the server would not say" is a
+    different fact from "the lengths agreed", and a caller who cares needs to tell them apart.
+
+    A **mismatch** is not one of the values. It raises
+    :class:`~gantry_sftp.exceptions.TransferError` instead, because a file of the wrong
+    length is not a result to report -- and on the atomic path the check runs before the
+    rename, so the destination is never published at all.
+
+    Unlike :class:`Durability` there is no ``SKIPPED``, and that is a decision. Section 6 says
+    *always*, and on the upload side we control the source: a local file whose length
+    disagrees with what the server ended up holding is wrong every time, with none of the
+    "the remote file is legitimately changing" cases that earn ``get`` its ``verify_size``
+    flag. The cost is one ``STAT`` per upload, stated here rather than discovered. An opt-out
+    was considered and deferred rather than dropped -- ``put`` is already at the
+    ten-argument ceiling, and `pyproject.toml`'s note on that ceiling says a function wanting
+    more is doing too much, so the flag belongs with the signature rework rather than with a
+    raised limit.
+
+    What it catches is truncation, and nothing else. It is not a hash. A size check that gets
+    described as a verified transfer is the thing this library exists to stop doing.
+    """
+
+    MATCHED = "matched"
+    """The server reported a length and it equalled the local file's."""
+
+    UNAVAILABLE = "unavailable"
+    """Nothing could be compared: the server refused the ``STAT``, or answered one carrying no
+    size. Both collapse here because the consequence is identical -- the length is unknown --
+    and neither fails the upload, for the reason the ``limits`` probe does not fail a
+    connection: a measurement that cannot be taken is not evidence that the thing being
+    measured is broken. Rare in practice; OpenSSH, asyncssh and paramiko all report a size.
+    The honest answer where it happens is that rung 3 was not available, not that it passed."""
+
+
 @dataclass(frozen=True, slots=True)
 class UploadResult:
     """What one ``put`` actually did.
@@ -113,6 +154,9 @@ class UploadResult:
         remote_path: Where the file ended up.
         mechanism: How it got there.
         durability: Whether it was flushed before being published.
+        size_check: Whether the length was confirmed against the local file. A mismatch
+            raises rather than appearing here, so this never says "wrong" -- only whether
+            the question was asked and answerable.
         staged_at: The temp path the bytes were written to first, or ``None`` when they were
             written straight to :attr:`remote_path`. Kept because a failure leaves it behind
             and something has to be able to name it.
@@ -122,6 +166,7 @@ class UploadResult:
     remote_path: bytes
     mechanism: PublishMechanism
     durability: Durability
+    size_check: SizeCheck
     staged_at: bytes | None = None
 
     @property

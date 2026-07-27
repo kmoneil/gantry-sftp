@@ -70,6 +70,9 @@ def test_the_publish_example_reports_the_mechanism_it_used():
     assert returncode == 0
     assert "mechanism=posix-rename" in stdout
     assert "durability=fsynced" in stdout
+    # Rung 3 of DESIGN.md 6's ladder, against a real sftp-server: the published length was
+    # confirmed against the local file's before the rename ran.
+    assert "size=matched" in stdout
     assert "mechanism=in-place" in stdout
 
 

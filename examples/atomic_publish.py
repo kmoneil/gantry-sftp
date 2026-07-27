@@ -46,7 +46,7 @@ def describe(result: UploadResult) -> str:
     return (
         f"{result.transferred} bytes -> {result.remote_path.decode()}  "
         f"mechanism={result.mechanism}  durability={result.durability}  "
-        f"atomic={result.atomic}  durable={result.durable}"
+        f"size={result.size_check}  atomic={result.atomic}  durable={result.durable}"
     )
 
 

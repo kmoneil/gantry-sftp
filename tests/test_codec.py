@@ -374,12 +374,72 @@ def test_the_codec_is_terminal_after_a_protocol_error():
     assert exc.value.args[0] == "codec is in a failed state; the connection is not recoverable"
 
 
-def test_a_malformed_frame_fails_the_codec_permanently():
+# Each entry is a chunk the codec must refuse *and* be finished by. The four cover both
+# sources that were missed until 0.8 -- the splitter's own length rejections and the
+# decoder's -- because `_handle` was the only path that ever reached `_fail`.
+MALFORMED_CHUNKS = [
+    pytest.param(b"\x00\x00\x00\x02\x7f\x00", id="unknown-packet-type"),
+    pytest.param(b"\x00\x00\x00\x04\x65\x00\x00\x00", id="truncated-status-body"),
+    pytest.param(b"\x00\x00\x00\x00", id="zero-length-frame"),
+    pytest.param((_codec.DEFAULT_MAX_FRAME_LENGTH + 1).to_bytes(4, "big"), id="over-ceiling"),
+]
+
+
+@pytest.mark.parametrize("chunk", MALFORMED_CHUNKS)
+def test_a_malformed_frame_fails_the_codec_permanently(chunk: bytes):
+    # The previous version of this test asserted only that two calls raised, and its second
+    # `pytest.raises` caught "server sent Status for request id 1, which is not outstanding"
+    # -- request 1 was never sent, so it raised for a reason that has nothing to do with the
+    # malformed frame. It passed identically with the bug present and with it fixed. The
+    # request is now genuinely outstanding, so a failed state is the only thing left to
+    # refuse it, and the message is pinned.
+    codec = negotiated_codec()
+    codec.send(Stat(1, b"/x"))
+
+    with pytest.raises(ProtocolError):
+        codec.receive(chunk)
+    assert codec.state is CodecState.FAILED
+
+    with pytest.raises(ProtocolError) as exc:
+        codec.receive(encode(Status(1, StatusCode.OK)))
+    assert exc.value.args[0] == "codec is in a failed state; the connection is not recoverable"
+
+
+@pytest.mark.parametrize("chunk", MALFORMED_CHUNKS)
+def test_sending_after_a_malformed_frame_is_refused(chunk: bytes):
     codec = negotiated_codec()
     with pytest.raises(ProtocolError):
-        codec.receive(b"\x00\x00\x00\x02\x7f\x00")  # unknown packet type
-    with pytest.raises(ProtocolError):
-        codec.receive(encode(Status(1, StatusCode.OK)))
+        codec.receive(chunk)
+    with pytest.raises(ProtocolError) as exc:
+        codec.send(Stat(1, b"/a"))
+    assert exc.value.args[0] == "codec is in a failed state; the connection is not recoverable"
+
+
+def test_a_good_frame_ahead_of_a_bad_one_is_discarded_with_the_error():
+    # The documented decision, pinned so it is a decision rather than an accident. One call
+    # cannot both return a value and raise; the connection is terminal either way; and
+    # discarding costs a completed operation being reported as failed, which is the safe
+    # direction. The dangerous direction -- reporting a failed operation as done -- is what
+    # the FAILED latch exists to prevent, and it is asserted on the next line.
+    codec = negotiated_codec()
+    codec.send(Stat(1, b"/x"))
+    codec.send(Stat(2, b"/y"))
+
+    good = encode(AttrsReply(1, Attrs(size=7)))
+    with pytest.raises(ProtocolError) as exc:
+        codec.receive(good + b"\x00\x00\x00\x02\x7f\x00")
+    # Prefix rather than the whole string, matching tests/test_packets.py's convention for
+    # this one message: its tail is generated from the packet-type enum, so pinning it here
+    # would break every time a type is added and would assert the enum rather than the
+    # error. The offending value is in the prefix, which is what identifies *which* frame
+    # failed -- the second one, not the first.
+    assert exc.value.args[0].startswith("unknown packet type 127; filexfer v3 defines")
+    assert codec.state is CodecState.FAILED
+
+    # Request 1 was retired on the way past, so it is gone from the outstanding table even
+    # though nobody was told it completed. That is visible rather than hidden: the codec is
+    # FAILED, so no caller can act on the table again.
+    assert codec.outstanding == 1
 
 
 def test_sending_after_failure_is_refused():

@@ -111,6 +111,7 @@ from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._publish import (
     Durability,
     PublishMechanism,
+    SizeCheck,
     UploadResult,
     split_parent,
     staged_path,
@@ -945,12 +946,14 @@ class Session:
         depth: int | None = None,
         no_follow: bool = False,
         resume: bool = False,
+        verify_size: bool = True,
     ) -> int:
         """Download ``remote_path`` to ``local_path``.
 
-        The size is taken from a STAT so the transfer is bounded and the progress callback
-        has a total to report against. A server that declines to report one is fine -- the
-        download reads until EOF instead, at the cost of one extra round trip.
+        The size is taken from a STAT so the transfer is bounded, the progress callback has a
+        total to report against, and -- as of 0.8 -- what arrived is checked against it. A
+        server that declines to report one is fine: the download reads until EOF instead, at
+        the cost of one extra round trip and of rung 3 being unavailable rather than passed.
 
         Args:
             remote_path: Path on the server.
@@ -970,6 +973,20 @@ class Session:
                 remote file, so a local partial longer than the remote file is refused rather
                 than truncated, and a server that will not report a size makes the check
                 impossible and the resume is refused too.
+            verify_size: Refuse a download that ended short of the size the server reported --
+                rung 3 of DESIGN.md 6's ladder. On by default and free: the ``STAT`` it
+                compares against is the one ``get`` already makes.
+
+                What it catches is the case an SFTP client is most likely to get wrong. A
+                short ``DATA`` is legal, and an ``EOF`` arriving before the stated size is
+                legal too, so the scheduler treats both as "stop issuing" rather than as an
+                error -- correct for the scheduler, and on its own it means a truncating
+                appliance or a file being rewritten under us produces a short local file and a
+                *successful* call. Pass ``False`` only when reading something that is
+                genuinely changing size underneath, and know that the result is then a
+                snapshot of unknown completeness.
+
+                It is a length comparison, not a hash: it catches truncation and nothing else.
 
         Returns:
             Bytes written **by this call**. On a resume that is the remainder, not the file's
@@ -978,8 +995,9 @@ class Session:
         Raises:
             NoSuchFileError: If the remote path does not exist.
             ServerError: If the server refuses.
-            TransferError: If the transfer fails partway, or if ``resume`` cannot establish a
-                safe offset.
+            TransferError: If the transfer fails partway, if ``resume`` cannot establish a
+                safe offset, or if ``verify_size`` finds fewer bytes arrived than the server
+                said there were.
         """
         encoded = _encode_path(remote_path)
         attributes = await self.stat(encoded)
@@ -1009,6 +1027,18 @@ class Session:
             await _close_quietly(self, handle)
             raise
         await self.close(handle)
+        # Rung 3, and it costs no round trip: the STAT above is the one `get` already makes.
+        # `start + transferred` rather than `transferred`, because a resume returns only the
+        # remainder and comparing that against the whole file would fail every resume.
+        if verify_size and attributes.size is not None and start + transferred != attributes.size:
+            raise TransferError(
+                f"{encoded!r} is {attributes.size} bytes but the download ended after "
+                f"{start + transferred}; it was truncated or the file shrank underneath it",
+                transferred=start + transferred,
+                offset=start + transferred,
+                remote_path=encoded,
+                local_path=str(local_path),
+            )
         return transferred
 
     async def _download_into(
@@ -1304,14 +1334,25 @@ class Session:
                 payload in memory, so this costs more here than on the download side.
 
         Returns:
-            What actually happened, including which publish mechanism was used.
+            What actually happened, including which publish mechanism was used and whether the
+            length was confirmed.
+
+            **The length is always confirmed**, which is rung 3 of DESIGN.md 6's ladder and
+            has no flag. Under ``atomic`` the check runs against the *staging file, before the
+            rename*, so a truncated upload never becomes the destination; in place it
+            necessarily runs afterwards, because the destination is the file being written.
+            It costs one ``STAT``, and the outcome is
+            :attr:`~gantry_sftp.session.UploadResult.size_check` -- which says ``UNAVAILABLE``
+            rather than success on a server that will not report a length. It catches
+            truncation and nothing else; it is not a hash.
 
         Raises:
             ValueError: If a ``require_*`` flag contradicts the flag it strengthens.
             CapabilityError: If a required guarantee is not available on this server.
             PermissionDeniedError: If the server will not create or write the file.
             ServerError: For any other refusal.
-            TransferError: If the transfer fails partway.
+            TransferError: If the transfer fails partway, or if the published length
+                disagrees with the local file's.
         """
         target = _encode_path(remote_path)
         _check_publish_flags(
@@ -1348,6 +1389,52 @@ class Session:
 
     # --- put, in its two shapes ------------------------------------------------------------
 
+    async def _confirm_size(self, path: bytes, expected: int) -> SizeCheck:
+        """Rung 3 of DESIGN.md 6's ladder: does the remote file have the length it should?
+
+        Args:
+            path: Remote file to measure. On the atomic path this is the *staging* file, so
+                the answer arrives before anything is published.
+            expected: Length it should have -- the local file's size, not the byte count this
+                run moved, which differs under ``resume``.
+
+        Returns:
+            Which of the two answerable outcomes happened. A *mismatch* is not among them.
+
+        Raises:
+            TransferError: If the server reports a length and it is not ``expected``. Raised
+                rather than reported, because there is no useful thing a caller does with a
+                published file of the wrong size, and returning it as a value is how a
+                truncation gets logged and ignored.
+        """
+        # Three states, and the errored one decided explicitly. A server that refuses to STAT
+        # the file it just accepted has told us nothing about its length -- it has not told us
+        # the upload failed. Propagating would replace the diagnosis with an unrelated one on
+        # the very path where the diagnosis matters most: `_publish`'s fallback needs the
+        # rename's refusal to be the error the caller sees. This is the same call
+        # `_confirmed_present` makes for the same reason, and the same one the `limits` probe
+        # makes -- an optional measurement that fails degrades, it does not fail the operation
+        # it was measuring.
+        try:
+            size = (await self.stat(path)).size
+        except ServerError:
+            return SizeCheck.UNAVAILABLE
+        if size is None:
+            # Not a failure either. Every server in the matrix reports one, so this branch
+            # keeps a server we have not met from being refused over a tuning fact -- and it
+            # reports unavailable rather than passed, because a check that could not run did
+            # not run.
+            return SizeCheck.UNAVAILABLE
+        if size != expected:
+            raise TransferError(
+                f"uploaded {expected} bytes but {path!r} is {size} bytes on the server; "
+                f"the transfer was truncated or the file changed underneath it",
+                transferred=size,
+                offset=size,
+                remote_path=path,
+            )
+        return SizeCheck.MATCHED
+
     async def _put_in_place(self, upload: _Upload, target: bytes) -> UploadResult:
         """Write the destination directly, which a consumer can observe half-written.
 
@@ -1366,7 +1453,12 @@ class Session:
         transferred, durability = await self._fill_and_close(
             upload, handle, target, start_offset=start
         )
-        return UploadResult(transferred, target, PublishMechanism.IN_PLACE, durability)
+        # After the fact, necessarily: in place, the destination *is* the file being written,
+        # so there is no earlier moment at which a short write could have been caught. That is
+        # the same trade `atomic=False` already makes, and it is why the atomic path checks
+        # the staging file instead.
+        size_check = await self._confirm_size(target, _local_size(upload.local_path))
+        return UploadResult(transferred, target, PublishMechanism.IN_PLACE, durability, size_check)
 
     async def _put_atomically(
         self, upload: _Upload, target: bytes, staged: bytes, *, require_atomic: bool
@@ -1391,6 +1483,12 @@ class Session:
             transferred, durability = await self._fill_and_close(
                 upload, handle, staged, start_offset=start
             )
+            # Before the rename, deliberately. Checking the *destination* afterwards would
+            # report a truncation that consumers can already see, which is the failure atomic
+            # publish exists to prevent; checking the staging file means a short upload never
+            # becomes the destination at all. A mismatch raises into the cleanup path below,
+            # so the staging file goes and the destination is left alone.
+            size_check = await self._confirm_size(staged, _local_size(upload.local_path))
             mechanism = await self._publish(staged, target, require_atomic=require_atomic)
         except _StagedIsTheOnlyCopyError as lost:
             # Do NOT clean up. The destination has already been removed and this file is the
@@ -1405,7 +1503,7 @@ class Session:
         except BaseException as error:
             await self._discard(staged, error)
             raise
-        return UploadResult(transferred, target, mechanism, durability, staged)
+        return UploadResult(transferred, target, mechanism, durability, size_check, staged)
 
     async def _open_staging_file(self, staged: bytes, target: bytes, *, resume: bool) -> bytes:
         """Create the staging file, or fail in a way that names what to do about it.

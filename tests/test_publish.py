@@ -54,6 +54,7 @@ from gantry_sftp.session import (
     MAX_STAGED_NAME_LENGTH,
     Durability,
     PublishMechanism,
+    SizeCheck,
     UploadResult,
     open_session,
     split_parent,
@@ -158,7 +159,7 @@ def test_a_target_with_no_filename_is_refused():
 def test_every_mechanism_decides_whether_it_was_atomic(mechanism: PublishMechanism, atomic: bool):
     # Parametrised over the whole enum on purpose: a mechanism added later without a decision
     # here is a mechanism whose atomicity nobody stated.
-    result = UploadResult(1, TARGET, mechanism, Durability.FSYNCED)
+    result = UploadResult(1, TARGET, mechanism, Durability.FSYNCED, SizeCheck.MATCHED)
     assert result.atomic is atomic
 
 
@@ -171,7 +172,8 @@ def test_every_mechanism_decides_whether_it_was_atomic(mechanism: PublishMechani
     ],
 )
 def test_every_durability_decides_whether_it_was_durable(durability: Durability, durable: bool):
-    assert UploadResult(1, TARGET, PublishMechanism.RENAME, durability).durable is durable
+    result = UploadResult(1, TARGET, PublishMechanism.RENAME, durability, SizeCheck.MATCHED)
+    assert result.durable is durable
 
 
 def test_the_mechanisms_render_as_the_names_a_log_line_wants():
@@ -424,6 +426,7 @@ async def test_a_default_put_stages_flushes_and_renames(source: Path):
         remote_path=TARGET,
         mechanism=PublishMechanism.POSIX_RENAME,
         durability=Durability.FSYNCED,
+        size_check=SizeCheck.MATCHED,
         staged_at=STAGED,
     )
     assert result.atomic
@@ -444,12 +447,16 @@ async def test_the_order_is_stage_write_flush_close_rename(source: Path):
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         _ = await sftp.put(source, TARGET, staging_name=STAGED)
 
+    # The Stat is rung 3, and it sits between the Close and the rename deliberately: the
+    # length is confirmed on the staging file, so a truncated upload is refused before it can
+    # become the destination rather than reported after a consumer could already read it.
     assert server.kinds() == [
         "Init",
         "Open",
         "Write",
         "fsync@openssh.com",
         "Close",
+        "Stat",
         "posix-rename@openssh.com",
     ]
 
@@ -613,6 +620,7 @@ async def test_without_posix_rename_an_existing_target_costs_a_remove_first(sour
         "Open",
         "Write",
         "Close",
+        "Stat",
         "posix-rename@openssh.com",
         "Rename",
         "LStat",
@@ -876,7 +884,9 @@ async def test_atomic_false_writes_the_destination_directly(source: Path):
     assert not result.atomic
     assert result.staged_at is None
     assert result.durability is Durability.FSYNCED
-    assert server.kinds() == ["Init", "Open", "Write", "fsync@openssh.com", "Close"]
+    # In place the Stat is last and can only be last: the destination *is* the file being
+    # written, so there is no earlier moment at which a short write could have been caught.
+    assert server.kinds() == ["Init", "Open", "Write", "fsync@openssh.com", "Close", "Stat"]
     assert server.opened(OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC) == [TARGET]
 
 
