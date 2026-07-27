@@ -143,6 +143,37 @@ async def test_realpath_resolves_over_a_real_connection(ssh_server):
         assert reply.entries[0].filename.startswith(b"/")
 
 
+async def test_streaming_a_directory_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
+    """A scan that stops mid-directory, with a real SSH channel underneath it.
+
+    The bare-pipe lane cannot show this one. `scandir` abandons a listing with batches still
+    unread and closes the handle underneath them, which over ssh means an OPENDIR, some
+    READDIRs and a CLOSE interleaved on a channel that is also carrying a STAT per entry --
+    the multiplexed shape, on the transport where a stall would actually cost something.
+    """
+    source = tmp_path / "remote"
+    source.mkdir()
+    for index in range(120):  # more than one OpenSSH batch, so a scan really does stop short
+        (source / f"file{index:03d}.bin").write_bytes(b"x" * index)
+
+    async with connect(ssh_server) as transport, open_session(transport) as sftp:
+        seen = 0
+        async with sftp.scandir(str(source)) as entries:
+            async for item in entries:
+                # A second operation from inside an open scan: the interleave that a session
+                # lock would deadlock on, over the transport that has its own windowing.
+                attributes = await sftp.stat(f"{source}/{item.name}")
+                assert attributes.size is not None
+                seen += 1
+                if seen == 5:
+                    break
+
+        # The connection is unaffected by the abandoned scan, and both forms agree.
+        assert len({item.name for item in await sftp.listdir(str(source))}) == 120
+
+    assert seen == 5
+
+
 async def test_a_recursive_download_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
     """A tree, over a real SSH channel, with the destination boundary enforced.
 

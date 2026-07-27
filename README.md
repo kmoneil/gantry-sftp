@@ -44,8 +44,9 @@ exists today:
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
 - a session with `stat`, `lstat`, `realpath`, `open`/`close`, `mkdir`, `rmdir`, `remove`,
-  `rename`, `posix_rename`, `fsync`, `supports()`, `listdir()`, and pipelined `get()` /
-  `put()`, with typed errors, timeouts on every wait, and a progress callback
+  `rename`, `posix_rename`, `fsync`, `supports()`, `listdir()` / streaming `scandir()`, and
+  pipelined `get()` / `put()`, with typed errors, timeouts on every wait, and a progress
+  callback
 - **recursive transfer both ways**: `walk()` and `get_tree()`, with the zip-slip defence that
   makes a hostile server's filenames safe to write, plus `put_tree()` and `rmtree()` — trees
   go up as well as down, and come back off again
@@ -150,6 +151,34 @@ Three things this does differently from the tools you have used:
 `.` and `..` are filtered out. `readdir()` gives you the raw batches if you want to see
 exactly what the server sent — one READDIR is not a directory, and the server decides how
 many entries a batch holds (OpenSSH: 100).
+
+### Streaming a directory you did not size
+
+`listdir()` follows every batch to the end, so **how much memory it takes is the server's
+decision, not yours** — a directory with millions of entries, or a server willing to answer
+READDIR with new names forever, is unbounded allocation driven by the peer. Nothing is
+capped, because a silent cap breaks the legitimate large directory *and* reports success.
+`scandir()` is the form that holds one batch:
+
+```python
+async with sftp.scandir("/incoming") as entries:
+    async for entry in entries:
+        if entry.is_file and entry.name.endswith(".csv"):
+            break            # the directory handle goes back here
+```
+
+It is a context manager rather than a bare generator because it holds a directory handle
+open across the yield, and a suspended async generator that is merely dropped is not
+finalised by trio — the handle would sit on the server until the garbage collector felt like
+it, if ever. Iterating one without the `async with` raises `StateError` instead of leaking.
+
+Other work on the session is fine inside the loop — a `stat` per entry, or a `get` — because
+a session multiplexes and a scan holds no lock.
+
+`listdir()` is `scandir()` collected, so the two cannot disagree about what a directory
+contains. `walk()` uses it too, which means the raw listing and the classified one are never
+both in memory; one directory still is, and that bound is structural — a top-down walk cannot
+know where to descend until it has seen every name.
 
 ## Walking and recursive download
 

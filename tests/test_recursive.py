@@ -350,6 +350,24 @@ async def test_an_entry_with_no_attributes_costs_one_lstat_and_is_then_correct()
     assert sum(isinstance(packet, LStat) for packet in server.seen) == 2
 
 
+async def test_the_settling_lstat_is_issued_while_the_directory_is_still_open():
+    """The seam that changed when the walk started streaming, pinned.
+
+    ``_walk_one`` used to accumulate the whole directory with ``listdir`` and *then* classify
+    it, so every LSTAT arrived after the CLOSE. It now classifies as entries stream in, which
+    puts a second operation on the connection inside an open directory handle -- legal only
+    because a session multiplexes, and a deadlock again the moment anything reintroduces a
+    lock. Ordering is asserted rather than described, since the fake cannot deadlock.
+    """
+    tree = {b"/root": (named(b"mystery", None), named(b"a.csv", REGULAR, 2))}
+    server = TreeServer(tree=tree, files={b"/root/a.csv": b"aa"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await first_entry(sftp)
+
+    kinds = [type(packet) for packet in server.seen]
+    assert kinds.index(LStat) < kinds.index(Close), "the directory was closed before the LSTAT"
+
+
 async def test_an_entry_the_server_will_not_describe_at_all_is_skipped_rather_than_guessed():
     # Attributes absent *and* the LSTAT refused. Two failures to answer is not evidence of
     # anything, so it is skipped with a reason rather than sorted into a bucket by guess.
@@ -386,7 +404,7 @@ async def test_abandoning_a_walk_early_leaks_no_handles():
     """Stopping as soon as you find what you wanted is the natural way to use a walk.
 
     Nothing server-side is held between yields -- each directory's handle is opened and closed
-    inside one listdir -- so an abandoned iterator needs no ``aclosing`` and leaks nothing.
+    inside one scandir -- so an abandoned iterator needs no ``aclosing`` and leaks nothing.
     """
     server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES)
     async with open_session(server) as sftp:  # type: ignore[arg-type]

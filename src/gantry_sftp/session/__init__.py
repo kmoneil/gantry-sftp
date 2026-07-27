@@ -67,6 +67,7 @@ from gantry_sftp.session._recursive import (
 from gantry_sftp.session._session import (
     DEFAULT_REQUEST_TIMEOUT,
     LIMITS_EXTENSION,
+    DirectoryScan,
     Session,
     open_session,
     raise_for_status,
@@ -86,6 +87,7 @@ __all__ = [
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
     "DirEntry",
+    "DirectoryScan",
     "Dispatcher",
     "Durability",
     "EntryKind",

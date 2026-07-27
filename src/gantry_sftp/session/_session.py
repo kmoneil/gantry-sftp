@@ -37,6 +37,7 @@ from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import override
 
 import anyio
@@ -86,6 +87,7 @@ from gantry_sftp.exceptions import (
     ProtocolError,
     ServerError,
     SFTPError,
+    StateError,
     TransferTimeoutError,
     UnsupportedError,
     flatten_exception_group,
@@ -222,6 +224,140 @@ class _Upload:
     require_fsync: bool
     progress: ProgressCallback | None
     depth: int | None
+
+
+class DirectoryScan:
+    """One directory, streamed batch by batch instead of accumulated.
+
+    :meth:`Session.listdir` follows every ``READDIR`` to the end and hands back a list. That
+    is what a caller wants for an ordinary directory and it is a **peer-driven memory
+    bound**: the server decides how many names there are, and a server willing to answer
+    ``READDIR`` with new names forever makes the client allocate forever. Capping the list
+    would be the worse bug -- it breaks the legitimate large directory and reports success --
+    so the fix is an iterating form, and this is it. Memory here is one batch.
+
+    It is a **context manager and not a bare async generator**, because it holds a directory
+    handle open across the yield and a suspended async generator that is merely dropped is
+    not finalised by trio -- the handle would sit on the server until the garbage collector
+    happened to feel like it, if ever::
+
+        async with sftp.scandir(b"/incoming") as entries:
+            async for entry in entries:
+                if entry.name.endswith(".csv"):
+                    break                     # the handle is closed on the way out
+
+    ``.`` and ``..`` are filtered, matching :meth:`Session.listdir`. Nothing else is: names
+    are server-supplied and are surfaced verbatim, exactly as everywhere else.
+
+    Other operations may run on the session inside the loop -- a ``stat`` per entry, or a
+    ``get`` -- because a session multiplexes and this holds no lock. That was not always
+    true, and it is the reason this shape was cheap to build.
+
+    Args:
+        session: The session to read through.
+        path: Remote directory, already encoded.
+    """
+
+    def __init__(self, session: Session, path: bytes) -> None:
+        self._session = session
+        self._path = path
+        self._handle: bytes | None = None
+        self._entered = False
+        self._batch: tuple[DirEntry, ...] = ()
+        self._index = 0
+        self._exhausted = False
+
+    @override
+    def __repr__(self) -> str:
+        state = "open" if self._handle is not None else ("spent" if self._entered else "unopened")
+        return f"<DirectoryScan {self._path!r} {state}>"
+
+    async def __aenter__(self) -> DirectoryScan:
+        """Open the directory.
+
+        Raises:
+            StateError: If this scan has already been entered. One scan is one handle; a
+                second ``async with`` on the same object would silently restart the listing.
+            NoSuchFileError: If the path does not exist -- which is also what a server
+                answers for a path that exists and is not a directory.
+            ServerError: If the server refuses.
+        """
+        if self._entered:
+            raise StateError("this scandir() has already been used; call scandir() again")
+        self._entered = True
+        self._handle = await self._session.opendir(self._path)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the directory handle, whichever way the block ended.
+
+        A ``CLOSE`` that fails on the way *out* of a clean block is reported, the same as
+        :meth:`Session.listdir`. On the way out of a failing one it is swallowed: a
+        housekeeping complaint must not replace the diagnosis that is already on its way up.
+        """
+        handle, self._handle = self._handle, None
+        self._batch = ()
+        self._index = 0
+        if handle is None:
+            return
+        if exc_type is None:
+            await self._session.close(handle)
+        else:
+            await _close_quietly(self._session, handle)
+
+    def __aiter__(self) -> DirectoryScan:
+        """Iterate the entries.
+
+        Raises:
+            StateError: If the scan was never entered. Iterating a scandir() that is not
+                inside its ``async with`` would leak the handle it is holding, so it is
+                refused rather than half-supported.
+        """
+        if self._handle is None:
+            raise StateError("scandir() must be entered with `async with` before iterating")
+        return self
+
+    async def __anext__(self) -> DirEntry:
+        """The next entry, asking the server for another batch when this one runs out."""
+        while (entry := self._next_buffered()) is None:
+            await self._fill()
+        return entry
+
+    def _next_buffered(self) -> DirEntry | None:
+        """The next non-dot entry from the batch in hand, or ``None`` once it is used up."""
+        while self._index < len(self._batch):
+            entry = self._batch[self._index]
+            self._index += 1
+            if entry.filename not in DOT_ENTRIES:
+                return entry
+        return None
+
+    async def _fill(self) -> None:
+        """Fetch the next batch.
+
+        Raises:
+            StopAsyncIteration: At end of directory. Latched, so an iterator driven past the
+                end does not spend a round trip re-asking a server that already said EOF.
+            StateError: If the scan is no longer open, which means iteration outlived the
+                ``async with`` that owns the handle.
+            ServerError: If the server refuses mid-listing. The handle is still closed, by
+                the ``async with`` this must be inside.
+        """
+        if self._handle is None:
+            raise StateError("this scandir() is closed; its `async with` block has ended")
+        if self._exhausted:
+            raise StopAsyncIteration
+        batch = await self._session.readdir(self._handle)
+        if batch is None:
+            self._exhausted = True
+            raise StopAsyncIteration
+        self._batch = batch
+        self._index = 0
 
 
 class Session:
@@ -456,6 +592,35 @@ class Session:
             raise_for_status(reply)
         raise _unexpected(reply, expected="NAME")
 
+    def scandir(self, path: bytes | str) -> DirectoryScan:
+        """Stream a directory, one batch at a time, holding one handle open.
+
+        The bounded-memory listing. :meth:`listdir` accumulates the whole directory, which is
+        a memory cost the *server* chooses; this one holds a batch. Reach for it when the
+        directory may be enormous, when the server is not one you control, or when the answer
+        you want is the first entry that matches::
+
+            async with sftp.scandir("/incoming") as entries:
+                async for entry in entries:
+                    if entry.is_file and entry.name.endswith(".csv"):
+                        break
+
+        The ``async with`` is not decoration -- it owns the directory handle. Iterating
+        without it raises :class:`~gantry_sftp.exceptions.StateError` rather than leaking one.
+
+        Not a coroutine: it returns the scan object, so it is ``async with sftp.scandir(...)``
+        and never ``async with await sftp.scandir(...)``.
+
+        Args:
+            path: Remote directory.
+
+        Returns:
+            A :class:`DirectoryScan`, which opens the directory when it is entered. Entries
+            come in the order the server sent them, which is not guaranteed to be sorted, and
+            ``.`` and ``..`` are excluded exactly as in :meth:`listdir`.
+        """
+        return DirectoryScan(self, _encode_path(path))
+
     async def listdir(self, path: bytes | str) -> list[DirEntry]:
         """List a directory, following the batches to the end.
 
@@ -463,11 +628,12 @@ class Session:
         forgets writes a recursion that never terminates. OpenSSH sends both; a server that
         does not needs no special case.
 
-        The whole listing is accumulated in memory. For an ordinary directory that is what
-        you want; for a directory with millions of entries, or a server willing to answer
-        READDIR forever, it is a memory cost this cannot bound without also breaking the
-        legitimate large case. Streaming lands with ``walk()``; the trade-off is registered
-        rather than hidden.
+        **The whole listing is accumulated in memory, and the server decides how large that
+        is.** For an ordinary directory that is exactly what a caller wants. For one with
+        millions of entries, or a server willing to answer READDIR with new names forever, it
+        is unbounded allocation driven by the peer -- so use :meth:`scandir`, which holds one
+        batch. Nothing is capped here, because a silent cap breaks the legitimate large
+        directory *and* reports success, which is the worse bug.
 
         Args:
             path: Remote directory.
@@ -479,16 +645,8 @@ class Session:
             NoSuchFileError: If the path does not exist.
             ServerError: If it is not a directory, or the server refuses.
         """
-        handle = await self.opendir(path)
-        entries: list[DirEntry] = []
-        try:
-            while (batch := await self.readdir(handle)) is not None:
-                entries.extend(entry for entry in batch if entry.filename not in DOT_ENTRIES)
-        except BaseException:
-            await self._close_quietly(handle)
-            raise
-        await self.close(handle)
-        return entries
+        async with self.scandir(path) as entries:
+            return [entry async for entry in entries]
 
     async def close(self, handle: bytes) -> None:
         """Close a remote handle.
@@ -661,7 +819,7 @@ class Session:
             # invisible from this side until the server starts refusing to open anything. It
             # must not replace the transfer's error with one about the close, though -- the
             # first error is the diagnosis and the second is housekeeping.
-            await self._close_quietly(handle)
+            await _close_quietly(self, handle)
             raise
         await self.close(handle)
         return transferred
@@ -713,7 +871,7 @@ class Session:
         entries are surfaced so a caller can decide for themselves.
 
         **Nothing server-side is held between yields** -- each directory's handle is opened
-        and closed inside a single :meth:`listdir` -- so stopping early, which is the natural
+        and closed inside a single :meth:`scandir` -- so stopping early, which is the natural
         way to use a walk, leaks nothing on the server. It is still an async generator, so
         close it rather than dropping it::
 
@@ -733,7 +891,11 @@ class Session:
                 tree is something a hostile server can simply answer with.
 
         Yields:
-            One :class:`~gantry_sftp.session.WalkEntry` per directory visited.
+            One :class:`~gantry_sftp.session.WalkEntry` per directory visited. Each carries
+            one directory's classified entries, so peak memory is the largest directory in
+            the tree rather than the tree -- a bound the walk cannot drop, because it cannot
+            know where to descend until it has seen every name. :meth:`scandir` is the
+            listing API with no such bound.
 
         Raises:
             NoSuchFileError: If the root does not exist. Note this is *also* what the server
@@ -756,23 +918,35 @@ class Session:
     async def _walk_one(
         self, directory: bytes, relative: tuple[bytes, ...], *, max_depth: int | None
     ) -> WalkEntry:
-        """List one directory and sort its entries into descend / transfer / skip."""
+        """List one directory and sort its entries into descend / transfer / skip.
+
+        Streamed through :meth:`scandir` rather than :meth:`listdir`: classifying as the
+        entries arrive means the raw listing and the sorted one are never both in memory, and
+        the ``LSTAT`` an unknown entry costs happens *inside* the open directory handle. That
+        second part is only legal because a session multiplexes -- under the lock this layer
+        used to hold, a stat between two READDIRs on the same connection was a deadlock.
+
+        One directory is still materialised, and that is structural rather than an oversight:
+        a top-down walk cannot know where to descend until it has seen every name.
+        :meth:`scandir` is the API with no such bound.
+        """
         directories: list[DirEntry] = []
         files: list[DirEntry] = []
         skipped: list[Skipped] = []
         at_limit = max_depth is not None and len(relative) >= max_depth
 
-        for child in await self.listdir(directory):
-            path = join_remote(directory, child.filename)
-            kind = await self._settle_kind(path, child)
-            if kind is EntryKind.DIRECTORY and at_limit:
-                skipped.append(Skipped(path, child, SkipReason.TOO_DEEP))
-            elif kind is EntryKind.DIRECTORY:
-                directories.append(child)
-            elif kind is EntryKind.FILE:
-                files.append(child)
-            else:
-                skipped.append(Skipped(path, child, _skip_reason(kind)))
+        async with self.scandir(directory) as children:
+            async for child in children:
+                path = join_remote(directory, child.filename)
+                kind = await self._settle_kind(path, child)
+                if kind is EntryKind.DIRECTORY and at_limit:
+                    skipped.append(Skipped(path, child, SkipReason.TOO_DEEP))
+                elif kind is EntryKind.DIRECTORY:
+                    directories.append(child)
+                elif kind is EntryKind.FILE:
+                    files.append(child)
+                else:
+                    skipped.append(Skipped(path, child, _skip_reason(kind)))
 
         return WalkEntry(directory, relative, tuple(directories), tuple(files), tuple(skipped))
 
@@ -1046,7 +1220,7 @@ class Session:
             # Closing is not optional -- a leaked handle counts against max-open-handles and
             # is invisible from this side until the server refuses to open anything. But it
             # must not replace the error that got us here with one about the close.
-            await self._close_quietly(handle)
+            await _close_quietly(self, handle)
             raise
         await self.close(handle)
         return transferred, durability
@@ -1355,17 +1529,6 @@ class Session:
 
     # --- cleanup ------------------------------------------------------------------------------
 
-    async def _close_quietly(self, handle: bytes) -> None:
-        """Close a handle during failure handling, shielded and without raising.
-
-        ``Exception`` rather than a precise tuple on purpose. This runs while another error is
-        already on its way up, and *anything* raised here replaces the diagnosis with a
-        housekeeping complaint. Cancellation is not caught -- it derives from
-        ``BaseException`` -- and cannot arrive anyway inside the shield.
-        """
-        with anyio.CancelScope(shield=True), suppress(Exception):
-            await self.close(handle)
-
     async def _discard(self, staged: bytes, error: BaseException) -> None:
         """Remove a staging file after a failure, and say so if that did not work.
 
@@ -1385,6 +1548,21 @@ class Session:
                     f"the staging file {staged!r} was left on the server: "
                     f"removing it also failed ({cleanup_failure!r})"
                 )
+
+
+async def _close_quietly(session: Session, handle: bytes) -> None:
+    """Close a handle during failure handling, shielded and without raising.
+
+    ``Exception`` rather than a precise tuple on purpose. This runs while another error is
+    already on its way up, and *anything* raised here replaces the diagnosis with a
+    housekeeping complaint. Cancellation is not caught -- it derives from ``BaseException``
+    -- and cannot arrive anyway inside the shield.
+
+    A free function rather than a method because :class:`DirectoryScan` needs it too, and
+    two copies of a cleanup path is how one of them ends up not fixed.
+    """
+    with anyio.CancelScope(shield=True), suppress(Exception):
+        await session.close(handle)
 
 
 def _ensure_directory(path: Path, *, parents: bool = False) -> Path:

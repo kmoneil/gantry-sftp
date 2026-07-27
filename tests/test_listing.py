@@ -32,10 +32,11 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.exceptions import NoSuchFileError, ProtocolError, ServerError
+from gantry_sftp.exceptions import NoSuchFileError, ProtocolError, ServerError, StateError
 from gantry_sftp.session import (
     DirEntry,
     EntryKind,
+    Session,
     decode_name,
     entry_kind,
     open_session,
@@ -180,7 +181,10 @@ class ListingServer:
             self._on_readdir(packet)
         elif isinstance(packet, Close):
             self.open_handles.discard(packet.handle)
-            self._reply(Status(packet.request_id, StatusCode.OK))
+            if (refusal := self.refuse.get("close")) is not None:
+                self._refuse(packet, refusal)
+            else:
+                self._reply(Status(packet.request_id, StatusCode.OK))
         else:
             self._reply(Status(packet.request_id, StatusCode.FAILURE, b"unscripted"))
 
@@ -347,6 +351,256 @@ async def test_a_hostile_name_is_surfaced_verbatim_rather_than_sanitised_here():
     assert [item.filename for item in listing] == list(hostile)
 
 
+# --- streaming a directory ----------------------------------------------------------------------
+#
+# The point of scandir is a bound the *server* cannot choose. listdir follows every batch to
+# the end, so a server willing to answer READDIR with new names forever makes the client
+# allocate forever -- peer-driven memory exhaustion in a client that parses hostile input.
+# These tests are about that bound and about the handle, not about the entries: the entries
+# are listdir's tests above, and the two must agree.
+
+
+async def test_scandir_asks_for_a_batch_only_when_the_last_one_is_used_up():
+    """The whole claim, asserted rather than described.
+
+    A client that read the directory up front and then handed out entries would pass every
+    other test in this file and have exactly the memory shape scandir exists to remove. So
+    the assertion is on the *server*: after one entry, one batch has been sent.
+    """
+    names = [f"file{i:02d}.csv".encode() for i in range(7)]
+    server = ListingServer(entries=tuple(entry(name) for name in names), batch=2)
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.scandir("/incoming") as entries,
+    ):
+        iterator = aiter(entries)
+        first = await anext(iterator)
+        assert first.filename == names[0]
+        assert server.batches_sent == 1, "the whole directory was read up front"
+
+        # Second entry is already in hand: same batch, no round trip.
+        _ = await anext(iterator)
+        assert server.batches_sent == 1
+
+        _ = await anext(iterator)
+        assert server.batches_sent == 2, "the next batch was not fetched on demand"
+
+    assert not server.open_handles
+
+
+async def test_scandir_and_listdir_agree_on_what_a_directory_contains():
+    # listdir is implemented on scandir, so this is the equivalence that lets there be one
+    # batch-following loop in the library instead of two that drift.
+    names = [f"file{i:02d}.csv".encode() for i in range(7)]
+    server = ListingServer(
+        entries=(entry(b".", DIRECTORY), *[entry(name) for name in names], entry(b"..", DIRECTORY)),
+        batch=3,
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        listed = await sftp.listdir("/incoming")
+
+    server.position = 0
+    server.batches_sent = 0
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.scandir("/incoming") as entries,
+    ):
+        streamed = [item async for item in entries]
+
+    assert [item.filename for item in streamed] == [item.filename for item in listed] == names
+
+
+async def test_stopping_a_scan_early_closes_the_directory_handle():
+    """Finding the first match and leaving is the reason to stream at all.
+
+    A directory handle counts against the server's open-handle limit exactly like a file one
+    and is just as invisible from this side, so the ``async with`` has to close it on the
+    ``break`` -- which is why this is a context manager and not a bare async generator.
+    """
+    names = [f"file{i:02d}.csv".encode() for i in range(20)]
+    server = ListingServer(entries=tuple(entry(name) for name in names), batch=2)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        async with sftp.scandir("/incoming") as entries:
+            async for item in entries:
+                if item.filename == b"file01.csv":
+                    break
+
+        assert not server.open_handles, "the directory handle was leaked on an early exit"
+        assert server.batches_sent == 1, "the rest of the directory was read anyway"
+
+
+async def test_an_exception_inside_the_loop_closes_the_handle_and_keeps_the_error():
+    # The cleanup must not replace the diagnosis that is already on its way up: a caller
+    # debugging their own error should not be handed a housekeeping complaint instead.
+    async def fail_inside_the_loop(sftp: Session) -> None:
+        async with sftp.scandir("/incoming") as entries:
+            async for _item in entries:
+                _ = 1 / 0
+
+    server = ListingServer(entries=tuple(entry(f"f{i}".encode()) for i in range(9)), batch=2)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ZeroDivisionError) as exc:
+            await fail_inside_the_loop(sftp)
+
+        assert exc.value.args[0] == "division by zero"
+        assert not server.open_handles
+
+
+async def test_a_scan_that_fails_midway_closes_the_handle_and_reports_the_server_error():
+    server = ListingServer(entries=tuple(entry(f"f{i}".encode()) for i in range(9)), fail_after=2)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as exc:
+            async with sftp.scandir("/incoming") as entries:
+                _ = [item async for item in entries]
+
+        assert exc.value.args[0] == "server returned FAILURE: FAILURE"
+        assert not server.open_handles, "the directory handle was leaked"
+
+
+async def test_a_close_that_fails_at_the_end_of_a_clean_scan_is_reported():
+    # Not swallowed. Some servers report a failure on CLOSE rather than on the operation that
+    # caused it, and a scan that ended cleanly has no other error to protect.
+    server = ListingServer(entries=(entry(b"a.csv"),), refuse={"close": StatusCode.FAILURE})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as exc:
+            async with sftp.scandir("/incoming") as entries:
+                _ = [item async for item in entries]
+
+    assert exc.value.args[0] == "server returned FAILURE: FAILURE"
+
+
+async def test_dot_entries_are_filtered_out_of_a_stream_too():
+    # Including the case where they are the only thing in a batch: the buffered-entry loop
+    # has to ask for another batch rather than report end of directory.
+    server = ListingServer(
+        entries=(entry(b".", DIRECTORY), entry(b"..", DIRECTORY), entry(b"real.csv")), batch=2
+    )
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.scandir("/incoming") as entries,
+    ):
+        streamed = [item async for item in entries]
+
+    assert [item.filename for item in streamed] == [b"real.csv"]
+
+
+async def test_an_empty_directory_streams_as_nothing():
+    server = ListingServer(entries=())
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.scandir("/empty") as entries,
+    ):
+        assert [item async for item in entries] == []
+
+
+async def test_a_directory_of_only_dot_entries_streams_as_nothing():
+    server = ListingServer(entries=(entry(b".", DIRECTORY), entry(b"..", DIRECTORY)))
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.scandir("/empty") as entries,
+    ):
+        assert [item async for item in entries] == []
+
+
+async def test_the_end_of_a_directory_is_latched_rather_than_re_asked():
+    # An iterator driven past its end must not spend a round trip asking a server that has
+    # already said EOF -- and a server that answered EOF once is not obliged to again.
+    server = ListingServer(entries=(entry(b"a.csv"),), batch=9)
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.scandir("/incoming") as entries,
+    ):
+        iterator = aiter(entries)
+        _ = await anext(iterator)
+        with pytest.raises(StopAsyncIteration):
+            _ = await anext(iterator)
+        readdirs = sum(1 for packet in server.seen if isinstance(packet, ReadDir))
+
+        with pytest.raises(StopAsyncIteration):
+            _ = await anext(iterator)
+        assert sum(1 for packet in server.seen if isinstance(packet, ReadDir)) == readdirs
+
+
+async def test_a_missing_directory_is_reported_when_the_scan_is_entered():
+    # The OPENDIR happens in __aenter__, so the error arrives at the `async with` rather than
+    # at the first `async for` -- which is where a caller's try/except will be.
+    server = ListingServer(refuse={"opendir": StatusCode.NO_SUCH_FILE})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(NoSuchFileError) as exc:
+            async with sftp.scandir("/absent"):
+                pytest.fail("the body must not run")
+
+    assert exc.value.path == b"/absent"
+
+
+# --- misusing a scan, which has to fail loudly rather than leak --------------------------------
+
+
+async def test_iterating_a_scan_that_was_never_entered_is_refused():
+    """The misuse the context manager exists to prevent, made an error rather than a leak.
+
+    ``async for entry in sftp.scandir(p)`` without the ``async with`` is the spelling a
+    caller will try first, and supporting it would hold a directory handle open with nothing
+    responsible for closing it.
+    """
+
+    async def iterate_without_entering(sftp: Session) -> None:
+        async for _item in sftp.scandir("/incoming"):
+            pytest.fail("iteration must not start")
+
+    server = ListingServer(entries=(entry(b"a.csv"),))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(StateError) as exc:
+            await iterate_without_entering(sftp)
+
+    assert exc.value.args[0] == "scandir() must be entered with `async with` before iterating"
+    assert not server.open_handles
+
+
+async def test_iterating_a_scan_after_its_block_has_ended_is_refused():
+    # The handle is gone, so the honest answer is an error rather than the entries that
+    # happened to be buffered when the block exited.
+    server = ListingServer(entries=tuple(entry(f"f{i}".encode()) for i in range(9)), batch=4)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        async with sftp.scandir("/incoming") as entries:
+            iterator = aiter(entries)
+            _ = await anext(iterator)
+
+        with pytest.raises(StateError) as exc:
+            _ = await anext(iterator)
+
+    assert exc.value.args[0] == "this scandir() is closed; its `async with` block has ended"
+
+
+async def test_a_scan_cannot_be_entered_twice():
+    # One scan is one handle. Re-entering would silently restart the listing, which reads as
+    # a duplicate-entries bug somewhere else entirely.
+    server = ListingServer(entries=(entry(b"a.csv"),))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        scan = sftp.scandir("/incoming")
+        async with scan:
+            pass
+
+        with pytest.raises(StateError) as exc:
+            async with scan:
+                pytest.fail("the body must not run")
+
+    assert exc.value.args[0] == "this scandir() has already been used; call scandir() again"
+    assert not server.open_handles
+
+
+async def test_a_scan_says_which_state_it_is_in():
+    # The library has to keep telling the truth about itself: a scan in a debugger or a log
+    # line should say whether it is holding a handle.
+    server = ListingServer(entries=(entry(b"a.csv"),))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        scan = sftp.scandir(b"/incoming")
+        assert repr(scan) == "<DirectoryScan b'/incoming' unopened>"
+        async with scan:
+            assert repr(scan) == "<DirectoryScan b'/incoming' open>"
+        assert repr(scan) == "<DirectoryScan b'/incoming' spent>"
+
+
 # --- against a real server ---------------------------------------------------------------------
 
 
@@ -484,6 +738,112 @@ async def test_opening_a_file_as_a_directory_reports_no_such_file_not_failure(tm
     # OpenSSH's own words for it, carried through rather than replaced by ours.
     assert exc.value.code == int(StatusCode.NO_SUCH_FILE)
     assert exc.value.message == b"No such file"
+
+
+async def test_streaming_a_real_directory_larger_than_one_batch(tmp_path: Path):
+    """What no fake can prove: a real server's batching, streamed.
+
+    The fake chooses its batch size; OpenSSH chooses its own, and this is the only place the
+    two are made to agree. The count is not asserted -- it is the server's business -- only
+    that more than one batch was needed and that nothing was lost between them.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    expected = {f"file{i:03d}.bin" for i in range(250)}
+    for name in expected:
+        (tmp_path / name).write_bytes(b"")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        async with sftp.scandir(str(tmp_path)) as entries:
+            streamed = {item.name async for item in entries}
+
+        # And the same directory the accumulating way, which must not disagree.
+        assert {item.name for item in await sftp.listdir(str(tmp_path))} == streamed
+
+    assert streamed == expected
+
+
+async def test_a_real_server_answers_a_stat_from_inside_an_open_directory_scan(tmp_path: Path):
+    """The constraint that shaped this API, and the one that turned out to be void.
+
+    A streaming listing that held the session while suspended would deadlock any caller who
+    used it the obvious way -- ``stat`` each entry as it arrives, which is what a walk does.
+    The session lock that would have caused it is gone, so this is a proof that the hazard
+    stayed gone: interleaving STAT with READDIR on one connection, against a real server that
+    has to be willing to answer that way.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    for index in range(120):  # more than one OpenSSH batch, so the interleave spans READDIRs
+        (tmp_path / f"file{index:03d}.bin").write_bytes(b"x" * index)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        sizes: dict[str, int | None] = {}
+        with anyio.fail_after(60):  # a deadlock must fail this test, not hang the suite
+            async with sftp.scandir(str(tmp_path)) as entries:
+                async for item in entries:
+                    attributes = await sftp.stat(f"{tmp_path}/{item.name}")
+                    sizes[item.name] = attributes.size
+
+    assert len(sizes) == 120
+    assert sizes["file042.bin"] == 42
+
+
+async def test_a_real_server_tolerates_a_scan_abandoned_mid_directory(tmp_path: Path):
+    """Stopping mid-listing, repeatedly, against a server that keeps real state.
+
+    The *leak* is caught upstairs by the fake, which can see its own handle table; nothing
+    here can observe `sftp-server`'s. What this proves is the half a fake cannot: that closing
+    a directory handle with batches still unread is something the reference server accepts,
+    over and over, and that the connection is unaffected afterwards. A CLOSE mid-READDIR is
+    not obviously fine -- it is fine because OpenSSH says so, which is why it is measured.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    for index in range(150):  # several real batches, so every scan leaves some unread
+        (tmp_path / f"file{index:03d}.bin").write_bytes(b"")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        for _attempt in range(50):
+            async with sftp.scandir(str(tmp_path)) as entries:
+                async for item in entries:
+                    assert item.name.startswith("file")
+                    break
+
+        assert len(await sftp.listdir(str(tmp_path))) == 150
+
+
+async def test_a_real_server_reports_a_non_utf8_name_through_a_scan_too(tmp_path: Path):
+    # The axis that bites, varied on the streaming path as well: a name is bytes on both.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    raw_name = b"caf\xe9-\xff.bin"
+    (tmp_path / os.fsdecode(raw_name)).write_bytes(b"payload")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        async with sftp.scandir(str(tmp_path)) as entries:
+            streamed = [item async for item in entries]
+
+        assert [item.filename for item in streamed] == [raw_name]
+        attributes = await sftp.stat(str(tmp_path).encode() + b"/" + streamed[0].filename)
+
+    assert attributes.size == 7
 
 
 async def test_the_permissions_a_real_server_sends_classify_correctly(tmp_path: Path):

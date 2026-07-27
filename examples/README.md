@@ -8,7 +8,7 @@ real server either way; the only thing the local mode skips is `ssh`.
 ```bash
 python examples/download.py                       # pipelined get(), with progress
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
-python examples/listing.py                        # listdir(), and what a listing can't know
+python examples/listing.py                        # listdir() and scandir(), and what a listing can't know
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
 python examples/concurrent_transfers.py           # many transfers over one session
@@ -36,7 +36,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | ------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `download.py`             | `get()`, the progress callback, and where the pipelining happens                                       |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
-| `listing.py`              | `listdir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN`                          |
+| `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused                   |
 | `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
