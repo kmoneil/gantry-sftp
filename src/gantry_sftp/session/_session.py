@@ -577,14 +577,40 @@ class Session:
         belongs to :meth:`listdir`, and keeping one place that shows what the server actually
         sent is what makes that filtering testable.
 
+        **A NAME carrying zero names ends the directory too, and that is a decision.** The
+        draft is explicit that it should not happen -- SSH_FXP_READDIR is answered with "one
+        or more names", and end of directory is a ``STATUS`` of ``EOF`` -- and OpenSSH's
+        server never sends one: ``process_readdir`` is ``if (count > 0) send_names(...) else
+        send_status(id, SSH2_FX_EOF)``. So a zero-count NAME is a server bug whichever way we
+        read it, and the only question is which way to fail on it.
+
+        Treating it as an empty *batch* and asking again is what a literal reading gives, and
+        it is a **livelock**: a server that answers every READDIR that way pins the client at
+        100% CPU forever, in the operation every recursive transfer starts with. Refusing it
+        with a ``ProtocolError`` would be defensible from the draft alone, but it would make
+        this library **stricter than ``sftp(1)``** -- OpenSSH's own client reads the count and
+        does ``if (count == 0) break;``, on the line above its ``SSH2_FX_EOF`` check. Every
+        server in production has been tested against that client, which is what makes the
+        truncation risk here structural rather than merely unlikely: a server that sends an
+        empty NAME with entries still to come already silently truncates for every OpenSSH
+        user, so it does not survive to ship. A server that sends one *as* its end-of-listing
+        marker works fine with ``sftp(1)`` and therefore can and does exist.
+
+        So it ends the listing, matching the reference client. Sourced in DESIGN.md 7.
+
         Returns:
-            The batch, or ``None`` once the server answers ``EOF``.
+            The batch, or ``None`` once the directory is finished -- by ``EOF`` or by an empty
+            NAME, which are treated alike.
 
         Raises:
             ServerError: If the server refuses.
         """
         reply = await self.request(ReadDir(self._next(), handle))
         if isinstance(reply, Name):
+            # An empty NAME is end of directory, not an empty batch. Returning `()` here is
+            # what made every batch-following loop in this file spin forever on one.
+            if not reply.entries:
+                return None
             return tuple(DirEntry.from_name_entry(entry) for entry in reply.entries)
         if isinstance(reply, Status):
             if reply.code is StatusCode.EOF:

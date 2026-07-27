@@ -150,7 +150,10 @@ Three things this does differently from the tools you have used:
 
 `.` and `..` are filtered out. `readdir()` gives you the raw batches if you want to see
 exactly what the server sent — one READDIR is not a directory, and the server decides how
-many entries a batch holds (OpenSSH: 100).
+many entries a batch holds (OpenSSH: 100). It reports the end of a directory as `None`, for
+an `EOF` status **and** for a NAME carrying zero names: the draft says a READDIR is answered
+with "one or more names" and OpenSSH's server never sends an empty one, but OpenSSH's client
+stops on one, and being stricter than `sftp(1)` against real-world servers buys nothing.
 
 ### Streaming a directory you did not size
 

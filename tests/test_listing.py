@@ -134,11 +134,16 @@ class ListingServer:
         batch: int = 2,
         refuse: dict[str, StatusCode] | None = None,
         fail_after: int | None = None,
+        empty_name_after: int | None = None,
     ) -> None:
         self.entries = entries
         self.batch = batch
         self.refuse = dict(refuse or {})
         self.fail_after = fail_after
+        # Answer with a NAME carrying zero names once this many batches have gone out, and
+        # keep doing it. The draft says one or more; OpenSSH's server never sends one. A
+        # client that reads it as "an empty batch, ask again" spins here forever.
+        self.empty_name_after = empty_name_after
 
         self.seen: list[object] = []
         self.position = 0
@@ -202,6 +207,10 @@ class ListingServer:
             return
         if self.fail_after is not None and self.batches_sent >= self.fail_after:
             self._refuse(packet, StatusCode.FAILURE)
+            return
+        if self.empty_name_after is not None and self.batches_sent >= self.empty_name_after:
+            self.batches_sent += 1
+            self._reply(Name(packet.request_id, ()))
             return
         chunk = self.entries[self.position : self.position + self.batch]
         if not chunk:
@@ -349,6 +358,65 @@ async def test_a_hostile_name_is_surfaced_verbatim_rather_than_sanitised_here():
         listing = await sftp.listdir("/incoming")
 
     assert [item.filename for item in listing] == list(hostile)
+
+
+# --- a NAME with no names in it -----------------------------------------------------------------
+#
+# The draft answers READDIR with "one or more names" and signals end of directory with a
+# STATUS of EOF; OpenSSH's server never sends a zero-count NAME (`if (count > 0) send_names()
+# else send_status(id, SSH2_FX_EOF)`). So one is a server bug either way, and the only
+# question is how to fail on it. Reading it as "an empty batch, ask again" is a livelock --
+# 100% CPU forever, in the operation every recursive transfer starts with. Refusing it would
+# make this library stricter than `sftp(1)`, whose client does `if (count == 0) break;`.
+# It ends the listing, matching the reference client.
+#
+# Every test here is wrapped in `fail_after`, because without the fix they do not fail --
+# they hang, and a hanging test is a test nobody runs twice.
+
+EMPTY_NAME_TIMEOUT = 10.0
+
+
+async def test_a_name_with_no_names_in_it_ends_the_listing_rather_than_spinning():
+    server = ListingServer(
+        entries=tuple(entry(f"f{i}".encode()) for i in range(4)), batch=2, empty_name_after=2
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with anyio.fail_after(EMPTY_NAME_TIMEOUT):
+            listing = await sftp.listdir("/incoming")
+
+    assert [item.filename for item in listing] == [b"f0", b"f1", b"f2", b"f3"]
+    assert not server.open_handles, "the directory handle was leaked"
+
+
+async def test_an_empty_name_ends_a_stream_too():
+    server = ListingServer(
+        entries=tuple(entry(f"f{i}".encode()) for i in range(4)), batch=2, empty_name_after=2
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with anyio.fail_after(EMPTY_NAME_TIMEOUT):
+            async with sftp.scandir("/incoming") as entries:
+                streamed = [item async for item in entries]
+
+    assert [item.filename for item in streamed] == [b"f0", b"f1", b"f2", b"f3"]
+
+
+async def test_an_empty_name_on_the_very_first_readdir_is_an_empty_directory():
+    # The shape a lazy server would produce for a directory with nothing in it: a NAME with
+    # no names, where the draft wants an EOF status. Not an error, and not a hang.
+    server = ListingServer(entries=(entry(b"unreachable"),), empty_name_after=0)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with anyio.fail_after(EMPTY_NAME_TIMEOUT):
+            assert await sftp.listdir("/incoming") == []
+
+
+async def test_readdir_reports_an_empty_name_as_the_end_rather_than_as_a_batch():
+    # The raw surface makes the same call, because it is the one place that translates a
+    # reply into "a batch, or the end" -- `Status(EOF)` already goes through it.
+    server = ListingServer(entries=(entry(b"a.csv"),), empty_name_after=0)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.opendir("/incoming")
+        assert await sftp.readdir(handle) is None
+        await sftp.close(handle)
 
 
 # --- streaming a directory ----------------------------------------------------------------------
