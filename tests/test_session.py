@@ -284,6 +284,64 @@ async def test_realpath_returns_the_canonical_name():
         assert await sftp.realpath(".") == b"/canonical"
 
 
+async def test_realpath_refuses_a_reply_carrying_several_names():
+    """Picking the first of several would be calling one of the server's answers canonical.
+
+    The draft specifies a single name and ``sftp-client.c`` does ``if (count != 1) fatal("Got
+    multiple names (%d)")``, so both the written spec and the reference client are strict
+    here -- which is exactly the case where there is nothing to be lenient towards. The
+    opposite call is right for READDIR, where they disagree; see ``Session.readdir``.
+    """
+
+    class Ambiguous(FakeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, RealPath):
+                self._reply(
+                    Name(
+                        packet.request_id,
+                        (
+                            NameEntry(b"/first", b"/first", EMPTY_ATTRS),
+                            NameEntry(b"/second", b"/second", EMPTY_ATTRS),
+                        ),
+                    )
+                )
+                return
+            super()._handle(packet)
+
+    server = Ambiguous()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.realpath(".")
+
+    assert exc.value.args[0] == (
+        "REALPATH of b'.' answered with 2 names, and exactly one is the only useful answer"
+    )
+
+
+async def test_realpath_refuses_a_reply_carrying_no_names_and_says_so():
+    """The message this used to produce was 'answered with Name where NAME was expected'.
+
+    Which is nonsense -- a NAME *was* what arrived. An empty NAME is legal-looking and
+    useless, and the error has to say that rather than describe the packet type twice.
+    """
+
+    class Empty(FakeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, RealPath):
+                self._reply(Name(packet.request_id, ()))
+                return
+            super()._handle(packet)
+
+    server = Empty()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.realpath(".")
+
+    assert exc.value.args[0] == (
+        "REALPATH of b'.' answered with 0 names, and exactly one is the only useful answer"
+    )
+
+
 async def test_open_and_close_round_trip():
     server = FakeServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]

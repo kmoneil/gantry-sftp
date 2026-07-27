@@ -537,12 +537,32 @@ class Session:
         Servers disagree about what this does for a path that does not exist -- some
         canonicalise anyway, some refuse. That disagreement belongs to the quirks layer and
         is not smoothed over here.
+
+        **Exactly one name, and a count that is not one is an error rather than a guess.**
+        Unlike READDIR -- where the draft and OpenSSH's client disagree about strictness and
+        the client wins (see :meth:`readdir`) -- here they agree: the draft specifies a single
+        name, and ``sftp-client.c`` does ``if (count != 1) fatal("Got multiple names (%d)")``.
+        Where both are strict there is nothing for us to be lenient *towards*. Taking the
+        first of several would be picking one of the server's answers and calling it the
+        canonical path, which is the silently-wrong failure this layer exists to prevent.
+
+        Raises:
+            ProtocolError: If the server answers with something other than a NAME, or with a
+                NAME carrying any number of names other than one.
+            NoSuchFileError: If the server refuses because the path does not exist.
+            ServerError: For any other refusal.
         """
         encoded = _encode_path(path)
         reply = await self.request(RealPath(self._next(), encoded))
-        if isinstance(reply, Name) and reply.entries:
-            return reply.entries[0].filename
-        raise _unexpected(reply, expected="NAME", path=encoded)
+        if not isinstance(reply, Name):
+            raise _unexpected(reply, expected="NAME", path=encoded)
+        if len(reply.entries) != 1:
+            raise ProtocolError(
+                f"REALPATH of {encoded!r} answered with {len(reply.entries)} names, "
+                f"and exactly one is the only useful answer",
+                request_id=reply.request_id,
+            )
+        return reply.entries[0].filename
 
     async def open(self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ) -> bytes:
         """Open a remote file and return its handle."""

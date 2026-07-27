@@ -24,6 +24,11 @@ A READ can come back three ways and each needs a decision:
 * **EOF** -- a STATUS, a different frame type entirely. The file ended earlier than its size
   said, which happens when it is being written concurrently.
 
+And a fourth that is a server bug rather than a shape: a DATA short by *all* of it. Zero bytes
+re-queues the range just asked for, so it never terminates, and the server is answering the
+whole time so the idle timeout never fires either. One is tolerated and the second fails --
+:meth:`_Downloader._refuse_a_second_zero_length` has the reasoning and the source.
+
 A consumer, not a driver
 ------------------------
 This reads its replies from an :class:`~gantry_sftp.session._dispatch.Exchange` rather than
@@ -156,6 +161,9 @@ class _Downloader:
         self._outstanding: dict[int, _Range] = {}
         self._written = 0
         self._eof_at: int | None = None
+        self._seen_zero_length = False
+        """Whether a DATA carrying no bytes has already been let through -- see
+        :meth:`_refuse_a_second_zero_length`. Per transfer, matching OpenSSH's own scope."""
 
     def _more_to_issue(self) -> bool:
         if self._backlog:
@@ -227,12 +235,48 @@ class _Downloader:
 
     def _handle_data(self, issued: _Range, response: Data) -> None:
         payload = response.data
+        if not payload:
+            self._refuse_a_second_zero_length(issued)
         self._write_at(issued.offset, payload)
         self._written += len(payload)
 
         if len(payload) < issued.length:
             # Legal, and not EOF. Re-queue only what is missing.
             self._backlog.append(_Range(issued.offset + len(payload), issued.length - len(payload)))
+
+    def _refuse_a_second_zero_length(self, issued: _Range) -> None:
+        """Let one zero-length DATA through, and no more.
+
+        A DATA carrying no bytes makes no progress: the shortfall re-queued above is exactly
+        the range that was just asked for, so a server answering every READ that way spins
+        the transfer forever -- and it is *answering*, so the idle timeout never fires. End
+        of file is a STATUS of EOF, not an empty DATA.
+
+        **One is tolerated rather than none because that is what OpenSSH's client does**:
+        ``if (len == 0) { if (seen_zerolen) fatal_f("server sent zero data length");
+        seen_zerolen = 1; }``. Being stricter than ``sftp(1)`` refuses servers that work
+        everywhere else, and the bound is the reference client's rather than a number chosen
+        here.
+
+        Counting it as end of file instead -- which is the call READDIR gets, for the same
+        wire shape -- would silently truncate a *file*. A listing that stops early is a
+        listing; a download that stops early is data loss wearing a success's clothes.
+
+        Raises:
+            TransferError: On the second one. ``TransferError`` rather than ``ProtocolError``
+                because the state a caller needs here is how far the transfer got and where
+                it stopped, and the message says what the server did wrong.
+        """
+        if not self._seen_zero_length:
+            self._seen_zero_length = True
+            return
+        raise TransferError(
+            f"server sent a second zero-length DATA, at offset {issued.offset}: "
+            f"it is making no progress, and end of file is a STATUS not an empty DATA",
+            transferred=self._written,
+            offset=issued.offset,
+            remote_path=self._remote_path,
+        )
 
     def _handle_status(self, issued: _Range, response: Status) -> None:
         if response.code is StatusCode.EOF:

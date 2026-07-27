@@ -238,6 +238,89 @@ async def test_repeated_short_reads_still_converge(tmp_path: Path):
     assert (tmp_path / "out").read_bytes() == content
 
 
+# --- the degenerate short read: a DATA carrying no bytes at all ------------------------------
+#
+# A short read is legal and is re-requested from where it stopped. A read short by *all* of
+# it makes no progress: the re-queued range is the one just asked for. A server answering
+# every READ that way spins the transfer forever, and it is answering, so the idle timeout
+# never fires. OpenSSH's client draws the line at the second one -- `if (len == 0) { if
+# (seen_zerolen) fatal_f("server sent zero data length"); seen_zerolen = 1; }` -- so the
+# bound here is the reference client's rather than a number chosen here. Treating it as EOF,
+# which is the call READDIR gets for the same wire shape, would truncate a file silently.
+
+
+class ZeroLength(ScriptedServer):
+    """Answers READs with a DATA carrying no bytes, from ``after`` onwards."""
+
+    def __init__(self, content: bytes, *, after: int = 0) -> None:
+        super().__init__(content)
+        self.after = after
+        self.zero_replies = 0
+
+    def _handle(self, packet: object) -> None:
+        if isinstance(packet, Read) and packet.offset >= self.after:
+            self.reads.append((packet.offset, packet.length))
+            self.zero_replies += 1
+            self._queue(encode(Data(packet.request_id, memoryview(b""))))
+            return
+        super()._handle(packet)
+
+
+async def test_a_zero_length_data_is_tolerated_once_like_sftp1_does(tmp_path: Path):
+    # One is a hiccup, and refusing it would make this client stricter than sftp(1) against
+    # a server that works everywhere else. The retry after it carries the transfer.
+    class OnceOnly(ScriptedServer):
+        def __init__(self, content: bytes) -> None:
+            super().__init__(content)
+            self.zero_replies = 0
+
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read) and self.zero_replies == 0:
+                self.zero_replies += 1
+                self.reads.append((packet.offset, packet.length))
+                self._queue(encode(Data(packet.request_id, memoryview(b""))))
+                return
+            super()._handle(packet)
+
+    content = b"0123456789ABCDEF"
+    server = OnceOnly(content)
+    written = await fetch(server, tmp_path / "out", read_length=16, depth=1)
+
+    assert server.zero_replies == 1
+    assert written == len(content)
+    assert (tmp_path / "out").read_bytes() == content
+
+
+async def test_a_second_zero_length_data_fails_rather_than_spinning(tmp_path: Path):
+    # Without the bound this test does not fail, it hangs -- so it is under a deadline, and
+    # the deadline is generous enough that only a spin can reach it.
+    server = ZeroLength(bytes(256), after=64)
+    with anyio.fail_after(30):
+        with pytest.raises(TransferError) as exc:
+            await fetch(server, tmp_path / "out", read_length=64, depth=1)
+
+    assert exc.value.args[0] == (
+        "server sent a second zero-length DATA, at offset 64: "
+        "it is making no progress, and end of file is a STATUS not an empty DATA"
+    )
+    # The state that makes it actionable: how far it got, and where it stopped.
+    assert exc.value.offset == 64
+    assert exc.value.transferred == 64
+    assert server.zero_replies == 2, "it should stop on the second, not keep asking"
+
+
+async def test_a_zero_length_data_at_the_very_first_read_still_terminates(tmp_path: Path):
+    # The boundary case where nothing has been transferred: `transferred=0` must not be
+    # mistaken for "no progress information".
+    server = ZeroLength(bytes(128))
+    with anyio.fail_after(30):
+        with pytest.raises(TransferError) as exc:
+            await fetch(server, tmp_path / "out", read_length=64, depth=1)
+
+    assert exc.value.offset == 0
+    assert exc.value.transferred == 0
+
+
 # --- EOF ------------------------------------------------------------------------------------
 
 
