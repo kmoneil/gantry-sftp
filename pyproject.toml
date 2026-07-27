@@ -39,6 +39,10 @@ packages = ["src/gantry_sftp"]
 # not to need, and a default `uv sync` that installed it would make the claim harder to
 # check than it should be. `uv sync --group bench` when you want to run `benchmarks/`;
 # without it, those rows skip with that exact line as the reason.
+#
+# It buys more than benchmark clients now: both libraries ship an SFTP *server* too, so
+# `live-tests/matrix.py` gets two more implementations to measure our client against without
+# needing Docker. Same group, same skip-with-a-reason rule.
 [dependency-groups]
 bench = [
     "asyncssh>=2.19",
