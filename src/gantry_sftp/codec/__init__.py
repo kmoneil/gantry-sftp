@@ -30,6 +30,7 @@ from __future__ import annotations
 from gantry_sftp.codec._attrs import EMPTY_ATTRS, Attrs, Owner, Times, decode_attrs, encode_attrs
 from gantry_sftp.codec._codec import Codec, CodecState, Completed, Event, Negotiated
 from gantry_sftp.codec._constants import (
+    EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
     EXTENSION_LIMITS,
     EXTENSION_POSIX_RENAME,
@@ -43,9 +44,12 @@ from gantry_sftp.codec._constants import (
     StatusCode,
 )
 from gantry_sftp.codec._extensions import (
+    CHECK_FILE_NAME,
     FSYNC_NAME,
     LIMITS_NAME,
     POSIX_RENAME_NAME,
+    CheckFile,
+    CheckFileReply,
     Fsync,
     PosixRename,
 )
@@ -88,8 +92,10 @@ from gantry_sftp.codec._packets import (
 from gantry_sftp.codec._wire import WireReader, WireWriter
 
 __all__ = [
+    "CHECK_FILE_NAME",
     "DEFAULT_MAX_FRAME_LENGTH",
     "EMPTY_ATTRS",
+    "EXTENSION_CHECK_FILE",
     "EXTENSION_FSYNC",
     "EXTENSION_LIMITS",
     "EXTENSION_POSIX_RENAME",
@@ -103,6 +109,8 @@ __all__ = [
     "AttrFlag",
     "Attrs",
     "AttrsReply",
+    "CheckFile",
+    "CheckFileReply",
     "Close",
     "Codec",
     "CodecState",

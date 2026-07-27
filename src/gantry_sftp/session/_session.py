@@ -32,6 +32,7 @@ loop leaves the link idle for; passing it needs a second transport (DESIGN.md 5.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
@@ -50,6 +51,8 @@ from gantry_sftp.codec import (
     POSIX_RENAME_NAME,
     Attrs,
     AttrsReply,
+    CheckFile,
+    CheckFileReply,
     Close,
     Codec,
     CodecState,
@@ -861,6 +864,77 @@ class Session:
             ServerError: For any other refusal, including a handle it does not recognise.
         """
         await self._expect_status(Fsync(self._next(), handle).to_extended())
+
+    async def check_file(
+        self,
+        handle: bytes,
+        *,
+        algorithms: bytes = b"sha256,sha1,md5",
+        start_offset: int = 0,
+        length: int = 0,
+        block_size: int = 0,
+    ) -> tuple[bytes, tuple[bytes, ...]]:
+        """Ask the server to hash a file it already has, without moving the bytes again.
+
+        Rung 1 of DESIGN.md 6's verification ladder, and the only rung that verifies
+        *content* rather than byte count. **Most servers do not have it** -- OpenSSH answers
+        ``OP_UNSUPPORTED`` under all three spellings, measured -- so a caller that needs
+        verification everywhere still falls back to rung 3, a size check, and is told so
+        rather than left to assume.
+
+        The digest count is not on the wire: the server sends one digest per block,
+        concatenated, and how many that is follows from ``block_size`` and the digest size of
+        whichever algorithm it picked. That size comes from ``hashlib`` here, so an algorithm
+        this Python does not know is an error rather than a silently mis-split answer.
+
+        Args:
+            handle: An **open** file handle, from :meth:`open`. Not a path -- paramiko's
+                spelling of this extension takes a handle, and answers ``BAD_MESSAGE`` for
+                one it does not recognise.
+            algorithms: Preference order as a name-list. The server picks the first it
+                supports and names its choice in the reply.
+            start_offset: First byte to hash.
+            length: Bytes to hash, or ``0`` for the rest of the file.
+            block_size: Bytes per digest, or ``0`` for a single digest over the whole range.
+                Paramiko refuses anything between 1 and 255, so this is ``0`` or ``>= 256``.
+
+        Returns:
+            The algorithm the server chose, and one digest per block.
+
+        Raises:
+            UnsupportedError: If the server does not implement the extension.
+            ServerError: If it refuses -- including ``FAILURE`` when it supports none of the
+                algorithms offered, and ``BAD_MESSAGE`` for an unknown handle.
+            ProtocolError: If the reply is not a well-formed check-file answer, or names an
+                algorithm whose digest size does not divide the bytes it sent.
+        """
+        request = CheckFile(
+            self._next(),
+            handle,
+            algorithms=algorithms,
+            start_offset=start_offset,
+            length=length,
+            block_size=block_size,
+        )
+        reply = await self.request(request.to_extended())
+        if not isinstance(reply, ExtendedReplyPacket):
+            raise _unexpected(reply, expected="EXTENDED_REPLY")
+
+        parsed = CheckFileReply.from_reply(reply)
+        try:
+            digest_size = hashlib.new(parsed.algorithm.decode("ascii")).digest_size
+        except (ValueError, UnicodeDecodeError) as unknown:
+            raise ProtocolError(
+                f"server hashed with {parsed.algorithm!r}, which this Python cannot size, "
+                f"so its {len(parsed.digests)} digest bytes cannot be split",
+                request_id=reply.request_id,
+            ) from unknown
+        try:
+            return parsed.algorithm, parsed.split(digest_size)
+        except ValueError as misaligned:
+            raise ProtocolError(
+                str(misaligned), request_id=reply.request_id, raw_frame=reply.data
+            ) from misaligned
 
     async def get(
         self,

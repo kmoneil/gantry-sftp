@@ -31,18 +31,22 @@ from dataclasses import dataclass
 from typing import ClassVar, Self
 
 from gantry_sftp.codec._constants import (
+    EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
     EXTENSION_LIMITS,
     EXTENSION_POSIX_RENAME,
 )
-from gantry_sftp.codec._packets import Extended
+from gantry_sftp.codec._packets import Extended, ExtendedReply
 from gantry_sftp.codec._wire import WireReader, WireWriter
 from gantry_sftp.exceptions import ProtocolError
 
 __all__ = [
+    "CHECK_FILE_NAME",
     "FSYNC_NAME",
     "LIMITS_NAME",
     "POSIX_RENAME_NAME",
+    "CheckFile",
+    "CheckFileReply",
     "Fsync",
     "PosixRename",
 ]
@@ -52,6 +56,9 @@ POSIX_RENAME_NAME = EXTENSION_POSIX_RENAME.encode("ascii")
 
 FSYNC_NAME = EXTENSION_FSYNC.encode("ascii")
 """``fsync@openssh.com`` as it appears on the wire."""
+
+CHECK_FILE_NAME = EXTENSION_CHECK_FILE.encode("ascii")
+"""``check-file`` as it appears on the wire -- unsuffixed, which is paramiko's spelling."""
 
 LIMITS_NAME = EXTENSION_LIMITS.encode("ascii")
 """``limits@openssh.com`` as it appears on the wire.
@@ -175,3 +182,169 @@ class Fsync:
         """
         reader = _payload_of(request, cls.extension_name)
         return cls(request_id=request.request_id, handle=bytes(reader.read_string()))
+
+
+@dataclass(frozen=True, slots=True)
+class CheckFile:
+    """``check-file``: ask the server to hash a file it already has.
+
+    Rung 1 of DESIGN.md 6's verification ladder, and the only rung that verifies *content*
+    without moving the bytes a second time. **OpenSSH does not implement it** -- all three
+    spellings answer ``OP_UNSUPPORTED``, measured -- so every use of this degrades to a size
+    check or a full re-read.
+
+    **Sourced from paramiko's ``SFTPServer._check_file``**, which is the implementation this
+    library has actually spoken to, and from the frames that exchange produced. It is in no
+    secsh draft: ``draft-ietf-secsh-filexfer-05``, ``-09`` and ``-13`` were each fetched and
+    searched, and the string does not appear in any of them. Paramiko's own comment says it
+    "comes from v6 protocol"; whatever document that refers to, it is not one of those three,
+    so the layout below cites code rather than a specification.
+
+    Two spellings exist in the wild and this is the paramiko one. The extension it advertises
+    is ``check-file``, unsuffixed, taking a **handle**; other documents describe separate
+    ``check-file-handle`` and ``check-file-name`` requests. A server advertising those needs
+    its own type, not a flag on this one.
+
+    Body layout::
+
+        string  "check-file"
+        string  handle
+        string  algorithms      -- a name-list: "md5,sha1"
+        uint64  start_offset
+        uint64  length          -- 0 means "to the end of the file"
+        uint32  block_size      -- 0 means "one digest over the whole range"
+
+    Attributes:
+        request_id: Correlates the reply.
+        handle: An **open** file handle. Paramiko answers ``BAD_MESSAGE`` for one it does not
+            know, which is a different failure from the request being malformed and is worth
+            not confusing with it.
+        algorithms: Preference order. The server picks the first it supports and says which
+            in the reply; if it supports none it answers ``FAILURE``.
+        start_offset: First byte to hash.
+        length: Bytes to hash, or ``0`` for the rest of the file.
+        block_size: Bytes per digest, or ``0`` for a single digest over the whole range.
+            Paramiko refuses anything below 256 with ``FAILURE``, so this is not a free
+            parameter -- it is 0 or at least 256.
+    """
+
+    extension_name: ClassVar[bytes] = CHECK_FILE_NAME
+
+    request_id: int
+    handle: bytes
+    algorithms: bytes = b"sha256,sha1,md5"
+    start_offset: int = 0
+    length: int = 0
+    block_size: int = 0
+
+    def to_extended(self) -> Extended:
+        """Build the ``EXTENDED`` request that carries this check."""
+        writer = WireWriter()
+        writer.write_string(self.handle)
+        writer.write_string(self.algorithms)
+        writer.write_uint64(self.start_offset)
+        writer.write_uint64(self.length)
+        writer.write_uint32(self.block_size)
+        return Extended(self.request_id, self.extension_name, writer.getvalue())
+
+    @classmethod
+    def from_extended(cls, request: Extended) -> Self:
+        """Read one back out of an ``EXTENDED`` request.
+
+        Raises:
+            ProtocolError: If the name does not match, or the body is truncated.
+        """
+        reader = _payload_of(request, cls.extension_name)
+        return cls(
+            request_id=request.request_id,
+            handle=bytes(reader.read_string()),
+            algorithms=bytes(reader.read_string()),
+            start_offset=reader.read_uint64(),
+            length=reader.read_uint64(),
+            block_size=reader.read_uint32(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CheckFileReply:
+    """The ``EXTENDED_REPLY`` to a :class:`CheckFile`, and its last field is the trap.
+
+    Body layout, after the ``uint32`` request id the packet already carries::
+
+        string  "check-file"    -- the extension name, echoed back
+        string  algorithm       -- which one the server chose
+        bytes   digests         -- **raw, not length-prefixed**, to the end of the packet
+
+    Two things a layout written from memory gets wrong. The reply **echoes the extension
+    name**, which an ``EXTENDED_REPLY`` is under no general obligation to do -- most carry
+    only the extension's own data. And the digest field is *not* a ``string``: paramiko emits
+    it with ``Message.add_bytes``, so there is no length prefix and the digests run to the end
+    of the frame. Reading it as a ``string`` consumes four bytes of the first digest as a
+    length and then overruns.
+
+    One digest per block, concatenated, so the count follows from the request's ``block_size``
+    and the digest size of the chosen algorithm rather than being stated anywhere.
+
+    Attributes:
+        request_id: The request this answers.
+        algorithm: The algorithm the server chose, as it named it.
+        digests: The raw concatenated digest bytes, exactly as sent.
+    """
+
+    request_id: int
+    algorithm: bytes
+    digests: bytes
+
+    @classmethod
+    def from_reply(cls, reply: ExtendedReply) -> Self:
+        """Parse an ``EXTENDED_REPLY`` body as a check-file answer.
+
+        Raises:
+            ProtocolError: If the echoed name is not ``check-file``, or the body is truncated
+                before the algorithm.
+        """
+        reader = WireReader(reply.data)
+        try:
+            name = bytes(reader.read_string())
+            algorithm = bytes(reader.read_string())
+        except ProtocolError as truncated:
+            raise ProtocolError(
+                "check-file reply is truncated before the algorithm name",
+                request_id=reply.request_id,
+                raw_frame=reply.data,
+            ) from truncated
+        if name != CHECK_FILE_NAME:
+            raise ProtocolError(
+                f"check-file reply echoed {name!r} where {CHECK_FILE_NAME!r} was expected",
+                request_id=reply.request_id,
+                raw_frame=reply.data,
+            )
+        return cls(
+            request_id=reply.request_id,
+            algorithm=algorithm,
+            digests=bytes(reader.read_bytes(reader.remaining)),
+        )
+
+    def split(self, digest_size: int) -> tuple[bytes, ...]:
+        """Split the concatenated digests into one per block.
+
+        The wire says nothing about how many there are, so the caller supplies the digest
+        size -- from ``hashlib`` for the algorithm the server named.
+
+        Raises:
+            ValueError: If ``digest_size`` is not positive, or does not divide the payload.
+                A remainder means the algorithm we sized against is not the one that produced
+                these bytes, and splitting anyway would hand back digests that are silently
+                misaligned.
+        """
+        if digest_size < 1:
+            raise ValueError(f"digest_size must be at least 1, got {digest_size}")
+        if len(self.digests) % digest_size:
+            raise ValueError(
+                f"{len(self.digests)} digest bytes do not divide into {digest_size}-byte "
+                f"digests, so this is not {self.algorithm!r} output"
+            )
+        return tuple(
+            self.digests[start : start + digest_size]
+            for start in range(0, len(self.digests), digest_size)
+        )

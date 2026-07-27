@@ -17,6 +17,7 @@ processes to prove nothing about anyio.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,6 +25,7 @@ from pathlib import Path
 import pytest
 from matrix import SERVER_NAMES, MatrixServer, running_server, unavailable_reason
 
+from gantry_sftp.codec import CheckFileReply, decode
 from gantry_sftp.exceptions import NoSuchFileError, ServerError
 from gantry_sftp.session import Session, open_session, parse_vendor_id
 from gantry_sftp.transport import open_ssh_transport
@@ -169,6 +171,131 @@ async def test_nothing_can_be_relied_on_beyond_what_all_three_share(server: Matr
     # exactly why every use of one has to degrade.
     shared = set.intersection(*(set(names) for names in EXPECTED_EXTENSIONS.values()))
     assert shared == set(), f"the matrix now shares {shared}, and the fallbacks can relax"
+
+
+async def test_a_real_check_file_digest_matches_what_hashlib_computes(
+    server: MatrixServer, tmp_path: Path
+):
+    """D-5, closed: rung 1 of §6's ladder, read off a server that really speaks it.
+
+    Open since 0.2 on the grounds that no reachable server implemented ``check-file`` --
+    OpenSSH answers ``OP_UNSUPPORTED`` under all three spellings, and ProFTPD's ``checkFile``
+    was known only from documentation. Paramiko advertises it, so the layout stops being an
+    inference.
+
+    **The assertion is the digest, not the shape.** A layout that parses without raising and
+    yields the wrong bytes is exactly the failure this had to rule out, and comparing against
+    ``hashlib`` over the same content is the only thing that does. The frame is also written
+    out as a golden fixture by ``test_check_file_fixture_is_current`` in the ordinary suite.
+    """
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    # sha1 because paramiko's server offers only md5 and sha1, and `usedforsecurity=False`
+    # because this is a comparison against what the server computed rather than a security
+    # decision -- the algorithm is the server's constraint, not our choice.
+    #
+    # Each 1 KiB block is a distinct byte value, which matters: the first version of this
+    # used a repeating pattern, every block hashed identically, and the ordering assertion
+    # below could not have failed however scrambled the reply was.
+    payload = b"".join(bytes([n]) * 1024 for n in range(10))
+    target = server.root / "hashed.bin"
+    target.write_bytes(payload)
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target))
+        try:
+            whole = await sftp.check_file(handle, algorithms=b"sha1")
+            blocked = await sftp.check_file(handle, algorithms=b"sha1", block_size=1024)
+        finally:
+            await sftp.close(handle)
+
+    algorithm, digests = whole
+    assert algorithm == b"sha1"
+    assert digests == (hashlib.sha1(payload, usedforsecurity=False).digest(),)
+
+    _, per_block = blocked
+    expected = tuple(
+        hashlib.sha1(payload[start : start + 1024], usedforsecurity=False).digest()
+        for start in range(0, len(payload), 1024)
+    )
+    assert per_block == expected, "block boundaries or ordering are wrong"
+
+
+async def test_check_file_hashes_only_the_range_it_was_given(server: MatrixServer, tmp_path: Path):
+    # start_offset and length are the fields a from-memory layout gets in the wrong order,
+    # and a whole-file test cannot tell the difference because both are zero.
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    payload = bytes(range(256)) * 8
+    target = server.root / "ranged.bin"
+    target.write_bytes(payload)
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target))
+        try:
+            algorithm, digests = await sftp.check_file(
+                handle, algorithms=b"sha1", start_offset=300, length=500
+            )
+        finally:
+            await sftp.close(handle)
+
+    assert algorithm == b"sha1"
+    assert digests == (hashlib.sha1(payload[300:800], usedforsecurity=False).digest(),)
+
+
+async def test_the_committed_check_file_fixture_still_matches_what_paramiko_sends(
+    server: MatrixServer,
+):
+    """Ties the golden frame in ``tests/fixtures`` to the server it was captured from.
+
+    That fixture is the *only* source for the reply layout -- ``check-file`` is in no secsh
+    draft, so if paramiko changes its wire format there is no document to notice the
+    disagreement against. This is the notice: it re-runs the exact capture and compares the
+    digests, so a stale fixture fails here rather than silently pinning history.
+    """
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    fixture = Path(__file__).parent.parent / "tests" / "fixtures" / "paramiko_check_file_reply.bin"
+    committed = CheckFileReply.from_reply(decode(memoryview(fixture.read_bytes())[4:]))  # type: ignore[arg-type]
+
+    # The capture hashed ten 1 KiB blocks, block n being the byte n repeated.
+    payload = b"".join(bytes([n]) * 1024 for n in range(10))
+    target = server.root / "fixture-content.bin"
+    target.write_bytes(payload)
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target))
+        try:
+            algorithm, digests = await sftp.check_file(handle, algorithms=b"sha1", block_size=1024)
+        finally:
+            await sftp.close(handle)
+
+    assert algorithm == committed.algorithm
+    assert b"".join(digests) == committed.digests, "the committed fixture is stale"
+
+
+async def test_check_file_with_no_algorithm_in_common_is_refused(server: MatrixServer):
+    # The server picks from our list and answers FAILURE when it can offer none. Worth
+    # pinning because the alternative -- silently hashing with something we did not ask for
+    # -- would be a verification that verified the wrong thing.
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    target = server.root / "unhashable.bin"
+    target.write_bytes(b"x")
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target))
+        try:
+            with pytest.raises(ServerError) as exc:
+                _ = await sftp.check_file(handle, algorithms=b"blake3,crc32")
+        finally:
+            await sftp.close(handle)
+
+    assert exc.value.message == b"No supported hash types found"
 
 
 async def test_only_paramiko_offers_hash_based_verification(server: MatrixServer):

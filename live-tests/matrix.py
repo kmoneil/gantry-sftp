@@ -333,6 +333,23 @@ if paramiko is not None:
         def check_channel_request(self, kind: str, chanid: int) -> int:
             return paramiko.OPEN_SUCCEEDED
 
+    class _ParamikoFileHandle(paramiko.SFTPHandle):
+        """An open file, with ``stat`` implemented.
+
+        ``SFTPHandle.stat`` is unimplemented in paramiko and answers ``OP_UNSUPPORTED`` --
+        which is fine for reads and writes and is *not* fine for ``check-file``: its
+        ``length=0`` case, meaning "hash to the end of the file", asks the handle how long
+        the file is and reports "Unable to stat file" when it will not say. Found by the
+        check-file test failing on exactly that path, which is the handler being incomplete
+        rather than the protocol disagreeing with us.
+        """
+
+        def stat(self) -> Any:
+            try:
+                return paramiko.SFTPAttributes.from_stat(os.fstat(self.readfile.fileno()))
+            except OSError as error:
+                return paramiko.SFTPServer.convert_errno(error.errno)
+
     class _ParamikoHandler(paramiko.SFTPServerInterface):
         """The filesystem half of paramiko's SFTP server.
 
@@ -375,7 +392,7 @@ if paramiko is not None:
                 return paramiko.SFTPServer.convert_errno(error.errno)
             writing = bool(flags & (os.O_WRONLY | os.O_RDWR))
             stream = os.fdopen(descriptor, "r+b" if writing else "rb")
-            handle = paramiko.SFTPHandle(flags)
+            handle = _ParamikoFileHandle(flags)
             handle.filename = path
             handle.readfile = stream
             handle.writefile = stream if writing else None

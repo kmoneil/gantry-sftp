@@ -57,6 +57,8 @@ exists today:
   the link drops, with a classification that refuses to retry a failed authentication
 - **server identification**: the session names which SFTP implementation it is talking to,
   from what the handshake already carried — measured against three real servers
+- **server-side hashing** where a server has it: `check_file()` verifies content without
+  moving the bytes again, with its layout read off the wire because no draft defines it
 - **one session, many transfers at once**: a single reader task routes each reply to whichever
   operation asked for it, so `get`/`put` overlap over one channel instead of queueing behind
   a lock
@@ -412,6 +414,37 @@ rather than remembered.
 
 `_plans/DESIGN.md` is canonical for intent and `_plans/progress.md` for what is actually
 built. Neither is committed.
+
+## Verifying a transfer
+
+Three rungs, and the library is explicit about which one you actually got:
+
+1. **Server-side hash** — `check_file()`, where the server has it. Verifies *content* without
+   moving the bytes again.
+2. **Full re-read** — download what you uploaded and compare. Works anywhere, costs a second
+   transfer, so it is opt-in paranoid mode.
+3. **Size check** — always. Catches truncation, which is the common failure, and nothing else.
+
+**Rung 3 is what you get by default, everywhere**, because OpenSSH does not implement
+`check-file` — it answers `OP_UNSUPPORTED` under all three spellings. Calling a size
+comparison a "verified transfer" is the sort of thing this library exists to stop doing.
+
+```python
+handle = await sftp.open("/incoming/big.iso")
+algorithm, digests = await sftp.check_file(handle, algorithms=b"sha256,sha1", block_size=1 << 20)
+await sftp.close(handle)
+```
+
+You get one digest per block and the algorithm the server chose — it picks the first from your
+list that it supports, and answers `FAILURE` if it supports none rather than quietly hashing
+with something else. The digest *count* is nowhere on the wire; it follows from the block size
+and the width of the chosen algorithm, so a payload that does not divide evenly is a
+`ProtocolError` rather than a set of silently misaligned digests.
+
+`check-file` is in no published SFTP draft — 05, 09 and 13 were each checked. The layout here
+was read off paramiko's implementation and off a captured frame, and it is committed as a
+golden fixture in both directions with a live test that re-runs the capture, because there is
+no document to notice a disagreement against.
 
 ## Which server is at the other end
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 from enum import IntEnum, IntFlag
 
 __all__ = [
+    "EXTENSION_CHECK_FILE",
     "EXTENSION_COPY_DATA",
     "EXTENSION_FSYNC",
     "EXTENSION_HOME_DIRECTORY",
@@ -141,6 +142,14 @@ EXTENSION_EXPAND_PATH = "expand-path@openssh.com"
 EXTENSION_COPY_DATA = "copy-data"  # no @openssh.com -- verified on the wire
 EXTENSION_HOME_DIRECTORY = "home-directory"  # no @openssh.com -- verified on the wire
 EXTENSION_USERS_GROUPS_BY_ID = "users-groups-by-id@openssh.com"
+
+EXTENSION_CHECK_FILE = "check-file"
+"""Server-side hashing. **Not an OpenSSH extension** -- it answers ``OP_UNSUPPORTED`` under
+all three spellings, measured. Paramiko's server advertises exactly this, unsuffixed, with a
+value of ``md5,sha1``; ProFTPD's ``mod_sftp`` implements the same idea as ``checkFile``.
+
+It is rung 1 of DESIGN.md 6's verification ladder and the only rung that verifies *content*
+without moving the bytes again."""
 
 OPENSSH_ADVERTISED_EXTENSIONS: tuple[tuple[str, str], ...] = (
     (EXTENSION_POSIX_RENAME, "1"),
