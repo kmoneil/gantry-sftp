@@ -55,6 +55,8 @@ exists today:
 - **resume**, both directions, opt-in and labelled with what it actually proves
 - **reconnect and retry**: `with_reconnect()` runs an operation against a fresh session when
   the link drops, with a classification that refuses to retry a failed authentication
+- **server identification**: the session names which SFTP implementation it is talking to,
+  from what the handshake already carried — measured against three real servers
 - **one session, many transfers at once**: a single reader task routes each reply to whichever
   operation asked for it, so `get`/`put` overlap over one channel instead of queueing behind
   a lock
@@ -410,6 +412,42 @@ rather than remembered.
 
 `_plans/DESIGN.md` is canonical for intent and `_plans/progress.md` for what is actually
 built. Neither is committed.
+
+## Which server is at the other end
+
+```python
+sftp.profile.name       # "openssh" | "asyncssh" | "paramiko" | "unknown"
+sftp.profile.version    # "2.24.0", where the server volunteers one
+repr(sftp)              # <Session server=asyncssh/2.24.0 version=3 extensions=11 ...>
+```
+
+Worked out from the extension list the handshake already carried, so it costs no round trip,
+and attached to capability refusals so "this server does not advertise `posix-rename`" names
+the server it is complaining about.
+
+**It is diagnostic only.** Nothing in the library changes behaviour because of it, and that
+bound is deliberate rather than a stage not yet reached: a fingerprint is a guess about an
+opaque peer, so a wrong guess should cost a wrong name in a log line, never a wrong answer in
+a file. `unknown` is a real answer — many endpoints advertise nothing at all — and it is what
+you get rather than the nearest match.
+
+Three profiles ship, not ten, because three is how many `live-tests/matrix.py` can actually
+start: OpenSSH, asyncssh and paramiko all serve SFTP and the last two were already installed
+as benchmark dependencies. A profile without a test against that server is a rumour.
+
+One measurement from that matrix is worth repeating here, because it decides what any
+"quirks" layer can ever do. Five distinct failure conditions — `MKDIR` on an existing
+directory, `RENAME` onto an existing target, `CREAT|EXCL` on an existing file, `RMDIR` of a
+non-empty directory, `REMOVE` of a directory — produce this:
+
+| | OpenSSH | asyncssh | paramiko |
+| --- | --- | --- | --- |
+| all five | `Failure` | `File exists` / `File already exists` / `Directory not empty` / `Is a directory` | `Failure` |
+
+**On OpenSSH the error message is a constant function of the error code.** So telling a
+transient failure from a permanent one by reading the message — the standard proposal, and
+the thing v3's catch-all `FAILURE` would need — cannot work on the reference server at all.
+That is why retry classifies on exception type rather than on message text.
 
 ## When the connection fails
 

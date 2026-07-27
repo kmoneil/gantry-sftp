@@ -25,7 +25,7 @@ import pytest
 from matrix import SERVER_NAMES, MatrixServer, running_server, unavailable_reason
 
 from gantry_sftp.exceptions import NoSuchFileError, ServerError
-from gantry_sftp.session import Session, open_session
+from gantry_sftp.session import Session, open_session, parse_vendor_id
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -296,7 +296,36 @@ async def test_only_asyncssh_says_who_it_is(server: MatrixServer):
         return
 
     assert vendor is not None
-    # The draft-05 layout: vendor, product, version, then a uint64 build number. Asserted on
-    # the bytes rather than parsed, because nothing in this library parses it yet and a
-    # decoder written from this one sample would be a guess wearing a measurement's clothes.
-    assert b"AsyncSSH" in vendor
+    # Layout: string vendor, string product, string version, uint64 build. Sourced from
+    # asyncssh's own `_parse_vendor_id` and from these bytes -- it is in neither
+    # draft-ietf-secsh-filexfer-05 nor -13, both of which were checked after an earlier
+    # version of this comment cited draft-05 for it and was wrong.
+    assert parse_vendor_id(vendor) == ("Ron Frederick", "AsyncSSH", "2.24.0", 0)
+
+
+async def test_every_server_is_identified_from_what_it_advertised(server: MatrixServer):
+    """Fingerprinting, against the three implementations it was written from.
+
+    The unit tests match against extension sets copied into the ordinary suite; this is the
+    one place the sets themselves are what a server really sent. A server that changes its
+    advertisement fails here first, which is the right order -- the copies are downstream.
+    """
+    async with connected(server) as sftp:
+        profile = sftp.profile
+
+    assert profile.name == server.name
+    assert profile.name in repr(sftp.profile) or profile.name == profile.label.split("/")[0]
+
+
+async def test_only_asyncssh_reports_a_version_because_only_it_says_one(server: MatrixServer):
+    # No version is inferred from an extension list. OpenSSH's is knowable only from the SSH
+    # banner, which this architecture does not see, so the honest answer is None.
+    async with connected(server) as sftp:
+        profile = sftp.profile
+
+    if server.name == "asyncssh":
+        assert profile.version is not None
+        assert profile.label == f"asyncssh/{profile.version}"
+    else:
+        assert profile.version is None
+        assert profile.label == server.name

@@ -417,6 +417,19 @@ async def test_a_session_reports_its_tunables():
     assert "idle_timeout=7.0" in text
 
 
+async def test_a_session_says_which_server_it_thinks_it_is_talking_to():
+    """A bug report that names the endpoint is worth more than one that describes it.
+
+    The fake advertises nothing, which is the honest case and the common one -- §7 says real
+    endpoints frequently advertise no extensions at all -- so it reports ``unknown`` rather
+    than picking the nearest match.
+    """
+    server = FakeServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert sftp.profile.name == "unknown"
+        assert "server=unknown" in repr(sftp)
+
+
 # --- paths are bytes ---------------------------------------------------------------------------
 
 

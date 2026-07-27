@@ -113,6 +113,7 @@ from gantry_sftp.session._publish import (
     staged_path,
     staging_token,
 )
+from gantry_sftp.session._quirks import ServerProfile, identify
 from gantry_sftp.session._recursive import (
     Skipped,
     SkipReason,
@@ -408,6 +409,13 @@ class Session:
         self._request_timeout = request_timeout
         self._idle_timeout = idle_timeout
         self._depth = depth
+        self._profile = identify(dispatcher.codec.extensions)
+        """Which implementation we believe is at the other end.
+
+        Worked out once, from the extension list the handshake already carried, so it costs
+        no round trip. Diagnostic only -- see :mod:`gantry_sftp.session._quirks` on why a
+        fingerprint is deliberately not allowed to change behaviour."""
+
         self._unsupported: set[bytes] = set()
         """Extensions this server answered ``OP_UNSUPPORTED`` for, so we stop asking.
 
@@ -429,6 +437,17 @@ class Session:
         """Protocol version negotiated."""
         return self._codec.server_version
 
+    @property
+    def profile(self) -> ServerProfile:
+        """Which SFTP implementation this looks like, from what it advertised.
+
+        Identification only: nothing in the library changes behaviour based on it, and
+        :mod:`gantry_sftp.session._quirks` explains why that bound is deliberate. Useful for
+        a log line, a bug report, and for a caller who *does* want to special-case a server
+        and would otherwise fingerprint it themselves, worse.
+        """
+        return self._profile
+
     @override
     def __repr__(self) -> str:
         """Report the tunables a slow transfer would make you want to check.
@@ -438,10 +457,22 @@ class Session:
         transfer, and one that is unexpectedly large is more concurrency than intended.
         """
         return (
-            f"<Session version={self._codec.server_version} "
+            f"<Session server={self._profile.label} version={self._codec.server_version} "
             f"extensions={len(self._codec.extensions)} depth={self._depth} "
             f"outstanding={self._codec.outstanding} "
             f"request_timeout={self._request_timeout} idle_timeout={self._idle_timeout}>"
+        )
+
+    def _server_note(self) -> str:
+        """One line naming the peer, for a capability refusal to carry.
+
+        "This server does not advertise X" is a complaint about a server the message does not
+        name. A user reading it in a log two days later has to work out which endpoint the
+        job was talking to; the connection already knew, and threw it away.
+        """
+        return (
+            f"the server identifies as {self._profile.label} ({self._profile.description}) "
+            f"and advertises {len(self._codec.extensions)} extension(s)"
         )
 
     def sizes_for(self, handle: bytes) -> TransferSizes:
@@ -1218,13 +1249,15 @@ class Session:
             staging_name=staging_name,
         )
         if require_fsync and not self.supports(EXTENSION_FSYNC):
-            raise CapabilityError(
+            refusal = CapabilityError(
                 f"require_fsync=True but this server does not advertise {EXTENSION_FSYNC}, "
                 f"so nothing can promise the bytes reached stable storage",
                 feature="durable upload",
                 missing=(EXTENSION_FSYNC,),
                 path=target,
             )
+            refusal.add_note(self._server_note())
+            raise refusal
 
         upload = _Upload(
             local_path=local_path,
@@ -1517,13 +1550,15 @@ class Session:
         """
         if not await self._confirmed_present(target):
             return
-        raise CapabilityError(
+        refusal = CapabilityError(
             f"require_atomic=True but {target!r} already exists and this server does not "
             f"advertise {EXTENSION_POSIX_RENAME}, so it cannot be replaced in one step",
             feature="atomic publish",
             missing=(EXTENSION_POSIX_RENAME,),
             path=target,
         )
+        refusal.add_note(self._server_note())
+        raise refusal
 
     async def _confirmed_present(self, path: bytes) -> bool:
         """Whether the server *positively reported* that the name ``path`` is taken.
