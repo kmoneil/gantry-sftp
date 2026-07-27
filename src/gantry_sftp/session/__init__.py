@@ -64,6 +64,14 @@ from gantry_sftp.session._recursive import (
     WalkEntry,
     join_remote,
 )
+from gantry_sftp.session._retry import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_BACKOFF,
+    DEFAULT_BACKOFF_MAX,
+    RETRYABLE_STATUS_CODES,
+    is_retryable,
+    with_reconnect,
+)
 from gantry_sftp.session._session import (
     DEFAULT_REQUEST_TIMEOUT,
     LIMITS_EXTENSION,
@@ -75,6 +83,9 @@ from gantry_sftp.session._session import (
 from gantry_sftp.session._upload import upload_handle
 
 __all__ = [
+    "DEFAULT_ATTEMPTS",
+    "DEFAULT_BACKOFF",
+    "DEFAULT_BACKOFF_MAX",
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_MAX_PACKET_LENGTH",
     "DEFAULT_PIPELINE_DEPTH",
@@ -84,6 +95,7 @@ __all__ = [
     "MAX_STAGED_NAME_LENGTH",
     "PREFERRED_READ_LENGTH",
     "PREFERRED_WRITE_LENGTH",
+    "RETRYABLE_STATUS_CODES",
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
     "DirEntry",
@@ -108,6 +120,7 @@ __all__ = [
     "decode_name",
     "download_handle",
     "entry_kind",
+    "is_retryable",
     "join_remote",
     "local_child",
     "local_dir_entry",
@@ -122,5 +135,6 @@ __all__ = [
     "unsafe_reason",
     "upload_handle",
     "walk_local",
+    "with_reconnect",
     "write_request_overhead",
 ]

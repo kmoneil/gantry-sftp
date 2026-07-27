@@ -53,6 +53,8 @@ exists today:
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - **resume**, both directions, opt-in and labelled with what it actually proves
+- **reconnect and retry**: `with_reconnect()` runs an operation against a fresh session when
+  the link drops, with a classification that refuses to retry a failed authentication
 - **one session, many transfers at once**: a single reader task routes each reply to whichever
   operation asked for it, so `get`/`put` overlap over one channel instead of queueing behind
   a lock
@@ -90,7 +92,7 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: `glob`, retry, the fsspec adapter, `SFTPPath`, or the generated sync API. The
+Not yet: `glob`, the fsspec adapter, `SFTPPath`, or the generated sync API. The
 names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not exist yet — `open_session` is
 the current spelling, and concurrency is spelled with your own task group rather than a
 `concurrency=` argument.
@@ -257,6 +259,56 @@ goes and what it points at does not, and a directory is refused rather than empt
 refusal is the safety net, and it means a wrong guess can only fail in the direction that
 raises. There is no `max_depth`, because a depth-limited recursive delete leaves the deepest
 directories populated and their parents unremovable.
+
+## Reconnect and retry
+
+A session cannot reconnect itself, and that is deliberate: `open_session()` is handed a
+transport whose lifetime is the caller's. Reconnection lives one level up and needs a
+*recipe* — any zero-argument callable that produces a new transport:
+
+```python
+from functools import partial
+from gantry_sftp.session import with_reconnect
+
+recipe = partial(open_ssh_transport, "example.com", user="bob")
+
+moved = await with_reconnect(
+    recipe,
+    lambda sftp: sftp.get("/incoming/big.iso", "big.iso", resume=True),
+    attempts=3,
+)
+```
+
+**The operation is re-run from the beginning against a session that did not exist before.**
+Nothing survives a reconnect — not the remote handles, not the request ids, not the
+negotiated limits. So it has to be *resumable* (`get`/`put` with `resume=True`, which
+re-establishes the offset from what is actually there) or *idempotent* (`listdir`,
+`get_tree`). A `rename` is neither: v3 `RENAME` refuses an existing target, so a lost reply
+makes the second attempt fail. Nothing here can tell the difference for you, so it is stated
+rather than guessed at.
+
+That is also why "writes are never blindly replayed" needs no machinery: it is `resume`'s
+own check, and its weaker claim on the upload side is made once per attempt.
+
+`is_retryable()` is the classification, and it is public because you may want to disagree
+with it:
+
+| Retryable | Terminal |
+| --- | --- |
+| `ConnectError` — the transport died | `AuthenticationError`, `HostKeyError` |
+| `TransferTimeoutError` — the far end went quiet | `NoSuchFileError`, `PermissionDeniedError`, `UnsupportedError` |
+| `ServerError` with `NO_CONNECTION` / `CONNECTION_LOST` | `ServerError` with `FAILURE`, `ProtocolError`, `UnsafePathError` |
+
+Two of those deserve their reasons. **A failed authentication is never retried**, and not just
+because credentials do not become correct by being offered again: OpenSSH 9.8+ applies
+`PerSourcePenalties`, so repeated failed auth from one address gets that address
+progressively locked out — a retry loop turns one wrong key into a host that stops answering
+for everything behind that IP. And **`FAILURE` is terminal**, even though it is sometimes
+transient: v3's catch-all is what a permission problem, a full disk, a name collision and a
+momentary appliance hiccup all arrive as, so retrying it would turn every fast clear failure
+into three slow ones. That changes when the quirks layer can match a server's message text.
+
+`examples/retry.py` drops a link mid-download and finishes it on the next connection.
 
 ## Atomic publish
 

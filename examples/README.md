@@ -12,6 +12,7 @@ python examples/listing.py                        # listdir() and scandir(), and
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
 python examples/resume.py                         # interrupt a transfer, then finish it
+python examples/retry.py                          # a link that drops, reconnected and resumed
 python examples/concurrent_transfers.py           # many transfers over one session
 python examples/connect_errors.py                 # why the connection failed, as a class
 ```
@@ -25,6 +26,7 @@ python examples/listing.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
 python examples/resume.py user@host /remote/dir
+python examples/retry.py user@host /remote/dir
 python examples/concurrent_transfers.py user@host /remote/dir
 python examples/connect_errors.py user@host
 ```
@@ -42,6 +44,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused                   |
 | `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
 | `resume.py`               | `get(resume=)`, `put(resume=)`, and the two refusals — a partial that cannot be a prefix, and atomic without a staging name |
+| `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
 | `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
 

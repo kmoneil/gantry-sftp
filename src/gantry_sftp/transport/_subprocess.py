@@ -236,6 +236,7 @@ class SubprocessTransport:
         self._closed = True
         with anyio.CancelScope(shield=True):
             await self._close_stdin()
+            await self._release_pipes()
             await self._reap()
 
     async def _close_stdin(self) -> None:
@@ -244,6 +245,38 @@ class SubprocessTransport:
             return
         with suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
             await self._process.stdin.aclose()
+
+    async def _release_pipes(self) -> None:
+        """Hand the child's pipes back, which reaping alone does not do.
+
+        **Not housekeeping: this is a descriptor leak.** Waiting for the child, or killing
+        it, does nothing about the pipe objects on our side -- and closing our own stream
+        wrappers is not enough either, because the *underlying* asyncio pipe transport stays
+        open behind them. It surfaces as ``ResourceWarning: unclosed transport`` from a
+        ``__del__``, at whatever unrelated moment the collector happens to run, which is why
+        it went unnoticed: one connection per process leaks one descriptor and nobody
+        notices, and until :func:`~gantry_sftp.session.with_reconnect` existed nothing in
+        this library opened a second connection to the same server.
+
+        ``Process.aclose()`` is anyio's own answer and closes both layers. It runs *before*
+        :meth:`_reap`, and the order is the difference between a fast teardown and a
+        five-second one. Closing stdin only tells a server that is *reading* to stop; one
+        blocked writing into a stdout pipe nobody drains never gets that far, so it misses
+        the EOF, sits out the whole grace period and is SIGTERMed. Closing the read end
+        gives it ``EPIPE`` and it exits on its own. anyio's own comment on that code says
+        the same thing, which is a good sign the ordering is not a local trick.
+
+        It waits for the child, so it is bounded here and :meth:`_reap` still owns the
+        escalation. On timeout anyio closes the transport, which kills and reaps -- so the
+        polite SIGTERM stage is skipped only in the case where politeness already failed.
+
+        Found by the retry lane, running two connections back to back for the first time.
+        """
+        with (
+            anyio.move_on_after(_TERMINATE_GRACE_SECONDS),
+            suppress(anyio.BrokenResourceError, anyio.ClosedResourceError),
+        ):
+            await self._process.aclose()
 
     async def _reap(self) -> None:
         """Wait, then escalate. Politeness first, but never indefinitely."""
