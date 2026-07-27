@@ -59,6 +59,7 @@ from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
     ProgressCallback,
+    Span,
 )
 
 __all__ = ["upload_handle"]
@@ -80,7 +81,7 @@ class _Uploader:
         handle: bytes,
         fd: int,
         *,
-        size: int,
+        span: Span,
         write_length: int,
         depth: int,
         idle_timeout: float | None,
@@ -91,7 +92,11 @@ class _Uploader:
         self._exchange = exchange
         self._handle = handle
         self._fd = fd
-        self._size = size
+        self._span = span
+        """Where this run starts and where the local file ends. A non-zero start is a resume,
+        and the bytes below it are assumed to be on the server already -- a claim the session
+        makes and this layer cannot check."""
+
         self._write_length = write_length
         self._idle_timeout = idle_timeout
         self._progress = progress
@@ -109,9 +114,11 @@ class _Uploader:
             self._finished.set()
 
     async def _send_all(self) -> None:
-        offset = 0
-        while offset < self._size:
-            length = min(self._write_length, self._size - offset)
+        offset = self._span.start
+        while self._span.end is None or offset < self._span.end:
+            length = self._write_length
+            if self._span.end is not None:
+                length = min(length, self._span.end - offset)
             # Reading the local file in a worker thread keeps a slow disk from stalling the
             # receive side, which is the half that has to keep draining for either to move.
             # `run_sync` is imported directly rather than reached as `anyio.to_thread...`:
@@ -139,7 +146,9 @@ class _Uploader:
         while not self._finished.is_set():
             self._acknowledge(await self._next_reply())
             if self._progress is not None:
-                self._progress(self._acknowledged, self._size)
+                # Absolute, not per-run: "4.5 GB of 9 GB" is what a caller displays, and
+                # "0.5 GB of 9 GB" after a resume is a lie about how much is left.
+                self._progress(self._span.start + self._acknowledged, self._span.end)
 
     async def _next_reply(self) -> Completed:
         if self._idle_timeout is None:
@@ -184,10 +193,17 @@ class _Uploader:
         self._settle()
 
     async def run(self) -> int:
-        """Transfer the file. Returns the number of bytes the server acknowledged."""
+        """Transfer the file.
+
+        Returns:
+            Bytes the server acknowledged **in this run**, which is the file's size only when
+            the span starts at 0. Progress, by contrast, is reported absolutely.
+        """
         if self._progress is not None:
-            self._progress(0, self._size)
-        if self._size == 0:
+            self._progress(self._span.start, self._span.end)
+        if self._span.end is not None and self._span.start >= self._span.end:
+            # Nothing left: an empty file, or a resume of one already fully uploaded. Both
+            # are successes that move no bytes, and neither may open a task group to find out.
             return 0
 
         try:
@@ -200,7 +216,7 @@ class _Uploader:
             raise flatten_exception_group(group) from None
 
         if self._progress is not None:
-            self._progress(self._acknowledged, self._size)
+            self._progress(self._span.start + self._acknowledged, self._span.end)
         return self._acknowledged
 
 
@@ -214,6 +230,7 @@ async def upload_handle(
     idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
     progress: ProgressCallback | None = None,
     remote_path: bytes | None = None,
+    start_offset: int = 0,
 ) -> int:
     """Upload ``source`` into an already-open remote file.
 
@@ -227,32 +244,45 @@ async def upload_handle(
         depth: Requests in flight. Note each one holds ``write_length`` bytes of payload, so
             this multiplies into real memory in a way the download side does not.
         idle_timeout: Seconds without any response before giving up.
-        progress: Called with ``(transferred, total)`` as writes are acknowledged.
+        progress: Called with ``(transferred, total)`` as writes are acknowledged. Reports
+            the *absolute* position, so a resumed upload starts the display where it left off.
         remote_path: Carried on errors for diagnosis.
+        start_offset: Byte of the local file to begin at. Non-zero resumes, and the writes go
+            to the same absolute offsets on the server -- so the remote file must already
+            hold exactly the first ``start_offset`` bytes of this source. Nothing here can
+            check that; it is the session's claim, made from a stat, and a weak one.
 
     Returns:
-        Bytes the server acknowledged.
+        Bytes the server acknowledged in this call, which is the file's size only when
+        ``start_offset`` is 0.
 
     Raises:
         TransferError: If the server refuses a write.
         TransferTimeoutError: If the server stops responding.
-        ValueError: If ``depth`` or ``write_length`` would make no progress.
+        ValueError: If ``depth`` or ``write_length`` would make no progress, or if
+            ``start_offset`` is negative or past the end of the local file.
     """
     if depth < 1:
         raise ValueError(f"depth must be at least 1, got {depth}")
     if write_length < 1:
         raise ValueError(f"write_length must be at least 1, got {write_length}")
+    if start_offset < 0:
+        raise ValueError(f"start_offset must not be negative, got {start_offset}")
 
     fd = os.open(source, os.O_RDONLY)
     try:
         size = os.fstat(fd).st_size
+        if start_offset > size:
+            raise ValueError(
+                f"start_offset {start_offset} is past the end of a {size}-byte local file"
+            )
         with dispatcher.exchange() as exchange:
             uploader = _Uploader(
                 dispatcher.codec,
                 exchange,
                 handle,
                 fd,
-                size=size,
+                span=Span(start_offset, size),
                 write_length=write_length,
                 depth=depth,
                 idle_timeout=idle_timeout,

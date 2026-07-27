@@ -384,6 +384,55 @@ async def test_settings_that_cannot_make_progress_are_refused(
         await fetch(server, tmp_path / "out", depth=depth, read_length=read_length)
 
 
+async def test_a_negative_start_offset_is_refused(tmp_path: Path):
+    server = ScriptedServer(bytes(64))
+    with pytest.raises(ValueError) as exc:
+        await fetch(server, tmp_path / "out", read_length=64, start_offset=-1)
+    assert exc.value.args[0] == "start_offset must not be negative, got -1"
+
+
+async def test_a_start_offset_past_the_end_of_the_file_is_refused(tmp_path: Path):
+    # Caught here as well as in the session, because this is where the arithmetic lives: an
+    # offset past the end issues no reads at all and would report a serene, empty success.
+    server = ScriptedServer(bytes(64))
+    with pytest.raises(ValueError) as exc:
+        await fetch(server, tmp_path / "out", read_length=64, start_offset=65)
+    assert exc.value.args[0] == "start_offset 65 is past the end of a 64-byte file"
+
+
+async def test_a_start_offset_reads_only_the_remainder(tmp_path: Path):
+    # The scheduler's half of resume, isolated from the session's decision about *whether* to
+    # resume: the reads start where they were told and nothing below the offset is requested.
+    content = bytes(range(256))
+    server = ScriptedServer(content)
+    written = await fetch(server, tmp_path / "out", read_length=64, start_offset=128)
+
+    assert written == 128
+    lowest = min(offset for offset, _ in server.reads)
+    assert lowest == 128, f"read below the offset it was given: {server.reads}"
+    assert (tmp_path / "out").read_bytes()[128:] == content[128:]
+
+
+async def test_a_start_offset_at_the_end_reads_nothing_at_all(tmp_path: Path):
+    server = ScriptedServer(bytes(64))
+    assert await fetch(server, tmp_path / "out", read_length=64, start_offset=64) == 0
+    assert server.reads == []
+
+
+async def test_progress_on_a_resumed_download_is_absolute(tmp_path: Path):
+    seen: list[tuple[int, int | None]] = []
+    server = ScriptedServer(bytes(256))
+    await fetch(
+        server,
+        tmp_path / "out",
+        read_length=64,
+        start_offset=192,
+        progress=lambda transferred, total: seen.append((transferred, total)),
+    )
+    assert seen[0] == (192, 256), "the first report restarted the count at zero"
+    assert seen[-1] == (256, 256)
+
+
 # --- pipelining and progress --------------------------------------------------------------
 
 

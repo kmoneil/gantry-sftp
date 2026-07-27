@@ -88,6 +88,7 @@ from gantry_sftp.exceptions import (
     ServerError,
     SFTPError,
     StateError,
+    TransferError,
     TransferTimeoutError,
     UnsupportedError,
     flatten_exception_group,
@@ -152,8 +153,23 @@ _STATUS_ERRORS = {
 _LOCAL_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
 """How a downloaded file is opened locally, before any safety flags are added."""
 
+_LOCAL_RESUME_FLAGS = os.O_WRONLY | os.O_CREAT
+"""The same without ``O_TRUNC``, for a resumed download.
+
+Not ``O_APPEND``: every write goes to an explicit offset with ``os.pwrite``, and ``O_APPEND``
+would ignore those offsets and redirect every reply to the end of the file -- which for
+out-of-order pipelined replies means a file assembled in arrival order. Silently, and wrong.
+"""
+
 _TRUNCATE_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
 """Open flags for writing a file in place: create it, or replace what is there."""
+
+_RESUME_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT
+"""Open flags for a resumed upload: adopt what is there, and do not truncate it.
+
+No ``TRUNC``, obviously, and no ``EXCL`` -- adopting an existing file is the whole point, and
+``EXCL`` is the flag that refuses to. Losing it loses the collision check with it, which is
+why a resumed atomic publish demands a caller-chosen staging name."""
 
 _STAGE_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL
 """Open flags for a staging file, and ``EXCL`` is the load-bearing one.
@@ -224,6 +240,7 @@ class _Upload:
     require_fsync: bool
     progress: ProgressCallback | None
     depth: int | None
+    resume: bool = False
 
 
 class DirectoryScan:
@@ -822,6 +839,7 @@ class Session:
         progress: ProgressCallback | None = None,
         depth: int | None = None,
         no_follow: bool = False,
+        resume: bool = False,
     ) -> int:
         """Download ``remote_path`` to ``local_path``.
 
@@ -831,24 +849,41 @@ class Session:
 
         Args:
             remote_path: Path on the server.
-            local_path: Local destination. Created or truncated.
-            progress: Called with ``(transferred, total)`` as data arrives.
+            local_path: Local destination. Created, and truncated unless ``resume``.
+            progress: Called with ``(transferred, total)`` as data arrives. On a resume the
+                first call reports the offset it started from, not zero.
             depth: Requests in flight, overriding the session default.
             no_follow: Refuse to write through a local symlink at ``local_path``. Off by
                 default, because pointing a download at a link you made yourself is a
                 legitimate thing to do; on for every file in a recursive download, where a
                 link in the destination tree is the last step of a path traversal.
+            resume: Continue an interrupted download instead of starting over. Off by
+                default -- see :meth:`put` for why resuming is always opt-in. This direction
+                is the **stronger** of the two: the partial file is on the local disk, so its
+                length is a fact rather than a report, and reads at an explicit offset are
+                idempotent. What it still cannot know is whether those bytes came from *this*
+                remote file, so a local partial longer than the remote file is refused rather
+                than truncated, and a server that will not report a size makes the check
+                impossible and the resume is refused too.
 
         Returns:
-            Bytes written.
+            Bytes written **by this call**. On a resume that is the remainder, not the file's
+            size, and on a resume of an already-complete file it is ``0``.
 
         Raises:
             NoSuchFileError: If the remote path does not exist.
             ServerError: If the server refuses.
-            TransferError: If the transfer fails partway.
+            TransferError: If the transfer fails partway, or if ``resume`` cannot establish a
+                safe offset.
         """
         encoded = _encode_path(remote_path)
         attributes = await self.stat(encoded)
+        start = _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
+        if resume and start == attributes.size:
+            # Already complete. Nothing to open, nothing to move, and saying so costs one
+            # STAT rather than a transfer that writes nothing.
+            return 0
+
         handle = await self.open(encoded, OpenFlag.READ)
         try:
             transferred = await self._download_into(
@@ -859,6 +894,7 @@ class Session:
                 progress=progress,
                 remote_path=encoded,
                 no_follow=no_follow,
+                start_offset=start,
             )
         except BaseException:
             # Closing is not optional: a leaked handle counts against max-open-handles and is
@@ -880,6 +916,7 @@ class Session:
         progress: ProgressCallback | None,
         remote_path: bytes,
         no_follow: bool,
+        start_offset: int = 0,
     ) -> int:
         """Open the local destination and let the scheduler fill it.
 
@@ -887,8 +924,13 @@ class Session:
         decision: ``O_NOFOLLOW`` where a recursive download must not write through a link
         somebody planted in the destination tree, and mode 0600 so a file is never briefly
         world-readable while it is being written.
+
+        ``O_TRUNC`` is dropped when resuming, and that is the whole of the local-side change:
+        writes already go to explicit offsets, so keeping the first ``start_offset`` bytes is
+        a matter of not deleting them.
         """
-        fd = os.open(local_path, _LOCAL_WRITE_FLAGS | (NO_FOLLOW if no_follow else 0), 0o600)
+        flags = _LOCAL_WRITE_FLAGS if not start_offset else _LOCAL_RESUME_FLAGS
+        fd = os.open(local_path, flags | (NO_FOLLOW if no_follow else 0), 0o600)
         try:
             return await download_handle(
                 self._dispatcher,
@@ -900,6 +942,7 @@ class Session:
                 idle_timeout=self._idle_timeout,
                 progress=progress,
                 remote_path=remote_path,
+                start_offset=start_offset,
             )
         finally:
             os.close(fd)
@@ -1089,6 +1132,7 @@ class Session:
         require_atomic: bool = False,
         require_fsync: bool = False,
         staging_name: bytes | str | None = None,
+        resume: bool = False,
         progress: ProgressCallback | None = None,
         depth: int | None = None,
     ) -> UploadResult:
@@ -1126,8 +1170,31 @@ class Session:
             staging_name: Override the staging file's name. A bare name is resolved as a
                 sibling of the destination; a value containing ``/`` is used verbatim and must
                 be on the same filesystem. For servers that forbid dot-files or mandate a
-                staging directory.
-            progress: Called with ``(transferred, total)`` as writes are acknowledged.
+                staging directory -- and the only way to make ``resume`` possible under
+                ``atomic``, since the default staging name is deliberately unguessable.
+            resume: Continue an interrupted upload from the size the server reports, instead
+                of sending the file again. **Off by default, and it is the weaker of the two
+                directions.** A size match proves the byte *count* agrees and nothing else:
+                the remote partial may be from a different run, a different source file, or a
+                concurrent writer, and there is no cheap way to tell from here. See
+                :meth:`get` for the download side, where the partial is on local disk and the
+                claim is correspondingly stronger.
+
+                It also interacts with ``atomic``, and not in the way it first looks. The
+                obstacle is *not* that ``CREAT|EXCL`` refuses to adopt a leftover staging
+                file -- it never meets one, because :func:`~gantry_sftp.session.staging_token`
+                puts fresh randomness in the name on every call. The obstacle is that the
+                previous run's staging file therefore has a name this run cannot know. So
+                ``resume=True`` with ``atomic=True`` needs an explicit ``staging_name``, and
+                raises ``ValueError`` without one rather than silently re-uploading.
+
+                Making the staging name deterministic instead was considered and refused:
+                that is exactly the collision ``EXCL`` exists to catch, and two publishers
+                resuming into one predictable name would interleave into a single file. When
+                ``staging_name`` is given, ``EXCL`` is dropped so the file *can* be adopted,
+                which hands that collision risk to the caller who named it.
+            progress: Called with ``(transferred, total)`` as writes are acknowledged. On a
+                resume the first call reports the offset it started from, not zero.
             depth: Requests in flight, overriding the session default. Each one holds a full
                 payload in memory, so this costs more here than on the download side.
 
@@ -1147,6 +1214,8 @@ class Session:
             fsync=fsync,
             require_atomic=require_atomic,
             require_fsync=require_fsync,
+            resume=resume,
+            staging_name=staging_name,
         )
         if require_fsync and not self.supports(EXTENSION_FSYNC):
             raise CapabilityError(
@@ -1163,6 +1232,7 @@ class Session:
             require_fsync=require_fsync,
             progress=progress,
             depth=depth,
+            resume=resume,
         )
         if not atomic:
             return await self._put_in_place(upload, target)
@@ -1178,9 +1248,17 @@ class Session:
         the file being written, so there is nothing to remove that would not be deleting the
         caller's data. A failed in-place write leaves a truncated destination, which is what
         ``atomic=False`` means.
+
+        Resuming here reads the destination's own length and continues into it. That is the
+        one place the two flags cooperate without an extra name: in-place has already given
+        up on the consumer never seeing a partial file, which is the same thing a resumable
+        upload leaves lying around between runs.
         """
-        handle = await self.open(target, _TRUNCATE_FLAGS)
-        transferred, durability = await self._fill_and_close(upload, handle, target)
+        start = await self._upload_resume_offset(upload, target)
+        handle = await self.open(target, _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS)
+        transferred, durability = await self._fill_and_close(
+            upload, handle, target, start_offset=start
+        )
         return UploadResult(transferred, target, PublishMechanism.IN_PLACE, durability)
 
     async def _put_atomically(
@@ -1200,9 +1278,12 @@ class Session:
         if require_atomic and not self.supports(EXTENSION_POSIX_RENAME):
             await self._refuse_unpublishable(target)
 
-        handle = await self._open_staging_file(staged, target)
+        start = await self._upload_resume_offset(upload, staged)
+        handle = await self._open_staging_file(staged, target, resume=upload.resume)
         try:
-            transferred, durability = await self._fill_and_close(upload, handle, staged)
+            transferred, durability = await self._fill_and_close(
+                upload, handle, staged, start_offset=start
+            )
             mechanism = await self._publish(staged, target, require_atomic=require_atomic)
         except _StagedIsTheOnlyCopyError as lost:
             # Do NOT clean up. The destination has already been removed and this file is the
@@ -1219,7 +1300,7 @@ class Session:
             raise
         return UploadResult(transferred, target, mechanism, durability, staged)
 
-    async def _open_staging_file(self, staged: bytes, target: bytes) -> bytes:
+    async def _open_staging_file(self, staged: bytes, target: bytes, *, resume: bool) -> bytes:
         """Create the staging file, or fail in a way that names what to do about it.
 
         Kept separate because **a failed OPEN must not reach the cleanup path**: nothing of
@@ -1230,9 +1311,14 @@ class Session:
         The note matters more than it looks. This is the first failure a user meets when the
         new default does not suit their server, and without it the message names a dot-file
         they never typed, in answer to a call about a path they did.
+
+        ``resume`` drops ``EXCL``, because adopting the previous run's staging file is the
+        entire point and ``EXCL`` exists to refuse exactly that. What is lost with it is the
+        collision check -- so this only happens when the caller named the staging file
+        themselves, which is enforced a layer up in :func:`_check_publish_flags`.
         """
         try:
-            return await self.open(staged, _STAGE_FLAGS)
+            return await self.open(staged, _RESUME_FLAGS if resume else _STAGE_FLAGS)
         except SFTPError as refusal:
             refusal.add_note(
                 f"{staged!r} is the staging file for {target!r}. Publishing atomically needs "
@@ -1243,7 +1329,7 @@ class Session:
             raise
 
     async def _fill_and_close(
-        self, upload: _Upload, handle: bytes, path: bytes
+        self, upload: _Upload, handle: bytes, path: bytes, *, start_offset: int = 0
     ) -> tuple[int, Durability]:
         """Push the file through an open handle, flush it, and close it.
 
@@ -1260,6 +1346,7 @@ class Session:
                 idle_timeout=self._idle_timeout,
                 progress=upload.progress,
                 remote_path=path,
+                start_offset=start_offset,
             )
             durability = await self._flush(upload, handle)
         except BaseException:
@@ -1270,6 +1357,52 @@ class Session:
             raise
         await self.close(handle)
         return transferred, durability
+
+    async def _upload_resume_offset(self, upload: _Upload, path: bytes) -> int:
+        """How much of ``path`` the server already holds, if we are allowed to trust it.
+
+        ``0`` for a fresh upload, and ``0`` when the file is not there yet -- which is the
+        ordinary case for a first attempt with ``resume=True`` and is not an error.
+
+        Two refusals, both in the direction that raises:
+
+        * **The server will not report a size.** Then there is no offset to continue from and
+          nothing to check, and guessing zero would silently re-send a nine-gigabyte file
+          while the caller believes they asked not to.
+        * **The remote is longer than the local file.** Whatever is there, it is not a prefix
+          of what we are sending. Continuing would leave a file that is part one upload and
+          part another, of the right length, and wrong.
+
+        What it cannot check is the case that matters most: a remote partial of the *right*
+        length from the *wrong* source. A size match proves the byte count agrees. That is
+        why this is opt-in and documented as the weaker claim rather than presented as
+        "resume support".
+        """
+        if not upload.resume:
+            return 0
+        local_size = _local_size(upload.local_path)
+        try:
+            attributes = await self.stat(path)
+        except NoSuchFileError:
+            return 0
+        if attributes.size is None:
+            raise TransferError(
+                f"resume needs a size for {path!r} and this server did not report one, "
+                f"so there is no offset to continue from and nothing to check it against",
+                remote_path=path,
+                local_path=str(upload.local_path),
+            )
+        if attributes.size > local_size:
+            raise TransferError(
+                f"cannot resume: {path!r} is {attributes.size} bytes on the server and the "
+                f"local file is only {local_size}, so what is there is not a prefix of what "
+                f"we are sending",
+                transferred=0,
+                offset=attributes.size,
+                remote_path=path,
+                local_path=str(upload.local_path),
+            )
+        return attributes.size
 
     async def _flush(self, upload: _Upload, handle: bytes) -> Durability:
         """Flush the handle, reporting what was possible rather than promising what was not."""
@@ -1658,21 +1791,92 @@ def _skip_reason(kind: EntryKind) -> str:
 
 
 def _check_publish_flags(
-    *, atomic: bool, fsync: bool, require_atomic: bool, require_fsync: bool
+    *,
+    atomic: bool,
+    fsync: bool,
+    require_atomic: bool,
+    require_fsync: bool,
+    resume: bool = False,
+    staging_name: bytes | str | None = None,
 ) -> None:
-    """Refuse a pair of flags that contradict each other.
+    """Refuse a combination of flags that contradict each other.
 
     ``require_atomic=True, atomic=False`` is not a policy this can satisfy by picking one --
     it is two opposite instructions, and honouring either silently would be guessing about
     the guarantee the caller cares most about.
 
+    ``resume=True, atomic=True`` with no ``staging_name`` is the same shape for a subtler
+    reason. The default staging name carries fresh randomness per call, so the file a
+    previous run left behind has a name this run cannot reconstruct: there is nothing to
+    resume *into*. Falling back to a full upload would be the silent downgrade this library
+    refuses everywhere else, so it is refused here and the message names the fix.
+
+    Deriving the staging name from the target instead -- making it findable -- was rejected
+    rather than overlooked: a predictable staging name is what
+    :func:`~gantry_sftp.session.staging_token` exists to avoid, and two publishers resuming
+    into one would interleave into a single file.
+
     Raises:
-        ValueError: If a ``require_*`` flag strengthens a flag that is switched off.
+        ValueError: If a ``require_*`` flag strengthens a flag that is switched off, or if
+            ``resume`` is asked for where nothing could be resumed.
     """
     if require_atomic and not atomic:
         raise ValueError("require_atomic=True contradicts atomic=False")
     if require_fsync and not fsync:
         raise ValueError("require_fsync=True contradicts fsync=False")
+    if resume and atomic and staging_name is None:
+        raise ValueError(
+            "resume=True needs staging_name= when atomic=True: the default staging file is "
+            "named with fresh randomness each call, so a previous run's partial upload "
+            "cannot be found. Pass staging_name= to fix the name, or atomic=False to resume "
+            "the destination itself"
+        )
+
+
+def _local_size(path: Path | str) -> int:
+    """Size of a local file, or ``0`` if it is not there.
+
+    A plain function because ASYNC240 is right that a filesystem call blocks the event loop,
+    and a single ``stat`` is not worth a thread. Absent is ``0`` rather than an error: a
+    first ``resume=True`` attempt with no local file is a caller mistake the ``open`` will
+    report far more clearly than this could.
+    """
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _download_resume_offset(local_path: Path | str, size: int | None, remote_path: bytes) -> int:
+    """Where a resumed download should continue from.
+
+    The mirror of :meth:`Session._upload_resume_offset`, and the *stronger* of the two: the
+    partial is on local disk, so its length is a fact rather than a report, and a read at an
+    explicit offset is idempotent. The refusals are the same two, for the same reasons -- no
+    remote size means nothing to check against, and a local partial longer than the remote
+    file is not a prefix of it.
+
+    Raises:
+        TransferError: If no safe offset can be established.
+    """
+    have = _local_size(local_path)
+    if size is None:
+        raise TransferError(
+            f"resume needs a size for {remote_path!r} and this server did not report one, "
+            f"so a local partial cannot be checked against it",
+            remote_path=remote_path,
+            local_path=str(local_path),
+        )
+    if have > size:
+        raise TransferError(
+            f"cannot resume: {local_path} already holds {have} bytes and {remote_path!r} is "
+            f"only {size}, so what is on disk is not a prefix of what is being downloaded",
+            transferred=0,
+            offset=have,
+            remote_path=remote_path,
+            local_path=str(local_path),
+        )
+    return have
 
 
 def _optional_path(path: bytes | str | None) -> bytes | None:

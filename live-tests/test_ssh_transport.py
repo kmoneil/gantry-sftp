@@ -174,6 +174,56 @@ async def test_streaming_a_directory_over_a_real_ssh_connection(ssh_server, tmp_
     assert seen == 5
 
 
+class StopPartwayError(Exception):
+    """Raised from a progress callback to cut a transfer off at a known point."""
+
+
+def stop_once_something_has_moved(transferred: int, total: int | None) -> None:
+    if total is not None and 0 < transferred < total:
+        raise StopPartwayError
+
+
+async def test_resuming_a_transfer_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
+    """Both directions, interrupted and resumed, over a real SSH channel.
+
+    The bare-pipe lane cannot show this one. A resume is an offset agreed between two ends
+    over a link with its own windowing and its own flow control, and the failure it guards
+    against -- a partial that is the right *length* and the wrong *bytes* -- is invisible to
+    anything but a full comparison. So both halves are compared byte for byte, with random
+    content, because a hole of zeros inside a file of zeros proves nothing.
+    """
+    payload = os.urandom(2_000_000)
+    source = tmp_path / "payload.bin"
+    source.write_bytes(payload)
+    downloaded = tmp_path / "downloaded.bin"
+    uploaded = tmp_path / "uploaded.bin"
+
+    async with connect(ssh_server) as transport, open_session(transport) as sftp:
+        with pytest.raises(StopPartwayError):
+            _ = await sftp.get(
+                str(source), downloaded, depth=1, progress=stop_once_something_has_moved
+            )
+        partial = downloaded.stat().st_size
+        assert 0 < partial < len(payload), "the download was not actually interrupted"
+        assert await sftp.get(str(source), downloaded, resume=True) == len(payload) - partial
+
+        with pytest.raises(StopPartwayError):
+            _ = await sftp.put(
+                source,
+                str(uploaded),
+                atomic=False,
+                depth=1,
+                progress=stop_once_something_has_moved,
+            )
+        sent = uploaded.stat().st_size
+        assert 0 < sent < len(payload), "the upload was not actually interrupted"
+        result = await sftp.put(source, str(uploaded), atomic=False, resume=True)
+        assert result.transferred == len(payload) - sent
+
+    assert downloaded.read_bytes() == payload
+    assert uploaded.read_bytes() == payload
+
+
 async def test_a_recursive_download_over_a_real_ssh_connection(ssh_server, tmp_path: Path):
     """A tree, over a real SSH channel, with the destination boundary enforced.
 

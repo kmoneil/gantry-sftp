@@ -254,6 +254,49 @@ async def test_settings_that_cannot_make_progress_are_refused(
         await push(WritableServer(), source, depth=depth, write_length=write_length)
 
 
+async def test_a_negative_start_offset_is_refused(tmp_path: Path):
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"x" * 64)
+    with pytest.raises(ValueError) as exc:
+        await push(WritableServer(), source, write_length=64, start_offset=-1)
+    assert exc.value.args[0] == "start_offset must not be negative, got -1"
+
+
+async def test_a_start_offset_past_the_end_of_the_local_file_is_refused(tmp_path: Path):
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"x" * 64)
+    with pytest.raises(ValueError) as exc:
+        await push(WritableServer(), source, write_length=64, start_offset=65)
+    assert exc.value.args[0] == "start_offset 65 is past the end of a 64-byte local file"
+
+
+async def test_a_start_offset_writes_only_the_remainder_at_absolute_offsets(tmp_path: Path):
+    """The scheduler's half of a resumed upload.
+
+    Both halves of the claim are asserted, because either alone would pass a broken
+    implementation: nothing below the offset is *sent*, and what is sent goes to the offsets
+    it came from rather than being re-based to zero.
+    """
+    content = bytes(range(256))
+    source = tmp_path / "in.bin"
+    source.write_bytes(content)
+    server = WritableServer()
+
+    written = await push(server, source, write_length=64, start_offset=128)
+
+    assert written == 128
+    assert min(offset for offset, _ in server.writes) == 128, f"wrote below it: {server.writes}"
+    assert bytes(server.stored)[128:] == content[128:]
+
+
+async def test_a_start_offset_at_the_end_writes_nothing_at_all(tmp_path: Path):
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"x" * 64)
+    server = WritableServer()
+    assert await push(server, source, write_length=64, start_offset=64) == 0
+    assert server.writes == []
+
+
 # --- progress ---------------------------------------------------------------------------------
 
 

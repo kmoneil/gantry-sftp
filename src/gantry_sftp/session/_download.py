@@ -64,6 +64,7 @@ __all__ = [
     "DEFAULT_PIPELINE_DEPTH",
     "NO_FOLLOW",
     "ProgressCallback",
+    "Span",
     "download_handle",
 ]
 
@@ -118,6 +119,31 @@ class _Range:
     length: int
 
 
+@dataclass(frozen=True, slots=True)
+class Span:
+    """The region of a file one run is responsible for.
+
+    Lives here rather than in a module of its own because this one is already where the
+    upload side gets ``ProgressCallback`` and the two transfer defaults -- the name says
+    "download" and the contents are "transfer plumbing shared by both directions", which is
+    a smell worth naming rather than hiding. Splitting it out is a rename touching every
+    import, and is not worth doing for four fields.
+
+    Two fields that used to be two parameters, which is what pushed the constructor past the
+    argument ceiling -- and they belong together anyway: ``start`` without ``end`` cannot say
+    whether there is anything left to do, and a resume is exactly the case where ``start`` is
+    not 0 and the distinction starts to matter.
+
+    Attributes:
+        start: First byte this run asks for. Non-zero when resuming.
+        end: The file's size, from a stat, or ``None`` when the server would not report one
+            and the run has to read until EOF.
+    """
+
+    start: int
+    end: int | None
+
+
 class _Downloader:
     """Drives one file's worth of pipelined reads.
 
@@ -138,7 +164,7 @@ class _Downloader:
         handle: bytes,
         fd: int,
         *,
-        size: int | None,
+        span: Span,
         read_length: int,
         depth: int,
         idle_timeout: float | None,
@@ -149,7 +175,7 @@ class _Downloader:
         self._exchange = exchange
         self._handle = handle
         self._fd = fd
-        self._size = size
+        self._span = span
         self._read_length = read_length
         self._depth = depth
         self._idle_timeout = idle_timeout
@@ -157,7 +183,7 @@ class _Downloader:
         self._remote_path = remote_path
 
         self._backlog: deque[_Range] = deque()
-        self._next_offset = 0
+        self._next_offset = span.start
         self._outstanding: dict[int, _Range] = {}
         self._written = 0
         self._eof_at: int | None = None
@@ -170,7 +196,7 @@ class _Downloader:
             return True
         if self._eof_at is not None:
             return False
-        return self._size is None or self._next_offset < self._size
+        return self._span.end is None or self._next_offset < self._span.end
 
     def _next_range(self) -> _Range:
         """Take the next range to request, preferring re-queued shortfalls.
@@ -181,8 +207,8 @@ class _Downloader:
         if self._backlog:
             return self._backlog.popleft()
         length = self._read_length
-        if self._size is not None:
-            length = min(length, self._size - self._next_offset)
+        if self._span.end is not None:
+            length = min(length, self._span.end - self._next_offset)
         issued = _Range(self._next_offset, length)
         self._next_offset += length
         return issued
@@ -310,9 +336,16 @@ class _Downloader:
             )
 
     async def run(self) -> int:
-        """Transfer the file. Returns the number of bytes written."""
+        """Transfer the file.
+
+        Returns:
+            Bytes written **by this run**, which is not the file's size when resuming. The
+            progress callback gets the absolute position instead, because "4.5 GB of 9 GB" is
+            what a caller wants to display and "0.5 GB of 9 GB" after a resume is a lie about
+            how much is left.
+        """
         if self._progress is not None:
-            self._progress(0, self._size)
+            self._progress(self._span.start, self._span.end)
 
         while True:
             await self._fill_window()
@@ -320,7 +353,7 @@ class _Downloader:
                 break
             self._dispatch(await self._next_reply())
             if self._progress is not None:
-                self._progress(self._written, self._size)
+                self._progress(self._span.start + self._written, self._span.end)
 
         return self._written
 
@@ -336,6 +369,7 @@ async def download_handle(
     idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
     progress: ProgressCallback | None = None,
     remote_path: bytes | None = None,
+    start_offset: int = 0,
 ) -> int:
     """Download an already-open remote file into an already-open local one.
 
@@ -357,21 +391,32 @@ async def download_handle(
             :func:`~gantry_sftp.session.negotiate_transfer_sizes`.
         depth: Requests in flight.
         idle_timeout: Seconds without any response before giving up. ``None`` waits forever.
-        progress: Called with ``(transferred, total)`` as data arrives.
+        progress: Called with ``(transferred, total)`` as data arrives. Reports the
+            *absolute* position, so a resumed transfer starts the display where it left off
+            rather than at zero.
         remote_path: Carried on errors for diagnosis.
+        start_offset: Byte to begin at. Non-zero resumes: reads start there and the
+            descriptor is written at absolute offsets, so whatever is already in the file
+            below this point is left alone. Whether that content is *right* is not knowable
+            from here -- the session decides that before calling.
 
     Returns:
-        Bytes written.
+        Bytes written by this call, which is the file's size only when ``start_offset`` is 0.
 
     Raises:
         TransferError: If the server refuses a read.
         TransferTimeout: If the server stops responding.
-        ValueError: If ``depth`` or ``read_length`` would make no progress.
+        ValueError: If ``depth`` or ``read_length`` would make no progress, or if
+            ``start_offset`` is negative or past the end of the file.
     """
     if depth < 1:
         raise ValueError(f"depth must be at least 1, got {depth}")
     if read_length < 1:
         raise ValueError(f"read_length must be at least 1, got {read_length}")
+    if start_offset < 0:
+        raise ValueError(f"start_offset must not be negative, got {start_offset}")
+    if size is not None and start_offset > size:
+        raise ValueError(f"start_offset {start_offset} is past the end of a {size}-byte file")
 
     with dispatcher.exchange() as exchange:
         downloader = _Downloader(
@@ -379,7 +424,7 @@ async def download_handle(
             exchange,
             handle,
             fd,
-            size=size,
+            span=Span(start_offset, size),
             read_length=read_length,
             depth=depth,
             idle_timeout=idle_timeout,

@@ -52,6 +52,7 @@ exists today:
   go up as well as down, and come back off again
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
+- **resume**, both directions, opt-in and labelled with what it actually proves
 - **one session, many transfers at once**: a single reader task routes each reply to whichever
   operation asked for it, so `get`/`put` overlap over one channel instead of queueing behind
   a lock
@@ -89,7 +90,7 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: `glob`, resume, retry, the fsspec adapter, `SFTPPath`, or the generated sync API. The
+Not yet: `glob`, retry, the fsspec adapter, `SFTPPath`, or the generated sync API. The
 names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not exist yet — `open_session` is
 the current spelling, and concurrency is spelled with your own task group rather than a
 `concurrency=` argument.
@@ -312,6 +313,42 @@ destination and the rename after it failed, the staging file is the only copy of
 it is left where it is and the error says where that is.
 
 `examples/atomic_publish.py` runs all of this against a real server with no arguments.
+
+## Resume
+
+Off by default in both directions, and the two are not equally trustworthy:
+
+```python
+await sftp.get("/remote/big.iso", "big.iso", resume=True)          # continue from what is on disk
+await sftp.put("big.iso", "/remote/big.iso", atomic=False, resume=True)
+```
+
+**Downloading is the stronger claim.** The partial is on your disk, so its length is a fact
+rather than a report, and a `READ` at an explicit offset is idempotent. **Uploading is the
+weaker one**, and the docs say so in those words: the offset comes from the size the *server*
+reports, and a size match proves the byte count agrees and nothing else — the remote partial
+may be from a different run, a different source file, or a concurrent writer.
+
+Both refuse rather than guess in two cases. A partial *longer* than the file it is supposed
+to be a prefix of is a `TransferError`, not a truncation. And a server that will not report a
+size makes the check impossible, so the resume is refused instead of silently starting over.
+
+**`resume=True` with `atomic=True` needs an explicit `staging_name`**, and raises `ValueError`
+without one. Not because `CREAT|EXCL` refuses to adopt a leftover staging file — it never
+meets one. The staging name carries fresh randomness on every call, which is what stops two
+publishers colliding, and it also means the previous run's staging file has a name this run
+cannot reconstruct. Making that name predictable instead would reintroduce exactly the
+collision `EXCL` exists to catch, so the choice is handed to the caller:
+
+```python
+await sftp.put(src, dst, resume=True, staging_name=b".big.iso.part")  # atomic and resumable
+```
+
+With a fixed staging name, `EXCL` is dropped so the file can be adopted — which is also the
+collision risk moving to whoever named it.
+
+`examples/resume.py` interrupts a transfer in each direction and finishes it, and catches
+both refusals so you can see what they say.
 
 One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
 opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends
