@@ -214,21 +214,29 @@ def raise_for_status(status: Status, *, path: bytes | None = None) -> None:
 
 
 class _StagedIsTheOnlyCopyError(Exception):
-    """Internal signal: the destination is gone and the staging file is all that is left.
+    """Internal signal: the destination may be gone and the staging file is all that is left.
 
-    Raised only from the ``REMOVE``-then-``RENAME`` fallback, when the remove succeeded and
-    the rename after it did not -- a concurrent writer recreating the destination in between
-    is enough, since v3 ``RENAME`` refuses an existing target. The normal cleanup would then
-    delete the staging file, which at that moment holds the *only* copy of the data, turning a
+    Raised only from the ``REMOVE``-then-``RENAME`` fallback. The normal cleanup would delete
+    the staging file, which in this window holds the *only* copy of the data, turning a
     recoverable failure into an unrecoverable one.
 
-    Never escapes the session: it is unwrapped at the boundary and the original refusal is
-    what the caller sees, with a note saying where the file is.
+    Never escapes the session: it is unwrapped at the boundary and the original failure is what
+    the caller sees, with a note saying where the file is.
+
+    Args:
+        failure: What went wrong, re-raised unchanged at the boundary. May be a cancellation.
+        destination_removed: Whether the ``REMOVE`` is *known* to have succeeded. False when
+            the remove itself failed in a way that does not say -- a timeout, a lost
+            connection, cancellation -- because the request may well have been executed with
+            only the answer going missing. The two cases get different notes: telling somebody
+            their file was deleted when it may still be there sends them to restore a backup
+            they did not need.
     """
 
-    def __init__(self, failure: BaseException) -> None:
+    def __init__(self, failure: BaseException, *, destination_removed: bool) -> None:
         super().__init__("the destination was removed and the staged file could not replace it")
         self.failure = failure
+        self.destination_removed = destination_removed
 
 
 @dataclass(frozen=True, slots=True)
@@ -1491,13 +1499,23 @@ class Session:
             size_check = await self._confirm_size(staged, _local_size(upload.local_path))
             mechanism = await self._publish(staged, target, require_atomic=require_atomic)
         except _StagedIsTheOnlyCopyError as lost:
-            # Do NOT clean up. The destination has already been removed and this file is the
-            # only copy of the data; deleting it here would turn a failure someone can undo
-            # by hand into one nobody can.
+            # Do NOT clean up. The destination has already been removed, or may have been, and
+            # this file is the only copy of the data; deleting it here would turn a failure
+            # someone can undo by hand into one nobody can. The original failure is re-raised
+            # unchanged -- which matters when it is a cancellation, because converting one into
+            # an ordinary exception would break the structured concurrency it belongs to.
             lost.failure.add_note(
-                f"the destination {target!r} was removed and the rename that should have "
-                f"replaced it failed; the uploaded file is intact at {staged!r} and is now the "
-                f"only copy of it"
+                (
+                    f"the destination {target!r} was removed and the rename that should have "
+                    f"replaced it failed; the uploaded file is intact at {staged!r} and is now "
+                    f"the only copy of it"
+                )
+                if lost.destination_removed
+                else (
+                    f"the destination {target!r} may already have been removed and was not "
+                    f"replaced; the uploaded file is intact at {staged!r} and may now be the "
+                    f"only copy of it"
+                )
             )
             raise lost.failure from None
         except BaseException as error:
@@ -1705,13 +1723,40 @@ class Session:
         else:
             return PublishMechanism.RENAME
 
-        # The window this rung is named for. Everything after the REMOVE is unwindable only by
-        # hand, so a failure past this point must leave the staged file where it is.
-        await self.remove(target)
+        # The window this rung is named for. Everything from the REMOVE onwards is unwindable
+        # only by hand, so *any* failure from here must leave the staged file where it is --
+        # including a failure of the REMOVE itself. That was the D-74 bug: this call sat
+        # outside the guard, so a REMOVE the server performed but never acknowledged fell
+        # through to the ordinary cleanup, which deleted the staging file with the destination
+        # already gone. Both copies, and a message saying only that a request timed out.
+        try:
+            await self.remove(target)
+        except BaseException as removal_failure:
+            if isinstance(removal_failure, ServerError):
+                # Definitive: the server answered and said no, so nothing was removed and the
+                # destination is intact. The staging file is litter, not the only copy, and
+                # leaving it behind would trade one silent failure for another.
+                raise
+            # Anything else -- a timeout, a lost connection, cancellation -- leaves us unable
+            # to say whether the REMOVE ran, and very often it did: the request goes out, the
+            # server performs it, and only the answer is missing. Assuming it ran costs a
+            # staging file left behind; assuming it did not costs the only remaining copy.
+            raise _StagedIsTheOnlyCopyError(
+                removal_failure, destination_removed=False
+            ) from removal_failure
+
         try:
             await self.rename(staged, target)
-        except Exception as second_failure:
-            raise _StagedIsTheOnlyCopyError(second_failure) from second_failure
+        except BaseException as second_failure:
+            # `BaseException`, not `Exception`: anyio's cancellation is a `BaseException`, and
+            # concurrent transfers are the whole point of this library -- a sibling task
+            # failing inside a task group cancels this one, in the one window where the
+            # staging file is the only copy of the data. The cancellation itself is re-raised
+            # unchanged at the boundary, so structured concurrency is preserved; all this
+            # suppresses is the cleanup.
+            raise _StagedIsTheOnlyCopyError(
+                second_failure, destination_removed=True
+            ) from second_failure
         return PublishMechanism.REMOVE_RENAME
 
     async def _refuse_unpublishable(self, target: bytes) -> None:

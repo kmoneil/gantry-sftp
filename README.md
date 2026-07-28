@@ -365,9 +365,16 @@ Three limits stated rather than implied. `fsync@openssh.com` flushes the *file*;
 way to flush a directory entry, so the rename that publishes it is never itself durable.
 Staging needs the right to create *and* rename a second name in the destination directory — a
 drop directory that only permits creation needs `atomic=False`. And a failed publish removes
-the staging file, with one deliberate exception: if the `remove-rename` fallback removed the
-destination and the rename after it failed, the staging file is the only copy of your data, so
-it is left where it is and the error says where that is.
+the staging file, with one deliberate exception: once the `remove-rename` fallback has issued
+the `REMOVE`, the staging file may be the only copy of your data, so it is left where it is and
+the error says where that is.
+
+That exception starts at the `REMOVE` rather than after it, which is not the obvious place. A
+`REMOVE` the server performed but never acknowledged — a request timeout is enough — is
+indistinguishable from one that never ran, so it is assumed to have run. A `REMOVE` the server
+*refused* is a different thing: nothing was removed, and the staging file is cleaned up
+normally. The two cases produce different error notes, one saying the destination was removed
+and the other that it may have been.
 
 `examples/atomic_publish.py` runs all of this against a real server with no arguments.
 

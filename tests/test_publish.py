@@ -49,6 +49,7 @@ from gantry_sftp.exceptions import (
     PermissionDeniedError,
     ServerError,
     TransferError,
+    TransferTimeoutError,
 )
 from gantry_sftp.session import (
     MAX_STAGED_NAME_LENGTH,
@@ -684,6 +685,161 @@ async def test_losing_the_race_inside_the_window_keeps_the_only_copy_of_the_data
         "replaced it failed; the uploaded file is intact at "
         "b'/incoming/.report.csv.deadbeef.part' and is now the only copy of it"
     )
+
+
+class _SwallowsTheRemoveReply(PublishingServer):
+    """Performs the ``REMOVE`` and withholds only the answer.
+
+    This is what a stalled link looks like from the client, and it is the case the client
+    genuinely cannot distinguish: the request went out, the server did the work, and the
+    acknowledgement never came back. Deleting the file for real is the whole point -- a fake
+    that refused instead would be a *definitive* answer, which is the safe case rather than
+    this one.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.swallowed = 0
+
+    def _on_remove(self, packet: Remove) -> None:
+        if self.swallowed == 0 and self._taken(packet.path):
+            self.swallowed += 1
+            _ = self.files.pop(packet.path, None)
+            return
+        super()._on_remove(packet)
+
+
+async def test_a_remove_whose_reply_never_arrives_does_not_delete_the_only_copy(source: Path):
+    """D-74. The same window as the race above, entered by a timeout instead.
+
+    The rung's own comment says everything past the ``REMOVE`` is unwindable only by hand, so
+    a failure there must leave the staged file where it is. It did not: the ``REMOVE`` was
+    *outside* the ``try`` that raises :class:`_StagedIsTheOnlyCopyError`, so a failure of the
+    remove itself fell through to the ordinary cleanup -- which deleted the staging file with
+    the destination already gone. Both copies, and an error message saying only that a request
+    timed out.
+
+    **No cancellation is needed to reach it**, which is what makes it ordinary rather than
+    exotic: a request timeout is a slow server or a link that hiccuped. And this rung runs only
+    where ``posix-rename@openssh.com`` is absent, which CLAUDE.md already names as most real
+    endpoints.
+    """
+    server = _SwallowsTheRemoveReply(extensions=(), implements=(), files={TARGET: b"yesterday"})
+    async with open_session(server, request_timeout=0.5) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferTimeoutError) as exc:
+            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert bytes(server.files[STAGED]) == b"id,total\n1,42\n", "the only copy was deleted"
+    assert server.swallowed == 1, "the destination really was removed, so this is the case"
+    # "may": the REMOVE went unanswered, so whether it ran is exactly what we cannot say.
+    # Telling somebody their file was deleted when it may still be there sends them to restore
+    # a backup they did not need.
+    assert exc.value.__notes__[0] == (
+        "the destination b'/incoming/report.csv' may already have been removed and was not "
+        "replaced; the uploaded file is intact at b'/incoming/.report.csv.deadbeef.part' and "
+        "may now be the only copy of it"
+    )
+
+
+async def test_a_cancellation_inside_the_remove_rename_window_does_not_delete_the_only_copy(
+    source: Path,
+):
+    """The same hole, reached the other way, and it needed a second fix rather than the same one.
+
+    A timeout is an ``Exception``; anyio's cancellation is a ``BaseException``, so even once
+    the ``REMOVE`` was inside the guarded region an ``except Exception`` there would still have
+    let a cancelled publish through to the cleanup. Concurrent transfers are the whole point of
+    this library, and a sibling task failing inside a task group cancels its siblings -- so
+    this is the default case, not an edge one.
+
+    The cancellation itself must still propagate: it is re-raised unchanged, which is why the
+    assertion is on the scope having been cancelled rather than on an exception type.
+    """
+    server = _SwallowsTheRemoveReply(extensions=(), implements=(), files={TARGET: b"yesterday"})
+    async with open_session(server, request_timeout=None) as sftp:  # type: ignore[arg-type]
+        with anyio.move_on_after(0.25) as scope:
+            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert scope.cancelled_caught, "the publish was never actually cancelled"
+    assert bytes(server.files[STAGED]) == b"id,total\n1,42\n", "the only copy was deleted"
+    assert server.swallowed == 1, "the destination really was removed, so this is the case"
+
+
+async def test_a_cancellation_during_the_second_rename_does_not_delete_the_only_copy(
+    source: Path,
+):
+    """The other half of the window, and it needs its own case.
+
+    The two guards fail independently: one covers a REMOVE that goes unanswered, this one
+    covers a cancellation arriving once the destination is definitely gone. A test that only
+    cancelled during the REMOVE would leave the rename's guard a mutation survivor -- turning
+    it back into ``except Exception`` would change nothing red.
+
+    Here the note is the *confirmed* wording, because the remove was answered: the destination
+    is known to be gone rather than merely possibly gone. That distinction is the difference
+    between telling somebody to restore a backup and telling them they might not need to.
+    """
+
+    class SwallowsTheSecondRenameReply(PublishingServer):
+        """Lets the REMOVE through and withholds the answer to the rename after it."""
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.renames = 0
+
+        def _on_rename(self, packet: Rename) -> None:
+            self.renames += 1
+            if self.renames == 2:
+                return
+            super()._on_rename(packet)
+
+    server = SwallowsTheSecondRenameReply(
+        extensions=(), implements=(), files={TARGET: b"yesterday"}
+    )
+    async with open_session(server, request_timeout=None) as sftp:  # type: ignore[arg-type]
+        with anyio.move_on_after(0.25) as scope:
+            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert scope.cancelled_caught, "the publish was never actually cancelled"
+    assert server.renames == 2, "the cancellation landed on the second rename, so this is the case"
+    assert TARGET not in server.files, "the destination really was removed, so this is the window"
+    assert bytes(server.files[STAGED]) == b"id,total\n1,42\n", "the only copy was deleted"
+
+
+async def test_a_refused_remove_is_definitive_so_the_staging_file_is_still_cleaned_up(
+    source: Path,
+):
+    """The other half, and the reason the fix is not "never clean up after a REMOVE".
+
+    A ``ServerError`` means the server answered and said no: nothing was removed, the
+    destination is intact, and the staging file is litter rather than the only copy. Leaving it
+    behind would trade one silent failure for another -- the directory a consumer is watching
+    slowly filling with dot-files nobody owns.
+    """
+
+    class RefusesToRemoveTheDestination(PublishingServer):
+        """Refuses only the destination's removal.
+
+        ``refuse={"remove": ...}`` would refuse the *cleanup* remove as well, and the staging
+        file would survive for that reason instead of the one under test -- a test that could
+        not have failed, in the direction that makes the fix look right.
+        """
+
+        def _on_remove(self, packet: Remove) -> None:
+            if packet.path == TARGET:
+                self._refuse(packet, StatusCode.PERMISSION_DENIED)
+                return
+            super()._on_remove(packet)
+
+    server = RefusesToRemoveTheDestination(
+        extensions=(), implements=(), files={TARGET: b"yesterday"}
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(PermissionDeniedError):
+            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+
+    assert bytes(server.files[TARGET]) == b"yesterday", "the destination was never removed"
+    assert STAGED not in server.files, "a definitive refusal leaves no reason to keep it"
 
 
 async def test_a_destination_that_is_a_dangling_symlink_still_counts_as_in_the_way(source: Path):
