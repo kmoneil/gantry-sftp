@@ -161,11 +161,28 @@ async def test_a_retryable_failure_from_the_operation_gets_a_fresh_session(tmp_p
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
 
-    identities: set[int] = set()
+    # The sessions are HELD, and both halves of that matter (D-73).
+    #
+    # Retrying is driven by how many times this ran -- `len(seen)`, which counts appends and
+    # cannot collide. It used to be driven by how many distinct `id(sftp)` values had been
+    # seen, and that is a memory address: `with_reconnect` closes each session before opening
+    # the next, so attempt two could be allocated exactly where attempt one had just been
+    # freed, the set would not grow, and the operation raised a third time for no reason but
+    # the allocator. It gave up with "gave up after 3 of 3 attempt(s), all retryable" about one
+    # full-suite run in six.
+    #
+    # An earlier version kept ids alone to avoid holding three dead transports until the
+    # garbage collector felt like running, on the grounds that it surfaces as an unraisable
+    # ResourceWarning blamed on some unrelated test. That is no longer a risk and is what made
+    # the addresses reusable: `with_reconnect` runs every attempt inside
+    # `async with connect() as transport, open_session(...) as sftp`, so both are closed
+    # deterministically on the way out. A reference to an already-closed session keeps nothing
+    # open -- it only keeps the address from being handed to the next one.
+    seen: list[Session] = []
 
     async def flaky(sftp: Session) -> str:
-        identities.add(id(sftp))
-        if len(identities) < 3:
+        seen.append(sftp)
+        if len(seen) < 3:
             raise ConnectError("ssh exited while we were writing to it")
         return "done"
 
@@ -173,10 +190,10 @@ async def test_a_retryable_failure_from_the_operation_gets_a_fresh_session(tmp_p
 
     assert await with_reconnect(recipe, flaky, attempts=3, backoff=0) == "done"
     assert recipe.calls == 3
-    # Ids only: holding the Session objects would keep three dead transports alive until the
-    # garbage collector felt like running, which surfaces as an unraisable ResourceWarning
-    # attributed to whatever unrelated test happens to be running at the time.
-    assert len(identities) == 3, "the same session was handed back"
+    # Compared here rather than as they arrive, because this is the one moment all three are
+    # simultaneously alive -- which is exactly the condition that makes comparing their ids
+    # mean anything.
+    assert len({id(sftp) for sftp in seen}) == 3, "the same session was handed back"
 
 
 async def test_attempts_below_one_is_refused():
