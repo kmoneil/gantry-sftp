@@ -749,6 +749,31 @@ async with open_ssh_transport("prod-sftp", user="bob") as t, open_session(t) as 
     ...
 ```
 
+### When the `ssh_config` is not yours
+
+"It connects the way `ssh` would" cuts both ways. An `ssh_config` is executable: `ProxyCommand`
+runs a program to obtain the connection, and `Match exec` runs one during config *parsing*,
+before a connection is attempted at all. If the config file is trusted — yours, or your
+organisation's — that is the feature that makes `ProxyJump` and bastion hosts work for free. If
+it is not, it is arbitrary command execution on the machine running the transfer.
+
+The shipped defaults do **not** close that. `PermitLocalCommand=no` and `ClearAllForwardings=yes`
+ship because an SFTP client has no business running `LocalCommand` or establishing forwardings,
+and they are worth having — but neither touches `ProxyCommand` or `Match exec`, both of which
+still execute with the full default set applied. Verified against OpenSSH 10.0p2 and pinned by
+`tests/test_transport.py::test_the_shipped_defaults_do_not_neutralise_an_untrusted_config`.
+
+The control is to not read the file:
+
+```python
+async with open_ssh_transport("host", user="bob", config_file=os.devnull) as t:
+    ...
+```
+
+`-F` suppresses `/etc/ssh/ssh_config` as well as the per-user file, so this is a real "no
+config" rather than half of one. Everything the config would have supplied — port, identity
+file, username — has an explicit parameter, so the trade is verbosity rather than capability.
+
 ### Passwords
 
 A large fraction of enterprise SFTP endpoints — MOVEit, GoAnywhere, Cleo, Sterling — are

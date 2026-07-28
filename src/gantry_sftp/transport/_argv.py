@@ -64,7 +64,15 @@ DEFAULT_SSH_OPTIONS: Mapping[str, str] = {
     # cosmetic: `LocalCommand` in a user's ssh_config runs an arbitrary program on *this*
     # machine when a connection is set up. `PermitLocalCommand no` disables it, and
     # `ClearAllForwardings yes` drops any forwardings a config tries to establish. An SFTP
-    # client has no business doing either, and a config file is not always trusted input.
+    # client has no business doing either.
+    #
+    # They are **not** a defence against a config file you do not trust, and saying so here
+    # rather than implying otherwise: `ProxyCommand` and `Match exec` both still run a program
+    # with all four applied -- the first to obtain the connection, the second during config
+    # *parsing*, before a connection is even attempted. Verified against OpenSSH 10.0p2 and
+    # pinned by `test_the_shipped_defaults_do_not_neutralise_an_untrusted_config`. The control
+    # for an untrusted config is `config_file=os.devnull`, which suppresses the per-user file
+    # *and* `/etc/ssh/ssh_config`.
     "PermitLocalCommand": "no",
     "ClearAllForwardings": "yes",
     "ForwardX11": "no",
@@ -330,7 +338,9 @@ def build_ssh_argv(
             both halves get validated.
         port: Remote port, passed as ``-p``.
         config_file: Passed as ``-F``. Pass ``os.devnull`` to ignore the user's config
-            entirely, which is what a test should do.
+            entirely, which is what a test should do -- and what a caller should do when the
+            config is not trusted, since ``-F`` suppresses ``/etc/ssh/ssh_config`` as well and
+            no ``-o`` default neutralises a config file's ``ProxyCommand`` or ``Match exec``.
         identity_file: Passed as ``-i``.
         options: ``-o`` options, overriding :data:`DEFAULT_SSH_OPTIONS` by name. Weakening
             ``StrictHostKeyChecking`` warns.

@@ -688,3 +688,81 @@ def test_ssh_matches_option_names_case_insensitively_and_takes_the_first():
     # order load-bearing and the bug silent.
     assert resolved("-o", "STRICTHOSTKEYCHECKING=no", "-o", "StrictHostKeyChecking=yes") == "false"
     assert resolved("-o", "StrictHostKeyChecking=yes", "-o", "STRICTHOSTKEYCHECKING=no") == "true"
+
+
+CONFIG_FILE_COMMAND_EXECUTION = [
+    pytest.param(
+        "Host *\n    ProxyCommand /bin/sh -c 'echo GANTRY_PROXY >&2; exit 1'\n",
+        "GANTRY_PROXY",
+        id="proxycommand",
+    ),
+    pytest.param(
+        'Match exec "echo GANTRY_MATCH >&2"\n    ProxyCommand /bin/false\n',
+        "GANTRY_MATCH",
+        id="match-exec",
+    ),
+]
+"""Two ``ssh_config`` directives that run a program on *this* machine at connection setup.
+
+``ProxyCommand`` is executed to obtain the connection; ``Match exec`` is executed during config
+*parsing*, before a connection is attempted at all. Neither needs the network, which is why
+these run as unit tests.
+"""
+
+
+@pytest.mark.skipif(not Path("/usr/bin/ssh").exists(), reason="ssh not installed")
+@pytest.mark.parametrize(("directive", "marker"), CONFIG_FILE_COMMAND_EXECUTION)
+def test_the_shipped_defaults_do_not_neutralise_an_untrusted_config(
+    tmp_path: Path, directive: str, marker: str
+):
+    """Characterisation of ssh(1), and a boundary this library deliberately does not claim.
+
+    ``PermitLocalCommand=no`` and ``ClearAllForwardings=yes`` ship because ``LocalCommand`` and
+    forwardings in an ``ssh_config`` are things an SFTP client has no business doing. They are
+    worth having and they are **not** a defence against a config file you do not trust: the two
+    directives that actually execute a program still execute one, with the full default set
+    applied. Asserted rather than described, because a comment claiming a boundary that is not
+    there is worse than no comment.
+
+    The defence is :func:`test_devnull_is_what_actually_ignores_a_config_file`.
+    """
+    config = tmp_path / "ssh_config"
+    config.write_text(directive)
+    # `.invalid` is reserved and never resolves, so neither case can reach the network: the
+    # ProxyCommand one never looks the host up, and the Match exec one fails DNS immediately.
+    result = subprocess.run(
+        build_ssh_argv("nonexistent.invalid", config_file=config),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert marker in result.stderr, (
+        "ssh no longer runs this directive from a config file with our defaults applied; "
+        "re-check what the defaults are documented to cover"
+    )
+
+
+@pytest.mark.skipif(not Path("/usr/bin/ssh").exists(), reason="ssh not installed")
+@pytest.mark.parametrize(("directive", "marker"), CONFIG_FILE_COMMAND_EXECUTION)
+def test_devnull_is_what_actually_ignores_a_config_file(
+    tmp_path: Path, directive: str, marker: str
+):
+    """``config_file=os.devnull`` is the control, and it covers the system config too.
+
+    ``-F`` replaces the per-user config *and* suppresses ``/etc/ssh/ssh_config``, so it is a
+    real "no config at all" rather than a half of one. Measured on this box: the system config
+    sets ``HashKnownHosts yes`` and ``GSSAPIAuthentication yes``, and under ``-F /dev/null``
+    ``ssh -G`` reports ``no`` for both.
+    """
+    config = tmp_path / "ssh_config"
+    config.write_text(directive)
+    # The config exists and says the same thing; the only difference is that we do not read it.
+    result = subprocess.run(
+        build_ssh_argv("nonexistent.invalid", config_file=os.devnull),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert marker not in result.stderr

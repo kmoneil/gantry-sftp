@@ -422,7 +422,9 @@ async def open_ssh_transport(
         host: Hostname or ``ssh_config`` alias.
         user: Remote username.
         port: Remote port.
-        config_file: ``-F``. Pass ``os.devnull`` to ignore the user's ``ssh_config``.
+        config_file: ``-F``. Pass ``os.devnull`` to ignore the user's ``ssh_config`` -- which
+            also suppresses ``/etc/ssh/ssh_config``, and is the only thing that stops a config
+            file's ``ProxyCommand`` or ``Match exec`` running a program on this machine.
         identity_file: ``-i``.
         options: ``-o`` options, overriding the defaults by name.
         subsystem: Subsystem name, or a path for a server with no subsystem configured.
