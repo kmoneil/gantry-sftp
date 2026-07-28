@@ -26,6 +26,8 @@ import pytest
 from gantry_sftp.codec import (
     OPENSSH_ADVERTISED_EXTENSIONS,
     PROTOCOL_VERSION,
+    Attrs,
+    AttrsReply,
     Close,
     Codec,
     CodecState,
@@ -34,6 +36,8 @@ from gantry_sftp.codec import (
     Extended,
     ExtendedReply,
     FrameSplitter,
+    FSetStat,
+    FStat,
     Handle,
     Init,
     LStat,
@@ -43,10 +47,13 @@ from gantry_sftp.codec import (
     OpenFlag,
     Packet,
     Read,
+    ReadLink,
     RealPath,
+    SetStat,
     Status,
     StatusCode,
     SymLink,
+    Times,
     Version,
     WireReader,
     decode,
@@ -55,6 +62,22 @@ from gantry_sftp.codec import (
 from gantry_sftp.session import ServerLimits, negotiate_transfer_sizes
 
 pytestmark = pytest.mark.sftp_server
+
+
+def _died(proc: subprocess.Popen[bytes]) -> str:
+    """Explain an EOF on the server's stdout, which is the server having exited.
+
+    ``sftp-server`` calls ``fatal_fr()`` and exits on a body it cannot parse -- it does not
+    answer ``BAD_MESSAGE``. So a packet whose layout is wrong shows up here as a closed pipe
+    and nothing else, and a reader that waits for a reply waits forever. Both loops in this
+    file read a byte at a time, and ``read(1)`` returns ``b""`` only at EOF, so this is the
+    one place the difference between "slow" and "gone" is visible. Naming it turns a hung
+    suite into a failure that says which request killed the server.
+    """
+    return (
+        f"sftp-server exited (returncode {proc.poll()}) without answering; a frame it could "
+        f"not parse is fatal to it, so this is what a wrong packet layout looks like"
+    )
 
 
 class LocalSftpServer:
@@ -84,7 +107,10 @@ class LocalSftpServer:
         """
         assert self._proc.stdout is not None
         while True:
-            frames = self._splitter.feed(self._proc.stdout.read(1))
+            chunk = self._proc.stdout.read(1)
+            if not chunk:
+                raise AssertionError(_died(self._proc))
+            frames = self._splitter.feed(chunk)
             if frames:
                 assert len(frames) == 1
                 return decode(frames[0])
@@ -378,6 +404,154 @@ def test_symlink_uses_openssh_field_order_and_the_draft_order_fails(
     assert link.readlink() == target
 
 
+# --- READLINK ---------------------------------------------------------------------------
+
+
+def test_readlink_returns_the_target_as_a_single_name(server: LocalSftpServer, tmp_path: Path):
+    """READLINK has no session surface, so this is the only lane that can send one.
+
+    Its reply is the odd one in v3: a NAME frame whose single entry is not a filename in a
+    directory but the *contents* of the link, with a cleared attribute set. Reading it as a
+    directory listing, or expecting an ATTRS because the request looks like a stat, both
+    parse -- and both are wrong.
+    """
+    target = tmp_path / "READLINK_TARGET.txt"
+    target.write_bytes(b"payload\n")
+    link = tmp_path / "READLINK_LINK"
+
+    created = server.request(
+        SymLink(server.next_id(), targetpath=str(target).encode(), linkpath=str(link).encode())
+    )
+    assert isinstance(created, Status)
+    assert created.code == StatusCode.OK
+
+    reply = server.request(ReadLink(server.next_id(), str(link).encode()))
+    assert isinstance(reply, Name), reply
+    (entry,) = reply.entries
+    assert entry.filename == str(target).encode()
+    # OpenSSH sends the same string twice and clears the attributes -- draft-02 6.10's
+    # "dummy attributes value", which is an empty flags word rather than a stat of the link.
+    assert entry.longname == entry.filename
+    assert entry.attrs == Attrs()
+
+
+def test_readlink_on_a_plain_file_answers_bad_message_not_failure(
+    server: LocalSftpServer, tmp_path: Path
+):
+    """The errored third state, and it arrives under a code that describes something else.
+
+    A reply to READLINK is a NAME *or* a STATUS, so code that unpacks ``reply.entries``
+    without checking crashes on the ordinary case of a path that is not a link. The code it
+    arrives under is the surprise: ``readlink(2)`` on a plain file sets ``EINVAL``, and
+    OpenSSH's ``errno_to_portable`` maps ``EINVAL`` and ``ENAMETOOLONG`` to
+    ``SSH2_FX_BAD_MESSAGE``. So ``BAD_MESSAGE`` here does **not** mean the frame we sent was
+    malformed -- it means the filesystem said no. Treating that code as a protocol violation
+    would tear down a working session over a correct request about an ordinary file.
+
+    Asserted because the library's own handling depends on it: ``BAD_MESSAGE`` maps to
+    ``ServerError`` and is absent from ``RETRYABLE_STATUS_CODES``, which is right for both
+    readings and would be wrong for one of them if either changed.
+    """
+    plain = tmp_path / "not_a_link.txt"
+    plain.write_bytes(b"x")
+
+    reply = server.request(ReadLink(server.next_id(), str(plain).encode()))
+    assert isinstance(reply, Status), reply
+    # And not NO_SUCH_FILE, which is the other plausible guess: the path exists, it is just
+    # not a symlink.
+    assert reply.code == StatusCode.BAD_MESSAGE
+
+
+# --- FSTAT, SETSTAT, FSETSTAT: the attrs bodies, against a server ------------------------
+#
+# These three have no `Session` surface either, so before this they had never been sent
+# anywhere. That matters more here than for the path-shaped requests, because an ATTRS body
+# is a flags word followed by positional fields: a transposition inside it is invisible to a
+# round trip through our own encoder, and produces a *successful* STATUS from the server
+# while setting the wrong thing.
+
+
+def test_fstat_reports_the_size_of_an_open_handle(server: LocalSftpServer, tmp_path: Path):
+    target = tmp_path / "fstat.bin"
+    target.write_bytes(b"0123456")
+    handle = open_file(server, target)
+
+    reply = server.request(FStat(server.next_id(), handle))
+    assert isinstance(reply, AttrsReply), reply
+    assert reply.attrs.size == 7
+    server.request(Close(server.next_id(), handle))
+
+
+def test_fstat_of_a_closed_handle_is_a_status_not_an_attrs(server: LocalSftpServer, tmp_path: Path):
+    # The errored third state for FSTAT, and the code is not the one the same condition
+    # produces elsewhere: CLOSE of an unknown handle answers NO_SUCH_FILE, while FSTAT of one
+    # answers the catch-all. Two requests, one bad handle, two different codes -- so a
+    # handle-validity check written against either one does not generalise to the other.
+    target = tmp_path / "fstat_closed.bin"
+    target.write_bytes(b"x")
+    handle = open_file(server, target)
+    server.request(Close(server.next_id(), handle))
+
+    reply = server.request(FStat(server.next_id(), handle))
+    assert isinstance(reply, Status), reply
+    assert reply.code == StatusCode.FAILURE
+
+
+def test_setstat_applies_permissions_and_times_from_the_positions_the_layout_claims(
+    server: LocalSftpServer, tmp_path: Path
+):
+    """The field-order proof, and the reason a single-flag ATTRS would not have been one.
+
+    Two flags are set at once, and the two fields under ACMODTIME are given different values.
+    So the assertions below fail three distinct ways: if permissions and atime swap position,
+    the mode is nonsense; if atime and mtime swap, the timestamps land on each other's
+    fields; and if the flags word itself is wrong, the server applies neither. A golden frame
+    proves we emit what the draft describes. This proves the draft describes what the server
+    reads.
+    """
+    target = tmp_path / "setstat.txt"
+    target.write_bytes(b"x")
+    target.chmod(0o600)
+    atime, mtime = 1_000_000_500, 1_000_000_000  # deliberately unequal, and atime the larger
+
+    reply = server.request(
+        SetStat(
+            server.next_id(),
+            str(target).encode(),
+            attrs=Attrs(permissions=0o642, times=Times(atime=atime, mtime=mtime)),
+        )
+    )
+    assert isinstance(reply, Status), reply
+    assert reply.code == StatusCode.OK
+
+    stat = target.stat()
+    assert stat.st_mode & 0o7777 == 0o642
+    assert stat.st_mtime == mtime
+    assert stat.st_atime == atime
+
+
+def test_fsetstat_truncates_and_chmods_through_an_open_handle(
+    server: LocalSftpServer, tmp_path: Path
+):
+    # The size field is a uint64 and sits first in the ATTRS body, ahead of the uint32s. A
+    # width error there does not desynchronise our own decoder -- it agrees with itself --
+    # but it truncates to the wrong length here, which is visible.
+    target = tmp_path / "fsetstat.bin"
+    target.write_bytes(b"0123456789")
+    target.chmod(0o600)
+    handle = open_file(server, target, OpenFlag.READ | OpenFlag.WRITE)
+
+    reply = server.request(
+        FSetStat(server.next_id(), handle, attrs=Attrs(size=4, permissions=0o640))
+    )
+    assert isinstance(reply, Status), reply
+    assert reply.code == StatusCode.OK
+    server.request(Close(server.next_id(), handle))
+
+    assert target.read_bytes() == b"0123"
+    assert target.stat().st_mode & 0o7777 == 0o640
+
+
 # --- capability probing -----------------------------------------------------------------
 
 
@@ -443,7 +617,10 @@ class CodecDrivenServer:
         assert self._proc.stdout is not None
         events: list[Completed | Negotiated] = []
         while len(events) < count:
-            events.extend(self.codec.receive(self._proc.stdout.read(1)))
+            chunk = self._proc.stdout.read(1)
+            if not chunk:
+                raise AssertionError(_died(self._proc))
+            events.extend(self.codec.receive(chunk))
         return events
 
     def close(self) -> None:

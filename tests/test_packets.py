@@ -174,6 +174,116 @@ GOLDEN = [
         b"\x00\x00\x00\x0d\xc9\x00\x00\x00\x01\x00\x00\x00\x00\x00\x04\x00\x00",
         id="EXTENDED_REPLY",
     ),
+    # The twelve below share three body shapes between them -- `id, path`, `id, handle`, and
+    # `id, path, ATTRS` -- so the *type byte* is the only thing distinguishing most of them on
+    # the wire. That is exactly the transposition a round-trip property cannot see:
+    # `decode(encode(x)) == x` holds just as well if LSTAT and FSTAT swap numbers, and so does
+    # a type-byte check that reads the number off the class it is checking. The literal below
+    # is written from draft-ietf-secsh-filexfer-02 and OpenSSH's `sftp.h`, so it agrees with
+    # something other than us.
+    pytest.param(
+        LStat(request_id=20, path=b"/lstat"),
+        b"\x00\x00\x00\x0f\x07\x00\x00\x00\x14\x00\x00\x00\x06/lstat",
+        id="LSTAT",
+    ),
+    pytest.param(
+        FStat(request_id=21, handle=b"\x00\x00\x00\x01"),
+        b"\x00\x00\x00\x0d\x08\x00\x00\x00\x15\x00\x00\x00\x04\x00\x00\x00\x01",
+        id="FSTAT",
+    ),
+    # draft-02 6.9. Three flags, so the flags word and the field order are both pinned: size
+    # is a uint64 and comes first, permissions is a uint32 and comes after it, and atime
+    # precedes mtime under one shared bit. An ATTRS body checked only in its empty form
+    # asserts none of that.
+    pytest.param(
+        SetStat(
+            request_id=22,
+            path=b"/setstat",
+            attrs=Attrs(size=1, permissions=0o644, times=Times(atime=2, mtime=3)),
+        ),
+        b"\x00\x00\x00\x29"
+        b"\x09"
+        b"\x00\x00\x00\x16"
+        b"\x00\x00\x00\x08/setstat"
+        b"\x00\x00\x00\x0d"  # flags: SIZE | PERMISSIONS | ACMODTIME
+        b"\x00\x00\x00\x00\x00\x00\x00\x01"  # size, uint64
+        b"\x00\x00\x01\xa4"  # permissions, 0o644
+        b"\x00\x00\x00\x02"  # atime
+        b"\x00\x00\x00\x03",  # mtime
+        id="SETSTAT-size-permissions-times",
+    ),
+    # The uid/gid pair, which is the other place a field order can silently transpose: two
+    # uint32s under one flag bit, and nothing on the wire says which is which.
+    pytest.param(
+        FSetStat(
+            request_id=23,
+            handle=b"\x00\x00\x00\x02",
+            attrs=Attrs(owner=Owner(uid=1000, gid=100), permissions=0o600),
+        ),
+        b"\x00\x00\x00\x1d"
+        b"\x0a"
+        b"\x00\x00\x00\x17"
+        b"\x00\x00\x00\x04\x00\x00\x00\x02"
+        b"\x00\x00\x00\x06"  # flags: UIDGID | PERMISSIONS
+        b"\x00\x00\x03\xe8"  # uid 1000
+        b"\x00\x00\x00\x64"  # gid 100
+        b"\x00\x00\x01\x80",  # permissions, 0o600
+        id="FSETSTAT-uidgid-permissions",
+    ),
+    pytest.param(
+        OpenDir(request_id=24, path=b"/dir"),
+        b"\x00\x00\x00\x0d\x0b\x00\x00\x00\x18\x00\x00\x00\x04/dir",
+        id="OPENDIR",
+    ),
+    pytest.param(
+        ReadDir(request_id=25, handle=b"\x00\x00\x00\x03"),
+        b"\x00\x00\x00\x0d\x0c\x00\x00\x00\x19\x00\x00\x00\x04\x00\x00\x00\x03",
+        id="READDIR",
+    ),
+    pytest.param(
+        Remove(request_id=26, path=b"/gone"),
+        b"\x00\x00\x00\x0e\x0d\x00\x00\x00\x1a\x00\x00\x00\x05/gone",
+        id="REMOVE",
+    ),
+    # The EXTENDED attribute bit is 0x80000000, and a flags word read as signed mangles it.
+    # This is the only golden frame that carries it, so it is the only one that would notice.
+    pytest.param(
+        MkDir(
+            request_id=27,
+            path=b"/new",
+            attrs=Attrs(permissions=0o755, extended=((b"x", b"y"),)),
+        ),
+        b"\x00\x00\x00\x23"
+        b"\x0e"
+        b"\x00\x00\x00\x1b"
+        b"\x00\x00\x00\x04/new"
+        b"\x80\x00\x00\x04"  # flags: EXTENDED | PERMISSIONS
+        b"\x00\x00\x01\xed"  # permissions, 0o755
+        b"\x00\x00\x00\x01"  # extended_count
+        b"\x00\x00\x00\x01x"
+        b"\x00\x00\x00\x01y",
+        id="MKDIR-permissions-and-an-extended-pair",
+    ),
+    pytest.param(
+        RmDir(request_id=28, path=b"/old"),
+        b"\x00\x00\x00\x0d\x0f\x00\x00\x00\x1c\x00\x00\x00\x04/old",
+        id="RMDIR",
+    ),
+    pytest.param(
+        RealPath(request_id=29, path=b"."),
+        b"\x00\x00\x00\x0a\x10\x00\x00\x00\x1d\x00\x00\x00\x01.",
+        id="REALPATH",
+    ),
+    pytest.param(
+        Stat(request_id=30, path=b"/stat"),
+        b"\x00\x00\x00\x0e\x11\x00\x00\x00\x1e\x00\x00\x00\x05/stat",
+        id="STAT",
+    ),
+    pytest.param(
+        ReadLink(request_id=31, path=b"/link"),
+        b"\x00\x00\x00\x0e\x13\x00\x00\x00\x1f\x00\x00\x00\x05/link",
+        id="READLINK",
+    ),
 ]
 
 
@@ -312,6 +422,14 @@ def test_a_frame_with_only_a_type_byte_is_rejected():
 
 
 # --- the decoder table is complete ------------------------------------------------------
+
+
+def test_every_packet_type_has_a_golden_frame():
+    # The other half of the sweep. A decoder proves a type can be parsed; a golden frame is
+    # the only thing that proves it is parsed the way the specification says. Adding a packet
+    # type without adding a fixture fails here, rather than on the first server that sends it.
+    covered = {packet.packet_type for packet, _wire in (param.values for param in GOLDEN)}
+    assert covered == set(PacketType)
 
 
 def test_every_packet_type_has_a_decoder():

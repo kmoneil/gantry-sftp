@@ -38,7 +38,9 @@ exists today:
 
 - a complete filexfer v3 codec: all 27 packet types plus ATTRS, encoding and decoding,
   checked against `draft-ietf-secsh-filexfer-02`, OpenSSH's `sftp.h`, and frames captured
-  from a real server
+  from a real server — every one of the 27 carries a byte-level fixture asserted in both
+  directions, which is a stronger claim than a round trip, because a round trip agrees with
+  any consistently wrong layout
 - wire primitives and an incremental frame splitter — no frame payload is ever copied
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
@@ -374,6 +376,14 @@ for everything behind that IP. And **`FAILURE` is terminal**, even though it is 
 transient: v3's catch-all is what a permission problem, a full disk, a name collision and a
 momentary appliance hiccup all arrive as, so retrying it would turn every fast clear failure
 into three slow ones. That changes when the quirks layer can match a server's message text.
+
+**`BAD_MESSAGE` is terminal too, and it does not mean what its name says.** It reads as "the
+frame you sent was malformed", which would make it a bug in this library rather than an answer
+about your file. On OpenSSH it is also where `EINVAL` and `ENAMETOOLONG` land, so a `readlink`
+of a path that is not a symlink, or an operation on an over-long name, arrives under it —
+measured, and the reason it is in the terminal column rather than raising as a protocol error.
+A genuinely unparseable frame does not produce this code at all: `sftp-server` exits without
+answering.
 
 `examples/retry.py` drops a link mid-download and finishes it on the next connection.
 

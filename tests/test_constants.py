@@ -106,25 +106,51 @@ def test_check_file_is_not_advertised(version_frame: bytes):
 # --- the enums themselves --------------------------------------------------------------
 
 
+# Every ``SSH2_FXP_*`` in OpenSSH's sftp.h, transcribed name by name. Contiguity is not
+# identity: a check that 1..20 has no gaps passes just as happily with LSTAT and FSTAT
+# transposed, and so does a round trip through our own encoder. Only a table that names each
+# number separately can say which name holds which.
+#
+# sftp.h also defines SSH2_FXP_STAT_VERSION_0 as a second name for 7 -- it is what STAT was
+# called in filexfer v0, and v3 spells that request LSTAT. There is no 28th packet type.
+SFTP_H_PACKET_NUMBERS = {
+    "INIT": 1,
+    "VERSION": 2,
+    "OPEN": 3,
+    "CLOSE": 4,
+    "READ": 5,
+    "WRITE": 6,
+    "LSTAT": 7,
+    "FSTAT": 8,
+    "SETSTAT": 9,
+    "FSETSTAT": 10,
+    "OPENDIR": 11,
+    "READDIR": 12,
+    "REMOVE": 13,
+    "MKDIR": 14,
+    "RMDIR": 15,
+    "REALPATH": 16,
+    "STAT": 17,
+    "RENAME": 18,
+    "READLINK": 19,
+    "SYMLINK": 20,
+    "STATUS": 101,
+    "HANDLE": 102,
+    "DATA": 103,
+    "NAME": 104,
+    "ATTRS": 105,
+    "EXTENDED": 200,
+    "EXTENDED_REPLY": 201,
+}
+
+
 def test_packet_type_numbers():
-    assert PacketType.INIT == 1
-    assert PacketType.VERSION == 2
-    assert PacketType.OPEN == 3
-    assert PacketType.READ == 5
-    assert PacketType.WRITE == 6
-    assert PacketType.SYMLINK == 20
-    assert PacketType.STATUS == 101
-    assert PacketType.HANDLE == 102
-    assert PacketType.DATA == 103
-    assert PacketType.NAME == 104
-    assert PacketType.ATTRS == 105
-    assert PacketType.EXTENDED == 200
-    assert PacketType.EXTENDED_REPLY == 201
+    assert {p.name: p.value for p in PacketType} == SFTP_H_PACKET_NUMBERS
 
 
 def test_no_gaps_in_the_low_request_range():
-    # 1..20 is contiguous in v3 except for the response codes; a missing member here means
-    # a packet type was dropped when the enum was typed out.
+    # Backs up the table above rather than standing in for it: a number dropped from both
+    # this file and the enum in the same edit still leaves a hole here.
     low = {p.value for p in PacketType if p.value <= 20}
     assert low == set(range(1, 21))
 
