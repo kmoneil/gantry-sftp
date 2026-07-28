@@ -104,6 +104,14 @@ CAVEATS = (
     "claim about the other two libraries.",
     "Our upload row is `atomic=False, fsync=False`, which is the work the other two do. What "
     "our default costs is the separate `atomic publish` scenario.",
+    "**Comparing the two small-file rows against each other measures two libraries' direction "
+    "asymmetries at once, not one.** Each client has its own ratio between its `get` and its "
+    "`put`, and a cross-library row cannot separate them -- D-72 was filed reading the "
+    "unshaped download win and upload loss as a single fact about this library, and ranging "
+    "each client against *itself* on the same corpus showed most of the swing was the "
+    "control's: paramiko's small-file `get` runs several times its own `put`, which inflates "
+    "our download row without saying anything about our scheduler. Re-derive both self-ratios "
+    "before quoting either cross-library number as evidence about this library.",
 )
 
 

@@ -1004,11 +1004,29 @@ Three of those rows are not the ones a pitch would choose, and they are the inte
 **We lose small-file upload on a fast link, and we win small-file download on the same one.**
 Unshaped, 200 × 8 KiB: 3.0–3.2× *faster* than paramiko downloading, 1.7–1.8× *slower* uploading,
 same files, same count, same connection. With the round trips nearly free the difference is
-per-operation work in Python, and the CPU column says so — 0.088–0.093 CPU s/MiB against
-paramiko's 0.046. It disappears the moment the link has any latency, where all three tie, so it
-costs nothing on the networks this library is for and everything on loopback. It is still a real
-asymmetry in our own two directions rather than a fact about paramiko, it is not the size check
-(paramiko performs the same one), and it is not yet explained. Carded rather than narrated away.
+per-operation work in Python, and the CPU column says so. It disappears the moment the link has
+any latency, where all three tie, so it costs nothing on the networks this library is for and
+everything on loopback. It is not the size check — paramiko performs the same one.
+
+**Measured 2026-07-28, and the swing between those two rows is mostly not ours.** Ranging each
+library against *itself* on the same corpus and connection: our upload is **1.25×** our own
+download, while paramiko's upload is **0.23×** theirs — paramiko's small-file `get` is over four
+times its own `put`, and disabling its prefetch does not change that. So the cross-library rows
+above are two facts, not one. Our own direction asymmetry is modest and its largest single
+component is that `put` reads the local file in a worker thread while `get` calls `os.pwrite`
+inline — worth 75–130 µs per file, about a third of the gap. The anyio primitives in that path
+are innocent: a task group, a semaphore acquire and an event wait total ~17 µs per file, measured
+directly.
+
+**Read the download row with that in mind.** It is an honest measurement of both libraries'
+default APIs, which is the benchmark's fairness rule — but a good part of the 3× is paramiko's
+`get`, not our scheduler. The row that demonstrates what the scheduling actually buys is the
+`one connection` one below, which is this library against itself.
+
+The upload gap is **measured, understood and deliberately not fixed** (D-72). Restoring the
+symmetry means reading small payloads inline, which trades away the property that a slow local
+disk cannot stall the receive side — to win back tens of milliseconds on a link with no latency,
+which is the one case nobody ships.
 
 **"No cryptography in Python" does not become a CPU win.** `cryptography` is OpenSSL and
 OpenSSL uses the CPU's AES instructions, so the expensive part was never interpreted in either
