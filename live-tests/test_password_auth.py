@@ -23,6 +23,7 @@ one twice would prove nothing about anyio.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,6 +31,7 @@ from pathlib import Path
 import pytest
 from matrix import MatrixServer, password_server_unavailable_reason, running_password_server
 
+from gantry_sftp._logging import MASKED
 from gantry_sftp.exceptions import AuthenticationError, ConnectError
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import ASKPASS_ARMING_VARIABLES, open_ssh_transport
@@ -121,6 +123,40 @@ async def test_the_password_reaches_the_server_without_reaching_argv(password_se
         assert PASSWORD not in " ".join(transport.argv)
         assert PASSWORD not in repr(transport)
         assert PASSWORD not in transport.stderr_text
+
+
+async def test_a_successful_authentication_leaves_nothing_in_the_logs(
+    password_server, caplog: pytest.LogCaptureFixture
+):
+    """The redaction rule, on the one lane where the credential is actually *accepted*.
+
+    Every other proof of this runs against a connection that failed -- a missing executable, a
+    fake `ssh` that exits 255 -- so the secret never travels far. Here it is written into a
+    helper, read by a real `ssh`, sent over a real connection and accepted by a real server,
+    with every logger in the package turned all the way up for the whole exchange.
+
+    The masking is asserted rather than the absence alone: a record that simply dropped the
+    variable would pass an "is the password there?" test while destroying the one fact a failed
+    password authentication needs, which is whether an answer was configured at all.
+    """
+    with caplog.at_level(logging.DEBUG, logger="gantry_sftp"):
+        async with (
+            connect(password_server, password=PASSWORD) as transport,
+            open_session(transport) as sftp,
+        ):
+            cwd = await sftp.realpath(b".")
+            assert await sftp.listdir(cwd) is not None
+
+    emitted = "\n".join(record.getMessage() for record in caplog.records)
+    arguments = "\n".join(repr(record.args) for record in caplog.records)
+    assert caplog.records, "logging captured nothing -- this test would prove nothing"
+    assert PASSWORD not in emitted
+    assert PASSWORD not in arguments
+    assert f"'GANTRY_SFTP_ASKPASS_ANSWER': '{MASKED}'" in emitted
+    # And the dump really did run over this connection, so the absence above is a fact about a
+    # busy logger rather than about a quiet one.
+    assert "-> REALPATH" in emitted
+    assert "<- NAME" in emitted
 
 
 # --- the shipped default refuses, and now says why ------------------------------------------

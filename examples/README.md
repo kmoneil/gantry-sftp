@@ -18,6 +18,7 @@ python examples/concurrent_transfers.py           # many transfers over one sess
 python examples/cancellation.py                   # stop a transfer, and what it leaves behind
 python examples/connect_errors.py                 # why the connection failed, as a class
 python examples/password_auth.py                  # password= , and where the secret does not go
+python examples/observability.py                  # the logs, a frame dump, and the counters
 ```
 
 Pass a destination to run the same code against a real server:
@@ -34,6 +35,7 @@ python examples/concurrent_transfers.py user@host /remote/dir
 python examples/cancellation.py user@host /remote/dir
 python examples/connect_errors.py user@host
 GANTRY_SFTP_PASSWORD=... python examples/password_auth.py user@host
+python examples/observability.py user@host /remote/dir
 ```
 
 `password_auth.py` is the one example that takes its input from the environment rather than
@@ -61,6 +63,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |
 | `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
 | `password_auth.py`        | `password=`, the `SSH_ASKPASS` helper it writes, why `BatchMode` has to be relaxed, and the proof that the secret reaches neither argv nor the exception |
+| `observability.py`        | the three loggers, a frame dump of a real transfer, the session counters, and a filename that tries to forge a log record |
 
 ## What `atomic_publish.py` is actually showing
 

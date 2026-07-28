@@ -36,6 +36,11 @@ FORBIDDEN_IMPORTS = frozenset(
         "datetime",
         "sched",
         "time",
+        # `logging` is here for the same reason rather than as an I/O rule: every log record
+        # is stamped with `time.time()` at construction, so a codec that logs is a codec that
+        # reads the clock. It is why the frame dumper is split -- `codec.describe()` renders a
+        # packet and returns a string, and the session seam is what emits it.
+        "logging",
         # nondeterminism -- request-id allocation is deterministic and owned by the codec
         "random",
         "secrets",

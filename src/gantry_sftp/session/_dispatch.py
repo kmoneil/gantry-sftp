@@ -39,6 +39,7 @@ decision, made with an anyio task group; this only makes sure they do not tread 
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -46,7 +47,8 @@ from typing import override
 
 import anyio
 
-from gantry_sftp.codec import Close, Codec, Completed, Event, Handle, Request
+from gantry_sftp._logging import frames_logger
+from gantry_sftp.codec import Close, Codec, Completed, Event, Handle, Request, describe
 from gantry_sftp.exceptions import ProtocolError, StateError
 from gantry_sftp.transport import Transport
 
@@ -157,6 +159,8 @@ class Dispatcher:
     """
 
     __slots__ = (
+        "_bytes_received",
+        "_bytes_sent",
         "_closed",
         "_codec",
         "_exchanges",
@@ -167,6 +171,8 @@ class Dispatcher:
         "_reading",
         "_reaped",
         "_reaper_scope",
+        "_replies_received",
+        "_requests_sent",
         "_routes",
         "_send_lock",
         "_transport",
@@ -197,6 +203,10 @@ class Dispatcher:
         self._orphan_arrived = anyio.Event()
         self._reaper_scope: anyio.CancelScope | None = None
         self._reaped = 0
+        self._requests_sent = 0
+        self._replies_received = 0
+        self._bytes_sent = 0
+        self._bytes_received = 0
 
     @property
     def codec(self) -> Codec:
@@ -225,6 +235,50 @@ class Dispatcher:
         return self._unclaimed
 
     @property
+    def requests_sent(self) -> int:
+        """Requests written to this connection since it opened. Cumulative, never reset.
+
+        Counts what was **committed to the wire**, not what was acknowledged -- incremented
+        before the write rather than after it, for the reason :meth:`_close_orphan` states and
+        this repository has already paid to learn once (D-74): a request whose reply never
+        arrived may well have been performed. A counter that only counted answered requests
+        would under-report exactly the connection somebody is trying to diagnose.
+
+        Excludes the handshake, which is sent before this object owns the transport.
+        """
+        return self._requests_sent
+
+    @property
+    def replies_received(self) -> int:
+        """Replies decoded and routed since the connection opened, including unclaimed ones.
+
+        The gap between this and :attr:`requests_sent` is what is in flight plus what will
+        never come back; :attr:`~gantry_sftp.codec.Codec.outstanding` is the instantaneous
+        half of the same picture.
+        """
+        return self._replies_received
+
+    @property
+    def bytes_sent(self) -> int:
+        """Bytes handed to the transport, framing included.
+
+        Payload accounting is per operation (``UploadResult.transferred`` and the progress
+        callback); this is the connection's own total, which is the one that can be compared
+        against what a link was expected to carry.
+        """
+        return self._bytes_sent
+
+    @property
+    def bytes_received(self) -> int:
+        """Bytes read from the transport, framing included.
+
+        Counted per read rather than per frame, so a chunk that did not complete a frame is
+        still in the total -- a connection receiving bytes that never become packets is a
+        distinct failure from one receiving nothing, and only this counter tells them apart.
+        """
+        return self._bytes_received
+
+    @property
     def reaped(self) -> int:
         """Orphaned handles a ``CLOSE`` has been sent for by :meth:`reap_orphans`.
 
@@ -242,6 +296,10 @@ class Dispatcher:
         ``reader`` is here because it can no longer be inferred from the rest: the reader is
         shielded, so a session whose task group was cancelled still has one, and a reader
         nobody stopped is a task group that will not exit.
+
+        The two totals are what distinguishes a stall from a slow link without a packet
+        capture: ``sent`` climbing while ``received`` does not is a server that has stopped
+        answering, and both frozen is a transfer that stopped asking.
         """
         state = "closed" if self._closed else "failed" if self._failure is not None else "open"
         reader = (
@@ -249,7 +307,9 @@ class Dispatcher:
         )
         return (
             f"<Dispatcher {state} reader={reader} exchanges={len(self._exchanges)} "
-            f"routes={len(self._routes)} unclaimed={self._unclaimed} reaped={self._reaped}>"
+            f"routes={len(self._routes)} unclaimed={self._unclaimed} reaped={self._reaped} "
+            f"sent={self._requests_sent}/{self._bytes_sent}B "
+            f"received={self._replies_received}/{self._bytes_received}B>"
         )
 
     # --- the reader ------------------------------------------------------------------------
@@ -292,7 +352,9 @@ class Dispatcher:
             self._reading = True
             try:
                 while True:
-                    for event in self._codec.receive(await self._transport.receive()):
+                    chunk = await self._transport.receive()
+                    self._bytes_received += len(chunk)
+                    for event in self._codec.receive(chunk):
                         self._route(event)
             except Exception as error:
                 # Deliberately as broad as it can be without swallowing cancellation, which
@@ -306,6 +368,12 @@ class Dispatcher:
     def _route(self, event: Event) -> None:
         if not isinstance(event, Completed):  # pragma: no cover -- codec refuses a 2nd VERSION
             raise ProtocolError(f"server sent {type(event).__name__} after the handshake")
+        self._replies_received += 1
+        if frames_logger.isEnabledFor(logging.DEBUG):
+            # Before the routing decision, so a reply nobody claimed is still in the dump --
+            # which is the frame you want when a session is behaving as though it is one
+            # reply behind.
+            frames_logger.debug("<- %s", describe(event.response))
         exchange = self._routes.pop(event.request.request_id, None)
         if exchange is None:
             self._unclaimed += 1
@@ -450,6 +518,10 @@ class Dispatcher:
         # an await before this point could let another task allocate the same one.
         wire = self._codec.send(request)
         self._routes[request.request_id] = exchange
+        self._requests_sent += 1
+        self._bytes_sent += len(wire)
+        if frames_logger.isEnabledFor(logging.DEBUG):
+            frames_logger.debug("-> %s", describe(request))
         async with self._send_lock:
             await self._transport.send(wire)
 

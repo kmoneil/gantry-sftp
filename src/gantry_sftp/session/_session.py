@@ -33,6 +33,7 @@ loop leaves the link idle for; passing it needs a second transport (DESIGN.md 5.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import tempfile
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -44,6 +45,7 @@ from typing import override
 
 import anyio
 
+from gantry_sftp._logging import operation, session_logger
 from gantry_sftp.codec import (
     EMPTY_ATTRS,
     EXTENSION_CHECK_FILE,
@@ -81,6 +83,7 @@ from gantry_sftp.codec import (
     Status,
     StatusCode,
     Times,
+    render_field,
 )
 from gantry_sftp.codec import (
     Extended as ExtendedRequest,
@@ -183,6 +186,13 @@ Not ``O_APPEND``: every write goes to an explicit offset with ``os.pwrite``, and
 would ignore those offsets and redirect every reply to the end of the file -- which for
 out-of-order pipelined replies means a file assembled in arrival order. Silently, and wrong.
 """
+
+_LOGGED_EXTENSIONS = 12
+"""Advertised extension names the handshake record will list before it stops.
+
+A count as well as the names, so a server advertising two hundred of them is visible as that
+rather than as a truncated list. Twelve covers every server in the matrix with room to spare --
+OpenSSH advertises six."""
 
 _TRUNCATE_FLAGS = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
 """Open flags for writing a file in place: create it, or replace what is there."""
@@ -489,6 +499,36 @@ class Session:
         return self._dispatcher.reaped
 
     @property
+    def requests_sent(self) -> int:
+        """Requests this session has written, cumulatively. Excludes the handshake.
+
+        Cumulative rather than instantaneous, which is the half that was missing: ``depth``
+        and ``outstanding`` say what is happening now, and only a total can answer "did the
+        retry loop actually retry?" or "how many round trips did that tree cost?".
+        """
+        return self._dispatcher.requests_sent
+
+    @property
+    def replies_received(self) -> int:
+        """Replies this session has routed, cumulatively, including unclaimed ones."""
+        return self._dispatcher.replies_received
+
+    @property
+    def bytes_sent(self) -> int:
+        """Bytes this session has written to the transport, framing included."""
+        return self._dispatcher.bytes_sent
+
+    @property
+    def bytes_received(self) -> int:
+        """Bytes this session has read from the transport, framing included.
+
+        Larger than the payload of a download by the framing, and larger again than the file
+        on disk if anything was re-read -- a resume gate verifying an adopted prefix moves
+        bytes that never reach the destination file.
+        """
+        return self._dispatcher.bytes_received
+
+    @property
     def profile(self) -> ServerProfile:
         """Which SFTP implementation this looks like, from what it advertised.
 
@@ -506,11 +546,18 @@ class Session:
         ``outstanding`` is here because a session is no longer one operation at a time: a
         number that stays pinned at the pipeline depth while nothing finishes is a stalled
         transfer, and one that is unexpectedly large is more concurrency than intended.
+
+        ``requests`` and ``bytes`` are the cumulative pair beside it. A gauge alone cannot
+        answer whether anything is *moving*: two reprs a second apart with the same
+        ``outstanding`` and different totals is a slow link, and with the same totals it is a
+        stall.
         """
         return (
             f"<Session server={self._profile.label} version={self._codec.server_version} "
             f"extensions={len(self._codec.extensions)} depth={self._depth} "
             f"outstanding={self._codec.outstanding} "
+            f"requests={self._dispatcher.requests_sent}/{self._dispatcher.replies_received} "
+            f"bytes={self._dispatcher.bytes_sent}/{self._dispatcher.bytes_received} "
             f"request_timeout={self._request_timeout} idle_timeout={self._idle_timeout}>"
         )
 
@@ -1309,55 +1356,64 @@ class Session:
                 said there were.
         """
         encoded = _encode_path(remote_path)
-        attributes = await self.stat(encoded)
-        start = _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
-        # DESIGN.md 6's gate, on the direction that is usually assumed safe. The local partial
-        # being *ours* makes its length trustworthy; it does not make its contents a prefix of
-        # this remote file. A partial left by a previous run against a different source is the
-        # same corruption as on the upload side, and it is caught here before the first READ.
-        # `get` returns an `int`, so this can refuse but cannot report -- see D-38.
-        _ = await self._gate_resume(encoded, local_path, start, Verify.SIZE)
-        if resume and start == attributes.size:
-            # Already complete: nothing to open and nothing to move. Deliberately *after* the
-            # gate rather than before it -- this is the case that adopts the entire file and
-            # returns success having verified nothing, which makes it the one most worth
-            # gating, not the one to skip for a round trip.
-            return 0
+        with operation(session_logger, "get", remote=encoded, local=local_path) as record:
+            attributes = await self.stat(encoded)
+            start = _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
+            # DESIGN.md 6's gate, on the direction that is usually assumed safe. The local
+            # partial being *ours* makes its length trustworthy; it does not make its contents a
+            # prefix of this remote file. A partial left by a previous run against a different
+            # source is the same corruption as on the upload side, and it is caught here before
+            # the first READ. `get` returns an `int`, so this can refuse but cannot report --
+            # see D-38.
+            _ = await self._gate_resume(encoded, local_path, start, Verify.SIZE)
+            if resume and start == attributes.size:
+                # Already complete: nothing to open and nothing to move. Deliberately *after*
+                # the gate rather than before it -- this is the case that adopts the entire file
+                # and returns success having verified nothing, which makes it the one most worth
+                # gating, not the one to skip for a round trip.
+                record["bytes"] = 0
+                record["adopted"] = start
+                return 0
 
-        handle = await self.open(encoded, OpenFlag.READ)
-        try:
-            transferred = await self._download_into(
-                local_path,
-                handle,
-                size=attributes.size,
-                depth=depth,
-                progress=progress,
-                remote_path=encoded,
-                no_follow=no_follow,
-                start_offset=start,
-                times=attributes.times if preserve_times else None,
-            )
-        except BaseException:
-            # Closing is not optional: a leaked handle counts against max-open-handles and is
-            # invisible from this side until the server starts refusing to open anything. It
-            # must not replace the transfer's error with one about the close, though -- the
-            # first error is the diagnosis and the second is housekeeping.
-            await _close_quietly(self, handle)
-            raise
-        await self.close(handle)
-        # Rung 3, and it costs no round trip: the STAT above is the one `get` already makes.
-        # `start + transferred` rather than `transferred`, because a resume returns only the
-        # remainder and comparing that against the whole file would fail every resume.
-        if verify_size and attributes.size is not None and start + transferred != attributes.size:
-            raise TransferError(
-                f"{encoded!r} is {attributes.size} bytes but the download ended after "
-                f"{start + transferred}; it was truncated or the file shrank underneath it",
-                transferred=start + transferred,
-                offset=start + transferred,
-                remote_path=encoded,
-                local_path=str(local_path),
-            )
-        return transferred
+            handle = await self.open(encoded, OpenFlag.READ)
+            try:
+                transferred = await self._download_into(
+                    local_path,
+                    handle,
+                    size=attributes.size,
+                    depth=depth,
+                    progress=progress,
+                    remote_path=encoded,
+                    no_follow=no_follow,
+                    start_offset=start,
+                    times=attributes.times if preserve_times else None,
+                )
+            except BaseException:
+                # Closing is not optional: a leaked handle counts against max-open-handles and
+                # is invisible from this side until the server starts refusing to open anything.
+                # It must not replace the transfer's error with one about the close, though --
+                # the first error is the diagnosis and the second is housekeeping.
+                await _close_quietly(self, handle)
+                raise
+            await self.close(handle)
+            record["bytes"] = transferred
+            # Rung 3, and it costs no round trip: the STAT above is the one `get` already makes.
+            # `start + transferred` rather than `transferred`, because a resume returns only the
+            # remainder and comparing that against the whole file would fail every resume.
+            if (
+                verify_size
+                and attributes.size is not None
+                and start + transferred != attributes.size
+            ):
+                raise TransferError(
+                    f"{encoded!r} is {attributes.size} bytes but the download ended after "
+                    f"{start + transferred}; it was truncated or the file shrank underneath it",
+                    transferred=start + transferred,
+                    offset=start + transferred,
+                    remote_path=encoded,
+                    local_path=str(local_path),
+                )
+            return transferred
 
     async def _download_into(
         self,
@@ -1582,47 +1638,54 @@ class Session:
         # returned, so this costs no round trip.
         directory_times: list[tuple[Path, Times]] = []
 
-        # aclosing, because the common exit from this loop is an exception -- a refused name,
-        # a failed transfer -- and a suspended async generator that is merely dropped is left
-        # to the garbage collector, which trio will not finalise for it.
-        async with aclosing(self.walk(remote_path, max_depth=max_depth)) as walker:
-            async for entry in walker:
-                local_directory = _local_directory(destination, entry.relative)
-                if entry.relative:
-                    _ = _ensure_directory(local_directory)
-                    directories += 1
-                    collisions.extend(_claim_directory(ledger, local_directory, entry))
-                if preserve_times:
-                    directory_times.extend(
-                        (local_child(local_directory, child.filename), child.attrs.times)
-                        for child in entry.directories
-                        if child.attrs.times is not None
-                    )
-                skipped.extend(entry.skipped)
-                for child in entry.files:
-                    moved, collision = await self._get_child(
-                        destination=destination,
-                        local_directory=local_directory,
-                        entry=entry,
-                        child=child,
-                        ledger=ledger,
-                        progress=progress,
-                        preserve_times=preserve_times,
-                    )
-                    if collision is not None:
-                        collisions.append(collision)
-                        skipped.append(
-                            Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION)
+        with operation(
+            session_logger, "get_tree", remote=_encode_path(remote_path), local=destination
+        ) as record:
+            # aclosing, because the common exit from this loop is an exception -- a refused
+            # name, a failed transfer -- and a suspended async generator that is merely dropped
+            # is left to the garbage collector, which trio will not finalise for it.
+            async with aclosing(self.walk(remote_path, max_depth=max_depth)) as walker:
+                async for entry in walker:
+                    local_directory = _local_directory(destination, entry.relative)
+                    if entry.relative:
+                        _ = _ensure_directory(local_directory)
+                        directories += 1
+                        collisions.extend(_claim_directory(ledger, local_directory, entry))
+                    if preserve_times:
+                        directory_times.extend(
+                            (local_child(local_directory, child.filename), child.attrs.times)
+                            for child in entry.directories
+                            if child.attrs.times is not None
                         )
-                        continue
-                    transferred += moved
-                    files += 1
+                    skipped.extend(entry.skipped)
+                    for child in entry.files:
+                        moved, collision = await self._get_child(
+                            destination=destination,
+                            local_directory=local_directory,
+                            entry=entry,
+                            child=child,
+                            ledger=ledger,
+                            progress=progress,
+                            preserve_times=preserve_times,
+                        )
+                        if collision is not None:
+                            collisions.append(collision)
+                            skipped.append(
+                                Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION)
+                            )
+                            continue
+                        transferred += moved
+                        files += 1
 
-        _stamp_local_directories(directory_times)
-        result = TreeResult(files, directories, transferred, tuple(skipped))
-        if collisions:
-            raise _collision_error(collisions, destination, result)
-        return result
+            _stamp_local_directories(directory_times)
+            result = TreeResult(files, directories, transferred, tuple(skipped))
+            record["files"] = result.files
+            record["directories"] = result.directories
+            record["bytes"] = result.transferred
+            record["skipped"] = len(result.skipped)
+            if collisions:
+                raise _collision_error(collisions, destination, result)
+            return result
 
     async def _get_child(
         self,
@@ -1823,6 +1886,21 @@ class Session:
             # unverified upload would otherwise cost.
             verify=Verify(verify),
         )
+        with operation(session_logger, "put", local=local_path, remote=target) as record:
+            result = await self._publish_upload(upload, target, policy)
+            record["bytes"] = result.transferred
+            record["mechanism"] = result.mechanism.name
+            return result
+
+    async def _publish_upload(
+        self, upload: _Upload, target: bytes, policy: Publish
+    ) -> UploadResult:
+        """Route one prepared upload to the in-place or the staged path.
+
+        Split out of :meth:`put` so the operation record has a result to close over -- and only
+        that far, because everything above it is argument handling that can raise before a byte
+        moves, and a record for an upload that never started is noise.
+        """
         if not policy.atomic:
             return await self._put_in_place(upload, target)
         staged_name = _optional_path(policy.staging_name)
@@ -2434,27 +2512,32 @@ class Session:
         # `stat` is free, so this costs nothing until the final pass.
         directory_times: list[tuple[bytes, Times]] = []
 
-        for entry in walk_local(Path(local_path), max_depth=max_depth):
-            remote_directory = _remote_directory(root, entry.relative)
-            if entry.relative:
-                await self.mkdir(remote_directory, exist_ok=True)
-                directories += 1
-                if preserve_times:
-                    directory_times.append((remote_directory, _local_times(entry.path)))
-            skipped.extend(entry.skipped)
-            for name in entry.files:
-                result = await self.put(
-                    entry.path / os.fsdecode(name),
-                    join_remote(remote_directory, remote_component(name)),
-                    publish=policy,
-                    preserve_times=preserve_times,
-                    progress=progress,
-                )
-                transferred += result.transferred
-                files += 1
+        with operation(session_logger, "put_tree", local=local_path, remote=root) as record:
+            for entry in walk_local(Path(local_path), max_depth=max_depth):
+                remote_directory = _remote_directory(root, entry.relative)
+                if entry.relative:
+                    await self.mkdir(remote_directory, exist_ok=True)
+                    directories += 1
+                    if preserve_times:
+                        directory_times.append((remote_directory, _local_times(entry.path)))
+                skipped.extend(entry.skipped)
+                for name in entry.files:
+                    result = await self.put(
+                        entry.path / os.fsdecode(name),
+                        join_remote(remote_directory, remote_component(name)),
+                        publish=policy,
+                        preserve_times=preserve_times,
+                        progress=progress,
+                    )
+                    transferred += result.transferred
+                    files += 1
 
-        await self._set_directory_times(directory_times)
-        return TreeResult(files, directories, transferred, tuple(skipped))
+            await self._set_directory_times(directory_times)
+            record["files"] = files
+            record["directories"] = directories
+            record["bytes"] = transferred
+            record["skipped"] = len(skipped)
+            return TreeResult(files, directories, transferred, tuple(skipped))
 
     async def _mkdir_parents(self, path: bytes) -> None:
         """Create ``path`` and any missing ancestors, cheaply in the common case.
@@ -2512,24 +2595,27 @@ class Session:
                 entry that turned out to be a directory, which names that exact path.
         """
         root = _encode_path(path)
-        entries: list[WalkEntry] = []
-        async with aclosing(self.walk(root)) as walker:
-            async for entry in walker:
-                entries.append(entry)
+        with operation(session_logger, "rmtree", remote=root) as record:
+            entries: list[WalkEntry] = []
+            async with aclosing(self.walk(root)) as walker:
+                async for entry in walker:
+                    entries.append(entry)
 
-        files = directories = 0
-        # Reversed: walk yields top down, and a directory cannot go before its contents.
-        for entry in reversed(entries):
-            for name in [child.filename for child in entry.files]:
-                await self.remove(join_remote(entry.path, name))
-                files += 1
-            for skip in entry.skipped:
-                await self.remove(skip.path)
-                files += 1
-            await self.rmdir(entry.path)
-            directories += 1
+            files = directories = 0
+            # Reversed: walk yields top down, and a directory cannot go before its contents.
+            for entry in reversed(entries):
+                for name in [child.filename for child in entry.files]:
+                    await self.remove(join_remote(entry.path, name))
+                    files += 1
+                for skip in entry.skipped:
+                    await self.remove(skip.path)
+                    files += 1
+                await self.rmdir(entry.path)
+                directories += 1
 
-        return TreeResult(files, directories, 0, ())
+            record["files"] = files
+            record["directories"] = directories
+            return TreeResult(files, directories, 0, ())
 
     # --- cleanup ------------------------------------------------------------------------------
 
@@ -2890,6 +2976,17 @@ async def open_session(
     await transport.send(codec.initiate())
     await _await_version(transport, codec, request_timeout)
     limits = await _probe_limits(transport, codec, request_timeout)
+    # The one handshake record. `gantry_sftp.frames` cannot cover INIT and VERSION: they are
+    # exchanged before the dispatcher owns `receive`, and VERSION is not a reply to anything --
+    # it has no request id to route. So the two facts a bug report needs from the handshake are
+    # stated here instead, and the dump begins at the first request.
+    if session_logger.isEnabledFor(logging.DEBUG):
+        session_logger.debug(
+            "negotiated version=%s extensions=%d [%s]",
+            codec.server_version,
+            len(codec.extensions),
+            " ".join(render_field(name) for name in tuple(codec.extensions)[:_LOGGED_EXTENSIONS]),
+        )
 
     dispatcher = Dispatcher(transport, codec)
     try:

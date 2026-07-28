@@ -18,6 +18,7 @@ and was discarded. Here it is the first thing in the exception.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -28,6 +29,7 @@ from typing import override
 import anyio
 from anyio.abc import Process
 
+from gantry_sftp._logging import mask_environment, transport_logger
 from gantry_sftp.exceptions import ConnectError, flatten_exception_group
 from gantry_sftp.transport._argv import (
     DEFAULT_SUBSYSTEM,
@@ -35,6 +37,7 @@ from gantry_sftp.transport._argv import (
     options_for_password_auth,
 )
 from gantry_sftp.transport._askpass import (
+    ASKPASS_ANSWER_VARIABLE,
     ASKPASS_ARMING_VARIABLES,
     Secret,
     askpass_environment,
@@ -43,6 +46,7 @@ from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
 from gantry_sftp.transport._diagnosis import classify_failure, password_auth_hint
 
 __all__ = [
+    "LOGGED_ENVIRONMENT_VARIABLES",
     "SFTP_SERVER_CANDIDATES",
     "StderrBuffer",
     "SubprocessTransport",
@@ -260,6 +264,17 @@ class SubprocessTransport:
             await self._close_stdin()
             await self._release_pipes()
             await self._reap()
+        # After the reap, so the exit status is the child's real one rather than `None`. That
+        # is the whole value of the record: a non-zero status here is the difference between a
+        # connection that ended and one that was killed. Guarded because `text()` decodes the
+        # whole stderr buffer, and a teardown must not pay for a record nobody asked for.
+        if transport_logger.isEnabledFor(logging.DEBUG):
+            transport_logger.debug(
+                "closed pid=%s returncode=%s stderr=%dB",
+                self._process.pid,
+                self._process.returncode,
+                len(self._stderr.text()),
+            )
 
     async def _close_stdin(self) -> None:
         """Closing stdin is how a well-behaved sftp server is told to exit."""
@@ -357,6 +372,13 @@ async def _open_process_transport(
         ) from exc
 
     transport = SubprocessTransport(process, argv, stderr, askpass_armed=askpass_armed)
+    if transport_logger.isEnabledFor(logging.DEBUG):
+        transport_logger.debug(
+            "spawned pid=%s argv=%r steering=%r",
+            process.pid,
+            list(argv),
+            mask_environment(_steering_variables(env)),
+        )
     try:
         try:
             async with anyio.create_task_group() as task_group:
@@ -381,6 +403,37 @@ async def _open_process_transport(
         # must not leave a child running.
         with anyio.CancelScope(shield=True):
             await transport.aclose()
+
+
+LOGGED_ENVIRONMENT_VARIABLES = (
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "SSH_AUTH_SOCK",
+    ASKPASS_ANSWER_VARIABLE,
+)
+"""The child's variables a failed connection is usually explained by, and only those.
+
+Not the whole environment, for two reasons that both matter. It is the caller's, so it holds
+their cloud credentials and their CI tokens, and this library has no business copying those into
+a log record even masked. And these six are the ones that decide *how* ``ssh`` authenticates --
+which is what a "Permission denied" is actually asking about. Their values pass through
+:func:`~gantry_sftp._logging.mask_environment` on the way out, which is what keeps
+``GANTRY_SFTP_ASKPASS_ANSWER`` in the list rather than exempted from it: its presence is the
+diagnostic fact, and its value is the secret.
+"""
+
+
+def _steering_variables(env: Mapping[str, str] | None) -> dict[str, str]:
+    """Pick the variables above out of the child's environment, or out of this process's.
+
+    ``None`` means the child inherits, so the honest answer is what *this* process holds -- a
+    record saying "no askpass configured" because the caller passed no explicit environment
+    would be a confidently wrong diagnosis of the case where one was inherited.
+    """
+    source = os.environ if env is None else env
+    return {name: source[name] for name in LOGGED_ENVIRONMENT_VARIABLES if name in source}
 
 
 def _askpass_is_armed(password: str | None, env: Mapping[str, str] | None) -> bool:

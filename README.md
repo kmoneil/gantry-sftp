@@ -956,6 +956,101 @@ it happens to run in deliberately does not stop it.
 
 `examples/cancellation.py` runs this with no arguments.
 
+## Seeing what it is doing
+
+Nothing is printed unless you ask. The package logger carries a `NullHandler`, so an
+application that never configures `logging` sees nothing at all from this library — including
+on stderr, which is where an unhandled warning would otherwise go.
+
+```python
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("gantry_sftp.session").setLevel(logging.DEBUG)  # one record per operation
+logging.getLogger("gantry_sftp.transport").setLevel(logging.DEBUG)  # spawn and teardown
+logging.getLogger("gantry_sftp.frames").setLevel(logging.DEBUG)  # every packet, both ways
+```
+
+| Logger                    | Level   | Carries                                                                        |
+| ------------------------- | ------- | ------------------------------------------------------------------------------ |
+| `gantry_sftp.session`     | DEBUG   | Handshake, and one record each when an operation starts and finishes            |
+| `gantry_sftp.session`     | WARNING | A retryable failure `with_reconnect()` swallowed — the only warning in the tree |
+| `gantry_sftp.transport`   | DEBUG   | The `ssh` child: pid, argv, the variables that steer authentication, exit status |
+| `gantry_sftp.frames`      | DEBUG   | Every packet sent and received, decoded                                         |
+
+```
+DEBUG gantry_sftp.session   negotiated version=3 extensions=6 [b'posix-rename@openssh.com' ...]
+DEBUG gantry_sftp.session   get start remote=b'/incoming/data.parquet' local='data.parquet'
+DEBUG gantry_sftp.frames    -> STAT id=1 path=b'/incoming/data.parquet'
+DEBUG gantry_sftp.frames    <- ATTRS id=1 attrs=(size=16777216 mode=0o100644)
+DEBUG gantry_sftp.frames    -> READ id=3 handle=b'\x00\x00\x00\x00' offset=0 len=261120
+DEBUG gantry_sftp.frames    <- DATA id=3 len=261120
+DEBUG gantry_sftp.session   get ok remote=b'/incoming/data.parquet' bytes=16777216 elapsed=1.284s
+```
+
+**The frame dump is per packet and it means it** — a 16 MiB download is a few hundred lines and
+a recursive tree is thousands. Turn it on for a protocol question. When it is off it costs one
+`isEnabledFor` check per packet and nothing is rendered, which is asserted rather than assumed.
+
+**Payloads are never in it.** `DATA` and `WRITE` show as `len=N offset=M`. That is not
+squeamishness: a quarter-megabyte payload per line is unreadable, and rendering it would copy
+the `memoryview` that the copy-free data path exists to avoid.
+
+**Every server-supplied name is escaped and truncated.** A filename, a path and a `STATUS`
+message are all chosen by the far end, and written raw into a log stream a `\n` forges a second
+record while an `\x1b[` sequence drives the terminal of whoever is tailing the file. They are
+rendered with `repr` — which escapes both, and every non-printable codepoint besides — and
+capped at 96 bytes with the dropped count stated, because a 64 KiB filename is legal and a log
+line per frame is a disk to fill.
+
+`gantry_sftp.codec.describe(packet)` is the renderer, and it is public and pure: pass it any
+packet and get the same line back, with no logging configured and no session running.
+
+### Counters
+
+`Session` carries cumulative totals beside the instantaneous gauges, and both are in its `repr`:
+
+```python
+sftp.requests_sent  # requests written to this connection, handshake excluded
+sftp.replies_received  # replies routed, including ones nobody was waiting for
+sftp.bytes_sent  # bytes handed to the transport, framing included
+sftp.bytes_received  # bytes read from it
+sftp.reaped  # handles closed on behalf of an abandoned OPEN
+
+repr(sftp)
+# <Session server=OpenSSH version=3 extensions=6 depth=64 outstanding=17
+#  requests=142/125 bytes=4321/16783104 request_timeout=30.0 idle_timeout=60.0>
+```
+
+Two `repr`s a second apart is the cheapest diagnosis there is: same `outstanding` and moving
+totals is a slow link, and same totals is a stall. `requests_sent` climbing while
+`replies_received` does not is a server that has stopped answering.
+
+There is deliberately **no retry counter**. `with_reconnect()` builds a new session per attempt,
+so a counter would reset exactly when it became interesting — the WARNING above is where retry
+visibility lives, and it names the attempt, the error and the backoff.
+
+### Credentials
+
+A password never reaches argv, a file, or a log record. It travels in the child's environment
+via an `SSH_ASKPASS` helper, and:
+
+- the value renders as `'<redacted>'` in any frame-locals dump — Sentry, `pytest --showlocals`,
+  `rich`, IPython all render locals with `repr`, and that is the boundary it defends;
+- the environment is masked by name before it can reach a log record, so the record says
+  `'GANTRY_SFTP_ASKPASS_ANSWER': '<redacted>'` — the *presence* of an askpass answer is exactly
+  what a failed password authentication needs to know, and the value is not;
+- the mask also covers any variable whose name contains `PASSWORD`, `PASSPHRASE`, `SECRET`,
+  `TOKEN` or `CREDENTIAL`, including ones this library never sets, so a caller's own `env=`
+  overlay is covered too.
+
+What that does **not** cover, stated because a half-understood guarantee is worse than none: a
+reporter that calls `str()` rather than `repr()` on a local, a core dump, and
+`/proc/<pid>/environ`. The last is the deliberate trade — owner-and-root readable beats `ps`
+output readable by every user on the machine.
+
+`examples/logging.py` runs all of this with no arguments.
+
 ## Why it is faster, and where it is not
 
 Speed is not the objective — see above — but it is measurable, and a claim about it should

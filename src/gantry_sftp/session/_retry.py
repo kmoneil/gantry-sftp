@@ -32,6 +32,7 @@ from contextlib import AbstractAsyncContextManager
 
 import anyio
 
+from gantry_sftp._logging import session_logger, summarise
 from gantry_sftp.codec import StatusCode
 from gantry_sftp.exceptions import (
     AuthenticationError,
@@ -226,6 +227,18 @@ async def with_reconnect[T](
             if not is_retryable(error) or attempt >= attempts:
                 _note_attempts(error, attempt, attempts)
                 raise
+            # The library's only WARNING, and the reason it is one: this failure is about to be
+            # swallowed. Every other error in this package reaches the caller as a typed
+            # exception carrying its own state, so logging those as well would report them
+            # twice. A retried one reaches nobody -- without this record, a link that drops on
+            # every second transfer is indistinguishable at runtime from a healthy one.
+            session_logger.warning(
+                "attempt %d of %d failed (%s), reconnecting in %.1fs",
+                attempt,
+                attempts,
+                summarise(error),
+                delay,
+            )
         await anyio.sleep(delay)
         delay = min(delay * 2, backoff_max)
 

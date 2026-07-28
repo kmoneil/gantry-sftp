@@ -23,6 +23,11 @@ request/response correlation together::
 :class:`FrameSplitter`, :func:`encode` and :func:`decode` are the layer underneath and stay
 public: they are what a debug frame dumper, a fuzz harness, or a future server
 implementation needs, and none of those want a client's state machine attached.
+
+:func:`describe` is that frame dumper's rendering half -- one safe, truncated line per packet,
+in either direction. It is pure like everything else here; what turns it into log output lives
+at the session seam, because a log record carries a timestamp and this layer does not read the
+clock.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ from gantry_sftp.codec._constants import (
     PacketType,
     StatusCode,
 )
+from gantry_sftp.codec._describe import MAX_FIELD_BYTES, describe, render_field
 from gantry_sftp.codec._extensions import (
     CHECK_FILE_NAME,
     FSYNC_NAME,
@@ -109,6 +115,7 @@ __all__ = [
     "EXTENSION_POSIX_RENAME",
     "FSYNC_NAME",
     "LIMITS_NAME",
+    "MAX_FIELD_BYTES",
     "MAX_STATUS_CODE",
     "MAX_V3_TIMESTAMP",
     "NO_REQUEST_ID",
@@ -167,6 +174,8 @@ __all__ = [
     "Write",
     "decode",
     "decode_attrs",
+    "describe",
     "encode",
     "encode_attrs",
+    "render_field",
 ]
