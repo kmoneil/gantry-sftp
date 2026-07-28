@@ -337,7 +337,7 @@ class Codec:
             raise StateError(f"cannot {action} while {self._state.name}")
 
     def _fail(self, message: str, *, request_id: int | None = None) -> ProtocolError:
-        """Move to the terminal state and build the error to raise.
+        """Build the terminal error to raise. The latch itself lives in :meth:`receive`.
 
         Only for peer misbehaviour. A caller mistake raises
         :class:`~gantry_sftp.exceptions.StateError` and leaves the connection alone -- the
@@ -345,6 +345,13 @@ class Codec:
 
         Returned rather than raised so the call site reads ``raise self._fail(...)`` and
         static analysis can see the control flow.
+
+        This set :attr:`CodecState.FAILED` itself until 0.8. Widening the latch to
+        ``receive``'s ``except ProtocolError`` -- which had to happen, because a length the
+        splitter rejects and a body the decoder cannot parse never reach this method -- made
+        that assignment dead: every call site is inside that ``try``, so the handler
+        overwrote whatever was written here. The mutation lane is what noticed. Setting
+        ``None`` instead survived every test, not because a test was missing but because no
+        reachable path could tell the two apart.
         """
-        self._state = CodecState.FAILED
         return ProtocolError(message, request_id=request_id)

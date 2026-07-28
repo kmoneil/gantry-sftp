@@ -34,6 +34,8 @@ unshaped profile needs no `tc` at all and runs in a plain checkout.
 | download 16 MiB | the latency-bound case. 16 MiB is eight times the 2 MiB channel window, so a client that fills the window is distinguishable from one that does not |
 | upload 16 MiB (in place) | the other direction, with our atomic publish and fsync **off**, because that is the work the other two libraries do |
 | download N × 8 KiB, sequential | the round-trip-bound case. Sequential for all three — see below |
+| upload N × 8 KiB, sequential | the same case in the direction the matrix used to miss entirely. Both 16 MiB upload rows move one file, so a per-file round trip rounds to nothing in them; this is the only row a cost paid *per file* can appear in, and `put_tree` over a drop directory is the workload it stands for |
+| download N × 8 KiB, one connection | not a comparison. Our own sequential path against our own overlapped one, same files, same connection |
 | atomic publish 16 MiB | not a comparison. What *our own* default costs against our own in-place path |
 
 Across five link profiles: unshaped, 5 ms, 50 ms, 200 ms, and 50 ms rate-limited to 100 Mbit/s.
@@ -80,9 +82,12 @@ Each one could have gone the other way, so each one is written down:
   config, and a stray `Compression yes` would move every number without moving any code.
 - **All three verify host keys.** `AutoAddPolicy` and `known_hosts=None` would have been
   simpler and would have handed the other two a head start on a check we perform.
-- **The small-file scenario is sequential for all three.** Overlapping files is exactly what
-  `Session` cannot do yet (deferred as D-12). Letting only the other two overlap would measure
-  a feature gap while looking like it measured a speed gap.
+- **The small-file scenarios are sequential for all three.** Not because we cannot overlap —
+  the multiplexing change closed D-12 and a task group over `get` now overlaps files — but
+  because the other two can be driven concurrently as well, paramiko with a thread per
+  transfer and asyncssh with a task group. Racing our overlapped path against their `for` loop
+  would measure a feature gap while looking like a speed gap. The comparison rows stay
+  sequential; what overlapping is worth is its own row, against ourselves.
 - **Our upload row has `atomic=False, fsync=False`.** What our default costs is its own
   scenario rather than a penalty silently applied to the comparison.
 - **Connections are not reused between samples.** Connecting once and looping hides the cost of

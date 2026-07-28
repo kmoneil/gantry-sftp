@@ -118,11 +118,17 @@ class SizeCheck(StrEnum):
     *always*, and on the upload side we control the source: a local file whose length
     disagrees with what the server ended up holding is wrong every time, with none of the
     "the remote file is legitimately changing" cases that earn ``get`` its ``verify_size``
-    flag. The cost is one ``STAT`` per upload, stated here rather than discovered. An opt-out
-    was considered and deferred rather than dropped -- ``put`` is already at the
-    ten-argument ceiling, and `pyproject.toml`'s note on that ceiling says a function wanting
-    more is doing too much, so the flag belongs with the signature rework rather than with a
-    raised limit.
+    flag.
+
+    **There is no opt-out because the measurement did not justify one.** The cost is one
+    ``STAT`` per upload, and 0.8 shipped it unconditionally while promising a ``verify_size``
+    flag once ``put``'s argument list had room. Benchmarking it removed the reason. On every
+    shaped profile the small-file upload row is a three-way tie with paramiko and asyncssh --
+    where a round trip costs something, this one is invisible against the three the transfer
+    already needs. And paramiko's own ``put`` has done the identical ``STAT``-and-compare by
+    default since 1.7.7 (its ``confirm`` parameter), so the cost is not even unusual. The
+    number and the link profiles that produced it are in ``benchmarks/`` and the report it
+    writes; re-run it rather than trusting this sentence.
 
     What it catches is truncation, and nothing else. It is not a hash. A size check that gets
     described as a verified transfer is the thing this library exists to stop doing.

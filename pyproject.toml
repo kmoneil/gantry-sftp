@@ -229,8 +229,21 @@ venv = ".venv"
 # runs as a subprocess, which imports the *installed* library rather than the
 # mutated copy on the parent's sys.path. Those tests cannot kill a mutant, so
 # including them would only add wall-clock.
+#
+# `tests/test_benchmark_harness.py` is ignored for the same reason, plus a harder
+# one: it reaches `benchmarks/` by appending `Path(__file__).parent.parent /
+# "benchmarks"` to sys.path, and under mutmut `__file__` is `mutants/tests/...`,
+# so that resolves to a `mutants/benchmarks/` mutmut never created and collection
+# dies with `ModuleNotFoundError: No module named '_harness'` before a single
+# mutant runs. `--ignore` rather than `-k`, because the failure is at import
+# during collection and `-k` filters after that. The alternative -- `also_copy =
+# ["benchmarks/"]` -- would fix the import and then run paramiko, asyncssh and an
+# sshd for every mutant; the module imports no `gantry_sftp`, so it cannot kill
+# one. In `pytest_add_cli_args`, not the selection key, so it applies to the stats
+# pass and the per-mutant runs alike.
 # ---------------------------------------------------------------------------
 [tool.mutmut]
 source_paths = ["src/"]
 only_mutate = ["src/gantry_sftp/codec/*"]
 pytest_add_cli_args_test_selection = ["tests/"]
+pytest_add_cli_args = ["--ignore=tests/test_benchmark_harness.py"]

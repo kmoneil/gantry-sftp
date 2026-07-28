@@ -436,7 +436,7 @@ Rung 3 is not free of decisions, so here is what it actually does:
 | --- | --- | --- |
 | what it compares | bytes that arrived vs. the size the `STAT` reported | the local file's length vs. what the server says it holds |
 | when | after the transfer | **before the rename**, against the staging file, so a short upload never becomes the destination — in place, necessarily after |
-| cost | nothing; `get` already makes that `STAT` | one extra `STAT` |
+| cost | nothing; `get` already makes that `STAT` | one extra `STAT` — measured, and level with paramiko and asyncssh on every shaped profile |
 | on mismatch | `TransferError` carrying both paths and the offset | `TransferError`; the staging file is removed and the destination is left alone |
 | server won't report a size | check skipped, download still succeeds | `result.size_check` is `unavailable` |
 | turning it off | `get(..., verify_size=False)` | no flag — see below |
@@ -453,7 +453,12 @@ changing size underneath you, and makes the result a snapshot of unknown complet
 
 There is no matching flag on `put()`: we control the source there, so a length disagreement is
 wrong every time, and `SizeCheck` has no `skipped` value as a result. The cost is one `STAT`
-per upload.
+per upload, and it was benchmarked rather than assumed — on every shaped profile the small-file
+upload row ties with paramiko and asyncssh to within 5%, because one round trip is invisible
+beside the ones a transfer already spends. paramiko's `put` has done the same
+`STAT`-and-compare by default since 1.7.7 — its `confirm` parameter — so the benchmark's paramiko
+column pays it too and still ties. An earlier draft promised an opt-out flag here; the measurement
+withdrew it.
 
 ```python
 handle = await sftp.open("/incoming/big.iso")
@@ -609,7 +614,8 @@ the bytes it moved. Against **paramiko 5.0.0** and **asyncssh 2.24.0** on OpenSS
 | -------- | ----------- | ----------- |
 | download 16 MiB | **1.6–3.2× faster** | 1.1–1.4× faster |
 | upload 16 MiB | 1.2–1.5× faster | up to 1.5×, level on the rate-limited profile |
-| 100 × 8 KiB sequential | ~1.5× faster | **a tie** |
+| N × 8 KiB download, sequential | ~1.5× faster | **a tie** |
+| N × 8 KiB upload, sequential | level shaped (≤1.05×); **1.7–1.8× slower unshaped** | level shaped (≤1.07×); 1.1–1.2× slower unshaped |
 | connect and close | **1.2–1.4× slower** | **1.2–2.1× slower** |
 | CPU per MiB, download | about the same | **1.2–1.6× worse** |
 | CPU per MiB, upload | 1.1–1.6× better | mixed, 0.7–1.4× |
@@ -623,6 +629,13 @@ ratio in that table is drawn from the least stable row. Absolute figures, the ex
 full caveats are in the report the suite writes; re-run it with `pytest benchmarks/ -s` and it
 re-derives all of them.
 
+The **small-file upload row is newer and its range comes from two runs, not three** — it was
+added in 0.8 when the size check gave every `put` an extra `STAT` and it emerged that the matrix
+could not see a per-file cost at all: every small-file row was a download, and both 16 MiB
+upload rows move one file. Those two 16 MiB rows were re-measured in the same pair of runs and
+did not move outside the ranges above; at 200 ms RTT the added round trip shows up as roughly
++0.15 s on a 3.3 s transfer, which is the one `STAT` and nothing else.
+
 **Concurrency, measured against ourselves.** The same small-file corpus over one connection,
 eight transfers at a time against one at a time: **3.1× on unshaped loopback, 9.1× at 5 ms RTT
 and 8.0× at 50 ms**, with CPU per MiB *lower* rather than higher. Us against us, deliberately —
@@ -631,7 +644,16 @@ paramiko and asyncssh can be driven concurrently too, so racing our task group a
 above stays sequential for all three. The gain is round trips, which is why it grows with
 latency and why the unshaped number is the smallest one here.
 
-Two of those rows are not the ones a pitch would choose, and they are the interesting ones.
+Three of those rows are not the ones a pitch would choose, and they are the interesting ones.
+
+**We lose small-file upload on a fast link, and we win small-file download on the same one.**
+Unshaped, 200 × 8 KiB: 3.0–3.2× *faster* than paramiko downloading, 1.7–1.8× *slower* uploading,
+same files, same count, same connection. With the round trips nearly free the difference is
+per-operation work in Python, and the CPU column says so — 0.088–0.093 CPU s/MiB against
+paramiko's 0.046. It disappears the moment the link has any latency, where all three tie, so it
+costs nothing on the networks this library is for and everything on loopback. It is still a real
+asymmetry in our own two directions rather than a fact about paramiko, it is not the size check
+(paramiko performs the same one), and it is not yet explained. Carded rather than narrated away.
 
 **"No cryptography in Python" does not become a CPU win.** `cryptography` is OpenSSL and
 OpenSSL uses the CPU's AES instructions, so the expensive part was never interpreted in either

@@ -1,4 +1,4 @@
-"""The benchmark matrix: three libraries, five scenarios, five link profiles.
+"""The benchmark matrix: three libraries, six scenarios, five link profiles.
 
 This is a pytest module rather than a script on purpose. A benchmark that is not also a test
 drifts until it measures something other than what it claims, and there is no assertion to
@@ -61,11 +61,12 @@ class Profile:
     rtt_ms: float | None = None
     rate_mbit: float | None = None
     small_files: int = 0
-    """Files in the small-file scenario, or ``0`` to skip it on this profile.
+    """Files in each small-file scenario, or ``0`` to skip them on this profile.
 
-    It scales down as latency rises because the scenario costs several round trips *per file*:
-    200 files at 200 ms RTT is minutes per sample, and the shape of the result is already
-    visible at 24.
+    It scales down as latency rises because those scenarios cost several round trips *per
+    file*: 200 files at 200 ms RTT is minutes per sample, and the shape of the result is
+    already visible at 24. One count drives the download row, the upload row and the
+    concurrency row, so the three stay comparable to each other on any given profile.
     """
 
 
@@ -88,12 +89,16 @@ CAVEATS = (
     "CPU is measured over **connect through close**, not over the transfer alone -- "
     "`getrusage(RUSAGE_CHILDREN)` cannot see the `ssh` child until it is reaped. The "
     "`connect` scenario measures that half on its own so it can be subtracted.",
-    "The cross-library small-file scenario is **sequential for all three clients**. This "
+    "The cross-library small-file scenarios are **sequential for all three clients**. This "
     "library can overlap files as of the multiplexing change, and so can the other two -- "
     "paramiko with a thread per transfer, asyncssh with a task group. Racing our concurrent "
     "path against their sequential one would measure a feature gap while looking like a speed "
-    "gap, so the comparison row stays sequential and the concurrency gain is measured "
+    "gap, so the comparison rows stay sequential and the concurrency gain is measured "
     "separately, against ourselves.",
+    "The small-file **upload** row is where a per-file cost is visible at all. Both 16 MiB "
+    "upload rows move one file, so a round trip added to every `put` -- as the size check "
+    "did -- rounds to nothing there. At 8 KiB the number is round trips, so that row is the "
+    "one that can catch it.",
     "The `concurrent` small-file row is **gantry-sftp against gantry-sftp**, like the atomic "
     "publish row: same files, same one connection, sequential versus overlapped. It is not a "
     "claim about the other two libraries.",
@@ -232,6 +237,41 @@ async def _scenario_small_files(
             assert _identical(into / source.name, source), (
                 f"{client.name} downloaded {source.name} wrongly"
             )
+    return measurements
+
+
+async def _scenario_small_files_upload(
+    clients: Sequence[Client], sources: Sequence[Path], upload_dir: Path, count: int
+) -> list[Measurement]:
+    """The mirror of the sequential download row, and the only row a per-file cost shows in.
+
+    Added with D-69, after the size check gave every ``put`` an extra ``STAT`` and the matrix
+    turned out to have no small-file upload to notice it with: every small-file row was a
+    download, and both upload rows moved 16 MiB in a single file. Worth having on its own
+    account too -- ``put_tree`` over a drop directory of small files is a headline workload
+    that had no measurement behind it.
+    """
+    chosen = list(sources[:count])
+
+    def make(client: Client) -> RunOnce:
+        into = upload_dir / f"{client.name}-small-up"
+        into.mkdir(exist_ok=True)
+        return lambda: client.upload_many(chosen, into)
+
+    scenario = f"upload {count} x 8 KiB, sequential"
+    measurements = await _sweep(clients, scenario=scenario, make=make)
+    for client in clients:
+        into = upload_dir / f"{client.name}-small-up"
+        for source in chosen:
+            assert _identical(into / source.name, source), (
+                f"{client.name} uploaded {source.name} wrongly"
+            )
+        # Per-client subdirectory, so no dot-prefixed staging file from one client can be
+        # mistaken for another's -- and so the atomic row's `_hidden_names(upload_dir)` check
+        # keeps meaning what it says. `atomic=False` should stage nothing; assert it does not,
+        # because a leaked staging file here would inflate this row's time as well as litter.
+        leftovers = _hidden_names(into)
+        assert leftovers == [], f"{client.name} left staging files behind: {leftovers}"
     return measurements
 
 
@@ -389,6 +429,13 @@ async def test_benchmark_profile(
             render_scenario(
                 f"download {profile.small_files} x 8 KiB, sequential",
                 await _scenario_small_files(clients, small, tmp_path, profile.small_files),
+                baseline_client=BASELINE,
+            )
+        )
+        sections.append(
+            render_scenario(
+                f"upload {profile.small_files} x 8 KiB, sequential",
+                await _scenario_small_files_upload(clients, small, upload_dir, profile.small_files),
                 baseline_client=BASELINE,
             )
         )

@@ -112,11 +112,27 @@ class Client(ABC):
     async def download_many(self, remotes: Sequence[Path], into: Path) -> tuple[float, int]:
         """Fetch many files over one connection, sequentially.
 
-        Sequentially for all three on purpose. Concurrency across files is exactly what
-        ``Session`` cannot do yet (deferred as D-12), and a benchmark in which only the other
-        two libraries were allowed to overlap files would be measuring a feature gap while
-        looking like it measured a speed gap. This measures round trips per file, which is
-        the thing the gap is actually about.
+        Sequentially for all three on purpose -- and no longer because we have no choice.
+        This said ``Session`` could not overlap files, deferred as D-12; multiplexing closed
+        that, and :meth:`GantryClient.download_many_concurrently` two methods below is the
+        proof. The rule survives its original reason because paramiko and asyncssh can be
+        driven concurrently too, so racing our task group against their ``for`` loop would
+        measure a feature gap while looking like a speed gap. This measures round trips per
+        file, which is the thing the gap is actually about.
+        """
+
+    @abstractmethod
+    async def upload_many(self, sources: Sequence[Path], into: Path) -> tuple[float, int]:
+        """Send many files over one connection, sequentially. Mirror of ``download_many``.
+
+        This row exists because the matrix had no small-file *upload* at all: both upload
+        scenarios moved 16 MiB in one file, where a per-file round trip is noise by
+        construction, so a change that added one to every ``put`` was invisible to the lane
+        whose job is to notice. At 8 KiB the number is round trips rather than bytes, which
+        is the only place a per-file cost can show up -- and ``put_tree`` over a drop
+        directory of small files is a headline workload, so it needed a row regardless.
+
+        Sequential for all three for the same fairness reason ``download_many`` is.
         """
 
 
@@ -167,6 +183,20 @@ class GantryClient(Client):
             moved = 0
             for remote in remotes:
                 moved += await sftp.get(str(remote), into / remote.name)
+            elapsed = time.perf_counter() - started
+        return elapsed, moved
+
+    async def upload_many(self, sources: Sequence[Path], into: Path) -> tuple[float, int]:
+        # `atomic=False, fsync=False` to match `upload` and the other two clients. The size
+        # check D-32 added is *not* opt-out-able here and that is the point of the row: with
+        # atomic off it runs after the write rather than before the rename, but it runs, so
+        # its per-file round trip is inside the timed region exactly as a user would pay it.
+        async with self._transport() as transport, open_session(transport) as sftp:
+            started = time.perf_counter()
+            moved = 0
+            for source in sources:
+                result = await sftp.put(source, str(into / source.name), atomic=False, fsync=False)
+                moved += result.transferred
             elapsed = time.perf_counter() - started
         return elapsed, moved
 
@@ -280,6 +310,19 @@ class ParamikoClient(Client):
             client.close()
         return elapsed, sum(_file_size(into / r.name) for r in remotes)
 
+    def _upload_many(self, sources: Sequence[Path], into: Path) -> tuple[float, int]:
+        client = self._open()
+        try:
+            sftp = client.open_sftp()
+            started = time.perf_counter()
+            for source in sources:
+                sftp.put(str(source), str(into / source.name))
+            elapsed = time.perf_counter() - started
+            sftp.close()
+        finally:
+            client.close()
+        return elapsed, sum(_file_size(into / s.name) for s in sources)
+
     async def connect_and_close(self) -> tuple[float, int]:
         return await anyio.to_thread.run_sync(self._connect_and_close)
 
@@ -291,6 +334,9 @@ class ParamikoClient(Client):
 
     async def download_many(self, remotes: Sequence[Path], into: Path) -> tuple[float, int]:
         return await anyio.to_thread.run_sync(self._download_many, remotes, into)
+
+    async def upload_many(self, sources: Sequence[Path], into: Path) -> tuple[float, int]:
+        return await anyio.to_thread.run_sync(self._upload_many, sources, into)
 
 
 class AsyncsshClient(Client):
@@ -346,6 +392,14 @@ class AsyncsshClient(Client):
                 await sftp.get(str(remote), str(into / remote.name))
             elapsed = time.perf_counter() - started
         return elapsed, sum(_file_size(into / r.name) for r in remotes)
+
+    async def upload_many(self, sources: Sequence[Path], into: Path) -> tuple[float, int]:
+        async with self._connect() as conn, conn.start_sftp_client() as sftp:
+            started = time.perf_counter()
+            for source in sources:
+                await sftp.put(str(source), str(into / source.name))
+            elapsed = time.perf_counter() - started
+        return elapsed, sum(_file_size(into / s.name) for s in sources)
 
 
 ALL_CLIENTS: tuple[type[Client], ...] = (GantryClient, ParamikoClient, AsyncsshClient)
