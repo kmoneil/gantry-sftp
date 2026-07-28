@@ -139,6 +139,26 @@ def test_the_connect_errors_example_classifies_rather_than_guesses():
     assert "HostKeyError" not in stdout
 
 
+def test_the_password_example_proves_the_secret_is_not_on_the_command_line():
+    """The example's claim is a security property, so the property is what gets pinned.
+
+    ``sshpass -p`` puts a credential in argv, where ``ps`` shows it to every user on the
+    machine. If these two lines ever print ``True``, the example is demonstrating the bug
+    rather than the fix -- and unlike most drift, nobody would notice by reading it.
+
+    No ``sftp-server`` needed: the example connects to a closed port, because what it is
+    asserting is decided before a packet is sent.
+    """
+    returncode, stdout, _ = run_example(Path(__file__).parent / "password_auth.py")
+    assert returncode == 0
+    assert "password anywhere in argv:      False" in stdout
+    assert "password anywhere in the error: False" in stdout
+    # And it must still be showing *why* the parameter has to exist: the shipped default is
+    # not a preference here, it is what makes the feature impossible without it.
+    assert "BatchMode=yes   <- suppresses ssh's askpass helper" in stdout
+    assert "BatchMode=no" in stdout
+
+
 def test_the_verification_example_shows_corruption_slipping_past_the_size_check():
     """The example's whole argument is one line of its output, so that line is pinned.
 

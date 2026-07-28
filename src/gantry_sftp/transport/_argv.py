@@ -42,7 +42,9 @@ from gantry_sftp.exceptions import InsecureOptionWarning
 __all__ = [
     "DEFAULT_SSH_OPTIONS",
     "DEFAULT_SUBSYSTEM",
+    "PASSWORD_AUTH_OPTIONS",
     "build_ssh_argv",
+    "options_for_password_auth",
     "resolve_ssh_executable",
 ]
 
@@ -73,6 +75,33 @@ DEFAULT_SSH_OPTIONS: Mapping[str, str] = {
     "ControlMaster": "no",
 }
 """Options applied unless the caller overrides them by name."""
+
+PASSWORD_AUTH_OPTIONS: Mapping[str, str] = {
+    # The finding D-78 was filed for. `BatchMode=yes` does not merely discourage a password
+    # prompt, it suppresses the askpass helper *outright* -- measured against OpenSSH 10.0p2,
+    # with a correct `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force` present and ignored. So
+    # password authentication is not awkward under the shipped default, it is impossible, and
+    # relaxing this on the password path is what makes the feature exist at all.
+    "BatchMode": "no",
+    # Deterministic method order, which matters more than it looks. Without it `ssh` tries
+    # publickey first and offers every identity it can find; against a server with a low
+    # `MaxAuthTries` the attempts are exhausted before password is ever reached, and the
+    # failure -- "Too many authentication failures" -- names nothing that is actually wrong.
+    # `keyboard-interactive` is included because appliances routinely offer *only* that, and
+    # OpenSSH answers its prompts through the same askpass helper.
+    "PreferredAuthentications": "password,keyboard-interactive",
+    # One attempt. The default is three, and each one re-runs the helper with the same wrong
+    # secret -- three guaranteed failures, which on an OpenSSH 9.8+ server earns the source
+    # address a `PerSourcePenalties` timeout that then breaks the *next*, unrelated
+    # connection from this host.
+    "NumberOfPasswordPrompts": "1",
+}
+"""Options layered over :data:`DEFAULT_SSH_OPTIONS` when a password is supplied.
+
+Applied *under* the caller's own ``options``, so every one of them can still be overridden by
+name -- except ``BatchMode``, where an explicit ``yes`` contradicts the request rather than
+refining it and is refused. See :func:`options_for_password_auth`.
+"""
 
 _FORBIDDEN_IN_ARGUMENTS = ("\x00", "\n", "\r")
 
@@ -151,6 +180,38 @@ def _merged_options(overrides: Mapping[str, str] | None) -> dict[str, str]:
             stacklevel=3,
         )
     return options
+
+
+def options_for_password_auth(options: Mapping[str, str] | None) -> dict[str, str]:
+    """Layer :data:`PASSWORD_AUTH_OPTIONS` under the caller's own options.
+
+    Pure, so what the password path does to the command line is testable without spawning
+    anything -- which is the same reason the rest of this module exists.
+
+    Args:
+        options: The caller's ``-o`` overrides, or ``None``. Takes precedence over
+            :data:`PASSWORD_AUTH_OPTIONS` for every name except ``BatchMode``.
+
+    Returns:
+        Options to hand to :func:`build_ssh_argv`, which still layers them over
+        :data:`DEFAULT_SSH_OPTIONS`.
+
+    Raises:
+        ValueError: If the caller asks for password authentication and ``BatchMode=yes`` in
+            the same call. That is a contradiction rather than a preference: the connection
+            would fail with ``Permission denied`` and nothing in the message would say why.
+    """
+    merged = dict(PASSWORD_AUTH_OPTIONS)
+    if options:
+        merged.update(options)
+    batch_mode = merged["BatchMode"]
+    if batch_mode.strip().lower() != "no":
+        raise ValueError(
+            f"password= needs BatchMode=no, but options set BatchMode={batch_mode!r}; "
+            f"BatchMode=yes suppresses the askpass helper outright, so ssh would never ask "
+            f"for the password and the connection would fail with 'Permission denied'"
+        )
+    return merged
 
 
 def resolve_ssh_executable(

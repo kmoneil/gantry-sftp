@@ -17,6 +17,7 @@ python examples/retry.py                          # a link that drops, reconnect
 python examples/concurrent_transfers.py           # many transfers over one session
 python examples/cancellation.py                   # stop a transfer, and what it leaves behind
 python examples/connect_errors.py                 # why the connection failed, as a class
+python examples/password_auth.py                  # password= , and where the secret does not go
 ```
 
 Pass a destination to run the same code against a real server:
@@ -32,7 +33,12 @@ python examples/retry.py user@host /remote/dir
 python examples/concurrent_transfers.py user@host /remote/dir
 python examples/cancellation.py user@host /remote/dir
 python examples/connect_errors.py user@host
+GANTRY_SFTP_PASSWORD=... python examples/password_auth.py user@host
 ```
+
+`password_auth.py` is the one example that takes its input from the environment rather than
+the command line, and that is the lesson rather than an inconvenience: a password passed as an
+argument is in the reader's shell history and in `ps` output for every user on the machine.
 
 `test_examples.py` executes each one as a subprocess and fails if it does not exit clean. An
 example that has drifted out of sync with the library is a confident, wrong answer somebody
@@ -54,6 +60,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
 | `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |
 | `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
+| `password_auth.py`        | `password=`, the `SSH_ASKPASS` helper it writes, why `BatchMode` has to be relaxed, and the proof that the secret reaches neither argv nor the exception |
 
 ## What `atomic_publish.py` is actually showing
 

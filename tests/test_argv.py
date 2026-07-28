@@ -12,7 +12,13 @@ import itertools
 import pytest
 
 from gantry_sftp.exceptions import InsecureOptionWarning
-from gantry_sftp.transport import DEFAULT_SSH_OPTIONS, build_ssh_argv, resolve_ssh_executable
+from gantry_sftp.transport import (
+    DEFAULT_SSH_OPTIONS,
+    PASSWORD_AUTH_OPTIONS,
+    build_ssh_argv,
+    options_for_password_auth,
+    resolve_ssh_executable,
+)
 
 
 def options_in(argv: list[str]) -> dict[str, str]:
@@ -256,6 +262,82 @@ def test_legitimate_hosts_are_accepted(host: str):
     # Rejecting an option-looking host must not turn into rejecting IPv6 literals or
     # ssh_config aliases, which are what a lot of real deployments actually use.
     assert build_ssh_argv(host)[-2] == host
+
+
+# --- the password path's options ------------------------------------------------------------
+
+
+def test_the_password_path_relaxes_batchmode_because_the_default_disables_askpass():
+    # The finding D-78 was filed for, pinned as a test. `BatchMode=yes` does not discourage a
+    # password prompt, it suppresses the askpass helper outright -- so without this line the
+    # `password=` parameter would silently do nothing at all.
+    assert DEFAULT_SSH_OPTIONS["BatchMode"] == "yes"
+    assert options_for_password_auth(None)["BatchMode"] == "no"
+
+
+def test_the_password_path_asks_for_the_interactive_methods_in_a_fixed_order():
+    # Without this, ssh tries publickey first and offers every identity it can find; against
+    # a server with a low MaxAuthTries the attempts run out before password is reached, and
+    # the failure names nothing that is actually wrong.
+    options = options_for_password_auth(None)
+    assert options["PreferredAuthentications"] == "password,keyboard-interactive"
+    # keyboard-interactive is not padding: appliances routinely offer only that one.
+    assert "keyboard-interactive" in options["PreferredAuthentications"]
+
+
+def test_the_password_path_asks_once_so_a_wrong_secret_is_not_offered_three_times():
+    # OpenSSH's default is three prompts, each re-running the helper with the same wrong
+    # secret. On a 9.8+ server that is three failures, which earns this source address a
+    # PerSourcePenalties timeout that then breaks the *next* connection from this host.
+    assert options_for_password_auth(None)["NumberOfPasswordPrompts"] == "1"
+
+
+def test_every_password_option_except_batchmode_can_still_be_overridden():
+    overridden = options_for_password_auth(
+        {"PreferredAuthentications": "keyboard-interactive", "NumberOfPasswordPrompts": "3"}
+    )
+    assert overridden["PreferredAuthentications"] == "keyboard-interactive"
+    assert overridden["NumberOfPasswordPrompts"] == "3"
+    assert overridden["BatchMode"] == "no"
+
+
+@pytest.mark.parametrize("spelling", ["yes", "YES", "Yes", " yes "])
+def test_a_password_with_batchmode_yes_is_refused_as_the_contradiction_it_is(spelling):
+    # Silently winning this argument in either direction is worse than refusing it: honouring
+    # BatchMode would make password= a no-op, and honouring password= would override an
+    # explicit security-shaped setting the caller wrote down.
+    with pytest.raises(ValueError) as exc:
+        options_for_password_auth({"BatchMode": spelling})
+    assert exc.value.args[0] == (
+        f"password= needs BatchMode=no, but options set BatchMode={spelling!r}; "
+        f"BatchMode=yes suppresses the askpass helper outright, so ssh would never ask "
+        f"for the password and the connection would fail with 'Permission denied'"
+    )
+
+
+def test_saying_batchmode_no_alongside_a_password_is_agreement_not_contradiction():
+    assert options_for_password_auth({"BatchMode": "no"})["BatchMode"] == "no"
+
+
+def test_the_password_options_layer_over_the_security_defaults_rather_than_replacing_them():
+    # The layering is the part that could quietly go wrong: password auth must not cost the
+    # host-key check or the LocalCommand defence.
+    argv = build_ssh_argv("example.com", options=options_for_password_auth(None))
+    options = options_in(argv)
+    assert options["BatchMode"] == "no"
+    assert options["StrictHostKeyChecking"] == "yes"
+    assert options["PermitLocalCommand"] == "no"
+    assert options["ClearAllForwardings"] == "yes"
+
+
+def test_the_password_options_are_only_the_three_that_have_a_reason():
+    # A guard on scope. Every entry here changes how authentication behaves, and the next
+    # person to add one should have to change this test and say why.
+    assert set(PASSWORD_AUTH_OPTIONS) == {
+        "BatchMode",
+        "PreferredAuthentications",
+        "NumberOfPasswordPrompts",
+    }
 
 
 # --- executable resolution ----------------------------------------------------------------

@@ -38,6 +38,7 @@ keyed on a server implementation is the wrong place to record what our own subpr
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Final
 
 from gantry_sftp.exceptions import AuthenticationError, ConnectError, HostKeyError
@@ -69,6 +70,106 @@ arrives as ``Received disconnect from host port N:2: Too many authentication fai
 that offered too many keys reporting a bare ``ConnectError``. That one was found by probing
 rather than by reasoning about it.
 """
+
+
+INTERACTIVE_AUTH_METHODS: Final = ("password", "keyboard-interactive")
+"""Methods OpenSSH answers by asking a human, which is what an askpass helper stands in for.
+
+Both, not just ``password``: an appliance frequently offers *only* ``keyboard-interactive``,
+and OpenSSH answers its prompts through the same helper. Matching the literal string
+``(password)`` would have missed every one of them -- measured, since asyncssh's server
+advertises ``(keyboard-interactive,password)`` where OpenSSH's ``sshd`` advertises
+``(password)`` for the same configuration.
+"""
+
+_PERMISSION_DENIED = "Permission denied ("
+
+
+def _offered_methods(stderr: str) -> frozenset[str]:
+    """Which authentication methods the server named in its refusal.
+
+    OpenSSH ends a rejected connection with ``user@host: Permission denied (publickey,password).``
+    -- the parenthesised list is the *server's* methods, which is why it cannot answer the
+    question users actually have. Parsed rather than substring-matched so that ``password``
+    appearing in a server banner cannot be read as an offered method.
+
+    Args:
+        stderr: OpenSSH's standard error, as captured.
+
+    Returns:
+        The method names, lowercased. Empty when no refusal line is present.
+    """
+    methods: set[str] = set()
+    for line in stderr.splitlines():
+        start = line.find(_PERMISSION_DENIED)
+        if start < 0:
+            continue
+        inside = line[start + len(_PERMISSION_DENIED) :]
+        end = inside.find(")")
+        if end < 0:
+            continue
+        methods.update(name.strip().lower() for name in inside[:end].split(","))
+    return frozenset(methods - {""})
+
+
+def _option_value(argv: Sequence[str], name: str) -> str | None:
+    """The value of an ``-o`` option in an already-built argv, or ``None`` if absent.
+
+    Read back off argv rather than taken from the caller's ``options`` mapping, so the
+    diagnosis describes what was actually sent to ``ssh`` rather than what we meant to send.
+    Both spellings are handled -- ``-o Name=value`` and ``-oName=value`` -- because argv is
+    not always ours.
+    """
+    prefix = f"{name}="
+    for index, argument in enumerate(argv):
+        if argument == "-o" and index + 1 < len(argv) and argv[index + 1].startswith(prefix):
+            return argv[index + 1][len(prefix) :]
+        if argument.startswith("-o") and argument[2:].startswith(prefix):
+            return argument[2 + len(prefix) :]
+    return None
+
+
+def password_auth_hint(stderr: str, *, argv: Sequence[str], askpass_armed: bool) -> str:
+    """Explain a refusal that this client's own configuration made inevitable.
+
+    **The text alone cannot answer this, and that is the whole reason the function takes
+    three arguments.** Measured against asyncssh's server on 2026-07-28: a connection with
+    ``BatchMode=yes`` and a perfectly good askpass helper, and a connection with
+    ``BatchMode=no`` and no helper at all, both fail with the byte-identical line
+    ``Permission denied (keyboard-interactive,password).`` A rule keyed on the message would
+    have to pick one of the two causes and would be wrong half the time, so the client's own
+    configuration is read as well.
+
+    Args:
+        stderr: OpenSSH's standard error, as captured.
+        argv: The command that was actually spawned. Safe to inspect: no credential is ever
+            in argv, which is why the askpass helper exists.
+        askpass_armed: Whether this connection supplied a way to answer a prompt --
+            ``password=``, or an ``SSH_ASKPASS`` the caller armed themselves.
+
+    Returns:
+        One sentence naming the cause and the fix, or ``""`` when our configuration is not
+        what stood in the way. Silence is the honest answer for a password that was offered
+        and refused, or for a server that never offered an interactive method at all.
+    """
+    if askpass_armed:
+        # We did answer the prompt. The refusal is then about the secret or the account, and
+        # neither is something this client knows anything about.
+        return ""
+    if not _offered_methods(stderr) & frozenset(INTERACTIVE_AUTH_METHODS):
+        return ""
+
+    if (_option_value(argv, "BatchMode") or "").strip().lower() == "yes":
+        return (
+            "the server offered password authentication and this client had it switched "
+            "off: BatchMode=yes suppresses the askpass helper outright, so no password was "
+            "ever sent. Pass password=... to open_ssh_transport()"
+        )
+    return (
+        "the server offered password authentication and this client had no way to answer "
+        "the prompt: no askpass helper was configured, and ssh cannot prompt when its "
+        "input is a pipe. Pass password=... to open_ssh_transport()"
+    )
 
 
 def classify_failure(stderr: str) -> type[ConnectError]:

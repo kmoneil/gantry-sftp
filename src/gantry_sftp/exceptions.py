@@ -124,6 +124,12 @@ class ConnectError(SFTPError):
             report and safe to show: credentials never appear in argv (see
             ``SSH_ASKPASS``), which is itself a design constraint rather than a habit.
         returncode: Exit status of the ``ssh`` process, if it exited.
+        hint: What to do about it, when this client's own configuration is what made the
+            failure inevitable -- empty otherwise. It is separate from ``stderr`` because
+            they have different authors: ``stderr`` is what OpenSSH and the server said,
+            and a hint is what *we* know about the arguments we passed. Merging them would
+            put words in the server's mouth. See
+            :func:`gantry_sftp.transport.password_auth_hint` for the case that produces one.
     """
 
     def __init__(
@@ -133,11 +139,13 @@ class ConnectError(SFTPError):
         stderr: str = "",
         argv: tuple[str, ...] = (),
         returncode: int | None = None,
+        hint: str = "",
     ) -> None:
         super().__init__(message)
         self.stderr = stderr
         self.argv = argv
         self.returncode = returncode
+        self.hint = hint
 
     @override
     def __str__(self) -> str:
@@ -147,6 +155,9 @@ class ConnectError(SFTPError):
             parts.append(f"(exit status {self.returncode})")
         if self.stderr:
             parts.append(f"\nssh stderr:\n{self.stderr.rstrip()}")
+        if self.hint:
+            # Last, and labelled, so it is never mistaken for something the server said.
+            parts.append(f"\nhint: {self.hint}")
         return " ".join(parts)
 
 

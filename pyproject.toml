@@ -140,6 +140,17 @@ ban-relative-imports = "parents"
 "benchmarks/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
 "examples/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
 
+# The password lane's fixtures *are* passwords: a test proving that a secret never reaches
+# argv has to contain the secret it searches for, and the captured stderr fixtures are lines
+# with the word "password" in them. Listed file by file rather than added to the directory
+# globs above, because S105/S106 are worth keeping everywhere else -- an unexplained
+# credential literal in any other test is still something to look at twice.
+"tests/test_askpass.py" = ["S105", "S106"]
+"tests/test_diagnosis.py" = ["S105"]
+"tests/test_transport.py" = ["S105", "S106"]
+"live-tests/test_password_auth.py" = ["S105", "S106"]
+"examples/password_auth.py" = ["S105", "S106"]
+
 # ---------------------------------------------------------------------------
 # mypy -- stricter of the two type gates, scoped to shipped code
 # ---------------------------------------------------------------------------

@@ -6,14 +6,15 @@
 # people to skip the hook. Git's index mode is the thing that actually gets committed, and
 # it is what a reviewer on another machine will see.
 #
-# The allowlist exists because one file genuinely needs the bit: the SSH_ASKPASS helper is
-# exec'd by ssh(1) and does not work without it. Dropping the whole check to accommodate
-# that one file is the trade this allowlist refuses to make.
+# The allowlist was reserved for the SSH_ASKPASS helper, which is exec'd by ssh(1) and cannot
+# work without the bit. It is still empty, and that is now a design outcome rather than a
+# pending task: `password=` shipped in 0.9 and writes its helper to a 0700 temporary directory
+# at connect time instead of shipping an executable. Nothing in the distribution needs the bit,
+# so no file needs an exception -- and there is no fixed path on disk for another process owned
+# by this user to find. Keep it empty unless something genuinely has to ship executable.
 set -euo pipefail
 
-ALLOWED=(
-  # "src/gantry_sftp/transport/_askpass.py"  # uncomment when the helper lands
-)
+ALLOWED=()
 
 mapfile -t executables < <(git ls-files --stage | awk '$1 == "100755" { print $4 }')
 

@@ -18,14 +18,23 @@ from __future__ import annotations
 from gantry_sftp.transport._argv import (
     DEFAULT_SSH_OPTIONS,
     DEFAULT_SUBSYSTEM,
+    PASSWORD_AUTH_OPTIONS,
     build_ssh_argv,
+    options_for_password_auth,
     resolve_ssh_executable,
+)
+from gantry_sftp.transport._askpass import (
+    ASKPASS_ANSWER_VARIABLE,
+    ASKPASS_ARMING_VARIABLES,
+    askpass_environment,
 )
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE, Transport
 from gantry_sftp.transport._diagnosis import (
     AUTH_MARKERS,
     HOST_KEY_MARKERS,
+    INTERACTIVE_AUTH_METHODS,
     classify_failure,
+    password_auth_hint,
 )
 from gantry_sftp.transport._subprocess import (
     SFTP_SERVER_CANDIDATES,
@@ -37,19 +46,26 @@ from gantry_sftp.transport._subprocess import (
 )
 
 __all__ = [
+    "ASKPASS_ANSWER_VARIABLE",
+    "ASKPASS_ARMING_VARIABLES",
     "AUTH_MARKERS",
     "DEFAULT_RECEIVE_SIZE",
     "DEFAULT_SSH_OPTIONS",
     "DEFAULT_SUBSYSTEM",
     "HOST_KEY_MARKERS",
+    "INTERACTIVE_AUTH_METHODS",
+    "PASSWORD_AUTH_OPTIONS",
     "SFTP_SERVER_CANDIDATES",
     "StderrBuffer",
     "SubprocessTransport",
     "Transport",
+    "askpass_environment",
     "build_ssh_argv",
     "classify_failure",
     "find_sftp_server",
     "open_local_server_transport",
     "open_ssh_transport",
+    "options_for_password_auth",
+    "password_auth_hint",
     "resolve_ssh_executable",
 ]

@@ -68,6 +68,9 @@ exists today:
 - **one session, many transfers at once**: a single reader task routes each reply to whichever
   operation asked for it, so `get`/`put` overlap over one channel instead of queueing behind
   a lock
+- **password authentication** for the endpoint class that needs it, with the secret travelling
+  through the child's environment and never through argv, where `ps` would show it to every
+  user on the machine
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
@@ -77,8 +80,8 @@ exists today:
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
-host-key verification and public-key authentication all done by OpenSSH, and no cryptography in
-this package. It is also now measured against the alternatives — on a shaped link it downloads
+host-key verification and authentication — by key or by password — all done by OpenSSH, and no
+cryptography in this package. It is also now measured against the alternatives — on a shaped link it downloads
 1.6–3.2× faster than paramiko and 1.1–1.4× faster than asyncssh, it is *slower* to connect, and
 it wins nothing on CPU. All three of those are below, including the two that do not flatter it.
 It moves files:
@@ -734,6 +737,70 @@ transient failure from a permanent one by reading the message — the standard p
 the thing v3's catch-all `FAILURE` would need — cannot work on the reference server at all.
 That is why retry classifies on exception type rather than on message text.
 
+## Authenticating
+
+There is no authentication code in this library, and that is the thesis working. `ssh` is the
+client, so every method it supports works here with no adapter: keys from the agent,
+`IdentityFile`, `ProxyJump`, host certificates, FIDO tokens, `Match` blocks, `ControlMaster`.
+Point it at a host in your `ssh_config` and it connects the way `ssh` would.
+
+```python
+async with open_ssh_transport("prod-sftp", user="bob") as t, open_session(t) as sftp:
+    ...
+```
+
+### Passwords
+
+A large fraction of enterprise SFTP endpoints — MOVEit, GoAnywhere, Cleo, Sterling — are
+password-first. Pass one:
+
+```python
+async with (
+    open_ssh_transport("host", user="bob", password=os.environ["SFTP_PASSWORD"]) as t,
+    open_session(t) as sftp,
+):
+    ...
+```
+
+**The secret never reaches argv.** `ssh` refuses to take a password as an argument, and the two
+workarounds people reach for — `sshpass -p secret` and stuffing it into an `-o` value — both put
+the credential where `/proc/<pid>/cmdline` makes it readable by every user on the machine, for
+as long as the process lives. Instead, `password=` writes a throwaway `SSH_ASKPASS` helper to a
+`0700` temporary directory and hands `ssh` the secret in the child's *environment*, which on
+Linux only this user and root can read. The helper contains no secret — it is a `printf` of an
+environment variable — and it is deleted when the connection ends, whether or not it succeeded.
+
+Three `ssh` options change on that path, and the first of them is the reason the parameter
+exists at all:
+
+| option | value | why |
+| --- | --- | --- |
+| `BatchMode` | `no` | The shipped default is `yes`, and it does not merely discourage a prompt — it **suppresses the askpass helper outright**, regardless of `SSH_ASKPASS` or `SSH_ASKPASS_REQUIRE`. Password authentication was not awkward under the default; it was impossible. |
+| `PreferredAuthentications` | `password,keyboard-interactive` | Deterministic order. Otherwise `ssh` offers every key it can find first, and against a server with a low `MaxAuthTries` the attempts run out before password is reached — failing with `Too many authentication failures`, which names nothing that is wrong. Appliances routinely offer only `keyboard-interactive`, and OpenSSH answers it through the same helper. |
+| `NumberOfPasswordPrompts` | `1` | OpenSSH's default is three, each re-running the helper with the same wrong secret. Against an OpenSSH 9.8+ server that is three failed attempts, which earns your source address a `PerSourcePenalties` timeout that then breaks the *next* connection from that host. |
+
+All three are overridable by name through `options=`, except that `password=` together with an
+explicit `BatchMode=yes` is refused as the contradiction it is — with a `ValueError` naming
+both halves, rather than a `Permission denied` twenty seconds later.
+
+`password=` is POSIX-only: the helper is a shell script, and Windows OpenSSH's prompting path
+has never been run here, so it raises `NotImplementedError` rather than shipping an untested
+guess.
+
+**What the library will not do**: write your password to a file, put it on a command line, read
+it from one, or log it. Anything that can carry it is checked — `repr()` of the transport, the
+captured stderr, `ConnectError.argv`, and the rendered exception — and `tests/test_askpass.py`
+runs the helper against passwords built to break a shell (`$(...)`, backticks, `%s%n`, `-n`,
+embedded quotes) to prove what comes back out is what went in.
+
+### Arming your own askpass helper
+
+`password=` is a convenience over a mechanism that is still fully available: set `SSH_ASKPASS`
+to any program of yours and `SSH_ASKPASS_REQUIRE=force` through `env=`, and override
+`BatchMode`. `SSH_ASKPASS_REQUIRE=force` is what arms the helper on a headless machine —
+measured, `SSH_ASKPASS` alone does not, and `DISPLAY` or `WAYLAND_DISPLAY` each arm it on their
+own. This is also the path for a *passphrase* on an encrypted private key.
+
 ## When the connection fails
 
 ```python
@@ -769,7 +836,29 @@ Three things about that ladder are deliberate:
   subtly wrong does not fail loudly; it silently stops matching and the class quietly goes back
   to being decorative.
 
-`examples/connect_errors.py` runs this with no arguments.
+`ConnectError.hint` is the one thing on these errors that is *ours* rather than OpenSSH's, and
+it is separate from `stderr` for that reason — merging them would put words in the server's
+mouth. It is set only where this client's own configuration made the failure inevitable, and
+the case it exists for is the one the stderr cannot explain:
+
+```
+AuthenticationError: connection closed by the remote end (exit status 255)
+ssh stderr:
+bob@host: Permission denied (keyboard-interactive,password).
+hint: the server offered password authentication and this client had it switched off:
+BatchMode=yes suppresses the askpass helper outright, so no password was ever sent.
+Pass password=... to open_ssh_transport()
+```
+
+That line names the methods the *server* offers and says nothing about the one we disabled.
+Reading it is how people conclude the library is publickey-only. Note that it cannot be
+produced from the text alone: `BatchMode=yes` with a working helper, and `BatchMode=no` with no
+helper at all, are byte-identical on stderr, so the hint reads back the argv that was actually
+spawned to tell them apart — and stays empty when a password *was* offered and refused, because
+why the server said no is not something this client knows.
+
+`examples/connect_errors.py` runs this with no arguments, and `examples/password_auth.py`
+covers the password half.
 
 ## Timeouts, and stopping a transfer
 

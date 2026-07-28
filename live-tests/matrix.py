@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import socket
 import subprocess
 import threading
@@ -170,15 +171,16 @@ def _free_port() -> int:
 
 
 @contextmanager
-def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
-    assert asyncssh is not None
-    host_key = _keypair(root, "asyncssh_host")
-    client_key = _keypair(root, "asyncssh_client")
-    port = _free_port()
-    (root / "asyncssh_known_hosts").write_text(
-        f"[127.0.0.1]:{port} {(root / 'asyncssh_host.pub').read_text().strip()}\n"
-    )
+def _listening_asyncssh(name: str, **listen_kwargs: Any) -> Iterator[None]:
+    """Run ``asyncssh.listen`` on its own thread and event loop for the block's duration.
 
+    Extracted because two servers here need it -- the matrix's key-authenticating one and the
+    password-authenticating one the D-78 lane drives -- and a second copy of "how asyncssh is
+    started and stopped" is the arrangement :mod:`sshd`'s docstring exists to prevent.
+
+    asyncssh is asyncio-only and this suite also runs on trio, so it gets a thread of its own
+    rather than the test's loop.
+    """
     started = threading.Event()
     stopping = threading.Event()
     failure: list[BaseException] = []
@@ -186,13 +188,7 @@ def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
     def serve() -> None:
         async def main() -> None:
             assert asyncssh is not None
-            server = await asyncssh.listen(
-                "127.0.0.1",
-                port,
-                server_host_keys=[str(host_key)],
-                authorized_client_keys=str(root / "asyncssh_client.pub"),
-                sftp_factory=True,
-            )
+            server = await asyncssh.listen("127.0.0.1", **listen_kwargs)
             started.set()
             while not stopping.is_set():  # noqa: ASYNC110 -- bridging a threading.Event
                 await asyncio.sleep(0.05)
@@ -204,14 +200,36 @@ def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
             failure.append(error)
             started.set()
 
-    thread = threading.Thread(target=serve, daemon=True, name="asyncssh-matrix")
+    thread = threading.Thread(target=serve, daemon=True, name=name)
     thread.start()
     if not started.wait(_STARTUP_TIMEOUT):
-        raise sshd.ServerUnavailableError("asyncssh server did not start")
+        raise sshd.ServerUnavailableError(f"{name} did not start")
     if failure:
-        raise sshd.ServerUnavailableError(f"asyncssh server failed to start: {failure[0]!r}")
-
+        raise sshd.ServerUnavailableError(f"{name} failed to start: {failure[0]!r}")
     try:
+        yield
+    finally:
+        stopping.set()
+        thread.join(timeout=_STARTUP_TIMEOUT)
+
+
+@contextmanager
+def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
+    assert asyncssh is not None
+    host_key = _keypair(root, "asyncssh_host")
+    client_key = _keypair(root, "asyncssh_client")
+    port = _free_port()
+    (root / "asyncssh_known_hosts").write_text(
+        f"[127.0.0.1]:{port} {(root / 'asyncssh_host.pub').read_text().strip()}\n"
+    )
+
+    with _listening_asyncssh(
+        "asyncssh-matrix",
+        port=port,
+        server_host_keys=[str(host_key)],
+        authorized_client_keys=str(root / "asyncssh_client.pub"),
+        sftp_factory=True,
+    ):
         yield MatrixServer(
             "asyncssh",
             f"asyncssh {asyncssh.__version__}",
@@ -225,9 +243,85 @@ def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
             },
             root,
         )
-    finally:
-        stopping.set()
-        thread.join(timeout=_STARTUP_TIMEOUT)
+
+
+# --- a server that authenticates with a password, which OpenSSH's sshd cannot do here -------
+
+
+def password_server_unavailable_reason() -> str | None:
+    """Why :func:`running_password_server` cannot run here, or ``None``."""
+    return unavailable_reason("asyncssh")
+
+
+@contextmanager
+def running_password_server(root: Path, *, password: str) -> Iterator[MatrixServer]:
+    """A real SSH server that accepts exactly one password and offers nothing else.
+
+    **Not OpenSSH, and the reason is measured rather than a preference.** ``live-tests`` runs
+    ``sshd`` unprivileged, and an unprivileged ``sshd`` cannot verify a password: with
+    ``PasswordAuthentication yes`` and ``UsePAM no`` it offers the method, refuses every
+    attempt, and logs ``Could not get shadow information for dev`` -- ``/etc/shadow`` is
+    ``root:shadow 0640``. Making that lane work needs root or a PAM stack, which is a change
+    to the machine rather than to this repository.
+
+    What is under test is the **client** -- the argv, the askpass helper, and the environment
+    the child is given -- and the client does not care which implementation is at the far end.
+    So the far end is asyncssh, which validates a password in-process with no privilege at
+    all. It has a second advantage: ``PerSourcePenalties`` is an OpenSSH ``sshd`` feature, so
+    the deliberately-failing cases here cannot poison a later, unrelated test the way they do
+    against the reference server.
+
+    Args:
+        root: Directory for keys and the served file tree.
+        password: The one secret this server accepts.
+
+    Yields:
+        The running server. ``connect`` carries no ``identity_file``: offering a key here
+        would let a test pass without the password path being exercised at all.
+    """
+    assert asyncssh is not None
+
+    class PasswordOnly(asyncssh.SSHServer):
+        """Authentication by password and nothing else."""
+
+        def begin_auth(self, username: str) -> bool:
+            return True  # authentication is required; returning False would let anyone in
+
+        def password_auth_supported(self) -> bool:
+            return True
+
+        def validate_password(self, username: str, password_attempt: str) -> bool:
+            return secrets.compare_digest(password_attempt, password)
+
+    host_key = _keypair(root, "password_host")
+    port = _free_port()
+    known_hosts = root / "password_known_hosts"
+    known_hosts.write_text(
+        f"[127.0.0.1]:{port} {(root / 'password_host.pub').read_text().strip()}\n"
+    )
+
+    with _listening_asyncssh(
+        "asyncssh-password",
+        port=port,
+        server_factory=PasswordOnly,
+        server_host_keys=[str(host_key)],
+        sftp_factory=True,
+    ):
+        yield MatrixServer(
+            "asyncssh",
+            f"asyncssh {asyncssh.__version__}",
+            {
+                "host": "127.0.0.1",
+                "port": port,
+                "config_file": os.devnull,
+                # Scrubbed for the usual reason and for one specific to this lane: it removes
+                # every variable that would arm an askpass helper, so a test of the *refusing*
+                # case is genuinely unable to answer a prompt rather than accidentally able.
+                "env": sshd.scrubbed_ssh_env(),
+                "options": _client_options(known_hosts),
+            },
+            root,
+        )
 
 
 # --- paramiko ----------------------------------------------------------------------------------

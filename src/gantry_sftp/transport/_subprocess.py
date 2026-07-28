@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import subprocess
 from collections.abc import AsyncGenerator, Mapping, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import override
 
@@ -29,9 +29,14 @@ import anyio
 from anyio.abc import Process
 
 from gantry_sftp.exceptions import ConnectError, flatten_exception_group
-from gantry_sftp.transport._argv import DEFAULT_SUBSYSTEM, build_ssh_argv
+from gantry_sftp.transport._argv import (
+    DEFAULT_SUBSYSTEM,
+    build_ssh_argv,
+    options_for_password_auth,
+)
+from gantry_sftp.transport._askpass import ASKPASS_ARMING_VARIABLES, askpass_environment
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
-from gantry_sftp.transport._diagnosis import classify_failure
+from gantry_sftp.transport._diagnosis import classify_failure, password_auth_hint
 
 __all__ = [
     "SFTP_SERVER_CANDIDATES",
@@ -139,13 +144,25 @@ class SubprocessTransport:
     directly: the stderr drain is a background task, and a task needs a scope to live in.
     """
 
-    __slots__ = ("_argv", "_closed", "_process", "_stderr")
+    __slots__ = ("_argv", "_askpass_armed", "_closed", "_process", "_stderr")
 
-    def __init__(self, process: Process, argv: Sequence[str], stderr: StderrBuffer) -> None:
+    def __init__(
+        self,
+        process: Process,
+        argv: Sequence[str],
+        stderr: StderrBuffer,
+        *,
+        askpass_armed: bool = False,
+    ) -> None:
         self._process = process
         self._argv = tuple(argv)
         self._stderr = stderr
         self._closed = False
+        # A bool rather than the child's environment, deliberately. The environment is where
+        # the password lives, and an object that holds it is an object that can leak it into
+        # a repr, a log record or a frame dump. What the diagnosis needs is only whether a
+        # prompt could have been answered, which is one bit and carries nothing.
+        self._askpass_armed = askpass_armed
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -186,6 +203,7 @@ class SubprocessTransport:
             stderr=stderr,
             argv=self._argv,
             returncode=self._process.returncode,
+            hint=password_auth_hint(stderr, argv=self._argv, askpass_armed=self._askpass_armed),
         )
 
     async def send(self, data: bytes | memoryview) -> None:
@@ -315,6 +333,7 @@ async def _open_process_transport(
     *,
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
+    askpass_armed: bool = False,
 ) -> AsyncGenerator[SubprocessTransport]:
     """Spawn ``argv``, wire up the stderr drain, and guarantee the child is reaped."""
     stderr = StderrBuffer()
@@ -333,7 +352,7 @@ async def _open_process_transport(
             argv=tuple(argv),
         ) from exc
 
-    transport = SubprocessTransport(process, argv, stderr)
+    transport = SubprocessTransport(process, argv, stderr, askpass_armed=askpass_armed)
     try:
         try:
             async with anyio.create_task_group() as task_group:
@@ -360,6 +379,22 @@ async def _open_process_transport(
             await transport.aclose()
 
 
+def _askpass_is_armed(password: str | None, env: Mapping[str, str] | None) -> bool:
+    """Whether this connection could answer an interactive prompt at all.
+
+    Used only to decide whether a failure deserves a hint, so it errs towards *armed*: any of
+    :data:`~gantry_sftp.transport.ASKPASS_ARMING_VARIABLES` means ``ssh`` would have run some
+    helper, even without ``SSH_ASKPASS`` -- ``/usr/bin/ssh-askpass`` is compiled in as the
+    default and clearing the variable does not disarm it. Claiming "you had no way to answer"
+    when a display was present would be a confidently wrong diagnosis, which is worse than
+    none.
+    """
+    if password is not None:
+        return True
+    environment = os.environ if env is None else env
+    return any(name in environment for name in ASKPASS_ARMING_VARIABLES)
+
+
 @asynccontextmanager
 async def open_ssh_transport(
     host: str,
@@ -372,6 +407,7 @@ async def open_ssh_transport(
     subsystem: str = DEFAULT_SUBSYSTEM,
     ssh_executable: str | None = None,
     env: Mapping[str, str] | None = None,
+    password: str | None = None,
 ) -> AsyncGenerator[SubprocessTransport]:
     """Open an SFTP byte stream by spawning ``ssh -s sftp``.
 
@@ -388,6 +424,13 @@ async def open_ssh_transport(
         subsystem: Subsystem name, or a path for a server with no subsystem configured.
         ssh_executable: Which ``ssh`` to run.
         env: Environment for the child. ``None`` inherits.
+        password: Authenticate with this password instead of a key. The secret is passed to
+            ``ssh`` through a temporary ``SSH_ASKPASS`` helper and reaches it **only** in the
+            child's environment -- never in argv, where ``ps`` would show it to every user on
+            the machine, and never in a file. Supplying it also relaxes ``BatchMode``, which
+            the shipped defaults set to ``yes`` and which suppresses the askpass helper
+            outright; see :data:`~gantry_sftp.transport.PASSWORD_AUTH_OPTIONS` for the full
+            set and why each is there. POSIX only.
 
     Yields:
         A connected transport. Note that ``ssh`` is spawned immediately but authentication
@@ -396,7 +439,10 @@ async def open_ssh_transport(
         where the real explanation always was.
 
     Raises:
-        ValueError: If any argument could be misread as an ``ssh`` option.
+        ValueError: If any argument could be misread as an ``ssh`` option, if ``password``
+            contains a character that would let it answer more than one prompt, or if it is
+            combined with an explicit ``BatchMode=yes``.
+        NotImplementedError: If ``password`` is given on Windows.
         ConnectError: If ``ssh`` cannot be executed at all.
     """
     argv = build_ssh_argv(
@@ -405,12 +451,20 @@ async def open_ssh_transport(
         port=port,
         config_file=config_file,
         identity_file=identity_file,
-        options=options,
+        options=options if password is None else options_for_password_auth(options),
         subsystem=subsystem,
         ssh_executable=ssh_executable,
     )
-    async with _open_process_transport(argv, env=env) as transport:
-        yield transport
+    # The helper exists for exactly as long as the connection does. `nullcontext` keeps the
+    # key-based path -- which is every other caller -- writing no files at all.
+    askpass: AbstractContextManager[Mapping[str, str] | None] = (
+        nullcontext(env) if password is None else askpass_environment(password, env=env)
+    )
+    with askpass as child_env:
+        async with _open_process_transport(
+            argv, env=child_env, askpass_armed=_askpass_is_armed(password, env)
+        ) as transport:
+            yield transport
 
 
 @asynccontextmanager

@@ -7,8 +7,10 @@ a pipe, and the ssh failure cases are made to fail before any connection is atte
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import anyio
@@ -26,6 +28,7 @@ from gantry_sftp.codec import (
 )
 from gantry_sftp.exceptions import ConnectError, flatten_exception_group
 from gantry_sftp.transport import (
+    ASKPASS_ARMING_VARIABLES,
     StderrBuffer,
     build_ssh_argv,
     find_sftp_server,
@@ -455,3 +458,132 @@ async def test_the_group_is_flattened_all_the_way_down():
 def test_flattening_leaves_a_plain_exception_alone():
     error = ConnectError("not a group")
     assert flatten_exception_group(error) is error
+
+
+# --- passwords: where the secret goes, and what a refusal says ----------------------------
+
+SECRET = "correct-horse-battery-staple"
+
+
+def askpass_directories() -> set[Path]:
+    """Temporary directories the askpass helper has left behind, if any."""
+    return set(Path(tempfile.gettempdir()).glob("gantry-sftp-askpass-*"))
+
+
+@pytest.fixture
+def no_askpass_in_the_environment(monkeypatch):
+    """Unset everything that would arm an askpass helper, and prove it is unset.
+
+    A developer with `DISPLAY` set inherits a machine on which ssh *would* run a helper, and
+    the hint below is deliberately suppressed in that case -- so without this fixture these
+    tests pass or fail according to whose laptop they run on.
+    """
+    for name in ASKPASS_ARMING_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    for name in ASKPASS_ARMING_VARIABLES:
+        assert name not in os.environ, f"{name} is still set"
+
+
+async def test_a_password_never_reaches_argv(fake_ssh: Path):
+    """The reason this feature exists at all.
+
+    ``sshpass -p secret`` puts the credential in argv, where ``/proc/<pid>/cmdline`` makes it
+    readable by every user on the machine. Nothing this library spawns may do that, and argv
+    is captured on the exception, so the assertion covers the bug report too.
+    """
+    async with open_ssh_transport(
+        "example.com", ssh_executable=str(fake_ssh), password=SECRET
+    ) as transport:
+        assert SECRET not in repr(transport)
+        assert SECRET not in " ".join(transport.argv)
+        with pytest.raises(ConnectError) as exc:
+            await transport.receive()
+
+    assert SECRET not in " ".join(exc.value.argv)
+    assert SECRET not in str(exc.value)
+    assert SECRET not in exc.value.stderr
+    assert SECRET not in exc.value.hint
+
+
+async def test_the_password_path_relaxes_batchmode_in_the_command_it_actually_runs(
+    fake_ssh: Path,
+):
+    async with open_ssh_transport(
+        "example.com", ssh_executable=str(fake_ssh), password=SECRET
+    ) as transport:
+        assert "BatchMode=no" in transport.argv
+        assert "BatchMode=yes" not in transport.argv
+
+
+async def test_the_helper_does_not_outlive_the_connection(fake_ssh: Path):
+    # A credential-adjacent temporary file surviving a failed connection is the leak this
+    # design exists to avoid, and the failure path is the one nobody watches.
+    before = askpass_directories()
+    async with open_ssh_transport(
+        "example.com", ssh_executable=str(fake_ssh), password=SECRET
+    ) as transport:
+        with pytest.raises(ConnectError):
+            await transport.receive()
+    assert askpass_directories() == before
+
+
+async def test_a_password_that_could_answer_two_prompts_is_refused_before_spawning():
+    # Validation happens before any process exists, so a rejected password cannot leave a
+    # child, a helper or a directory behind.
+    before = askpass_directories()
+    with pytest.raises(ValueError) as exc:
+        await _open_and_close(open_ssh_transport("example.com", password="two\nlines"))
+    assert exc.value.args[0].startswith("password may not contain '\\n';")
+    assert askpass_directories() == before
+
+
+async def test_a_password_with_an_explicit_batchmode_yes_is_refused_before_spawning():
+    with pytest.raises(ValueError) as exc:
+        await _open_and_close(
+            open_ssh_transport("example.com", password=SECRET, options={"BatchMode": "yes"})
+        )
+    assert exc.value.args[0].startswith("password= needs BatchMode=no,")
+
+
+async def test_a_refusal_under_the_shipped_defaults_says_which_option_disabled_the_password(
+    fake_ssh: Path, no_askpass_in_the_environment
+):
+    """The gap D-78 was filed for, end to end.
+
+    The stderr names the methods the *server* offers and says nothing about the one this
+    client switched off. Without the hint the reader is sent to check their password, which
+    was never sent.
+    """
+    async with open_ssh_transport("example.com", ssh_executable=str(fake_ssh)) as transport:
+        with pytest.raises(ConnectError) as exc:
+            await transport.receive()
+
+    assert "BatchMode=yes suppresses the askpass helper outright" in exc.value.hint
+    # Rendered too: a bare `print(err)` has to be enough, which is the whole standard the
+    # stderr passthrough set.
+    assert "hint: " in str(exc.value)
+    assert exc.value.hint in str(exc.value)
+
+
+async def test_a_password_connection_that_is_refused_gets_no_hint(
+    fake_ssh: Path, no_askpass_in_the_environment
+):
+    # We answered the prompt. Why the server still said no is not something this client
+    # knows, and a hint that guesses is worse than none.
+    async with open_ssh_transport(
+        "example.com", ssh_executable=str(fake_ssh), password=SECRET
+    ) as transport:
+        with pytest.raises(ConnectError) as exc:
+            await transport.receive()
+    assert exc.value.hint == ""
+    assert "hint: " not in str(exc.value)
+
+
+async def test_a_caller_supplied_askpass_suppresses_the_hint(fake_ssh: Path, monkeypatch):
+    # Arming it by hand is the documented pre-`password=` recipe and still works. Telling
+    # somebody who did that they had "no way to answer the prompt" would be a wrong answer.
+    monkeypatch.setenv("SSH_ASKPASS_REQUIRE", "force")
+    async with open_ssh_transport("example.com", ssh_executable=str(fake_ssh)) as transport:
+        with pytest.raises(ConnectError) as exc:
+            await transport.receive()
+    assert exc.value.hint == ""
