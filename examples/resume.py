@@ -35,7 +35,7 @@ from pathlib import Path
 import anyio
 
 from gantry_sftp.exceptions import TransferError
-from gantry_sftp.session import Session, open_session
+from gantry_sftp.session import Publish, Session, open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport
 
 PAYLOAD = os.urandom(600_000)
@@ -115,16 +115,18 @@ async def resume_an_upload(sftp: Session, source: Path, remote: str) -> None:
 
     # In place: the destination is its own staging file, so there is a name to resume into.
     with suppress(InterruptedTransferError):
-        _ = await sftp.put(source, remote, atomic=False, depth=1, progress=stop_partway)
+        _ = await sftp.put(
+            source, remote, publish=Publish(atomic=False), depth=1, progress=stop_partway
+        )
 
-    result = await sftp.put(source, remote, atomic=False, resume=True)
+    result = await sftp.put(source, remote, publish=Publish(atomic=False), resume=True)
     print(f"  resumed in place, moved {result.transferred:,} more")
 
     # And the refusal that stops resume being a corruption primitive: a remote partial that
     # cannot be a prefix of what we are sending.
     longer = write_half_payload(source.parent / "longer.bin")
     try:
-        _ = await sftp.put(longer, remote, atomic=False, resume=True)
+        _ = await sftp.put(longer, remote, publish=Publish(atomic=False), resume=True)
     except TransferError as refusal:
         print(f"  remote longer than the source -> refused:\n    {refusal}")
 

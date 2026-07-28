@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from pathlib import Path
 
 import anyio
@@ -55,8 +56,10 @@ from gantry_sftp.exceptions import (
     TransferTimeoutError,
 )
 from gantry_sftp.session import (
+    DEFAULT_PUBLISH,
     MAX_STAGED_NAME_LENGTH,
     Durability,
+    Publish,
     PublishMechanism,
     SizeCheck,
     UploadResult,
@@ -65,6 +68,7 @@ from gantry_sftp.session import (
     staged_path,
     staging_token,
 )
+from gantry_sftp.session._publish import publish_from_legacy
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -431,7 +435,7 @@ def staging_files(directory: Path, stem: str) -> list[Path]:
 async def test_a_default_put_stages_flushes_and_renames(source: Path):
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result == UploadResult(
         transferred=14,
@@ -457,7 +461,7 @@ async def test_the_order_is_stage_write_flush_close_rename(source: Path):
     """
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        _ = await sftp.put(source, TARGET, staging_name=STAGED)
+        _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     # The Stat is rung 3, and it sits between the Close and the rename deliberately: the
     # length is confirmed on the staging file, so a truncated upload is refused before it can
@@ -476,7 +480,7 @@ async def test_the_order_is_stage_write_flush_close_rename(source: Path):
 async def test_the_bytes_go_to_the_staging_name_and_never_to_the_destination(source: Path):
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        _ = await sftp.put(source, TARGET, staging_name=STAGED)
+        _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     written = {server.handles.get(p.handle, STAGED) for p in server.seen if isinstance(p, Write)}
     assert server.opened(OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL) == [STAGED]
@@ -489,7 +493,7 @@ async def test_the_staging_file_is_opened_exclusively(source: Path):
     # and wrong.
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        _ = await sftp.put(source, TARGET, staging_name=STAGED)
+        _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     opens = [p for p in server.seen if isinstance(p, Open)]
     assert opens[0].pflags & OpenFlag.EXCL
@@ -508,7 +512,7 @@ async def test_the_default_staging_name_is_a_hidden_sibling_with_a_token(source:
 async def test_publishing_over_an_existing_file_is_still_atomic(source: Path):
     server = PublishingServer(files={TARGET: b"yesterday's numbers"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.mechanism is PublishMechanism.POSIX_RENAME
     assert result.atomic
@@ -523,7 +527,7 @@ async def test_a_server_without_posix_rename_uses_a_plain_rename(source: Path):
     # proves the destination appeared whole.
     server = PublishingServer(extensions=(FSYNC_NAME,))
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.mechanism is PublishMechanism.RENAME
     assert result.atomic
@@ -545,7 +549,7 @@ async def test_posix_rename_is_attempted_even_when_it_was_never_advertised(sourc
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         assert not sftp.supports(EXTENSION_POSIX_RENAME)
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.mechanism is PublishMechanism.POSIX_RENAME
     assert result.atomic
@@ -558,8 +562,10 @@ async def test_an_unsupported_answer_is_remembered_for_the_session(source: Path)
     # subsequent publish -- and publishing is something jobs do in a loop.
     server = PublishingServer(extensions=())
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        _ = await sftp.put(source, TARGET, staging_name=STAGED)
-        _ = await sftp.put(source, b"/incoming/second.csv", staging_name=b"/incoming/.second.part")
+        _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
+        _ = await sftp.put(
+            source, b"/incoming/second.csv", publish=Publish(staging_name=b"/incoming/.second.part")
+        )
 
     assert server.kinds().count("posix-rename@openssh.com") == 1
 
@@ -577,9 +583,11 @@ async def test_a_refusal_that_is_not_unsupported_is_not_remembered(source: Path)
         refuse={"posix-rename": StatusCode.FAILURE},
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
         assert result.mechanism is PublishMechanism.RENAME
-        result = await sftp.put(source, b"/incoming/second.csv", staging_name=b"/incoming/.two")
+        result = await sftp.put(
+            source, b"/incoming/second.csv", publish=Publish(staging_name=b"/incoming/.two")
+        )
 
     assert result.mechanism is PublishMechanism.RENAME
     assert server.kinds().count("posix-rename@openssh.com") == 2
@@ -595,7 +603,7 @@ async def test_an_advertised_extension_refusing_for_another_reason_propagates(so
     server = PublishingServer(refuse={"posix-rename": StatusCode.PERMISSION_DENIED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(PermissionDeniedError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert exc.value.path == TARGET
     assert "Rename" not in server.kinds(), "fell through to a fallback that cannot help"
@@ -607,7 +615,7 @@ async def test_an_advertised_extension_that_answers_unsupported_falls_through(so
     # fallback must be the tested path, not the theoretical one.
     server = PublishingServer(refuse={"posix-rename": StatusCode.OP_UNSUPPORTED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.mechanism is PublishMechanism.RENAME
     assert server.kinds().count("posix-rename@openssh.com") == 1
@@ -622,7 +630,7 @@ async def test_without_posix_rename_an_existing_target_costs_a_remove_first(sour
     """
     server = PublishingServer(extensions=(), files={TARGET: b"yesterday"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.mechanism is PublishMechanism.REMOVE_RENAME
     assert not result.atomic
@@ -653,7 +661,7 @@ async def test_a_rename_that_fails_for_another_reason_deletes_nothing(source: Pa
     server = PublishingServer(extensions=(), refuse={"rename": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert exc.value.args[0] == "server returned FAILURE: FAILURE"
     assert "Remove" not in server.kinds()[:-1], "something was deleted on a guess"
@@ -687,7 +695,7 @@ async def test_losing_the_race_inside_the_window_keeps_the_only_copy_of_the_data
     server = LosesTheRace(extensions=(), implements=(), files={TARGET: b"yesterday"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert bytes(server.files[STAGED]) == b"id,total\n1,42\n", "the only copy was deleted"
     assert "Remove" in server.kinds()[:-1], "the destination was removed, so this is the case"
@@ -738,7 +746,7 @@ async def test_a_remove_whose_reply_never_arrives_does_not_delete_the_only_copy(
     server = _SwallowsTheRemoveReply(extensions=(), implements=(), files={TARGET: b"yesterday"})
     async with open_session(server, request_timeout=0.5) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferTimeoutError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert bytes(server.files[STAGED]) == b"id,total\n1,42\n", "the only copy was deleted"
     assert server.swallowed == 1, "the destination really was removed, so this is the case"
@@ -769,7 +777,7 @@ async def test_a_cancellation_inside_the_remove_rename_window_does_not_delete_th
     server = _SwallowsTheRemoveReply(extensions=(), implements=(), files={TARGET: b"yesterday"})
     async with open_session(server, request_timeout=None) as sftp:  # type: ignore[arg-type]
         with anyio.move_on_after(0.25) as scope:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert scope.cancelled_caught, "the publish was never actually cancelled"
     assert bytes(server.files[STAGED]) == b"id,total\n1,42\n", "the only copy was deleted"
@@ -809,7 +817,7 @@ async def test_a_cancellation_during_the_second_rename_does_not_delete_the_only_
     )
     async with open_session(server, request_timeout=None) as sftp:  # type: ignore[arg-type]
         with anyio.move_on_after(0.25) as scope:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert scope.cancelled_caught, "the publish was never actually cancelled"
     assert server.renames == 2, "the cancellation landed on the second rename, so this is the case"
@@ -847,7 +855,7 @@ async def test_a_refused_remove_is_definitive_so_the_staging_file_is_still_clean
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(PermissionDeniedError):
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert bytes(server.files[TARGET]) == b"yesterday", "the destination was never removed"
     assert STAGED not in server.files, "a definitive refusal leaves no reason to keep it"
@@ -863,7 +871,7 @@ async def test_a_destination_that_is_a_dangling_symlink_still_counts_as_in_the_w
     """
     server = PublishingServer(extensions=(), implements=(), dangling=(TARGET,))
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.mechanism is PublishMechanism.REMOVE_RENAME
     assert "LStat" in server.kinds()
@@ -881,7 +889,7 @@ async def test_a_stat_that_errors_is_not_evidence_the_target_is_absent(source: P
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert exc.value.code == int(StatusCode.FAILURE), "the rename's refusal is the diagnosis"
     assert "Remove" not in server.kinds()[:-1]
@@ -895,7 +903,9 @@ async def test_require_atomic_refuses_before_moving_any_bytes(source: Path):
     server = PublishingServer(extensions=(), files={TARGET: b"yesterday"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(CapabilityError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED, require_atomic=True)
+            _ = await sftp.put(
+                source, TARGET, publish=Publish(staging_name=STAGED, require_atomic=True)
+            )
 
     assert exc.value.args[0] == (
         "require_atomic=True but b'/incoming/report.csv' already exists and this server does "
@@ -913,7 +923,9 @@ async def test_require_atomic_is_satisfied_by_a_plain_rename_onto_a_free_name(so
     # and a rename onto a name that is free is atomic on every one of them.
     server = PublishingServer(extensions=())
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED, require_atomic=True)
+        result = await sftp.put(
+            source, TARGET, publish=Publish(staging_name=STAGED, require_atomic=True)
+        )
 
     assert result.mechanism is PublishMechanism.RENAME
     assert result.atomic
@@ -936,7 +948,9 @@ async def test_require_atomic_refuses_a_target_that_appears_during_the_transfer(
     server = Racing(extensions=())
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(CapabilityError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED, require_atomic=True)
+            _ = await sftp.put(
+                source, TARGET, publish=Publish(staging_name=STAGED, require_atomic=True)
+            )
 
     assert exc.value.args[0] == (
         "require_atomic=True but b'/incoming/report.csv' already exists and this server does "
@@ -963,7 +977,7 @@ async def test_contradictory_flags_are_refused_rather_than_reconciled(
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ValueError) as exc:
-            _ = await sftp.put(source, TARGET, **flags)
+            _ = await sftp.put(source, TARGET, publish=Publish(**flags))
     assert exc.value.args[0] == message
     assert "Open" not in server.kinds()
 
@@ -976,7 +990,7 @@ async def test_a_server_without_fsync_reports_no_durability_rather_than_claiming
 ):
     server = PublishingServer(extensions=(POSIX_RENAME_NAME,))
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.durability is Durability.UNAVAILABLE
     assert not result.durable
@@ -987,7 +1001,7 @@ async def test_a_server_without_fsync_reports_no_durability_rather_than_claiming
 async def test_fsync_can_be_switched_off_and_says_it_was_skipped(source: Path):
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED, fsync=False)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED, fsync=False))
 
     assert result.durability is Durability.SKIPPED
     assert "fsync@openssh.com" not in server.kinds()
@@ -998,7 +1012,7 @@ async def test_a_refused_flush_is_recorded_rather_than_fatal(source: Path):
     # upload. The caller who cannot accept that has require_fsync.
     server = PublishingServer(refuse={"fsync": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, staging_name=STAGED)
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert result.durability is Durability.UNAVAILABLE
     assert result.mechanism is PublishMechanism.POSIX_RENAME
@@ -1008,7 +1022,9 @@ async def test_require_fsync_turns_a_refused_flush_into_a_failure(source: Path):
     server = PublishingServer(refuse={"fsync": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED, require_fsync=True)
+            _ = await sftp.put(
+                source, TARGET, publish=Publish(staging_name=STAGED, require_fsync=True)
+            )
 
     assert exc.value.args[0] == "server returned FAILURE: FAILURE"
     assert TARGET not in server.files, "an unflushed file was published anyway"
@@ -1019,7 +1035,7 @@ async def test_require_fsync_refuses_a_server_that_does_not_advertise_it(source:
     server = PublishingServer(extensions=(POSIX_RENAME_NAME,))
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(CapabilityError) as exc:
-            _ = await sftp.put(source, TARGET, require_fsync=True)
+            _ = await sftp.put(source, TARGET, publish=Publish(require_fsync=True))
 
     assert exc.value.args[0] == (
         "require_fsync=True but this server does not advertise fsync@openssh.com, so nothing "
@@ -1033,7 +1049,7 @@ async def test_require_fsync_refuses_a_server_that_does_not_advertise_it(source:
 async def test_the_flush_reaches_the_staging_file_not_the_destination(source: Path):
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        _ = await sftp.put(source, TARGET, staging_name=STAGED)
+        _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
     assert server.fsynced == [STAGED]
 
 
@@ -1045,7 +1061,7 @@ async def test_atomic_false_writes_the_destination_directly(source: Path):
     # require: staging needs the right to create *and* rename a second name.
     server = PublishingServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, TARGET, atomic=False)
+        result = await sftp.put(source, TARGET, publish=Publish(atomic=False))
 
     assert result.mechanism is PublishMechanism.IN_PLACE
     assert not result.atomic
@@ -1060,7 +1076,7 @@ async def test_atomic_false_writes_the_destination_directly(source: Path):
 async def test_an_in_place_write_truncates_what_was_there(source: Path):
     server = PublishingServer(files={TARGET: b"a much longer previous version"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        _ = await sftp.put(source, TARGET, atomic=False)
+        _ = await sftp.put(source, TARGET, publish=Publish(atomic=False))
     assert bytes(server.files[TARGET]) == b"id,total\n1,42\n"
 
 
@@ -1073,7 +1089,7 @@ async def test_a_failed_transfer_removes_the_staging_file(source: Path):
     server = PublishingServer(refuse={"write": StatusCode.PERMISSION_DENIED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert not isinstance(exc.value, BaseExceptionGroup)
     assert exc.value.remote_path == STAGED, "the error names the file that has bytes in it"
@@ -1092,7 +1108,7 @@ async def test_a_staging_name_already_taken_deletes_nothing(source: Path):
     server = PublishingServer(files={STAGED: b"another publisher's work in progress"})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert bytes(server.files[STAGED]) == b"another publisher's work in progress"
     assert "Remove" not in server.kinds()
@@ -1116,7 +1132,7 @@ async def test_a_cleanup_that_also_fails_is_reported_on_the_original_error(sourc
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert exc.value.__notes__
     assert exc.value.__notes__[0].startswith(
@@ -1137,7 +1153,7 @@ async def test_a_failing_close_does_not_replace_the_error_that_caused_it(source:
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert "PERMISSION_DENIED" in exc.value.args[0]
     assert exc.value.transferred == 0
@@ -1152,7 +1168,7 @@ async def test_a_close_that_fails_on_the_success_path_fails_the_transfer(source:
     server = PublishingServer(refuse={"close": StatusCode.FAILURE})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
 
     assert exc.value.args[0] == "server returned FAILURE: FAILURE"
     assert TARGET not in server.files, "published a file the server would not close"
@@ -1180,7 +1196,7 @@ async def test_a_refused_open_of_the_destination_is_not_dressed_up(source: Path)
     server = PublishingServer(refuse={"open": StatusCode.PERMISSION_DENIED})
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(PermissionDeniedError) as exc:
-            _ = await sftp.put(source, TARGET, staging_name=STAGED)
+            _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
     assert exc.value.path == STAGED
 
 
@@ -1258,7 +1274,9 @@ async def test_with_atomic_false_the_destination_does_appear_mid_transfer(tmp_pa
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        result = await sftp.put(source, str(destination), atomic=False, progress=watch)
+        result = await sftp.put(
+            source, str(destination), publish=Publish(atomic=False), progress=watch
+        )
 
     assert result.mechanism is PublishMechanism.IN_PLACE
     assert any(seen_early[:-1]), "an in-place write should be visible while it happens"
@@ -1277,7 +1295,9 @@ async def test_publishing_over_an_existing_file_on_a_real_server(tmp_path: Path)
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        result = await sftp.put(source, str(destination), require_atomic=True, require_fsync=True)
+        result = await sftp.put(
+            source, str(destination), publish=Publish(require_atomic=True, require_fsync=True)
+        )
 
     assert result.mechanism is PublishMechanism.POSIX_RENAME
     assert result.durable
@@ -1351,7 +1371,9 @@ async def test_an_explicit_staging_path_is_the_documented_escape(tmp_path: Path)
 
     server = PublishingServer(root=VMS_ROOT)
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, b"report.csv", staging_name=b"staging/report.part")
+        result = await sftp.put(
+            source, b"report.csv", publish=Publish(staging_name=b"staging/report.part")
+        )
 
     assert result.staged_at == b"staging/report.part"
     assert result.atomic
@@ -1366,8 +1388,134 @@ async def test_a_relative_in_place_put_is_untouched(tmp_path: Path):
 
     server = PublishingServer(root=VMS_ROOT)
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, b"report.csv", atomic=False)
+        result = await sftp.put(source, b"report.csv", publish=Publish(atomic=False))
 
     assert result.transferred == 9
     assert bytes(server.files[b"report.csv"]) == b"id,total\n"
     assert not [packet for packet in server.seen if isinstance(packet, RealPath)]
+
+
+# --- the old spelling still resolves the old way --------------------------------------------
+#
+# CLAUDE.md's public-API rule, honoured literally. D-68 moved five arguments into `Publish`;
+# these prove the move cost nobody anything, and that the ways it can go wrong are refusals
+# rather than silent reinterpretations. `publish_from_legacy` is pure, so most of this needs
+# no server -- which is the point of having put the decision in a function.
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected"),
+    [
+        ({"atomic": False}, Publish(atomic=False)),
+        ({"fsync": False}, Publish(fsync=False)),
+        ({"require_atomic": True}, Publish(require_atomic=True)),
+        ({"require_fsync": True}, Publish(require_fsync=True)),
+        ({"staging_name": b".part"}, Publish(staging_name=b".part")),
+        (
+            {"atomic": False, "fsync": False, "require_atomic": False},
+            Publish(atomic=False, fsync=False),
+        ),
+    ],
+    ids=lambda v: "|".join(sorted(v)) if isinstance(v, dict) else "",
+)
+def test_every_legacy_publish_argument_still_means_what_it_meant(legacy, expected):
+    with pytest.deprecated_call():
+        assert publish_from_legacy(None, legacy, caller="put") == expected
+
+
+def test_no_arguments_at_all_is_the_default_policy_and_warns_about_nothing():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert publish_from_legacy(None, {}, caller="put") is DEFAULT_PUBLISH
+
+
+def test_the_new_spelling_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert publish_from_legacy(Publish(atomic=False), {}, caller="put") == Publish(atomic=False)
+
+
+def test_the_deprecation_names_the_arguments_it_is_about_and_the_replacement():
+    with pytest.warns(DeprecationWarning) as caught:
+        publish_from_legacy(None, {"atomic": False, "fsync": False}, caller="put")
+    assert str(caught[0].message) == (
+        "put(): atomic, fsync moved into the Publish object -- pass "
+        "publish=Publish(atomic=..., fsync=...) instead. The old names still work and still "
+        "mean the same thing."
+    )
+
+
+def test_both_spellings_at_once_is_refused_rather_than_merged():
+    # There is no correct merge: either side silently overrides something the caller wrote.
+    with pytest.raises(TypeError) as exc:
+        publish_from_legacy(Publish(atomic=True), {"atomic": False}, caller="put")
+    assert exc.value.args[0] == (
+        "put() got both publish= and the legacy argument(s) atomic; use one spelling or the "
+        "other, because there is no correct way to merge them -- either would silently "
+        "override something you wrote"
+    )
+
+
+def test_a_misspelled_argument_is_refused_and_the_message_lists_the_real_ones():
+    # The regression that absorbing these into **legacy would otherwise introduce: Python no
+    # longer rejects a typo for us, and `atmoic=False` would publish atomically while the
+    # caller believed the opposite.
+    with pytest.raises(TypeError) as exc:
+        publish_from_legacy(None, {"atmoic": False}, caller="put")
+    assert exc.value.args[0] == (
+        "put() got unexpected keyword argument(s) atmoic; publish policy is now a Publish "
+        "object passed as publish=, and the accepted legacy names are atomic, fsync, "
+        "require_atomic, require_fsync, staging_name"
+    )
+
+
+@pytest.mark.parametrize("name", ["atomic", "fsync", "require_atomic", "require_fsync"])
+def test_a_legacy_flag_that_is_not_a_bool_is_refused(name):
+    # `atomic="no"` is truthy. Under the old signature an annotation described it; absorbing
+    # the name into **legacy threw that away, so the check is explicit or it is absent.
+    with pytest.raises(TypeError) as exc:
+        publish_from_legacy(None, {name: "no"}, caller="put")
+    assert exc.value.args[0] == (
+        f"put(): {name} must be a bool, got str; a truthy value that is not True would "
+        f"publish differently than it reads"
+    )
+
+
+def test_a_legacy_staging_name_that_is_not_a_path_is_refused():
+    with pytest.raises(TypeError) as exc:
+        publish_from_legacy(None, {"staging_name": 7}, caller="put")
+    assert exc.value.args[0] == "put(): staging_name must be bytes or str, got int"
+
+
+async def test_the_old_spelling_still_publishes_the_way_it_used_to(source: Path):
+    # The end-to-end half. The pure function above proves the translation; this proves the
+    # translated policy still reaches the server as the same sequence of requests.
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.deprecated_call():
+            old = await sftp.put(source, TARGET, atomic=False)
+    assert old.mechanism is PublishMechanism.IN_PLACE
+
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        new = await sftp.put(source, TARGET, publish=Publish(atomic=False))
+    assert new.mechanism is PublishMechanism.IN_PLACE
+    assert old.transferred == new.transferred
+
+
+async def test_put_tree_refuses_a_staging_name_rather_than_colliding_every_file(tmp_path: Path):
+    # One name cannot serve many files: the second would collide with the first, and the
+    # report would blame whichever file the walk reached second.
+    (tmp_path / "tree").mkdir()
+    (tmp_path / "tree" / "a.txt").write_bytes(b"a")
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as exc:
+            _ = await sftp.put_tree(
+                tmp_path / "tree", b"/incoming", publish=Publish(staging_name=b".part")
+            )
+    assert exc.value.args[0] == (
+        "put_tree() cannot take a staging_name: it applies to every file in the tree, so they "
+        "would all stage under one name and overwrite each other. Leave it unset to get a "
+        "generated hidden sibling per file."
+    )

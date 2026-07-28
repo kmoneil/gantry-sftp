@@ -32,7 +32,7 @@ from gantry_sftp.codec import (
     StatusCode,
 )
 from gantry_sftp.exceptions import AuthenticationError, ConnectError, HostKeyError
-from gantry_sftp.session import Durability, PublishMechanism, SkipReason, open_session
+from gantry_sftp.session import Durability, Publish, PublishMechanism, SkipReason, open_session
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -211,13 +211,13 @@ async def test_resuming_a_transfer_over_a_real_ssh_connection(ssh_server, tmp_pa
             _ = await sftp.put(
                 source,
                 str(uploaded),
-                atomic=False,
+                publish=Publish(atomic=False),
                 depth=1,
                 progress=stop_once_something_has_moved,
             )
         sent = uploaded.stat().st_size
         assert 0 < sent < len(payload), "the upload was not actually interrupted"
-        result = await sftp.put(source, str(uploaded), atomic=False, resume=True)
+        result = await sftp.put(source, str(uploaded), publish=Publish(atomic=False), resume=True)
         assert result.transferred == len(payload) - sent
 
     assert downloaded.read_bytes() == payload
@@ -276,7 +276,9 @@ async def test_an_atomic_publish_over_a_real_ssh_connection(ssh_server, tmp_path
     destination.write_bytes(b"the previous version")
 
     async with connect(ssh_server) as transport, open_session(transport) as sftp:
-        result = await sftp.put(source, str(destination), require_atomic=True, require_fsync=True)
+        result = await sftp.put(
+            source, str(destination), publish=Publish(require_atomic=True, require_fsync=True)
+        )
 
     assert result.mechanism is PublishMechanism.POSIX_RENAME
     assert result.durability is Durability.FSYNCED

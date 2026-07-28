@@ -44,7 +44,7 @@ from typing import ClassVar
 import anyio
 from sshd import SSHServer, connect_kwargs
 
-from gantry_sftp.session import open_session
+from gantry_sftp.session import Publish, open_session
 from gantry_sftp.transport import open_ssh_transport
 
 
@@ -161,7 +161,7 @@ class GantryClient(Client):
     async def upload(self, local: Path, remote: Path) -> tuple[float, int]:
         async with self._transport() as transport, open_session(transport) as sftp:
             started = time.perf_counter()
-            result = await sftp.put(local, str(remote), atomic=False, fsync=False)
+            result = await sftp.put(local, str(remote), publish=Publish(atomic=False, fsync=False))
             elapsed = time.perf_counter() - started
         return elapsed, result.transferred
 
@@ -173,7 +173,7 @@ class GantryClient(Client):
         """
         async with self._transport() as transport, open_session(transport) as sftp:
             started = time.perf_counter()
-            result = await sftp.put(local, str(remote), atomic=True, fsync=True)
+            result = await sftp.put(local, str(remote), publish=Publish(atomic=True, fsync=True))
             elapsed = time.perf_counter() - started
         return elapsed, result.transferred
 
@@ -195,7 +195,9 @@ class GantryClient(Client):
             started = time.perf_counter()
             moved = 0
             for source in sources:
-                result = await sftp.put(source, str(into / source.name), atomic=False, fsync=False)
+                result = await sftp.put(
+                    source, str(into / source.name), publish=Publish(atomic=False, fsync=False)
+                )
                 moved += result.transferred
             elapsed = time.perf_counter() - started
         return elapsed, moved

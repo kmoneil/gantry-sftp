@@ -48,6 +48,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `destination_collision.py` | `DestinationCollisionError`: two legal remote names that a case-folding destination makes one file, and why the check asks the filesystem rather than the name |
 | `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
 | `resume.py`               | `get(resume=)`, `put(resume=)`, and the two refusals — a partial that cannot be a prefix, and atomic without a staging name |
+| `preserve_times.py`       | `preserve_times=` both directions, `UploadResult.times`, `entry.modified` — and why `longname` cannot carry a usable date |
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
 | `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |

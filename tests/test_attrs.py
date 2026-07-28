@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from gantry_sftp.codec import (
+    MAX_V3_TIMESTAMP,
     AttrFlag,
     Attrs,
     Owner,
@@ -198,17 +200,47 @@ def test_each_undefined_bit_is_rejected(bit: int):
 # --- ranges -----------------------------------------------------------------------------
 
 
-def test_a_timestamp_beyond_uint32_is_refused_rather_than_truncated():
-    # v3 timestamps are 32-bit seconds, so the wire format is Y2038-bounded whatever Python
-    # holds. Refusing beats silently wrapping to 1901.
+@pytest.mark.parametrize(
+    ("times", "field"),
+    [
+        (Times(atime=2**32, mtime=0), "atime"),
+        (Times(atime=0, mtime=2**32), "mtime"),
+        (Times(atime=0, mtime=-1), "mtime"),
+    ],
+    ids=["atime-too-large", "mtime-too-large", "mtime-negative"],
+)
+def test_a_timestamp_outside_the_v3_field_is_refused_rather_than_truncated(times, field):
+    # Refusing beats wrapping, and the dates that reach this are deliberate rather than
+    # accidental: retention and legal-hold systems set mtimes decades out, so a 2039 hold
+    # that silently became 1970 would read as expired instead of protected.
+    #
+    # The message names which field, the span, and both ceilings -- 2106 unsigned and the
+    # 2038 a signed server stops at. "uint32 out of range: 4294967296" named the type and
+    # not the problem, and the problem here has a date attached to it.
     with pytest.raises(ValueError) as exc:
-        encoded(Attrs(times=Times(atime=2**32, mtime=0)))
-    assert exc.value.args[0] == f"uint32 out of range: {2**32}"
+        encoded(Attrs(times=times))
+    assert exc.value.args[0] == (
+        f"{field} {getattr(times, field)} does not fit filexfer v3's uint32 seconds field, "
+        f"which spans 0 to 4294967295 (1970-01-01T00:00:00Z to 2106-02-07T06:28:15Z); a "
+        f"server reading it as signed stops even earlier, at 2038-01-19T03:14:07Z"
+    )
 
 
 def test_the_last_representable_timestamp_is_accepted():
-    attrs = Attrs(times=Times(atime=0xFFFFFFFF, mtime=0xFFFFFFFF))
+    # The other side of the boundary, so the refusal above is a ceiling rather than pessimism.
+    attrs = Attrs(times=Times(atime=MAX_V3_TIMESTAMP, mtime=MAX_V3_TIMESTAMP))
     assert roundtrip(attrs) == attrs
+
+
+def test_the_documented_ceiling_is_the_instant_the_docstring_names():
+    # MAX_V3_TIMESTAMP is quoted as a date in three docstrings and one error message. This is
+    # what stops those dates drifting from the number they describe.
+    assert MAX_V3_TIMESTAMP == 0xFFFFFFFF
+    assert dt.datetime.fromtimestamp(MAX_V3_TIMESTAMP, dt.UTC).isoformat() == (
+        "2106-02-07T06:28:15+00:00"
+    )
+    # And the earlier ceiling a signed server stops at, which is the one to design against.
+    assert dt.datetime.fromtimestamp(2**31 - 1, dt.UTC).isoformat() == "2038-01-19T03:14:07+00:00"
 
 
 def test_a_size_beyond_uint64_is_refused():

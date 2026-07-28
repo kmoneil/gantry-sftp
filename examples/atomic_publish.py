@@ -21,7 +21,7 @@ from pathlib import Path
 import anyio
 
 from gantry_sftp.exceptions import CapabilityError
-from gantry_sftp.session import UploadResult, open_session
+from gantry_sftp.session import Publish, UploadResult, open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport
 
 
@@ -83,7 +83,7 @@ async def main() -> None:
             # 3. Demanding the real guarantee. On a server with no posix-rename and a
             #    destination that exists, this raises instead of quietly downgrading.
             try:
-                result = await sftp.put(source, str(target), require_atomic=True)
+                result = await sftp.put(source, str(target), publish=Publish(require_atomic=True))
             except CapabilityError as refusal:
                 print("strict      refused:", refusal)
             else:
@@ -97,7 +97,9 @@ async def main() -> None:
             def watch(transferred: int, total: int | None) -> None:
                 sizes.append(in_place.stat().st_size if in_place.exists() else -1)
 
-            result = await sftp.put(source, str(in_place), atomic=False, progress=watch)
+            result = await sftp.put(
+                source, str(in_place), publish=Publish(atomic=False), progress=watch
+            )
             print("in place   ", describe(result))
             print(f"            a watcher saw sizes {sizes[:6]}... (-1 means 'not there yet')")
 

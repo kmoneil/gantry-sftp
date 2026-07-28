@@ -27,15 +27,22 @@ part that decides where a file gets staged is testable without a server.
 from __future__ import annotations
 
 import os
+import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
 __all__ = [
+    "DEFAULT_PUBLISH",
+    "LEGACY_PUBLISH_ARGUMENTS",
     "MAX_STAGED_NAME_LENGTH",
     "Durability",
+    "Publish",
     "PublishMechanism",
     "SizeCheck",
+    "TimePreservation",
     "UploadResult",
+    "publish_from_legacy",
     "split_parent",
     "staged_path",
     "staging_token",
@@ -147,6 +154,180 @@ class SizeCheck(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class Publish:
+    """How an upload becomes visible at its destination.
+
+    One type rather than five arguments, and the grouping is not cosmetic: these five are a
+    single policy with an internal consistency rule, which is why ``put`` had to check them
+    against each other at runtime before it could act on any of them. A type collects the rule
+    where the values are, so a caller reads one concept instead of five booleans whose
+    interactions they have to reconstruct.
+
+    The objection ``pyproject.toml`` raises against parameter objects -- that bundling
+    independent arguments moves fields rather than removing them -- is about the connection
+    entry points, where ``host``, ``port`` and ``identity_file`` really are unrelated. It does
+    not apply here.
+
+    ``require_atomic`` and ``require_fsync`` read awkwardly on their own: you set a flag and
+    then separately say you meant it. They stay, because the distinction is real -- ``atomic``
+    asks for the strongest available mechanism and accepts a downgrade, ``require_atomic``
+    refuses one -- and collapsing them into a tri-state would hide that a downgrade is the
+    normal, documented outcome against most of the field.
+
+    Attributes:
+        atomic: Stage the bytes under a temporary name and rename them over the destination,
+            so a consumer never observes a partial file. On by default.
+        fsync: Send ``fsync@openssh.com`` before publishing, so the bytes are on stable storage
+            rather than in a cache. On by default; silently unavailable on most servers.
+        require_atomic: Raise :class:`~gantry_sftp.exceptions.CapabilityError` rather than fall
+            back to a publish mechanism with an observable window.
+        require_fsync: Raise rather than publish with no durability barrier.
+        staging_name: Where to stage, instead of a generated hidden sibling. Naming it yourself
+            drops the ``EXCL`` that otherwise refuses a collision, so the collision risk moves
+            to you.
+    """
+
+    atomic: bool = True
+    fsync: bool = True
+    require_atomic: bool = False
+    require_fsync: bool = False
+    staging_name: bytes | str | None = None
+
+
+DEFAULT_PUBLISH = Publish()
+"""Stage, flush, rename -- and accept a downgrade where the server cannot do one of those.
+
+A module-level singleton rather than a default constructed per call, so ``put``'s default is
+identity-comparable and a caller can tell "they did not ask" from "they asked for the same
+thing"."""
+
+
+LEGACY_PUBLISH_ARGUMENTS = ("atomic", "fsync", "require_atomic", "require_fsync", "staging_name")
+"""The five names ``put`` took directly before :class:`Publish` collected them.
+
+Still accepted, still meaning exactly what they meant. Kept as data rather than as five
+``if`` branches so the deprecation path and its error messages are one list to update."""
+
+
+def publish_from_legacy(
+    publish: Publish | None, legacy: Mapping[str, object], *, caller: str
+) -> Publish:
+    """Resolve a publish policy from the new argument or the five it replaced.
+
+    The old spelling keeps working and keeps meaning the same thing -- CLAUDE.md's public-API
+    rule -- and this is where that is decided, as a pure function, so the guarantee is provable
+    without a server.
+
+    Args:
+        publish: The policy the caller passed, or ``None`` if they passed none.
+        legacy: Whatever landed in ``**legacy``, which is the old names when they are used and
+            a typo when they are not.
+        caller: The method name, for the messages below.
+
+    Returns:
+        The policy to act on.
+
+    Raises:
+        TypeError: If a name is not one of the five -- because absorbing the old spellings into
+            ``**legacy`` means Python no longer rejects a misspelling for us, and silently
+            ignoring ``atmoic=False`` would publish non-atomically while the caller believes
+            otherwise. Also if both spellings are used at once, which has no single answer:
+            picking either one silently overrides something the caller wrote down.
+    """
+    unknown = sorted(set(legacy) - set(LEGACY_PUBLISH_ARGUMENTS))
+    if unknown:
+        raise TypeError(
+            f"{caller}() got unexpected keyword argument(s) {', '.join(unknown)}; "
+            f"publish policy is now a Publish object passed as publish=, and the accepted "
+            f"legacy names are {', '.join(LEGACY_PUBLISH_ARGUMENTS)}"
+        )
+    if publish is not None and legacy:
+        raise TypeError(
+            f"{caller}() got both publish= and the legacy argument(s) "
+            f"{', '.join(sorted(legacy))}; use one spelling or the other, because there is no "
+            f"correct way to merge them -- either would silently override something you wrote"
+        )
+    if publish is not None:
+        return publish
+    if not legacy:
+        return DEFAULT_PUBLISH
+    # Built field by field rather than splatted, and the reason is not the type checker.
+    # Absorbing these names into `**legacy` threw away the annotations that used to describe
+    # them, so `atomic="no"` -- a truthy string -- would otherwise publish in place while the
+    # caller believed they had asked for the opposite. The checks put that back.
+    #
+    # **Validated before the warning is raised**, so a caller who got the value wrong is told
+    # that rather than told to rename the argument. Under `filterwarnings = error` the order
+    # is not cosmetic: warning first makes the deprecation the only thing they ever see.
+    policy = Publish(
+        atomic=_legacy_flag(legacy, "atomic", DEFAULT_PUBLISH.atomic, caller=caller),
+        fsync=_legacy_flag(legacy, "fsync", DEFAULT_PUBLISH.fsync, caller=caller),
+        require_atomic=_legacy_flag(
+            legacy, "require_atomic", DEFAULT_PUBLISH.require_atomic, caller=caller
+        ),
+        require_fsync=_legacy_flag(
+            legacy, "require_fsync", DEFAULT_PUBLISH.require_fsync, caller=caller
+        ),
+        staging_name=_legacy_staging_name(legacy, caller=caller),
+    )
+    warnings.warn(
+        f"{caller}(): {', '.join(sorted(legacy))} moved into the Publish object -- pass "
+        f"publish=Publish({', '.join(f'{k}=...' for k in sorted(legacy))}) instead. The old "
+        f"names still work and still mean the same thing.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return policy
+
+
+def _legacy_flag(legacy: Mapping[str, object], name: str, default: bool, *, caller: str) -> bool:
+    value = legacy.get(name, default)
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"{caller}(): {name} must be a bool, got {type(value).__name__}; "
+            f"a truthy value that is not True would publish differently than it reads"
+        )
+    return value
+
+
+def _legacy_staging_name(legacy: Mapping[str, object], *, caller: str) -> bytes | str | None:
+    value = legacy.get("staging_name")
+    if value is not None and not isinstance(value, bytes | str):
+        raise TypeError(
+            f"{caller}(): staging_name must be bytes or str, got {type(value).__name__}"
+        )
+    return value
+
+
+class TimePreservation(StrEnum):
+    """Whether the local file's timestamps survived the upload.
+
+    They do not survive by default, and until 0.9 they could not survive at all: a file this
+    library moved arrived stamped with the moment it was moved, in both directions and with
+    nothing to say so. That is a wrong answer rather than a missing one -- every downstream
+    decision keyed on mtime is then made on a fabricated value that looks entirely plausible,
+    which is why it costs real time to find. See D-79.
+
+    Three values for the same reason :class:`Durability` has three: "not asked for" and "asked
+    for and impossible" are different facts, and only the caller can decide what to do about
+    the second.
+    """
+
+    PRESERVED = "preserved"
+    """``FSETSTAT`` was sent with the local file's atime and mtime, and answered ``OK``."""
+
+    UNAVAILABLE = "unavailable"
+    """Asked for, and the server would not: it refused the ``FSETSTAT``, or accepted it and
+    left the times alone. The file is published and correct; only its timestamps are the time
+    of the upload. This never fails the transfer, for the same reason a missing ``fsync`` does
+    not -- the bytes are the payload and the metadata is not worth discarding them over."""
+
+    SKIPPED = "skipped"
+    """``preserve_times=False``, which is the default. The remote file carries the time it was
+    written, which is what a landing zone whose consumer polls for "modified since" wants."""
+
+
+@dataclass(frozen=True, slots=True)
 class UploadResult:
     """What one ``put`` actually did.
 
@@ -163,6 +344,9 @@ class UploadResult:
         size_check: Whether the length was confirmed against the local file. A mismatch
             raises rather than appearing here, so this never says "wrong" -- only whether
             the question was asked and answerable.
+        times: Whether the local file's timestamps survived onto the remote one. ``SKIPPED``
+            unless ``preserve_times=True`` was asked for, because the default leaves the
+            remote file stamped with the time of the upload.
         staged_at: The temp path the bytes were written to first, or ``None`` when they were
             written straight to :attr:`remote_path`. Kept because a failure leaves it behind
             and something has to be able to name it.
@@ -173,6 +357,7 @@ class UploadResult:
     mechanism: PublishMechanism
     durability: Durability
     size_check: SizeCheck
+    times: TimePreservation = TimePreservation.SKIPPED
     staged_at: bytes | None = None
 
     @property

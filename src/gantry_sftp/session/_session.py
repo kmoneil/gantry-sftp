@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +57,7 @@ from gantry_sftp.codec import (
     Codec,
     CodecState,
     Completed,
+    FSetStat,
     Fsync,
     Handle,
     LStat,
@@ -73,9 +74,11 @@ from gantry_sftp.codec import (
     Request,
     Response,
     RmDir,
+    SetStat,
     Stat,
     Status,
     StatusCode,
+    Times,
 )
 from gantry_sftp.codec import (
     Extended as ExtendedRequest,
@@ -112,9 +115,12 @@ from gantry_sftp.session._localpath import DestinationLedger, check_contained, l
 from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._publish import (
     Durability,
+    Publish,
     PublishMechanism,
     SizeCheck,
+    TimePreservation,
     UploadResult,
+    publish_from_legacy,
     split_parent,
     staged_path,
     staging_token,
@@ -256,6 +262,7 @@ class _Upload:
     progress: ProgressCallback | None
     depth: int | None
     resume: bool = False
+    preserve_times: bool = False
 
 
 class DirectoryScan:
@@ -1033,6 +1040,7 @@ class Session:
         no_follow: bool = False,
         resume: bool = False,
         verify_size: bool = True,
+        preserve_times: bool = False,
     ) -> int:
         """Download ``remote_path`` to ``local_path``.
 
@@ -1074,6 +1082,23 @@ class Session:
 
                 It is a length comparison, not a hash: it catches truncation and nothing else.
 
+            preserve_times: Stamp the local file with the remote file's atime and mtime instead
+                of the time of the download. **Off by default**, matching ``scp -p`` and
+                ``rsync -t``; see :meth:`put` for why the default is a decision rather than an
+                omission.
+
+                It costs no round trip -- the times come from the ``STAT`` ``get`` already
+                makes -- and it is applied to the open descriptor after the last write, so a
+                resumed transfer stamps the file once it is whole rather than while it is
+                partial.
+
+                **A server that reports no times leaves the local file stamped with now**, and
+                says so nowhere: ``get`` returns a byte count, and widening that to a result
+                object for one uncommon case is a worse trade than documenting it here. Read
+                :attr:`~gantry_sftp.session.DirEntry.modified` or ``stat()`` first if you need
+                to know whether there was a timestamp to preserve. v3 carries seconds, so
+                sub-second precision is lost whatever this is set to.
+
         Returns:
             Bytes written **by this call**. On a resume that is the remainder, not the file's
             size, and on a resume of an already-complete file it is ``0``.
@@ -1104,6 +1129,7 @@ class Session:
                 remote_path=encoded,
                 no_follow=no_follow,
                 start_offset=start,
+                times=attributes.times if preserve_times else None,
             )
         except BaseException:
             # Closing is not optional: a leaked handle counts against max-open-handles and is
@@ -1138,6 +1164,7 @@ class Session:
         remote_path: bytes,
         no_follow: bool,
         start_offset: int = 0,
+        times: Times | None = None,
     ) -> int:
         """Open the local destination and let the scheduler fill it.
 
@@ -1149,11 +1176,16 @@ class Session:
         ``O_TRUNC`` is dropped when resuming, and that is the whole of the local-side change:
         writes already go to explicit offsets, so keeping the first ``start_offset`` bytes is
         a matter of not deleting them.
+
+        ``times`` is applied to the **descriptor**, not to the path, and only once every write
+        has landed. Both halves matter: a write updates mtime, so stamping earlier would be
+        undone by the transfer itself; and re-opening the path to stamp it would hand a second
+        chance to whatever the ``O_NOFOLLOW`` above exists to refuse.
         """
         flags = _LOCAL_WRITE_FLAGS if not start_offset else _LOCAL_RESUME_FLAGS
         fd = os.open(local_path, flags | (NO_FOLLOW if no_follow else 0), 0o600)
         try:
-            return await download_handle(
+            transferred = await download_handle(
                 self._dispatcher,
                 handle,
                 fd,
@@ -1165,8 +1197,11 @@ class Session:
                 remote_path=remote_path,
                 start_offset=start_offset,
             )
+            if times is not None:
+                os.utime(fd, (times.atime, times.mtime))
         finally:
             os.close(fd)
+        return transferred
 
     # --- walking a tree ---------------------------------------------------------------------
 
@@ -1286,6 +1321,7 @@ class Session:
         *,
         max_depth: int | None = None,
         progress: ProgressCallback | None = None,
+        preserve_times: bool = False,
     ) -> TreeResult:
         """Download a remote tree into ``local_path``, refusing to escape it.
 
@@ -1308,6 +1344,15 @@ class Session:
             max_depth: Levels below the root to descend, or ``None`` for no limit.
             progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
                 each one. A tree-wide total would need the whole walk up front.
+            preserve_times: Carry each file's remote timestamps onto its local copy, and each
+                created directory's onto the local directory. Off by default -- see
+                :meth:`put` for the argument. Costs no round trip either way: a file's times
+                come from the ``STAT`` :meth:`get` already makes, and a directory's from the
+                ``READDIR`` that listed its parent.
+
+                **The destination directory you named is not stamped**, only directories this
+                call creates inside it. Restamping a directory the caller already had would be
+                a side effect on something they did not ask to have modified.
 
         Returns:
             Counts, bytes, and every entry that was skipped with the reason it was.
@@ -1326,6 +1371,10 @@ class Session:
         files = directories = transferred = 0
         skipped: list[Skipped] = []
         collisions: list[PathCollision] = []
+        # Collected during the walk and applied after it -- see _stamp_local_directories.
+        # A directory's times come from its *parent's* listing, which READDIR already
+        # returned, so this costs no round trip.
+        directory_times: list[tuple[Path, Times]] = []
 
         # aclosing, because the common exit from this loop is an exception -- a refused name,
         # a failed transfer -- and a suspended async generator that is merely dropped is left
@@ -1337,6 +1386,12 @@ class Session:
                     _ = _ensure_directory(local_directory)
                     directories += 1
                     collisions.extend(_claim_directory(ledger, local_directory, entry))
+                if preserve_times:
+                    directory_times.extend(
+                        (local_child(local_directory, child.filename), child.attrs.times)
+                        for child in entry.directories
+                        if child.attrs.times is not None
+                    )
                 skipped.extend(entry.skipped)
                 for child in entry.files:
                     moved, collision = await self._get_child(
@@ -1346,6 +1401,7 @@ class Session:
                         child=child,
                         ledger=ledger,
                         progress=progress,
+                        preserve_times=preserve_times,
                     )
                     if collision is not None:
                         collisions.append(collision)
@@ -1356,6 +1412,7 @@ class Session:
                     transferred += moved
                     files += 1
 
+        _stamp_local_directories(directory_times)
         result = TreeResult(files, directories, transferred, tuple(skipped))
         if collisions:
             raise _collision_error(collisions, destination, result)
@@ -1370,6 +1427,7 @@ class Session:
         child: DirEntry,
         ledger: DestinationLedger,
         progress: ProgressCallback | None,
+        preserve_times: bool = False,
     ) -> tuple[int, PathCollision | None]:
         """Transfer one walked file, or report the collision that stopped it.
 
@@ -1382,7 +1440,9 @@ class Session:
         first = ledger.collides_with(target)
         if first is not None:
             return 0, PathCollision(str(target), remote, first)
-        moved = await self.get(remote, target, progress=progress, no_follow=True)
+        moved = await self.get(
+            remote, target, progress=progress, no_follow=True, preserve_times=preserve_times
+        )
         ledger.claim(target, remote)
         return moved, None
 
@@ -1391,14 +1451,12 @@ class Session:
         local_path: Path | str,
         remote_path: bytes | str,
         *,
-        atomic: bool = True,
-        fsync: bool = True,
-        require_atomic: bool = False,
-        require_fsync: bool = False,
-        staging_name: bytes | str | None = None,
+        publish: Publish | None = None,
         resume: bool = False,
+        preserve_times: bool = False,
         progress: ProgressCallback | None = None,
         depth: int | None = None,
+        **legacy: bool | bytes | str | None,
     ) -> UploadResult:
         """Upload ``local_path`` to ``remote_path``, publishing it atomically by default.
 
@@ -1419,23 +1477,15 @@ class Session:
         Args:
             local_path: Local file to read.
             remote_path: Destination on the server.
-            atomic: Publish via a staging file and a rename. ``False`` writes the destination
-                in place, which is what every other SFTP client does by default and is the
-                behaviour a write-only drop directory may require, since staging needs the
-                right to create *and* rename a second name. In place also means a failure
-                leaves the destination truncated: there is no copy to fall back to, which is
-                the other half of what atomic publish buys.
-            fsync: Send ``fsync@openssh.com`` before publishing. Silently unavailable on a
-                server without it, which the result reports as
-                :attr:`~gantry_sftp.session.Durability.UNAVAILABLE`.
-            require_atomic: Fail rather than fall back to a mechanism with a window in which
-                the destination is missing or partial.
-            require_fsync: Fail rather than publish with no durability barrier.
-            staging_name: Override the staging file's name. A bare name is resolved as a
-                sibling of the destination; a value containing ``/`` is used verbatim and must
-                be on the same filesystem. For servers that forbid dot-files or mandate a
-                staging directory -- and the only way to make ``resume`` possible under
-                ``atomic``, since the default staging name is deliberately unguessable.
+            publish: How the bytes become visible at the destination --
+                :class:`~gantry_sftp.session.Publish`, holding ``atomic``, ``fsync``,
+                ``require_atomic``, ``require_fsync`` and ``staging_name``. Omit it for the
+                default policy: stage, flush, rename, and accept a downgrade where the server
+                cannot do one of those.
+
+                Those five used to be arguments here and **still work under their old names**,
+                with a :class:`DeprecationWarning` and unchanged meaning. Passing both spellings
+                at once raises :exc:`TypeError` rather than picking one.
             resume: Continue an interrupted upload from the size the server reports, instead
                 of sending the file again. **Off by default, and it is the weaker of the two
                 directions.** A size match proves the byte *count* agrees and nothing else:
@@ -1457,10 +1507,31 @@ class Session:
                 resuming into one predictable name would interleave into a single file. When
                 ``staging_name`` is given, ``EXCL`` is dropped so the file *can* be adopted,
                 which hands that collision risk to the caller who named it.
+            preserve_times: Stamp the uploaded file with the local file's atime and mtime
+                instead of the time of the upload. **Off by default**, and the default is a
+                decision rather than an omission.
+
+                Off matches ``scp -p`` and ``rsync -t``, so it is the behaviour a reader
+                already expects. More importantly, on-by-default breaks a real deployment: the
+                SFTP landing zone whose consumer collects "files modified since X" never picks
+                up a file that arrived wearing last year's date. That failure is as silent as
+                the one preserving fixes, and it points the other way.
+
+                What it costs when you do want it: one ``FSETSTAT`` on the open handle, which
+                pipelines with the writes rather than adding a round trip of its own. A server
+                that refuses it does **not** fail the upload -- the bytes are the payload -- and
+                :attr:`~gantry_sftp.session.UploadResult.times` says which happened. v3 carries
+                seconds, so sub-second precision is lost whatever this is set to.
             progress: Called with ``(transferred, total)`` as writes are acknowledged. On a
                 resume the first call reports the offset it started from, not zero.
             depth: Requests in flight, overriding the session default. Each one holds a full
                 payload in memory, so this costs more here than on the download side.
+            **legacy: The five publish arguments under their pre-:class:`Publish` names. Absorbed
+                here rather than declared so the compatibility is real and the signature stays
+                inside the project's argument ceiling. A name that is not one of the five raises
+                :exc:`TypeError` naming them, because ``**`` means Python no longer rejects a
+                misspelling for us and a silently ignored ``atmoic=False`` would publish
+                non-atomically while the caller believed otherwise.
 
         Returns:
             What actually happened, including which publish mechanism was used and whether the
@@ -1484,15 +1555,16 @@ class Session:
                 disagrees with the local file's.
         """
         target = _encode_path(remote_path)
+        policy = publish_from_legacy(publish, legacy, caller="put")
         _check_publish_flags(
-            atomic=atomic,
-            fsync=fsync,
-            require_atomic=require_atomic,
-            require_fsync=require_fsync,
+            atomic=policy.atomic,
+            fsync=policy.fsync,
+            require_atomic=policy.require_atomic,
+            require_fsync=policy.require_fsync,
             resume=resume,
-            staging_name=staging_name,
+            staging_name=policy.staging_name,
         )
-        if require_fsync and not self.supports(EXTENSION_FSYNC):
+        if policy.require_fsync and not self.supports(EXTENSION_FSYNC):
             refusal = CapabilityError(
                 f"require_fsync=True but this server does not advertise {EXTENSION_FSYNC}, "
                 f"so nothing can promise the bytes reached stable storage",
@@ -1505,21 +1577,24 @@ class Session:
 
         upload = _Upload(
             local_path=local_path,
-            fsync=fsync,
-            require_fsync=require_fsync,
+            fsync=policy.fsync,
+            require_fsync=policy.require_fsync,
             progress=progress,
             depth=depth,
             resume=resume,
+            preserve_times=preserve_times,
         )
-        if not atomic:
+        if not policy.atomic:
             return await self._put_in_place(upload, target)
-        staged_name = _optional_path(staging_name)
+        staged_name = _optional_path(policy.staging_name)
         if staged_name is None or b"/" not in staged_name:
             # A staging name carrying a separator is used verbatim, so no parent is derived
             # from the target and there is nothing for a foreign namespace to break.
             await self._require_rooted_paths(target, feature="atomic publish")
         staged = staged_path(target, staging_token(), name=staged_name)
-        return await self._put_atomically(upload, target, staged, require_atomic=require_atomic)
+        return await self._put_atomically(
+            upload, target, staged, require_atomic=policy.require_atomic
+        )
 
     # --- put, in its two shapes ------------------------------------------------------------
 
@@ -1584,7 +1659,7 @@ class Session:
         """
         start = await self._upload_resume_offset(upload, target)
         handle = await self.open(target, _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS)
-        transferred, durability = await self._fill_and_close(
+        transferred, durability, times = await self._fill_and_close(
             upload, handle, target, start_offset=start
         )
         # After the fact, necessarily: in place, the destination *is* the file being written,
@@ -1592,7 +1667,9 @@ class Session:
         # the same trade `atomic=False` already makes, and it is why the atomic path checks
         # the staging file instead.
         size_check = await self._confirm_size(target, _local_size(upload.local_path))
-        return UploadResult(transferred, target, PublishMechanism.IN_PLACE, durability, size_check)
+        return UploadResult(
+            transferred, target, PublishMechanism.IN_PLACE, durability, size_check, times
+        )
 
     async def _put_atomically(
         self, upload: _Upload, target: bytes, staged: bytes, *, require_atomic: bool
@@ -1614,7 +1691,12 @@ class Session:
         start = await self._upload_resume_offset(upload, staged)
         handle = await self._open_staging_file(staged, target, resume=upload.resume)
         try:
-            transferred, durability = await self._fill_and_close(
+            # The times land on the *staging* handle, inside `_fill_and_close`, which is the
+            # only place they can: `rename(2)` does not alter a file's mtime, so setting them
+            # before the publish is what makes the published file carry them. Setting them
+            # after the rename would need a second round trip to a path that a consumer can
+            # already see, and would briefly publish a file with the wrong timestamps.
+            transferred, durability, times = await self._fill_and_close(
                 upload, handle, staged, start_offset=start
             )
             # Before the rename, deliberately. Checking the *destination* afterwards would
@@ -1647,7 +1729,9 @@ class Session:
         except BaseException as error:
             await self._discard(staged, error)
             raise
-        return UploadResult(transferred, target, mechanism, durability, size_check, staged)
+        return UploadResult(
+            transferred, target, mechanism, durability, size_check, times, staged_at=staged
+        )
 
     async def _open_staging_file(self, staged: bytes, target: bytes, *, resume: bool) -> bytes:
         """Create the staging file, or fail in a way that names what to do about it.
@@ -1679,11 +1763,21 @@ class Session:
 
     async def _fill_and_close(
         self, upload: _Upload, handle: bytes, path: bytes, *, start_offset: int = 0
-    ) -> tuple[int, Durability]:
-        """Push the file through an open handle, flush it, and close it.
+    ) -> tuple[int, Durability, TimePreservation]:
+        """Push the file through an open handle, set its times, flush it, and close it.
 
-        The flush happens while the handle is still open, because that is the only time it
-        can: ``fsync@openssh.com`` on a closed handle answers ``NO_SUCH_FILE``.
+        Everything except the write happens while the handle is still open, because that is
+        the only time it can: ``fsync@openssh.com`` on a closed handle answers
+        ``NO_SUCH_FILE``, and a handle is the only thing ``FSETSTAT`` can address.
+
+        **Times before the flush**, so the metadata the caller asked to preserve is inside the
+        durability barrier rather than outside it. Getting this order backwards would flush the
+        bytes and then modify the inode, which is a narrower window than the one ``fsync``
+        exists to close but is the same class of mistake.
+
+        Both publish paths route through here, which is what makes one insertion cover them
+        both -- and on the atomic path the handle is the *staging* file's, so the times are set
+        before the rename that publishes it.
         """
         try:
             transferred = await upload_handle(
@@ -1697,6 +1791,7 @@ class Session:
                 remote_path=path,
                 start_offset=start_offset,
             )
+            times = await self._set_times(upload, handle)
             durability = await self._flush(upload, handle)
         except BaseException:
             # Closing is not optional -- a leaked handle counts against max-open-handles and
@@ -1705,7 +1800,7 @@ class Session:
             await _close_quietly(self, handle)
             raise
         await self.close(handle)
-        return transferred, durability
+        return transferred, durability, times
 
     async def _upload_resume_offset(self, upload: _Upload, path: bytes) -> int:
         """How much of ``path`` the server already holds, if we are allowed to trust it.
@@ -1752,6 +1847,54 @@ class Session:
                 local_path=str(upload.local_path),
             )
         return attributes.size
+
+    async def _set_directory_times(self, entries: Sequence[tuple[bytes, Times]]) -> None:
+        """Stamp remote directories, once every file inside them has been written.
+
+        **After, necessarily.** Creating or renaming a file inside a directory updates *that
+        directory's* mtime, so stamping one before its contents exist is undone by the very
+        next transfer. Setting the times of a nested directory does **not** dirty its parent --
+        that only tracks changes to its own entries -- so the order within this pass does not
+        matter and none is imposed.
+
+        ``SETSTAT`` on the path rather than ``FSETSTAT``, because no handle is held: a
+        directory handle comes from ``OPENDIR`` and exists to be read, not written through.
+
+        A refusal is swallowed per directory. The tree's *files* are the payload and they are
+        already published; failing a completed upload because a server would not restamp a
+        directory would be the wrong trade, and it is the same one :meth:`_set_times` makes for
+        a file.
+        """
+        for path, times in entries:
+            with suppress(ServerError):
+                await self._expect_status(SetStat(self._next(), path, Attrs(times=times)))
+
+    async def _set_times(self, upload: _Upload, handle: bytes) -> TimePreservation:
+        """Stamp the open handle with the local file's times, or report why not.
+
+        ``FSETSTAT`` rather than ``SETSTAT`` on the path, for two reasons. On the atomic path
+        the file's name is the staging name and it is about to change, so addressing it by
+        handle is addressing the thing rather than a name for it. And a path-based call between
+        the write and the publish is a second chance for something else to swap what that name
+        refers to.
+
+        The times cannot ride along on the ``OPEN`` that created the handle. OpenSSH's
+        ``process_open`` reads only ``PERMISSIONS`` out of that request's ATTRS, to pass as
+        ``open(2)``'s mode, and ignores ``ACMODTIME`` entirely -- verified in ``sftp-server.c``,
+        not assumed from the draft, which describes the field as settable there.
+        """
+        if not upload.preserve_times:
+            return TimePreservation.SKIPPED
+        attrs = Attrs(times=_local_times(upload.local_path))
+        try:
+            await self._expect_status(FSetStat(self._next(), handle, attrs))
+        except ServerError:
+            # Not fatal, and deliberately so: the bytes are the payload. A server that will
+            # not set times has still stored the file correctly, and discarding a completed
+            # upload over its metadata would be the wrong trade. The result says which
+            # happened -- see TimePreservation.UNAVAILABLE.
+            return TimePreservation.UNAVAILABLE
+        return TimePreservation.PRESERVED
 
     async def _flush(self, upload: _Upload, handle: bytes) -> Durability:
         """Flush the handle, reporting what was possible rather than promising what was not."""
@@ -1932,11 +2075,10 @@ class Session:
         remote_path: bytes | str,
         *,
         max_depth: int | None = None,
-        atomic: bool = True,
-        fsync: bool = True,
-        require_atomic: bool = False,
-        require_fsync: bool = False,
+        publish: Publish | None = None,
+        preserve_times: bool = False,
         progress: ProgressCallback | None = None,
+        **legacy: bool | bytes | str | None,
     ) -> TreeResult:
         """Upload a local tree into ``remote_path``, creating directories as it goes.
 
@@ -1966,18 +2108,29 @@ class Session:
                 the caller named it; nothing inside it is.
             remote_path: Remote destination. Created, with any missing parents, if absent.
             max_depth: Levels below the root to descend, or ``None`` for no limit.
-            atomic: Publish each file via a staging file and a rename. See :meth:`put`.
-            fsync: Send ``fsync@openssh.com`` before publishing each file.
-            require_atomic: Fail rather than fall back to a mechanism with a window.
-            require_fsync: Fail rather than publish with no durability barrier.
+            publish: Publish policy applied to **every file** in the tree -- see :meth:`put`.
+                ``staging_name`` is the one field that makes no sense here, since a tree has
+                many files and one name cannot serve them all; it raises :exc:`ValueError`.
+            preserve_times: Carry each local file's timestamps onto its remote copy, and each
+                created directory's onto the remote directory. Off by default -- see
+                :meth:`put` for the argument. Directories are stamped in a final pass, after
+                every file has been written, because writing into a directory updates that
+                directory's own mtime.
+
+                **The root you named is not stamped**, only directories this call creates
+                under it, matching :meth:`get_tree`.
             progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
                 each one. A tree-wide total would need the whole walk up front.
+            **legacy: The publish arguments under their pre-:class:`Publish` names, as
+                :meth:`put` accepts them and for the same reason.
 
         Returns:
             Counts, bytes, and every entry that was skipped with the reason it was.
 
         Raises:
             UnsafePathError: If a local name could not be a remote path component.
+            ValueError: If ``publish`` carries a ``staging_name``, which one tree's many files
+                cannot share.
             OSError: If a local directory or file cannot be read.
             CapabilityError: If a required guarantee is not available on this server, or if
                 ``remote_path`` is relative and this server's default directory is not rooted
@@ -1986,30 +2139,46 @@ class Session:
             TransferError: If a transfer fails partway.
         """
         root = _encode_path(remote_path)
+        policy = publish_from_legacy(publish, legacy, caller="put_tree")
+        if policy.staging_name is not None:
+            # Caught here rather than at the first file, because the failure is in the request
+            # and not in any one transfer: every file in the tree would stage under the same
+            # name, so the second would collide with the first and the report would blame a
+            # file chosen by walk order.
+            raise ValueError(
+                "put_tree() cannot take a staging_name: it applies to every file in the tree, "
+                "so they would all stage under one name and overwrite each other. Leave it "
+                "unset to get a generated hidden sibling per file."
+            )
         await self._require_rooted_paths(root, feature="uploading a tree")
         await self._mkdir_parents(root)
         files = directories = transferred = 0
         skipped: list[Skipped] = []
+
+        # Collected during the walk and applied after it -- see _set_directory_times. Local
+        # `stat` is free, so this costs nothing until the final pass.
+        directory_times: list[tuple[bytes, Times]] = []
 
         for entry in walk_local(Path(local_path), max_depth=max_depth):
             remote_directory = _remote_directory(root, entry.relative)
             if entry.relative:
                 await self.mkdir(remote_directory, exist_ok=True)
                 directories += 1
+                if preserve_times:
+                    directory_times.append((remote_directory, _local_times(entry.path)))
             skipped.extend(entry.skipped)
             for name in entry.files:
                 result = await self.put(
                     entry.path / os.fsdecode(name),
                     join_remote(remote_directory, remote_component(name)),
-                    atomic=atomic,
-                    fsync=fsync,
-                    require_atomic=require_atomic,
-                    require_fsync=require_fsync,
+                    publish=policy,
+                    preserve_times=preserve_times,
                     progress=progress,
                 )
                 transferred += result.transferred
                 files += 1
 
+        await self._set_directory_times(directory_times)
         return TreeResult(files, directories, transferred, tuple(skipped))
 
     async def _mkdir_parents(self, path: bytes) -> None:
@@ -2266,6 +2435,34 @@ def _local_size(path: Path | str) -> int:
         return Path(path).stat().st_size
     except OSError:
         return 0
+
+
+def _local_times(path: Path | str) -> Times:
+    """A local file's atime and mtime, truncated to the seconds filexfer v3 can carry.
+
+    ``int()`` rather than ``round()``: rounding a timestamp *up* invents a modification that
+    has not happened yet, and a file dated one second into the future is exactly what makes a
+    "modified since" sweep behave differently between two runs of the same upload.
+    """
+    stat_result = Path(path).stat()
+    return Times(atime=int(stat_result.st_atime), mtime=int(stat_result.st_mtime))
+
+
+def _stamp_local_directories(entries: Sequence[tuple[Path, Times]]) -> None:
+    """Apply remote directory times locally, once everything inside them has been written.
+
+    **After, necessarily**, for the reason :meth:`Session._set_directory_times` gives: writing
+    a file into a directory updates that directory's mtime, so stamping it earlier is undone
+    by the next transfer. Touching a nested directory does not dirty its parent, so no order is
+    imposed within this pass.
+
+    A failure is swallowed per directory. The files are the payload and they have all arrived;
+    a directory whose timestamp could not be set -- because the destination is read-only to us,
+    or on a filesystem that will not take one -- is not a reason to fail a completed download.
+    """
+    for path, times in entries:
+        with suppress(OSError):
+            os.utime(path, (times.atime, times.mtime))
 
 
 def _download_resume_offset(local_path: Path | str, size: int | None, remote_path: bytes) -> int:

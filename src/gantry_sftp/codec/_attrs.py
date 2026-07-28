@@ -11,9 +11,14 @@ everything after the ATTRS in the packet.
 So the pairs are single values of type :class:`Owner` and :class:`Times`. The illegal state
 is not validated against; it cannot be written down.
 
-Timestamps are ``uint32`` seconds. That is the v3 wire format, and it is Y2038-bounded no
-matter what Python holds -- :class:`Times` is what a caller sets, the range check happens on
-encode, and nothing here silently truncates a larger value.
+Timestamps are ``uint32`` seconds. That is the v3 wire format and it bounds what this library
+can express no matter what Python holds: :class:`Times` is what a caller sets, the range check
+happens on encode, and nothing here silently truncates a larger value.
+
+The ceiling is **2106-02-07T06:28:15Z** read as unsigned, which is what the draft specifies and
+what OpenSSH's ``Attrib`` stores -- not the 2038 the phrase "Y2038" would suggest. But a server
+that reads the field as *signed* wraps at 2038-01-19 instead, and nothing on the wire says which
+kind it is, so the earlier date is the one to design against. See :data:`MAX_V3_TIMESTAMP`.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from gantry_sftp.codec._constants import AttrFlag
 from gantry_sftp.codec._wire import WireReader, WireWriter
 from gantry_sftp.exceptions import ProtocolError
 
-__all__ = ["Attrs", "Owner", "Times", "decode_attrs", "encode_attrs"]
+__all__ = ["MAX_V3_TIMESTAMP", "Attrs", "Owner", "Times", "decode_attrs", "encode_attrs"]
 
 _KNOWN_FLAGS = (
     AttrFlag.SIZE | AttrFlag.UIDGID | AttrFlag.PERMISSIONS | AttrFlag.ACMODTIME | AttrFlag.EXTENDED
@@ -102,8 +107,45 @@ carries an ATTRS it almost never uses.
 """
 
 
+MAX_V3_TIMESTAMP = 0xFFFFFFFF
+"""The largest instant filexfer v3 can carry: 2106-02-07T06:28:15Z.
+
+Read as *unsigned*, which is what the draft says and what OpenSSH's ``Attrib`` stores. A server
+that treats the field as signed instead wraps at 2038-01-19T03:14:07Z, and nothing on the wire
+distinguishes the two -- so this is our ceiling, not a promise about the far end.
+"""
+
+
+def _write_timestamp(writer: WireWriter, value: int, *, field: str) -> None:
+    """Write one v3 timestamp, refusing a value the format cannot hold.
+
+    Refused rather than truncated, because the wrap is silent and the dates that reach it are
+    deliberate: retention and legal-hold systems set mtimes decades out, and a 2039 hold that
+    silently becomes 1970 is a file that looks expired instead of protected. OpenSSH's own
+    ``stat_to_attrib`` assigns a 64-bit ``time_t`` into a ``u_int32_t`` with no check, so the
+    far end will not catch it either.
+
+    ``ValueError``, not ``ProtocolError``: nothing malformed arrived from a server. A value
+    that does not fit the field is the same class of mistake as a size that does not fit a
+    ``uint64``, and :class:`~gantry_sftp.codec.WireWriter` already answers that with
+    ``ValueError``. Only the message is new -- ``uint32 out of range: 4294967296`` names the
+    type and not the problem, and the problem here has a date attached to it.
+    """
+    if not 0 <= value <= MAX_V3_TIMESTAMP:
+        raise ValueError(
+            f"{field} {value} does not fit filexfer v3's uint32 seconds field, which spans "
+            f"0 to {MAX_V3_TIMESTAMP} (1970-01-01T00:00:00Z to 2106-02-07T06:28:15Z); a "
+            f"server reading it as signed stops even earlier, at 2038-01-19T03:14:07Z"
+        )
+    writer.write_uint32(value)
+
+
 def encode_attrs(writer: WireWriter, attrs: Attrs) -> None:
-    """Append an ATTRS structure to ``writer``."""
+    """Append an ATTRS structure to ``writer``.
+
+    Raises:
+        ProtocolError: If a timestamp does not fit v3's ``uint32`` seconds field.
+    """
     writer.write_uint32(attrs.flags)
     if attrs.size is not None:
         writer.write_uint64(attrs.size)
@@ -113,8 +155,8 @@ def encode_attrs(writer: WireWriter, attrs: Attrs) -> None:
     if attrs.permissions is not None:
         writer.write_uint32(attrs.permissions)
     if attrs.times is not None:
-        writer.write_uint32(attrs.times.atime)
-        writer.write_uint32(attrs.times.mtime)
+        _write_timestamp(writer, attrs.times.atime, field="atime")
+        _write_timestamp(writer, attrs.times.mtime, field="mtime")
     if attrs.extended:
         writer.write_uint32(len(attrs.extended))
         for ext_type, ext_data in attrs.extended:

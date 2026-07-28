@@ -124,6 +124,9 @@ convention = "google"
 # would mean asserting the same string twice, in two spellings, and mutation survivors
 # cluster on the half nobody updates.
 raises-require-match-for = []
+# PT030 is the same rule for warnings, declined for the same reason: the
+# DeprecationWarning text is asserted in full right after the block.
+warns-require-match-for = []
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"

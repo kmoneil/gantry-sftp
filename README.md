@@ -288,9 +288,10 @@ namespace uses `/` is the thing we cannot know without asking. The probe is one 
 `.`, cached for the life of the session and readable as `sftp.server_root`.
 
 What still works on such a server is everything that does no arithmetic: `get()`, `stat()`,
-`open()`, `remove()`, `rename()` and `put(..., atomic=False)` pass your bytes through untouched.
+`open()`, `remove()`, `rename()` and `put(..., publish=Publish(atomic=False))` pass your bytes
+through untouched.
 An atomic `put()` works too if you name the staging path yourself —
-`put(..., staging_name=b"staging/report.part")` — because a staging name containing a separator
+`put(..., publish=Publish(staging_name=b"staging/report.part"))` — because a staging name with a separator
 is used verbatim and no parent is derived from the target.
 
 ## Recursive upload, and removal
@@ -415,7 +416,7 @@ result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
 | `posix-rename`  | The server implements `posix-rename@openssh.com`          | Yes, even over an existing file |
 | `rename`        | No extension, and the destination did not exist           | Yes — v3 `RENAME` cannot overwrite, so success means it appeared whole |
 | `remove-rename` | No extension, and the destination existed                 | **No** — a window with no file  |
-| `in-place`      | You passed `atomic=False`                                 | **No** — the classic behaviour  |
+| `in-place`      | You passed `Publish(atomic=False)`                        | **No** — the classic behaviour  |
 
 `posix-rename` is attempted whether or not the server advertised it, because endpoints
 under-advertise and the cost of asking is one round trip — `OP_UNSUPPORTED` is a definitive
@@ -426,10 +427,10 @@ experiment that costs a nine-gigabyte upload first.
 Refusing to downgrade is one flag, and it fails before moving any bytes where it can:
 
 ```python
-await sftp.put(src, dst, require_atomic=True)  # CapabilityError rather than remove-rename
-await sftp.put(src, dst, require_fsync=True)  # CapabilityError rather than no durability
-await sftp.put(src, dst, atomic=False)  # in place, for a write-only drop directory
-await sftp.put(src, dst, staging_name=b"x.tmp")  # servers that forbid dot-files, or mandate a
+await sftp.put(src, dst, publish=Publish(require_atomic=True))  # rather than remove-rename
+await sftp.put(src, dst, publish=Publish(require_fsync=True))  # rather than no durability
+await sftp.put(src, dst, publish=Publish(atomic=False))  # in place, for a write-only drop dir
+await sftp.put(src, dst, publish=Publish(staging_name=b"x.tmp"))  # servers that forbid dot-files, or mandate a
 # staging directory (same filesystem, or the
 # rename fails)
 ```
@@ -437,7 +438,7 @@ await sftp.put(src, dst, staging_name=b"x.tmp")  # servers that forbid dot-files
 Three limits stated rather than implied. `fsync@openssh.com` flushes the *file*; SFTP has no
 way to flush a directory entry, so the rename that publishes it is never itself durable.
 Staging needs the right to create *and* rename a second name in the destination directory — a
-drop directory that only permits creation needs `atomic=False`. And a failed publish removes
+drop directory that only permits creation needs `Publish(atomic=False)`. And a failed publish removes
 the staging file, with one deliberate exception: once the `remove-rename` fallback has issued
 the `REMOVE`, the staging file may be the only copy of your data, so it is left where it is and
 the error says where that is.
@@ -457,7 +458,7 @@ Off by default in both directions, and the two are not equally trustworthy:
 
 ```python
 await sftp.get("/remote/big.iso", "big.iso", resume=True)          # continue from what is on disk
-await sftp.put("big.iso", "/remote/big.iso", atomic=False, resume=True)
+await sftp.put("big.iso", "/remote/big.iso", publish=Publish(atomic=False), resume=True)
 ```
 
 **Downloading is the stronger claim.** The partial is on your disk, so its length is a fact
@@ -478,7 +479,7 @@ cannot reconstruct. Making that name predictable instead would reintroduce exact
 collision `EXCL` exists to catch, so the choice is handed to the caller:
 
 ```python
-await sftp.put(src, dst, resume=True, staging_name=b".big.iso.part")  # atomic and resumable
+await sftp.put(src, dst, resume=True, publish=Publish(staging_name=b".big.iso.part"))  # atomic + resumable
 ```
 
 With a fixed staging name, `EXCL` is dropped so the file can be adopted — which is also the
@@ -556,6 +557,78 @@ and the width of the chosen algorithm, so a payload that does not divide evenly 
 was read off paramiko's implementation and off a captured frame, and it is committed as a
 golden fixture in both directions with a live test that re-runs the capture, because there is
 no document to notice a disagreement against.
+
+## Timestamps
+
+**A transfer stamps its destination with the time of the transfer unless you ask otherwise.**
+That is the default here and in `scp`, `rsync` and every other SFTP client, and it is worth
+saying out loud because the alternative failure is silent: bytes correct, size check passed,
+result reporting success, and only a field nobody inspects quietly rewritten.
+
+```python
+await sftp.get("/remote/data.parquet", "data.parquet", preserve_times=True)
+await sftp.put("report.csv", "/remote/report.csv", preserve_times=True)
+await sftp.get_tree("/remote/archive", "archive", preserve_times=True)
+```
+
+It costs no round trip on download — the times come from the `STAT` `get` already makes — and
+one `FSETSTAT` on upload, sent on the open handle so it pipelines with the writes. On the
+atomic path it lands on the *staging* file before the rename, because `rename(2)` does not
+alter mtime. On a tree it also stamps the directories the call creates, in a pass after every
+file, since writing into a directory updates that directory's own mtime. **The root you named
+is never stamped** — only what the call creates under it.
+
+A server that refuses does not fail the upload. `UploadResult.times` says which happened:
+
+| | |
+| --- | --- |
+| `preserved` | `FSETSTAT` sent and accepted |
+| `unavailable` | asked for, and the server refused or ignored it |
+| `skipped` | not asked for — the default |
+
+**Why off by default.** On-by-default breaks a real deployment: the SFTP landing zone whose
+consumer collects "files modified since X" never picks up a file that arrived wearing last
+year's date. That is as silent as the failure preserving fixes, pointing the other way, so the
+choice belongs to whoever knows which pipeline they are in.
+
+### Reading a timestamp
+
+```python
+for entry in await sftp.listdir("/incoming"):
+    print(entry.name, entry.modified)  # aware UTC datetime, or None
+```
+
+`entry.modified` is `datetime | None`, and the `None` is the point: `times` is absent whenever
+a server did not set `ACMODTIME`, and coercing that to `0` dates the file to 1970 — which
+reads as "very old" to every `if remote > local`, so a sync built on it either re-transfers
+everything or skips everything, and looks correct doing it.
+
+**Do not read the date off `longname`.** It looks like it carries one and it does not. Measured
+against OpenSSH 10.0p2, all four:
+
+- Modified within the last **half year**: month, day, time — **no year**.
+- Anything else: month, day, year — **no time**. Never both.
+- A *future* mtime falls into the year branch too, because the guard is `now >= st_mtime`.
+- It is rendered in the **server's** timezone. The same instant reads `Jun 23  2025` under
+  `TZ=UTC` and `Jun 24  2025` under `TZ=Asia/Tokyo` — a different calendar **day**, with
+  nothing in the reply saying which offset to undo.
+
+So scraping it gives a wrong date rather than a coarse one. `entry.modified` reads the
+structured field, which is exact.
+
+### What this cannot promise
+
+- **One-second granularity.** v3 has no sub-second field, so two files written in the same
+  second are indistinguishable by mtime and mtime alone is not a change detector.
+- **Clock skew is not ours to correct.** Comparing a local mtime against a remote one compares
+  two machines' clocks.
+- **2038 or 2106.** The wire field is `uint32` seconds: usable to 2106-02-07 read as unsigned,
+  which is what the draft says and what OpenSSH stores, but a server treating it as signed
+  wraps at 2038-01-19 and nothing distinguishes the two. We refuse a value that does not fit
+  rather than truncating it, which matters most for retention and legal-hold systems that set
+  far-future dates deliberately.
+
+`examples/preserve_times.py` runs all of this.
 
 ## Which server is at the other end
 

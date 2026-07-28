@@ -41,7 +41,13 @@ from gantry_sftp.codec import (
     decode,
 )
 from gantry_sftp.exceptions import NoSuchFileError, ServerError
-from gantry_sftp.session import Session, SizeCheck, open_session, parse_vendor_id
+from gantry_sftp.session import (
+    Session,
+    SizeCheck,
+    TimePreservation,
+    open_session,
+    parse_vendor_id,
+)
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -755,3 +761,66 @@ async def test_a_server_whose_replies_go_unread_keeps_reading_our_requests(
 
     assert len(queued) > CHANNEL_WINDOW
     assert codec.outstanding == offset // len(payload)
+
+
+async def test_preserving_timestamps_works_or_degrades_on_every_server(
+    server: MatrixServer, tmp_path: Path
+):
+    """D-79 against something other than OpenSSH, which is the only way to trust the fallback.
+
+    ``preserve_times`` sends an ``FSETSTAT`` carrying an ATTRS whose ``ACMODTIME`` bit governs
+    two positional fields. A server that reads that body differently does not fail: it answers
+    ``OK`` and sets the wrong thing, or sets nothing at all. So this asserts the *file*, not
+    the status -- and it accepts a documented degrade rather than demanding success, because
+    "every extension use degrades" applies to attribute mutation as much as to `posix-rename`.
+
+    Skipped for paramiko: ``SFTPServer`` hands the filesystem to the caller, so an mtime read
+    back off it is :class:`matrix._ParamikoHandler` agreeing with the request this repo just
+    built. That is the fake-confirms-its-author trap, and it would read as a third data point.
+    """
+    skip_where_the_handler_is_ours(server)
+    known_mtime, known_atime = 1_600_000_000, 1_600_000_007
+    source = server.root / "dated.bin"
+    source.write_bytes(b"payload")
+    os.utime(source, (known_atime, known_mtime))
+    remote = server.root / "dated-copy.bin"
+    local = tmp_path / "dated-back.bin"
+
+    async with connected(server) as sftp:
+        result = await sftp.put(source, str(remote), preserve_times=True)
+        await sftp.get(str(remote), local, preserve_times=True)
+
+    if result.times is TimePreservation.UNAVAILABLE:
+        # The documented fallback: the file is published and correct, only its timestamps are
+        # the time of the upload. Asserted rather than tolerated, so a server that starts
+        # refusing shows up as a changed answer instead of a silent one.
+        assert remote.read_bytes() == b"payload"
+        pytest.skip(f"{server.name} refused FSETSTAT for times; degraded as documented")
+
+    assert result.times is TimePreservation.PRESERVED
+    assert int(remote.stat().st_mtime) == known_mtime, (
+        f"{server.name} answered OK to the FSETSTAT and did not set the mtime"
+    )
+    # And the download direction, which needs the server to *report* the times it stored.
+    assert int(local.stat().st_mtime) == known_mtime
+
+
+async def test_every_server_reports_a_modification_time_at_all(server: MatrixServer):
+    """The precondition for the test above, and for anything keyed on mtime.
+
+    ``times`` is optional in v3 and :func:`~gantry_sftp.session.modified_at` answers ``None``
+    when a server omits it. That branch has unit coverage; this measures how hypothetical the
+    omission is in the field, which is a different question and the one a caller planning a
+    sync actually needs answered.
+    """
+    probe = server.root / "has-a-time.txt"
+    probe.write_bytes(b"x")
+
+    async with connected(server) as sftp:
+        entries = await sftp.listdir(str(server.root))
+
+    (entry,) = [e for e in entries if e.name == "has-a-time.txt"]
+    assert entry.modified is not None, (
+        f"{server.name} sent no ACMODTIME, so nothing keyed on mtime can work against it"
+    )
+    assert entry.modified.tzinfo is not None, "a naive datetime is the client's clock"

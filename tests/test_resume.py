@@ -35,7 +35,7 @@ from gantry_sftp.codec import (
     encode,
 )
 from gantry_sftp.exceptions import TransferError
-from gantry_sftp.session import PublishMechanism, open_session
+from gantry_sftp.session import Publish, PublishMechanism, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -226,7 +226,9 @@ async def test_a_resumed_in_place_upload_completes_the_destination(tmp_path: Pat
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        result = await sftp.put(source, str(destination), atomic=False, resume=True)
+        result = await sftp.put(
+            source, str(destination), publish=Publish(atomic=False), resume=True
+        )
 
     assert result.transferred == len(CONTENT) - 30_000
     assert result.mechanism is PublishMechanism.IN_PLACE
@@ -251,7 +253,7 @@ async def test_a_resumed_atomic_upload_adopts_the_named_staging_file(tmp_path: P
         open_session(transport) as sftp,
     ):
         result = await sftp.put(
-            source, str(destination), resume=True, staging_name=b"dest.bin.partial"
+            source, str(destination), publish=Publish(staging_name=b"dest.bin.partial"), resume=True
         )
 
     assert result.transferred == len(CONTENT) - 30_000
@@ -274,7 +276,7 @@ async def test_a_resumed_upload_of_an_already_complete_staging_file_still_publis
         open_session(transport) as sftp,
     ):
         result = await sftp.put(
-            source, str(destination), resume=True, staging_name=b"dest.bin.partial"
+            source, str(destination), publish=Publish(staging_name=b"dest.bin.partial"), resume=True
         )
 
     assert result.transferred == 0
@@ -294,7 +296,7 @@ async def test_a_remote_partial_longer_than_the_local_file_is_refused(tmp_path: 
         open_session(transport) as sftp,
     ):
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, str(destination), atomic=False, resume=True)
+            _ = await sftp.put(source, str(destination), publish=Publish(atomic=False), resume=True)
 
     assert exc.value.args[0] == (
         f"cannot resume: {str(destination).encode()!r} is 5000 bytes on the server and the "
@@ -313,7 +315,9 @@ async def test_a_resumed_upload_with_nothing_on_the_server_sends_the_whole_file(
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        result = await sftp.put(source, str(destination), atomic=False, resume=True)
+        result = await sftp.put(
+            source, str(destination), publish=Publish(atomic=False), resume=True
+        )
 
     assert result.transferred == len(CONTENT)
     assert destination.read_bytes() == CONTENT
@@ -334,7 +338,7 @@ async def test_resumed_upload_progress_starts_where_the_server_left_off(tmp_path
         _ = await sftp.put(
             source,
             str(destination),
-            atomic=False,
+            publish=Publish(atomic=False),
             resume=True,
             progress=lambda t, n: seen.append((t, n)),
         )
@@ -410,7 +414,7 @@ async def test_an_upload_cannot_resume_onto_a_server_that_reports_no_size(tmp_pa
 
     async with open_session(SizelessServer()) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, b"/remote.bin", atomic=False, resume=True)
+            _ = await sftp.put(source, b"/remote.bin", publish=Publish(atomic=False), resume=True)
 
     assert exc.value.args[0] == (
         "resume needs a size for b'/remote.bin' and this server did not report one, "
@@ -496,7 +500,7 @@ async def test_an_upload_killed_partway_resumes_to_a_byte_identical_file(tmp_pat
             _ = await sftp.put(
                 source,
                 str(destination),
-                atomic=False,
+                publish=Publish(atomic=False),
                 depth=1,
                 progress=stop_once_something_has_moved,
             )
@@ -504,7 +508,9 @@ async def test_an_upload_killed_partway_resumes_to_a_byte_identical_file(tmp_pat
         partial = destination.stat().st_size
         assert 0 < partial < len(big), "the transfer was not actually interrupted"
 
-        result = await sftp.put(source, str(destination), atomic=False, resume=True)
+        result = await sftp.put(
+            source, str(destination), publish=Publish(atomic=False), resume=True
+        )
 
     assert destination.read_bytes() == big
     assert result.transferred == len(big) - partial

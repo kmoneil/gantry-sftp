@@ -27,7 +27,15 @@ implementation needs, and none of those want a client's state machine attached.
 
 from __future__ import annotations
 
-from gantry_sftp.codec._attrs import EMPTY_ATTRS, Attrs, Owner, Times, decode_attrs, encode_attrs
+from gantry_sftp.codec._attrs import (
+    EMPTY_ATTRS,
+    MAX_V3_TIMESTAMP,
+    Attrs,
+    Owner,
+    Times,
+    decode_attrs,
+    encode_attrs,
+)
 from gantry_sftp.codec._codec import Codec, CodecState, Completed, Event, Negotiated
 from gantry_sftp.codec._constants import (
     EXTENSION_CHECK_FILE,
@@ -102,6 +110,7 @@ __all__ = [
     "FSYNC_NAME",
     "LIMITS_NAME",
     "MAX_STATUS_CODE",
+    "MAX_V3_TIMESTAMP",
     "NO_REQUEST_ID",
     "OPENSSH_ADVERTISED_EXTENSIONS",
     "POSIX_RENAME_NAME",

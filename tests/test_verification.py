@@ -58,7 +58,7 @@ from gantry_sftp.codec import (
     encode,
 )
 from gantry_sftp.exceptions import TransferError
-from gantry_sftp.session import PublishMechanism, SizeCheck, open_session
+from gantry_sftp.session import Publish, PublishMechanism, SizeCheck, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -307,7 +307,9 @@ async def test_a_truncated_upload_is_refused_before_it_can_be_published(tmp_path
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, b"/incoming/report.csv", staging_name=b".staged")
+            _ = await sftp.put(
+                source, b"/incoming/report.csv", publish=Publish(staging_name=b".staged")
+            )
 
     # The error names the *staging* path, resolved as a sibling of the destination, because
     # that is the file whose length was measured and the one an operator would go looking for.
@@ -331,7 +333,9 @@ async def test_a_whole_upload_reports_the_length_as_matched(tmp_path: Path):
     server = LyingServer(stated_size=14)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, b"/incoming/report.csv", staging_name=b".staged")
+        result = await sftp.put(
+            source, b"/incoming/report.csv", publish=Publish(staging_name=b".staged")
+        )
 
     assert result.size_check is SizeCheck.MATCHED
     assert result.mechanism is PublishMechanism.POSIX_RENAME
@@ -347,7 +351,9 @@ async def test_an_upload_to_a_server_that_reports_no_size_is_unavailable_not_fai
     server = LyingServer(no_size=True)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, b"/incoming/report.csv", staging_name=b".staged")
+        result = await sftp.put(
+            source, b"/incoming/report.csv", publish=Publish(staging_name=b".staged")
+        )
 
     assert result.size_check is SizeCheck.UNAVAILABLE
     assert result.mechanism is PublishMechanism.POSIX_RENAME
@@ -366,7 +372,9 @@ async def test_an_upload_whose_stat_is_refused_is_unavailable_not_failed(tmp_pat
     server = LyingServer(refuse_stat=True)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put(source, b"/incoming/report.csv", staging_name=b".staged")
+        result = await sftp.put(
+            source, b"/incoming/report.csv", publish=Publish(staging_name=b".staged")
+        )
 
     assert result.size_check is SizeCheck.UNAVAILABLE
     assert result.mechanism is PublishMechanism.POSIX_RENAME
@@ -382,7 +390,7 @@ async def test_an_in_place_upload_is_checked_too(tmp_path: Path):
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put(source, b"/incoming/report.csv", atomic=False)
+            _ = await sftp.put(source, b"/incoming/report.csv", publish=Publish(atomic=False))
 
     assert exc.value.args[0] == (
         "uploaded 14 bytes but b'/incoming/report.csv' is 3 bytes on the server; "
@@ -412,7 +420,7 @@ async def test_a_truncated_file_fails_put_tree_and_stops_it(tmp_path: Path):
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as exc:
-            _ = await sftp.put_tree(source, b"/incoming", atomic=False)
+            _ = await sftp.put_tree(source, b"/incoming", publish=Publish(atomic=False))
 
     assert exc.value.args[0] == (
         "uploaded 14 bytes but b'/incoming/a.csv' is 9 bytes on the server; "
@@ -466,7 +474,7 @@ async def test_a_tree_whose_server_will_not_stat_is_not_reported_as_unverified(
     server = LyingServer(refuse_stat=True)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        result = await sftp.put_tree(source, b"/incoming", atomic=False)
+        result = await sftp.put_tree(source, b"/incoming", publish=Publish(atomic=False))
 
     assert result.files == 1
     assert result.transferred == 14

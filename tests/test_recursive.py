@@ -50,6 +50,7 @@ from gantry_sftp.exceptions import (
 )
 from gantry_sftp.session import (
     EntryKind,
+    Publish,
     SkipReason,
     TreeResult,
     join_remote,
@@ -921,7 +922,7 @@ async def test_uploading_without_atomic_leaves_no_staging_file_either(tmp_path: 
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        result = await sftp.put_tree(source, str(destination), atomic=False)
+        result = await sftp.put_tree(source, str(destination), publish=Publish(atomic=False))
 
     assert (destination / "plain.txt").read_bytes() == b"plain"
     assert sorted(item.name for item in destination.iterdir()) == ["plain.txt"]
