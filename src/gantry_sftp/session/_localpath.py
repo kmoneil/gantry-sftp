@@ -30,14 +30,17 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import override
 
 from gantry_sftp.exceptions import UnsafePathError
 
 __all__ = [
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
+    "DestinationLedger",
     "check_component",
     "check_contained",
+    "identity",
     "local_child",
     "unsafe_reason",
 ]
@@ -155,3 +158,72 @@ def check_contained(root: Path, candidate: Path) -> Path:
         reason="a path that escapes the destination directory",
         destination=str(root),
     )
+
+
+def identity(path: Path) -> tuple[int, int]:
+    """The filesystem's own name for a file: ``(st_dev, st_ino)``.
+
+    ``lstat`` rather than ``stat``, and the difference is load-bearing twice. A symlink is its
+    own file here rather than the one it points at, so a link somebody planted in the
+    destination reports its own identity instead of reading as a collision with its target --
+    and the link itself is already refused by the ``O_NOFOLLOW`` the download opens with. Two
+    *names* that the filesystem folds into one file still share an inode, which is the case
+    this exists to see.
+
+    Raises:
+        OSError: Whatever ``lstat`` raises. ``FileNotFoundError`` is the ordinary one and
+            means the path is free.
+    """
+    status = path.lstat()
+    return (status.st_dev, status.st_ino)
+
+
+class DestinationLedger:
+    """Which remote path each local file of a recursive download belongs to.
+
+    **The filesystem decides what "the same file" means, and nothing in Python can.** A tree
+    holding ``README.md`` and ``readme.md`` is legal on ext4 and is one file on APFS and NTFS;
+    so is ``report.`` beside ``report`` on Windows, and an NFC/NFD pair on HFS+. Folding the
+    names here would mean reimplementing that filesystem's own table -- three different tables
+    -- and a wrong guess either refuses a legitimate pair or misses a real collision. Asking
+    ``lstat`` after the write is authoritative on every filesystem and needs no table, because
+    it never asks *why* two names became one file.
+
+    That is also why this is stateful and lives beside the walk rather than in
+    :func:`check_component`: a collision is a property of a *set* of names, and a per-name
+    predicate has nothing to compare against.
+
+    What it prevents: the second write truncating the first while ``get_tree`` reports
+    success. :func:`check_contained` cannot catch that one -- both paths are legitimately
+    inside the destination.
+    """
+
+    def __init__(self) -> None:
+        self._claims: dict[tuple[int, int], bytes] = {}
+
+    @override
+    def __repr__(self) -> str:
+        """Name how many local files have been claimed so far."""
+        return f"<DestinationLedger {len(self._claims)} claimed>"
+
+    def collides_with(self, local: Path) -> bytes | None:
+        """The remote path this run already wrote to ``local``, or ``None`` if it is free.
+
+        Three states, and the third is the one worth naming: the path is claimed, the path is
+        absent, or ``lstat`` failed for some other reason. Absent answers ``None`` because a
+        file that is not there cannot be overwritten. Anything else propagates -- the open
+        that follows will fail on it too, and with a better message than this could give.
+        """
+        try:
+            claimed = identity(local)
+        except FileNotFoundError:
+            return None
+        return self._claims.get(claimed)
+
+    def claim(self, local: Path, remote: bytes) -> None:
+        """Record that ``remote`` is what is on disk at ``local``.
+
+        Called after the write rather than before it: the file has to exist for the
+        filesystem to have an opinion about its identity.
+        """
+        self._claims[identity(local)] = remote

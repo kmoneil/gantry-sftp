@@ -39,7 +39,12 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.exceptions import NoSuchFileError, ServerError, UnsafePathError
+from gantry_sftp.exceptions import (
+    DestinationCollisionError,
+    NoSuchFileError,
+    ServerError,
+    UnsafePathError,
+)
 from gantry_sftp.session import (
     EntryKind,
     SkipReason,
@@ -1000,3 +1005,153 @@ async def test_rmdir_on_a_real_server_refuses_a_populated_directory(tmp_path: Pa
         (root / "a.txt").unlink()
         await sftp.rmdir(str(root))
     assert not root.exists()
+
+
+# --- two remote names, one local file ----------------------------------------------------------
+#
+# The axis CLAUDE.md's Definition of Done names and this repository had never varied. It needs
+# no hostile server and no exotic endpoint: a case-sensitive server holding README.md beside
+# readme.md is entirely legal, and APFS and NTFS -- the defaults on macOS and Windows -- make
+# them one file. Without a check the second write truncates the first and the walk reports
+# success, which is silent data loss that check_contained cannot see, because both paths are
+# legitimately inside the destination.
+
+COLLIDING_TREE = {
+    b"/root": (named(b"README.md", REGULAR, 3), named(b"readme.md", REGULAR, 5)),
+}
+COLLIDING_FILES = {b"/root/README.md": b"AAA", b"/root/readme.md": b"bbbbb"}
+
+
+def fold_case(path: Path) -> tuple[int, int]:
+    """Stand in for a case-folding filesystem, for the cases a hard link cannot reach.
+
+    Directories are one of those: Linux refuses to hard-link them, so the only way to give
+    ``Docs`` and ``docs`` one identity here is to say so. The file-level proof below uses a
+    real hard link and no stub, so at least one of these does not depend on this function
+    being an honest model.
+    """
+    return (0, hash(str(path).lower()))
+
+
+async def test_a_second_name_for_one_local_file_is_refused_not_overwritten(tmp_path: Path):
+    # A hard link is the faithful stand-in: two directory entries, one inode, which is
+    # exactly what a case-folding filesystem hands back for README.md and readme.md.
+    destination = tmp_path / "out"
+    destination.mkdir()
+    first = destination / "README.md"
+    first.write_text("placeholder")
+    os.link(first, destination / "readme.md")
+
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    # The first file is intact. Without the check it holds b"bbbbb" and nothing says so.
+    assert first.read_bytes() == b"AAA"
+    assert caught.value.args[0] == (
+        "1 remote path resolved onto a local file this download had already written, "
+        "and was refused rather than overwriting it"
+    )
+    assert [(item.remote, item.first) for item in caught.value.collisions] == [
+        (b"/root/readme.md", b"/root/README.md")
+    ]
+    assert caught.value.destination == str(destination)
+
+
+async def test_everything_transferable_still_transfers_before_the_error(tmp_path: Path):
+    # Refusing the write that would destroy an earlier one is not a reason to abandon the
+    # files that have nothing wrong with them.
+    destination = tmp_path / "out"
+    destination.mkdir()
+    first = destination / "README.md"
+    first.write_text("placeholder")
+    os.link(first, destination / "readme.md")
+
+    tree = {
+        b"/root": (
+            named(b"README.md", REGULAR, 3),
+            named(b"readme.md", REGULAR, 5),
+            named(b"other.csv", REGULAR, 4),
+        ),
+    }
+    files = {**COLLIDING_FILES, b"/root/other.csv": b"cccc"}
+    server = TreeServer(tree=tree, files=files)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    assert (destination / "other.csv").read_bytes() == b"cccc"
+    assert caught.value.files == 2
+    assert caught.value.transferred == 7
+    assert "transferred 2 files, 7 bytes" in str(caught.value)
+
+
+async def test_a_case_folding_destination_refuses_the_second_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("gantry_sftp.session._localpath.identity", fold_case)
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", tmp_path / "out")
+
+    assert (tmp_path / "out" / "README.md").read_bytes() == b"AAA"
+    assert caught.value.collisions[0].remote == b"/root/readme.md"
+
+
+async def test_two_directories_that_fold_together_are_reported_not_merged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Quieter than the file case and still wrong: the two directories' contents merge, so the
+    # structure is unfaithful even where no individual file is lost.
+    monkeypatch.setattr("gantry_sftp.session._localpath.identity", fold_case)
+    tree = {
+        b"/root": (named(b"Docs", DIRECTORY), named(b"docs", DIRECTORY)),
+        b"/root/Docs": (named(b"a.csv", REGULAR, 3),),
+        b"/root/docs": (named(b"b.csv", REGULAR, 5),),
+    }
+    files = {b"/root/Docs/a.csv": b"aaa", b"/root/docs/b.csv": b"bbbbb"}
+    server = TreeServer(tree=tree, files=files)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", tmp_path / "out")
+
+    assert [(item.remote, item.first) for item in caught.value.collisions] == [
+        (b"/root/docs", b"/root/Docs")
+    ]
+    assert caught.value.files == 2
+
+
+async def test_the_refused_entry_is_reported_in_the_skip_list(tmp_path: Path):
+    destination = tmp_path / "out"
+    destination.mkdir()
+    first = destination / "README.md"
+    first.write_text("placeholder")
+    os.link(first, destination / "readme.md")
+
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError):
+            _ = await sftp.get_tree(b"/root", destination)
+
+    # The reason string is the one a human reads in a report, so it is pinned like the rest.
+    assert SkipReason.DESTINATION_COLLISION == (
+        "the destination filesystem does not tell it apart from an earlier name"
+    )
+
+
+async def test_a_file_left_by_an_earlier_run_is_overwritten_not_refused(tmp_path: Path):
+    # The guard against the check firing on the ordinary case. A destination holding last
+    # week's copy is the normal state of every scheduled transfer, and re-downloading onto it
+    # is the point -- only a file *this* run wrote is protected.
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (destination / "a.csv").write_text("from last week")
+
+    server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get_tree(b"/root", destination)
+
+    assert (destination / "a.csv").read_bytes() == b"aaa"
+    assert result.files == 3

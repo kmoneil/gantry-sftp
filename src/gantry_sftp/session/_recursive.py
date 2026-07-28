@@ -62,6 +62,7 @@ class SkipReason:
     UNKNOWN_KIND = "the server reported no attributes, and a stat did not settle it"
     NOT_A_FILE = "not a regular file or directory"
     TOO_DEEP = "deeper than max_depth"
+    DESTINATION_COLLISION = "the destination filesystem does not tell it apart from an earlier name"
 
 
 @dataclass(frozen=True, slots=True)

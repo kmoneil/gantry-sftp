@@ -50,6 +50,10 @@ exists today:
 - **recursive transfer both ways**: `walk()` and `get_tree()`, with the zip-slip defence that
   makes a hostile server's filenames safe to write, plus `put_tree()` and `rmtree()` — trees
   go up as well as down, and come back off again
+- **destination collisions are refused, not overwritten**: two legal remote names that a
+  case-folding local filesystem makes one file — `README.md` and `readme.md` downloaded onto
+  macOS or Windows — used to lose one silently. The check is filesystem identity rather than
+  name folding, so it covers Unicode normalisation and Windows trailing dots for free
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
 - **resume**, both directions, opt-in and labelled with what it actually proves
@@ -227,6 +231,39 @@ async with aclosing(sftp.walk("/incoming")) as walker:
 
 `max_depth` bounds the descent, which is the only defence against a tree that is infinite
 because the server says it is.
+
+### Two remote names, one local file
+
+A third refusal, and it is the one that needs no hostile server at all:
+
+```python
+try:
+    result = await sftp.get_tree("/incoming", "downloads/")
+except DestinationCollisionError as error:
+    for collision in error.collisions:
+        print(collision.remote, "would overwrite", collision.first, "at", collision.local)
+    print(error.files, "files and", error.transferred, "bytes did transfer")
+```
+
+A server holding `README.md` beside `readme.md` is doing nothing wrong — both names are legal
+on any case-sensitive filesystem. Download them onto **APFS or NTFS, the defaults on macOS and
+Windows**, and they are one file: the second write truncates the first and the walk reports
+success, with one file's contents gone and nothing saying so. Containment cannot catch it,
+because both paths are legitimately inside the destination. Nothing escaped anywhere.
+
+**The check asks the filesystem, not the name.** Every file a tree download writes is
+remembered by `(st_dev, st_ino)`, and a name landing on an inode this run already wrote is
+refused. That never asks *why* two names became one file, so one check covers case folding,
+`report.` beside `report` on Windows, and NFC/NFD pairs on HFS+ — reimplementing three
+filesystems' folding tables in Python would get all three subtly wrong instead.
+
+Everything transferable still transfers; only the write that would destroy an earlier one is
+refused, recorded in `result.skipped`, and reported at the end. A file left by a *previous*
+run is not a collision — overwriting that is the point of re-running a download, and it is
+what `resume=` depends on. Which member of a colliding pair survives is `READDIR` order, so it
+is the server's choice and not reproducible; the error names both.
+
+`examples/destination_collision.py` runs it.
 
 ## Recursive upload, and removal
 

@@ -85,7 +85,9 @@ from gantry_sftp.codec import (
 )
 from gantry_sftp.exceptions import (
     CapabilityError,
+    DestinationCollisionError,
     NoSuchFileError,
+    PathCollision,
     PermissionDeniedError,
     ProtocolError,
     ServerError,
@@ -106,7 +108,7 @@ from gantry_sftp.session._download import (
 )
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
 from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
-from gantry_sftp.session._localpath import check_contained, local_child
+from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
 from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._publish import (
     Durability,
@@ -1245,13 +1247,18 @@ class Session:
 
         Raises:
             UnsafePathError: If a server-supplied name would escape the destination.
+            DestinationCollisionError: If two remote names resolved to one local file. Raised
+                at the end rather than on contact, so everything transferable still transfers;
+                what is refused is only the write that would have destroyed an earlier one.
             NoSuchFileError: If the remote directory does not exist.
             ServerError: If the server refuses.
             TransferError: If a transfer fails partway.
         """
         destination = _ensure_directory(Path(local_path), parents=True)
+        ledger = DestinationLedger()
         files = directories = transferred = 0
         skipped: list[Skipped] = []
+        collisions: list[PathCollision] = []
 
         # aclosing, because the common exit from this loop is an exception -- a refused name,
         # a failed transfer -- and a suspended async generator that is merely dropped is left
@@ -1262,20 +1269,55 @@ class Session:
                 if entry.relative:
                     _ = _ensure_directory(local_directory)
                     directories += 1
+                    collisions.extend(_claim_directory(ledger, local_directory, entry))
                 skipped.extend(entry.skipped)
                 for child in entry.files:
-                    target = check_contained(
-                        destination, local_child(local_directory, child.filename)
-                    )
-                    transferred += await self.get(
-                        join_remote(entry.path, child.filename),
-                        target,
+                    moved, collision = await self._get_child(
+                        destination=destination,
+                        local_directory=local_directory,
+                        entry=entry,
+                        child=child,
+                        ledger=ledger,
                         progress=progress,
-                        no_follow=True,
                     )
+                    if collision is not None:
+                        collisions.append(collision)
+                        skipped.append(
+                            Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION)
+                        )
+                        continue
+                    transferred += moved
                     files += 1
 
-        return TreeResult(files, directories, transferred, tuple(skipped))
+        result = TreeResult(files, directories, transferred, tuple(skipped))
+        if collisions:
+            raise _collision_error(collisions, destination, result)
+        return result
+
+    async def _get_child(
+        self,
+        *,
+        destination: Path,
+        local_directory: Path,
+        entry: WalkEntry,
+        child: DirEntry,
+        ledger: DestinationLedger,
+        progress: ProgressCallback | None,
+    ) -> tuple[int, PathCollision | None]:
+        """Transfer one walked file, or report the collision that stopped it.
+
+        The ledger is consulted **before** the transfer and updated after it. Before, because
+        the point is to not open the earlier file with ``O_TRUNC``; after, because the
+        filesystem has no opinion about a file's identity until it exists.
+        """
+        target = check_contained(destination, local_child(local_directory, child.filename))
+        remote = join_remote(entry.path, child.filename)
+        first = ledger.collides_with(target)
+        if first is not None:
+            return 0, PathCollision(str(target), remote, first)
+        moved = await self.get(remote, target, progress=progress, no_follow=True)
+        ledger.claim(target, remote)
+        return moved, None
 
     async def put(
         self,
@@ -2051,6 +2093,38 @@ def _local_directory(destination: Path, relative: tuple[bytes, ...]) -> Path:
     for name in relative:
         local = local_child(local, name)
     return check_contained(destination, local)
+
+
+def _claim_directory(
+    ledger: DestinationLedger, local_directory: Path, entry: WalkEntry
+) -> tuple[PathCollision, ...]:
+    """Claim a walked directory's local path, reporting a collision rather than merging.
+
+    Directories collapse the same way files do -- ``Docs`` and ``docs`` are one directory on a
+    case-folding filesystem -- and the consequence is quieter: the two remote directories'
+    contents merge, so the *structure* is wrong even where no individual file is lost. Returns
+    a one-element tuple on collision and an empty one otherwise, so the caller stays flat.
+    """
+    first = ledger.collides_with(local_directory)
+    if first is None:
+        ledger.claim(local_directory, entry.path)
+        return ()
+    return (PathCollision(str(local_directory), entry.path, first),)
+
+
+def _collision_error(
+    collisions: list[PathCollision], destination: Path, result: TreeResult
+) -> DestinationCollisionError:
+    """Build the error that ends a tree the destination could not keep the names apart in."""
+    noun, verb = ("path", "was") if len(collisions) == 1 else ("paths", "were")
+    return DestinationCollisionError(
+        f"{len(collisions)} remote {noun} resolved onto a local file this download had "
+        f"already written, and {verb} refused rather than overwriting it",
+        collisions=tuple(collisions),
+        destination=str(destination),
+        files=result.files,
+        transferred=result.transferred,
+    )
 
 
 def _skip_reason(kind: EntryKind) -> str:

@@ -37,8 +37,10 @@ from gantry_sftp.session._listing import (
 from gantry_sftp.session._localpath import (
     WINDOWS_FORBIDDEN_CHARACTERS,
     WINDOWS_RESERVED_NAMES,
+    DestinationLedger,
     check_component,
     check_contained,
+    identity,
     local_child,
     unsafe_reason,
 )
@@ -108,6 +110,7 @@ __all__ = [
     "UNKNOWN",
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
+    "DestinationLedger",
     "DirEntry",
     "DirectoryScan",
     "Dispatcher",
@@ -133,6 +136,7 @@ __all__ = [
     "download_handle",
     "entry_kind",
     "identify",
+    "identity",
     "is_retryable",
     "join_remote",
     "local_child",

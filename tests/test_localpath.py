@@ -22,8 +22,10 @@ from hypothesis import strategies as st
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session import (
     WINDOWS_RESERVED_NAMES,
+    DestinationLedger,
     check_component,
     check_contained,
+    identity,
     local_child,
     unsafe_reason,
 )
@@ -207,3 +209,78 @@ def test_a_sibling_directory_with_a_shared_prefix_is_not_contained(tmp_path: Pat
 
     with pytest.raises(UnsafePathError):
         _ = check_contained(destination, tmp_path / "downloads-evil" / "file.csv")
+
+
+# --- destination collisions -------------------------------------------------------------------
+#
+# The second defence with a data-loss consequence, and unlike zip-slip it needs no hostile
+# server at all: a case-sensitive server holding README.md beside readme.md, downloaded onto
+# APFS or NTFS, is two legal remote names and one local file. Containment cannot see it --
+# both paths are legitimately inside the destination.
+
+
+def test_identity_uses_lstat_so_a_symlink_is_its_own_file(tmp_path: Path):
+    # stat() would report the target's inode here, so a link planted in the destination would
+    # read as a collision with whatever it points at. It is not one: O_NOFOLLOW refuses it.
+    target = tmp_path / "target.txt"
+    target.write_text("x")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+
+    assert identity(link) != identity(target)
+
+
+def test_two_names_for_one_file_share_an_identity(tmp_path: Path):
+    # A hard link is the honest stand-in for case folding on a case-sensitive filesystem:
+    # two directory entries, one inode, which is exactly what APFS gives README.md/readme.md.
+    first = tmp_path / "README.md"
+    first.write_text("first")
+    second = tmp_path / "readme.md"
+    os.link(first, second)
+
+    assert identity(first) == identity(second)
+
+
+def test_an_absent_path_is_free(tmp_path: Path):
+    assert DestinationLedger().collides_with(tmp_path / "nothing-here") is None
+
+
+def test_a_file_this_run_did_not_write_is_not_a_collision(tmp_path: Path):
+    # The ordinary re-download and the whole resume path. A file left by a previous run is
+    # there to be overwritten; only a file *this* run wrote must not be.
+    existing = tmp_path / "a.csv"
+    existing.write_text("from last time")
+
+    assert DestinationLedger().collides_with(existing) is None
+
+
+def test_a_claimed_file_names_the_remote_path_that_holds_it(tmp_path: Path):
+    written = tmp_path / "README.md"
+    written.write_text("first")
+    ledger = DestinationLedger()
+    ledger.claim(written, b"/root/README.md")
+
+    other_name = tmp_path / "readme.md"
+    os.link(written, other_name)
+
+    assert ledger.collides_with(other_name) == b"/root/README.md"
+
+
+def test_a_failure_that_is_not_absence_propagates(tmp_path: Path):
+    # Three states, and this is the third. Absent means free; anything else is a real error
+    # and belongs to the open that follows, which reports it better than a bool could.
+    not_a_directory = tmp_path / "file.txt"
+    not_a_directory.write_text("x")
+
+    with pytest.raises(NotADirectoryError):
+        _ = DestinationLedger().collides_with(not_a_directory / "child")
+
+
+def test_the_ledger_says_how_much_it_is_holding(tmp_path: Path):
+    written = tmp_path / "a.csv"
+    written.write_text("x")
+    ledger = DestinationLedger()
+
+    assert repr(ledger) == "<DestinationLedger 0 claimed>"
+    ledger.claim(written, b"/root/a.csv")
+    assert repr(ledger) == "<DestinationLedger 1 claimed>"

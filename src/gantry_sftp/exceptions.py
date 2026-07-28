@@ -12,15 +12,18 @@ looks like API.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import override
 
 __all__ = [
     "AuthenticationError",
     "CapabilityError",
     "ConnectError",
+    "DestinationCollisionError",
     "HostKeyError",
     "InsecureOptionWarning",
     "NoSuchFileError",
+    "PathCollision",
     "PermissionDeniedError",
     "ProtocolError",
     "SFTPError",
@@ -221,6 +224,74 @@ class UnsafePathError(SFTPError):
         parts = [super().__str__()]
         if self.destination is not None:
             parts.append(f"destination={self.destination!r}")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
+class PathCollision:
+    """Two distinct remote paths that the local filesystem made into one file.
+
+    Attributes:
+        local: The local path both remote names produced.
+        remote: The remote path that was refused. Bytes, because a name that could not be
+            decoded is exactly the kind that collides in surprising ways.
+        first: The remote path that reached that local file first, and whose contents are
+            what is on disk. Which of the two arrives first is ``READDIR`` order, so it is
+            the server's choice and is not reproducible.
+    """
+
+    local: str
+    remote: bytes
+    first: bytes
+
+
+class DestinationCollisionError(SFTPError):
+    """A recursive download could not be written faithfully: two remote names, one local file.
+
+    **The local filesystem, not the server, is what makes this happen.** A remote tree holding
+    both ``README.md`` and ``readme.md`` is entirely legal on a case-sensitive server and is a
+    single file on APFS and NTFS -- the default on macOS and Windows. The same class of
+    collapse produces ``report.`` and ``report`` on Windows, and an NFC/NFD pair on HFS+. So
+    this is not an exotic-server problem: it is reachable by downloading an ordinary Linux tree
+    onto an ordinary laptop.
+
+    **Why it is an error and not a skip.** Without the check, the second write truncates the
+    first and the walk reports success -- the tree looks copied, and one file's contents are
+    gone with nothing anywhere saying so. Unlike the zip-slip case
+    :class:`UnsafePathError` covers, containment cannot see this one: both paths are
+    legitimately inside the destination. Everything transferable is still transferred before
+    this is raised; what is refused is only the write that would have destroyed an earlier one.
+
+    Attributes:
+        collisions: Every refused path, with the remote path that already held its local file.
+        destination: The directory the download was confined to.
+        files: Files that did transfer before this was raised.
+        transferred: Bytes that did transfer before this was raised.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        collisions: tuple[PathCollision, ...],
+        destination: str,
+        files: int = 0,
+        transferred: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.collisions = collisions
+        self.destination = destination
+        self.files = files
+        self.transferred = transferred
+
+    @override
+    def __str__(self) -> str:
+        """Render the message with the first collision and what did get through."""
+        parts = [super().__str__(), f"destination={self.destination!r}"]
+        if self.collisions:
+            first = self.collisions[0]
+            parts.append(f"{first.remote!r} would overwrite {first.first!r} at {first.local!r}")
+        parts.append(f"(transferred {self.files} files, {self.transferred} bytes)")
         return " ".join(parts)
 
 

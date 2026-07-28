@@ -10,6 +10,7 @@ python examples/download.py                       # pipelined get(), with progre
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
 python examples/listing.py                        # listdir() and scandir(), and what a listing can't know
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
+python examples/destination_collision.py          # two remote names, one local file, and the refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
 python examples/resume.py                         # interrupt a transfer, then finish it
 python examples/retry.py                          # a link that drops, reconnected and resumed
@@ -44,6 +45,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, and the names a hostile server gets refused                   |
+| `destination_collision.py` | `DestinationCollisionError`: two legal remote names that a case-folding destination makes one file, and why the check asks the filesystem rather than the name |
 | `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
 | `resume.py`               | `get(resume=)`, `put(resume=)`, and the two refusals — a partial that cannot be a prefix, and atomic without a staging name |
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
