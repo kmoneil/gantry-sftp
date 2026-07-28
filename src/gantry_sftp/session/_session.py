@@ -450,6 +450,18 @@ class Session:
         return self._codec.server_version
 
     @property
+    def reaped(self) -> int:
+        """Handles this session has closed on behalf of an ``OPEN`` nobody was left to receive.
+
+        An ``OPEN`` abandoned by a timeout or a cancellation is still answered by the server,
+        which allocates a handle nothing here would otherwise close. They are cleaned up
+        automatically -- see :meth:`~gantry_sftp.session.Dispatcher.reap_orphans` -- and this
+        is the count, which is worth watching: a number that climbs is a caller giving up on
+        this server often enough to be worth knowing about, not a leak.
+        """
+        return self._dispatcher.reaped
+
+    @property
     def profile(self) -> ServerProfile:
         """Which SFTP implementation this looks like, from what it advertised.
 
@@ -2262,6 +2274,10 @@ async def open_session(
     try:
         async with anyio.create_task_group() as reader:
             _ = reader.start_soon(dispatcher.run)
+            # Beside the reader rather than inside it: the reaper sends, sending takes the
+            # send lock, and a reader waiting on that lock stops draining the pipe. See
+            # `Dispatcher.reap_orphans`.
+            _ = reader.start_soon(dispatcher.reap_orphans)
             try:
                 yield Session(
                     dispatcher,

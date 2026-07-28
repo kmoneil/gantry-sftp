@@ -5,13 +5,10 @@ that the staging file was removed, that the walk stopped. It cannot prove the se
 on the CLOSE -- the fake's handle table is our own idea of one -- and it has no child process
 to leave behind. This lane has both.
 
-**The handle table is read by asking the server, not by reading `/proc`.** `/proc/<pid>/fd`
-is the obvious route and it is unavailable here: this sandbox refuses the fd directory of a
-process it is itself the parent of. Asking is better anyway, because it works wherever the
-protocol does: a `CLOSE` of a handle the server no longer holds is refused, and one it does
-hold is accepted, so `close()` *is* the probe. Both directions of it are calibrated inside
-each test that leans on it -- "the scan found nothing" and "there is nothing to find" are the
-same green test otherwise, which is how a leak passes.
+**The handle table is read by asking the server, not by reading `/proc`.** That probe is
+`conftest.still_open`, shared with the orphaned-handle lane; its docstring says why, and both
+directions of it are calibrated in the test below -- "the probe found nothing" and "there is
+nothing to find" are the same green test otherwise, which is how a leak passes.
 
 Each test cancels at a rendezvous rather than after a sleep: the progress callback fires once
 per reply, so cancelling from inside it lands the cancel mid-transfer on every run.
@@ -24,9 +21,8 @@ import os
 import anyio
 import pytest
 
-from conftest import connect
-from gantry_sftp.codec import OpenFlag, StatusCode
-from gantry_sftp.exceptions import ServerError
+from conftest import connect, still_open
+from gantry_sftp.codec import OpenFlag
 from gantry_sftp.session import DEFAULT_REQUEST_TIMEOUT, open_session
 
 pytestmark = pytest.mark.anyio
@@ -59,28 +55,6 @@ def cancel_on_first_reply(scope: anyio.CancelScope):
             scope.cancel()
 
     return watch
-
-
-async def still_open(sftp, handle: bytes) -> bool:
-    """Whether the server still holds `handle`, asked in the only way the protocol allows.
-
-    Destructive by construction -- a handle that *was* open is closed by the asking -- which
-    is exactly right for the question "was one leaked": the answer is taken and the leak is
-    cleaned up in the same breath.
-    """
-    refused: ServerError | None = None
-    try:
-        await sftp.close(handle)
-    except ServerError as refusal:
-        refused = refusal
-    if refused is None:
-        return True
-    # Measured, not assumed: OpenSSH 10.0p2 answers NO_SUCH_FILE for a handle it does not
-    # hold -- not the catch-all FAILURE that v3's status list invites you to expect. Both are
-    # accepted because another server may spell the refusal the other way; what is asserted
-    # is that a refusal came back rather than something misread as one.
-    assert refused.code in {int(StatusCode.NO_SUCH_FILE), int(StatusCode.FAILURE)}, refused
-    return False
 
 
 async def test_a_cancelled_download_leaves_no_handle_open_on_the_server(ssh_server, tmp_path):

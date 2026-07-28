@@ -41,12 +41,12 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import override
 
 import anyio
 
-from gantry_sftp.codec import Codec, Completed, Event, Request
+from gantry_sftp.codec import Close, Codec, Completed, Event, Handle, Request
 from gantry_sftp.exceptions import ProtocolError, StateError
 from gantry_sftp.transport import Transport
 
@@ -161,8 +161,12 @@ class Dispatcher:
         "_codec",
         "_exchanges",
         "_failure",
+        "_orphan_arrived",
+        "_orphans",
         "_reader_scope",
         "_reading",
+        "_reaped",
+        "_reaper_scope",
         "_routes",
         "_send_lock",
         "_transport",
@@ -188,6 +192,11 @@ class Dispatcher:
         self._reader_scope: anyio.CancelScope | None = None
         """The reader's own scope, so :meth:`close` can stop a task it did not start."""
         self._reading = False
+        self._orphans: deque[bytes] = deque()
+        """Handles from an ``OPEN`` nobody was waiting for. Drained by :meth:`reap_orphans`."""
+        self._orphan_arrived = anyio.Event()
+        self._reaper_scope: anyio.CancelScope | None = None
+        self._reaped = 0
 
     @property
     def codec(self) -> Codec:
@@ -215,6 +224,17 @@ class Dispatcher:
         """
         return self._unclaimed
 
+    @property
+    def reaped(self) -> int:
+        """Orphaned handles a ``CLOSE`` has been sent for by :meth:`reap_orphans`.
+
+        A subset of :attr:`unclaimed`: the replies that were a ``HANDLE``, which are the only
+        unclaimed ones holding a resource open on the far end. Non-zero means abandoned
+        ``OPEN``s are happening -- a timeout, a cancel, a caller that gave up on a slow server
+        -- and that they were cleaned up rather than left to accumulate.
+        """
+        return self._reaped
+
     @override
     def __repr__(self) -> str:
         """Report the routing state a stalled or leaking session would need.
@@ -229,7 +249,7 @@ class Dispatcher:
         )
         return (
             f"<Dispatcher {state} reader={reader} exchanges={len(self._exchanges)} "
-            f"routes={len(self._routes)} unclaimed={self._unclaimed}>"
+            f"routes={len(self._routes)} unclaimed={self._unclaimed} reaped={self._reaped}>"
         )
 
     # --- the reader ------------------------------------------------------------------------
@@ -289,8 +309,22 @@ class Dispatcher:
         exchange = self._routes.pop(event.request.request_id, None)
         if exchange is None:
             self._unclaimed += 1
+            self._orphan(event)
             return
         exchange.deliver(event)
+
+    def _orphan(self, event: Completed) -> None:
+        """Queue a handle from a reply nobody was left to receive.
+
+        A ``HANDLE`` is by definition the answer to an ``OPEN`` or an ``OPENDIR``, so the
+        response type is the whole test -- an abandoned request that failed answers with a
+        ``STATUS`` and allocated nothing. Asking the event rather than tracking which ids were
+        opens keeps this free of bookkeeping that can go stale.
+        """
+        if not isinstance(event.response, Handle):
+            return
+        self._orphans.append(event.response.handle)
+        self._orphan_arrived.set()
 
     def _fail(self, error: BaseException) -> None:
         """Record the failure and wake everyone parked on this connection.
@@ -305,6 +339,56 @@ class Dispatcher:
         for exchange in self._exchanges:
             exchange.fail(error)
 
+    async def reap_orphans(self) -> None:
+        """Close handles from an ``OPEN`` nobody was left to receive. Runs beside the reader.
+
+        A request abandoned by a timeout or a cancellation is still outstanding on the server,
+        and when it was an ``OPEN`` the server answers it by allocating a handle. That reply
+        arrives with no waiter left, and the handle is then open on a session that is otherwise
+        perfectly healthy -- invisible from this side until the server starts refusing to open
+        anything. **Nothing at the call site can prevent it.** There is no checkpoint between
+        the reply and the variable it is assigned to, so what is missing is not a ``try`` in a
+        better place but somebody to notice a reply nobody claimed. This is that somebody
+        (D-75), and it covers the timeout case as much as the cancelled one -- reproduced with
+        no cancellation anywhere, on a default ``request_timeout``.
+
+        **A separate task rather than the reader itself, and that is not a style choice.**
+        Sending takes the send lock, and a reader parked on that lock is a reader not draining
+        the pipe: with a large ``WRITE`` in flight the peer stops reading, our write blocks
+        behind a full channel window, and neither side ever moves again.
+
+        **Never raises**, for the same reason :meth:`run` does not -- it is nobody's awaited
+        task, so anything it raised would surface at the session's boundary or nowhere.
+        Stopped by :meth:`close`, and shielded like the reader, because this *is* cleanup.
+        """
+        with anyio.CancelScope(shield=True) as scope:
+            self._reaper_scope = scope
+            while not self._closed:
+                while self._orphans:
+                    await self._close_orphan(self._orphans.popleft())
+                # Re-armed before the wait and never after, exactly as `Exchange.receive`
+                # does: there is no await between finding the queue empty and arming the
+                # event, so no arrival can fall between them.
+                self._orphan_arrived = anyio.Event()
+                await self._orphan_arrived.wait()
+
+    async def _close_orphan(self, handle: bytes) -> None:
+        """Send one ``CLOSE`` and wait for it, swallowing whatever the connection says.
+
+        A connection that cannot carry the ``CLOSE`` is one whose handles the server releases
+        when the channel closes, so a failure here is not worth reporting and not worth
+        retrying.
+
+        The count moves before the wait, not after, because it counts what was *sent*: an
+        unanswered request may still have been performed, which this repository has already
+        paid to learn once (D-74). Waiting at all is for the reply's sake rather than the
+        count's -- routing it to an exchange is what stops every reap inflating
+        :attr:`unclaimed`, the counter that says a session is a reply behind.
+        """
+        self._reaped += 1
+        with suppress(Exception):
+            _ = await self.round_trip(Close(self._codec.allocate_request_id(), handle))
+
     def close(self) -> None:
         """Refuse further work, and stop the reader. The only thing that stops the reader.
 
@@ -315,11 +399,12 @@ class Dispatcher:
         cancellation and takes its instruction from here, where the session's ``finally`` can
         give it *after* the cleanup it has to serve.
 
-        Idempotent, and safe before the reader starts or after it has stopped.
+        Idempotent, and safe before either task starts or after it has stopped.
         """
         self._closed = True
-        if self._reader_scope is not None:
-            self._reader_scope.cancel()
+        for scope in (self._reader_scope, self._reaper_scope):
+            if scope is not None:
+                scope.cancel()
 
     # --- exchanges -------------------------------------------------------------------------
 

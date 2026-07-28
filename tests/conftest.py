@@ -39,6 +39,7 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
     try:
         async with anyio.create_task_group() as reader:
             reader.start_soon(dispatcher.run)
+            reader.start_soon(dispatcher.reap_orphans)
             try:
                 yield dispatcher
             finally:

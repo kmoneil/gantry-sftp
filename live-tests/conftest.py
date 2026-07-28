@@ -26,8 +26,8 @@ from sshd import (
     scrubbed_ssh_env,
 )
 
-from gantry_sftp.codec import Codec, CodecState
-from gantry_sftp.exceptions import flatten_exception_group
+from gantry_sftp.codec import Codec, CodecState, StatusCode
+from gantry_sftp.exceptions import ServerError, flatten_exception_group
 from gantry_sftp.session import Dispatcher
 from gantry_sftp.transport import Transport, open_ssh_transport
 
@@ -37,7 +37,36 @@ __all__ = [
     "negotiate",
     "running_dispatcher",
     "scrubbed_ssh_env",
+    "still_open",
 ]
+
+
+async def still_open(sftp, handle: bytes) -> bool:
+    """Whether the server still holds `handle`, asked in the only way the protocol allows.
+
+    `/proc/<pid>/fd` is the obvious way to read a server's handle table and it is unavailable
+    here -- this sandbox refuses the fd directory of a process it is the parent of. Asking in
+    the protocol works wherever the protocol does: a CLOSE of a handle the server does not
+    hold is refused, and one it does hold is accepted.
+
+    Destructive by construction -- a handle that *was* open is closed by the asking -- which is
+    right for "was one leaked": the answer is taken and the leak cleaned up in one step. Both
+    directions of it are calibrated in the tests that lean on it, because "the probe found
+    nothing" and "there is nothing to find" are otherwise the same green test.
+    """
+    refused: ServerError | None = None
+    try:
+        await sftp.close(handle)
+    except ServerError as refusal:
+        refused = refusal
+    if refused is None:
+        return True
+    # Measured, not assumed: OpenSSH 10.0p2 answers NO_SUCH_FILE for a handle it does not
+    # hold -- not the catch-all FAILURE that v3's status list invites you to expect. Both are
+    # accepted because another server may spell the refusal the other way; what is asserted is
+    # that a refusal came back rather than something misread as one.
+    assert refused.code in {int(StatusCode.NO_SUCH_FILE), int(StatusCode.FAILURE)}, refused
+    return False
 
 
 def connect(server: SSHServer, **overrides):
@@ -73,6 +102,7 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
     try:
         async with anyio.create_task_group() as reader:
             reader.start_soon(dispatcher.run)
+            reader.start_soon(dispatcher.reap_orphans)
             try:
                 yield dispatcher
             finally:

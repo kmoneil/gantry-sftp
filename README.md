@@ -585,6 +585,14 @@ Cancelling from outside — the `move_on_after` above, a task group whose siblin
 - the partial local file from a cancelled `get` stays, because that is what `resume=True`
   continues from.
 
+**An `OPEN` that was abandoned is cleaned up too, and that one is not about cancellation.** A
+request that timed out or was cancelled is still outstanding on the server, and if it was an
+`OPEN` the server answers it by allocating a handle — which arrives with nobody waiting for it.
+Nothing at the call site can catch that: there is no moment between the reply and the variable
+in which to put a `try`. The session notices the unclaimed reply instead and closes the handle,
+and `sftp.reaped` counts how often it has had to. A number that climbs is not a leak; it is a
+server slow enough that callers are giving up on it.
+
 Cleanup is shielded so it survives the cancellation that triggered it, and **the session's
 reader is shielded for the same reason** — cleanup sends requests, and something has to read
 the replies. When it was not, a cancelled transfer took a full `request_timeout` to unwind and,
