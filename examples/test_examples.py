@@ -137,3 +137,27 @@ def test_the_connect_errors_example_classifies_rather_than_guesses():
     # And it must not have claimed to know more than it does.
     assert "AuthenticationError" not in stdout
     assert "HostKeyError" not in stdout
+
+
+def test_the_verification_example_shows_corruption_slipping_past_the_size_check():
+    """The example's whole argument is one line of its output, so that line is pinned.
+
+    It uploads onto a partial from the wrong source with no ``check-file`` available, and the
+    call *succeeds* with ``size_check=matched`` over a file that is half one upload and half
+    another. If that stops appearing, the example has stopped demonstrating why rungs 1 and 2
+    exist and has become a tour of an API.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "verify_content.py")
+    assert returncode == 0
+    # Rung 1 asked for and absent: reported, never passed off as success.
+    assert "verify=hash        content_check=unavailable" in stdout
+    # Rung 2 needs no extension, which is the point of having it.
+    assert "verify=reread      content_check=reread" in stdout
+    # The failure itself: rung 3 satisfied, contents wrong.
+    assert "size_check=matched -- passed, and the published file is corrupt" in stdout
+    assert "matches the source: False" in stdout
+    # And rung 2 refusing the same prefix on a server that cannot hash anything.
+    assert "cannot resume:" in stdout

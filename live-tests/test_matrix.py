@@ -40,11 +40,21 @@ from gantry_sftp.codec import (
     Write,
     decode,
 )
-from gantry_sftp.exceptions import NoSuchFileError, ServerError
+from gantry_sftp.exceptions import (
+    NoSuchFileError,
+    ServerError,
+    TransferError,
+    TransferTimeoutError,
+)
 from gantry_sftp.session import (
+    CHECK_FILE_BLOCK_SIZE,
+    ContentCheck,
+    Publish,
+    ResumeCheck,
     Session,
     SizeCheck,
     TimePreservation,
+    Verify,
     open_session,
     parse_vendor_id,
 )
@@ -408,6 +418,130 @@ async def test_check_file_with_no_algorithm_in_common_is_refused(server: MatrixS
             await sftp.close(handle)
 
     assert exc.value.message == b"No supported hash types found"
+
+
+async def test_the_default_block_size_hashes_a_file_larger_than_one_read(
+    server: MatrixServer, tmp_path: Path
+):
+    """D-38's regression, and it is bounded so a regression *fails* rather than hangs.
+
+    ``check_file``'s ``block_size`` defaulted to ``0`` -- the wire value for "one digest over
+    the whole range" -- until 0.9. Against paramiko that is a **hang** for any range over
+    64 KiB, because ``_check_file``'s inner loop advances by a cumulative count where it means
+    a per-read length, and once the runaway offsets pass EOF ``readfile.read()`` returns
+    ``b""``, which the loop does not count as progress. Its own :meth:`SFTPHandle.read`
+    documents returning exactly that at EOF, so the two halves disagree in stock code.
+
+    Every earlier case in this file hashes 10 KiB, which is under the boundary, so none of
+    them could have found it. This one is 200 KiB.
+
+    The timeout is the point of the test as much as the assertion. A run that hangs reads as a
+    slow machine rather than as a caught regression -- the lesson D-36 left behind -- so this
+    bounds itself and fails with a message naming what it was waiting for. **Measured against
+    the old default**: it fails, and the `CLOSE` in the teardown times out too, because the
+    server thread never leaves that loop and answers nothing else for the rest of the session.
+    That second timeout is why the handle is not closed on the failing path -- there is nothing
+    left to close it with.
+    """
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    payload = b"".join(bytes([n % 251]) * 1024 for n in range(200))
+    target = server.root / "over-one-read.bin"
+    target.write_bytes(payload)
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target))
+        try:
+            with anyio.fail_after(30):
+                algorithm, digests = await sftp.check_file(handle, algorithms=b"sha1")
+        except (TimeoutError, TransferTimeoutError):
+            pytest.fail(
+                "check_file did not answer: block_size reached the server as something over "
+                "64 KiB and paramiko is now looping in _check_file, permanently"
+            )
+        await sftp.close(handle)
+
+    assert algorithm == b"sha1"
+    assert digests == tuple(
+        hashlib.sha1(payload[start : start + CHECK_FILE_BLOCK_SIZE], usedforsecurity=False).digest()
+        for start in range(0, len(payload), CHECK_FILE_BLOCK_SIZE)
+    )
+
+
+async def test_a_resume_onto_a_wrong_prefix_is_refused_by_a_server_that_can_prove_it(
+    server: MatrixServer, tmp_path: Path
+):
+    """D-38's gate, against the one implementation of ``check-file`` this project can reach.
+
+    The scripted half in ``tests/test_content_verification.py`` proves the gate *fires*. This
+    proves it fires against a server whose digests we did not compute, over a real ``ssh``
+    connection -- the difference between agreeing with our idea of a server and agreeing with
+    one.
+    """
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"correct " * 512)
+    destination = server.root / "resumed.bin"
+    # A partial of the right length for its offset and the wrong bytes: exactly what a size
+    # match cannot refuse, and what the finished upload's size check would have accepted.
+    destination.write_bytes(b"WRONG!! " * 128)
+
+    async with connected(server) as sftp:
+        with pytest.raises(TransferError) as exc:
+            _ = await sftp.put(source, str(destination), publish=Publish(atomic=False), resume=True)
+
+    assert "are not a prefix of" in exc.value.args[0]
+    assert exc.value.offset == 1024
+    # Refused before a byte was sent, so the partial is exactly as it was found.
+    assert destination.read_bytes() == b"WRONG!! " * 128
+
+
+async def test_a_resume_onto_a_matching_prefix_is_proven_and_completed(
+    server: MatrixServer, tmp_path: Path
+):
+    # The other half: the gate must not misfire on the partial it is supposed to accept, and
+    # the upload must still send only the remainder rather than starting over.
+    if server.name != "paramiko":
+        pytest.skip(f"{server.name} does not advertise check-file")
+
+    payload = b"correct " * 512
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+    destination = server.root / "resumable.bin"
+    destination.write_bytes(payload[:1024])
+
+    async with connected(server) as sftp:
+        result = await sftp.put(
+            source, str(destination), publish=Publish(atomic=False), resume=True
+        )
+
+    assert result.resume_check is ResumeCheck.MATCHED
+    assert result.transferred == len(payload) - 1024
+    assert destination.read_bytes() == payload
+
+
+async def test_rung_2_verifies_content_on_every_server_in_the_matrix(
+    server: MatrixServer, tmp_path: Path
+):
+    """Rung 2's reason for existing: it needs no extension, so it works everywhere.
+
+    Not skipped for any row. ``check-file`` is paramiko-only, which is precisely why the
+    library cannot offer content verification through it alone -- and this is the assertion
+    that the fallback is genuinely universal rather than merely documented as such.
+    """
+    payload = os.urandom(300_007)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+    destination = server.root / "verified.bin"
+
+    async with connected(server) as sftp:
+        result = await sftp.put(source, str(destination), verify=Verify.REREAD)
+
+    assert result.content_check is ContentCheck.REREAD
+    assert destination.read_bytes() == payload
 
 
 async def test_only_paramiko_offers_hash_based_verification(server: MatrixServer):

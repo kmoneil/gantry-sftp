@@ -180,7 +180,7 @@ capped, because a silent cap breaks the legitimate large directory *and* reports
 async with sftp.scandir("/incoming") as entries:
     async for entry in entries:
         if entry.is_file and entry.name.endswith(".csv"):
-            break            # the directory handle goes back here
+            break  # the directory handle goes back here
 ```
 
 It is a context manager rather than a bare generator because it holds a directory handle
@@ -406,6 +406,8 @@ result.transferred  # 41310
 result.mechanism  # posix-rename | rename | remove-rename | in-place
 result.durability  # fsynced | unavailable | skipped
 result.size_check  # matched | unavailable — rung 3, below
+result.content_check  # hashed | reread | unavailable | skipped — rungs 1 and 2, below
+result.resume_check  # matched | unavailable | skipped — what the adopted prefix proved
 result.atomic  # True — no consumer could observe a partial destination
 result.durable  # True — the bytes reached stable storage before the rename
 result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
@@ -430,7 +432,9 @@ Refusing to downgrade is one flag, and it fails before moving any bytes where it
 await sftp.put(src, dst, publish=Publish(require_atomic=True))  # rather than remove-rename
 await sftp.put(src, dst, publish=Publish(require_fsync=True))  # rather than no durability
 await sftp.put(src, dst, publish=Publish(atomic=False))  # in place, for a write-only drop dir
-await sftp.put(src, dst, publish=Publish(staging_name=b"x.tmp"))  # servers that forbid dot-files, or mandate a
+await sftp.put(
+    src, dst, publish=Publish(staging_name=b"x.tmp")
+)  # servers that forbid dot-files, or mandate a
 # staging directory (same filesystem, or the
 # rename fails)
 ```
@@ -457,7 +461,7 @@ and the other that it may have been.
 Off by default in both directions, and the two are not equally trustworthy:
 
 ```python
-await sftp.get("/remote/big.iso", "big.iso", resume=True)          # continue from what is on disk
+await sftp.get("/remote/big.iso", "big.iso", resume=True)  # continue from what is on disk
 await sftp.put("big.iso", "/remote/big.iso", publish=Publish(atomic=False), resume=True)
 ```
 
@@ -471,6 +475,34 @@ Both refuse rather than guess in two cases. A partial *longer* than the file it 
 to be a prefix of is a `TransferError`, not a truncation. And a server that will not report a
 size makes the check impossible, so the resume is refused instead of silently starting over.
 
+**And where a content check is available, the adopted prefix is gated on it.** The failure a
+size match cannot refuse is a partial of the *right* length from the *wrong* source — a
+previous run against a different file, a truncated staging file, a concurrent writer. That
+upload completes, publishes, and passes the size check, because the finished length is
+correct. The gate hashes the prefix on both sides and refuses before a byte is sent:
+
+```python
+result = await sftp.put(src, dst, publish=Publish(atomic=False), resume=True)
+result.resume_check  # matched | unavailable | skipped
+```
+
+| | when it runs | what it costs |
+| --- | --- | --- |
+| rung 1 | automatically, where the server advertises `check-file` | one `OPEN`/`EXTENDED`/`CLOSE`, no payload |
+| rung 2 | only under `verify=Verify.REREAD` | re-reads the whole adopted prefix |
+| neither | the default case — `resume_check` is `unavailable` | nothing, and the claim stays the weak one |
+
+Rung 1 is automatic because it moves no bytes, so gating on it where it exists is free.
+Rung 2 is not, because re-reading the prefix is most of what resume set out to avoid — worth
+asking for on an asymmetric link, where reading back is cheaper than sending again, and that
+is a fact about your link rather than ours. A refusal leaves the partial exactly as it was
+found: it may be another publisher's, and it is the only evidence of what went wrong.
+
+The download side is gated too, including the case where the local file is *already complete* —
+that one adopts the whole file and returns success having moved nothing, which makes it the
+one most worth checking rather than the one to skip. `get` returns an `int`, so it can refuse
+but has nothing to report `unavailable` on.
+
 **`resume=True` with `atomic=True` needs an explicit `staging_name`**, and raises `ValueError`
 without one. Not because `CREAT|EXCL` refuses to adopt a leftover staging file — it never
 meets one. The staging name carries fresh randomness on every call, which is what stops two
@@ -479,7 +511,9 @@ cannot reconstruct. Making that name predictable instead would reintroduce exact
 collision `EXCL` exists to catch, so the choice is handed to the caller:
 
 ```python
-await sftp.put(src, dst, resume=True, publish=Publish(staging_name=b".big.iso.part"))  # atomic + resumable
+await sftp.put(
+    src, dst, resume=True, publish=Publish(staging_name=b".big.iso.part")
+)  # atomic + resumable
 ```
 
 With a fixed staging name, `EXCL` is dropped so the file can be adopted — which is also the
@@ -501,15 +535,49 @@ built. Neither is committed.
 
 Three rungs, and the library is explicit about which one you actually got:
 
-1. **Server-side hash** — `check_file()`, where the server has it. Verifies *content* without
-   moving the bytes again.
-2. **Full re-read** — download what you uploaded and compare. Works anywhere, costs a second
-   transfer, so it is opt-in paranoid mode.
-3. **Size check** — always. Catches truncation, which is the common failure, and nothing else.
+1. **Server-side hash** — `verify=Verify.HASH`, where the server has it. Verifies *content*
+   without moving the bytes again.
+2. **Full re-read** — `verify=Verify.REREAD`. Reads back what you uploaded and compares it.
+   Works anywhere, costs a second transfer, so it is opt-in paranoid mode.
+3. **Size check** — always, no flag. Catches truncation, which is the common failure, and
+   nothing else.
+
+```python
+result = await sftp.put("report.csv", "/incoming/report.csv", verify=Verify.REREAD)
+result.content_check  # hashed | reread | unavailable | skipped
+result.size_check  # matched | unavailable — rung 3, always
+```
 
 **Rung 3 is what you get by default, everywhere**, because OpenSSH does not implement
 `check-file` — it answers `OP_UNSUPPORTED` under all three spellings. Calling a size
 comparison a "verified transfer" is the sort of thing this library exists to stop doing.
+
+Which is also why **rung 2 is the one that matters in the field**: it asks for nothing but
+`READ`, so it is the only content check most endpoints can offer. It costs a second transfer
+*and* temporary local disk equal to the file, in `$TMPDIR` — the bytes come back at full
+pipelined speed into a scratch file and are compared from there, rather than one round trip
+per block. Asking for rung 1 where the server has no `check-file` reports `unavailable`, never
+success:
+
+| `verify=` | rung | works against | cost |
+| --- | --- | --- | --- |
+| `Verify.SIZE` *(default)* | 3 only | everything | nothing beyond the `STAT` every `put` makes |
+| `Verify.HASH` | 1, else `unavailable` | `check-file` servers — paramiko, ProFTPD, some appliances | one round trip, no payload |
+| `Verify.REREAD` | 2 | everything | a second transfer + scratch disk |
+
+A **mismatch** never appears as a value: it raises `TransferError`, and under `atomic` it
+raises *before the rename*, so corrupt content never becomes the destination.
+
+`verify=` is on `put` and not on `get`. The download side has the local file already, so
+"read it back" means downloading twice, and rung 1 there is reachable through `check_file()`
+directly; the blocker on a `get(verify=)` is that `get` returns an `int` and so has nowhere to
+report `unavailable` — a silent degrade being the one outcome this ladder exists to prevent.
+
+If you call `check_file()` yourself, leave `block_size` alone. It defaults to
+`CHECK_FILE_BLOCK_SIZE` (64 KiB) because that is the largest block paramiko answers correctly:
+above it the digests cover the wrong bytes and the server thread ends up in a loop it never
+leaves, and `block_size=0` — "one digest over the whole range" — is that same loop for any
+file over 64 KiB, and a `FAILURE` for any range under 256 bytes. Measured, not inferred.
 
 Rung 3 is not free of decisions, so here is what it actually does:
 
@@ -633,9 +701,9 @@ structured field, which is exact.
 ## Which server is at the other end
 
 ```python
-sftp.profile.name       # "openssh" | "asyncssh" | "paramiko" | "unknown"
-sftp.profile.version    # "2.24.0", where the server volunteers one
-repr(sftp)              # <Session server=asyncssh/2.24.0 version=3 extensions=11 ...>
+sftp.profile.name  # "openssh" | "asyncssh" | "paramiko" | "unknown"
+sftp.profile.version  # "2.24.0", where the server volunteers one
+repr(sftp)  # <Session server=asyncssh/2.24.0 version=3 extensions=11 ...>
 ```
 
 Worked out from the extension list the handshake already carried, so it costs no round trip,

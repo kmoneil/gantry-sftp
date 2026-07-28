@@ -96,8 +96,15 @@ from gantry_sftp.session._session import (
     raise_for_status,
 )
 from gantry_sftp.session._upload import upload_handle
+from gantry_sftp.session._verify import (
+    CHECK_FILE_BLOCK_SIZE,
+    ContentCheck,
+    ResumeCheck,
+    Verify,
+)
 
 __all__ = [
+    "CHECK_FILE_BLOCK_SIZE",
     "DEFAULT_ATTEMPTS",
     "DEFAULT_BACKOFF",
     "DEFAULT_BACKOFF_MAX",
@@ -116,6 +123,7 @@ __all__ = [
     "UNKNOWN",
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
+    "ContentCheck",
     "DestinationLedger",
     "DirEntry",
     "DirectoryScan",
@@ -127,6 +135,7 @@ __all__ = [
     "ProgressCallback",
     "Publish",
     "PublishMechanism",
+    "ResumeCheck",
     "ServerLimits",
     "ServerProfile",
     "Session",
@@ -137,6 +146,7 @@ __all__ = [
     "TransferSizes",
     "TreeResult",
     "UploadResult",
+    "Verify",
     "WalkEntry",
     "accessed_at",
     "check_component",

@@ -32,6 +32,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from gantry_sftp.session._verify import ContentCheck, ResumeCheck
+
 __all__ = [
     "DEFAULT_PUBLISH",
     "LEGACY_PUBLISH_ARGUMENTS",
@@ -347,6 +349,13 @@ class UploadResult:
         times: Whether the local file's timestamps survived onto the remote one. ``SKIPPED``
             unless ``preserve_times=True`` was asked for, because the default leaves the
             remote file stamped with the time of the upload.
+        content_check: Whether the *content* was verified, and by which rung of DESIGN.md 6's
+            ladder. ``SKIPPED`` unless ``verify=`` asked for one, because rungs 1 and 2 both
+            cost something and neither is the default. Distinct from :attr:`size_check` on
+            purpose: the right number of wrong bytes passes that one every time.
+        resume_check: Whether the partial a resume adopted was proven to be a prefix of the
+            local file. ``SKIPPED`` when nothing was adopted, which includes every upload that
+            did not ask to resume.
         staged_at: The temp path the bytes were written to first, or ``None`` when they were
             written straight to :attr:`remote_path`. Kept because a failure leaves it behind
             and something has to be able to name it.
@@ -358,6 +367,8 @@ class UploadResult:
     durability: Durability
     size_check: SizeCheck
     times: TimePreservation = TimePreservation.SKIPPED
+    content_check: ContentCheck = ContentCheck.SKIPPED
+    resume_check: ResumeCheck = ResumeCheck.SKIPPED
     staged_at: bytes | None = None
 
     @property
