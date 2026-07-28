@@ -24,12 +24,14 @@ from gantry_sftp.codec import (
     Handle,
     Init,
     LStat,
+    MkDir,
     Name,
     NameEntry,
     Open,
     OpenDir,
     Read,
     ReadDir,
+    RealPath,
     Remove,
     RmDir,
     Stat,
@@ -40,6 +42,7 @@ from gantry_sftp.codec import (
     encode,
 )
 from gantry_sftp.exceptions import (
+    CapabilityError,
     DestinationCollisionError,
     NoSuchFileError,
     ServerError,
@@ -106,8 +109,13 @@ class TreeServer:
         refuse: dict[str, StatusCode] | None = None,
         others: set[bytes] | None = None,
         opaque: set[bytes] | None = None,
+        root: bytes = b"/home/user",
     ) -> None:
         self.tree = dict(tree)
+        # What REALPATH of b"." answers. A value not starting with b"/" is a server whose
+        # namespace is not the one this library's path arithmetic assumes -- VMS, an MVS
+        # dataset name -- which is the axis D-77 exists to vary.
+        self.root = root
         self.files = dict(files or {})
         self.refuse = dict(refuse or {})
         # Paths that exist and are not regular files: symlinks, fifos, and entries the
@@ -188,6 +196,7 @@ class TreeServer:
             LStat: self._on_stat,
             Remove: self._on_remove,
             RmDir: self._on_rmdir,
+            RealPath: self._on_realpath,
         }
         handler = handlers.get(type(packet))
         if handler is None:
@@ -197,6 +206,9 @@ class TreeServer:
 
     def _on_init(self, packet: Init) -> None:
         self._reply(Version(3))
+
+    def _on_realpath(self, packet: RealPath) -> None:
+        self._reply(Name(packet.request_id, (NameEntry(self.root, self.root, Attrs()),)))
 
     def _on_opendir(self, packet: OpenDir) -> None:
         if (refusal := self.refuse.get("opendir")) is not None:
@@ -1155,3 +1167,92 @@ async def test_a_file_left_by_an_earlier_run_is_overwritten_not_refused(tmp_path
 
     assert (destination / "a.csv").read_bytes() == b"aaa"
     assert result.files == 3
+
+
+# --- a namespace that is not rooted at "/" -----------------------------------------------------
+#
+# D-77, split out of D-37. Every remote path this library builds is "/" arithmetic on bytes,
+# which is what draft-ietf-secsh-filexfer-02 6.2 says to assume -- "File names are assumed to
+# use the slash ('/') character as a directory separator", and "otherwise, no syntax is defined
+# for file names by this specification". So on a server whose namespace is not "/"-shaped there
+# is no correct join to perform, and the answer is to refuse rather than build a path the server
+# does not mean.
+
+VMS_ROOT = b"DISK$USER:[SMITH]"
+
+RELATIVE_TREE = {
+    b"incoming": (named(b"a.csv", REGULAR, 3),),
+}
+RELATIVE_FILES = {b"incoming/a.csv": b"aaa"}
+
+
+async def test_an_absolute_path_never_asks_the_server_where_it_is(tmp_path: Path):
+    # The cheap half, and the reason this costs nothing in the common case. 6.2: a name
+    # starting with "/" is absolute and relative to the root of the filesystem, so the caller
+    # has already asserted the namespace the arithmetic assumes. No REALPATH is sent at all --
+    # even on a server that would have answered with a foreign one.
+    server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES, root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get_tree(b"/root", tmp_path / "out")
+
+    assert result.files == 3
+    assert not [packet for packet in server.seen if isinstance(packet, RealPath)]
+    assert sftp.server_root is None
+
+
+async def test_a_relative_path_on_a_rooted_server_is_fine(tmp_path: Path):
+    server = TreeServer(tree=RELATIVE_TREE, files=RELATIVE_FILES, root=b"/home/smith")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get_tree(b"incoming", tmp_path / "out")
+
+    assert result.files == 1
+    assert (tmp_path / "out" / "a.csv").read_bytes() == b"aaa"
+    assert sftp.server_root == b"/home/smith"
+
+
+async def test_a_relative_walk_on_a_rootless_server_is_refused(tmp_path: Path):
+    server = TreeServer(tree=RELATIVE_TREE, files=RELATIVE_FILES, root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(CapabilityError) as caught:
+            _ = await sftp.get_tree(b"incoming", tmp_path / "out")
+
+    assert caught.value.args[0] == (
+        "walking a tree builds remote paths by '/' arithmetic and this server's default "
+        "directory is not rooted at '/': REALPATH of b'.' answered b'DISK$USER:[SMITH]'. "
+        "draft-ietf-secsh-filexfer-02 6.2 defines no other filename syntax, so joining or "
+        "splitting b'incoming' would produce a path this server does not mean. Pass an "
+        "absolute '/'-rooted path, or drive the per-file operations yourself with paths you "
+        "build"
+    )
+    assert caught.value.feature == "walking a tree"
+    assert caught.value.path == b"incoming"
+    assert not caught.value.missing
+    # Nothing was attempted: the refusal is ours, before any listing was asked for.
+    assert not [packet for packet in server.seen if isinstance(packet, OpenDir)]
+
+
+async def test_the_root_is_probed_once_and_remembered(tmp_path: Path):
+    # One REALPATH for the life of the session, however many relative operations run. A probe
+    # per operation would be a round trip per tree on the servers least able to spare one.
+    server = TreeServer(tree=RELATIVE_TREE, files=RELATIVE_FILES, root=b"/home/smith")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await sftp.get_tree(b"incoming", tmp_path / "one")
+        _ = await sftp.get_tree(b"incoming", tmp_path / "two")
+        _ = [entry async for entry in sftp.walk(b"incoming")]
+
+    assert len([packet for packet in server.seen if isinstance(packet, RealPath)]) == 1
+
+
+async def test_a_relative_upload_tree_on_a_rootless_server_is_refused(tmp_path: Path):
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    _ = (source / "a.csv").write_bytes(b"aaa")
+
+    server = TreeServer(tree={}, root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(CapabilityError) as caught:
+            _ = await sftp.put_tree(source, b"incoming")
+
+    assert caught.value.feature == "uploading a tree"
+    # MKDIR of the parents is the first thing put_tree would have sent, and it did not.
+    assert not [packet for packet in server.seen if isinstance(packet, MkDir)]

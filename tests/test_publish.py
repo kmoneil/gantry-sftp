@@ -31,9 +31,12 @@ from gantry_sftp.codec import (
     Handle,
     Init,
     LStat,
+    Name,
+    NameEntry,
     Open,
     OpenFlag,
     PosixRename,
+    RealPath,
     Remove,
     Rename,
     Stat,
@@ -203,7 +206,11 @@ class PublishingServer:
         files: dict[bytes, bytes] | None = None,
         dangling: tuple[bytes, ...] = (),
         refuse: dict[str, StatusCode] | None = None,
+        root: bytes = b"/home/user",
     ) -> None:
+        # What REALPATH of b"." answers. A value not starting with b"/" is a namespace this
+        # library's path arithmetic cannot join in -- see D-77 and the tests at the bottom.
+        self.root = root
         self.files: dict[bytes, bytearray] = {
             name: bytearray(content) for name, content in (files or {}).items()
         }
@@ -264,6 +271,7 @@ class PublishingServer:
             Remove: self._on_remove,
             Rename: self._on_rename,
             Extended: self._on_extended,
+            RealPath: self._on_realpath,
         }
         handler = handlers.get(type(packet))
         if handler is None:
@@ -351,6 +359,9 @@ class PublishingServer:
         else:
             self.files[packet.newpath] = self.files.pop(packet.oldpath)
             self._reply(Status(packet.request_id, StatusCode.OK))
+
+    def _on_realpath(self, packet: RealPath) -> None:
+        self._reply(Name(packet.request_id, (NameEntry(self.root, self.root, Attrs()),)))
 
     def _on_extended(self, packet: Extended) -> None:
         if packet.name not in self.implements:
@@ -1290,3 +1301,73 @@ async def test_a_real_round_trip_through_an_atomic_publish_is_byte_identical(tmp
 
     assert result.transferred == len(content)
     assert (tmp_path / "back.bin").read_bytes() == content
+
+
+# --- publishing into a namespace that is not rooted at "/" -------------------------------------
+#
+# D-77. An atomic publish derives the staging file's directory from the target's, by splitting
+# on "/". On a server whose namespace is not "/"-shaped that split finds nothing, the staging
+# file lands in the default directory instead of beside the target, and the rename that was
+# supposed to be atomic crosses directories -- silently, because a rename that is not atomic
+# still looks like one from the return value.
+
+VMS_ROOT = b"DISK$USER:[SMITH]"
+
+
+async def test_a_relative_atomic_publish_on_a_rootless_server_is_refused(tmp_path: Path):
+    source = tmp_path / "report.csv"
+    _ = source.write_bytes(b"id,total\n")
+
+    server = PublishingServer(root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(CapabilityError) as caught:
+            _ = await sftp.put(source, b"report.csv")
+
+    assert caught.value.feature == "atomic publish"
+    assert caught.value.path == b"report.csv"
+    # Ours, not the server's: nothing was opened, so no staging file was left anywhere.
+    assert not [packet for packet in server.seen if isinstance(packet, Open)]
+    assert not server.files
+
+
+async def test_an_absolute_atomic_publish_never_probes(tmp_path: Path):
+    source = tmp_path / "report.csv"
+    _ = source.write_bytes(b"id,total\n")
+
+    server = PublishingServer(root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, b"/incoming/report.csv")
+
+    assert result.atomic
+    assert not [packet for packet in server.seen if isinstance(packet, RealPath)]
+
+
+async def test_an_explicit_staging_path_is_the_documented_escape(tmp_path: Path):
+    # A staging name carrying a separator is used verbatim, so no parent is derived from the
+    # target and there is nothing for a foreign namespace to break. The error tells callers to
+    # build their own paths; this is that, and it has to actually work.
+    source = tmp_path / "report.csv"
+    _ = source.write_bytes(b"id,total\n")
+
+    server = PublishingServer(root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, b"report.csv", staging_name=b"staging/report.part")
+
+    assert result.staged_at == b"staging/report.part"
+    assert result.atomic
+    assert not [packet for packet in server.seen if isinstance(packet, RealPath)]
+
+
+async def test_a_relative_in_place_put_is_untouched(tmp_path: Path):
+    # atomic=False derives no parent and does no arithmetic, so it has no reason to be gated.
+    # The whole point of narrowing the refusal is that a rootless server stays usable.
+    source = tmp_path / "report.csv"
+    _ = source.write_bytes(b"id,total\n")
+
+    server = PublishingServer(root=VMS_ROOT)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, b"report.csv", atomic=False)
+
+    assert result.transferred == 9
+    assert bytes(server.files[b"report.csv"]) == b"id,total\n"
+    assert not [packet for packet in server.seen if isinstance(packet, RealPath)]

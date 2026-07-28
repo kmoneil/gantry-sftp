@@ -265,6 +265,32 @@ is the server's choice and not reproducible; the error names both.
 
 `examples/destination_collision.py` runs it.
 
+### Servers whose namespace is not rooted at `/`
+
+Every remote path this library *builds* — joining a child onto a directory, splitting a staging
+file's parent off its target — is `/` arithmetic on bytes. That is what the protocol says to
+assume: `draft-ietf-secsh-filexfer-02` §6.2, *"File names are assumed to use the slash ('/')
+character as a directory separator"*, and *"otherwise, no syntax is defined for file names by
+this specification."*
+
+So on an endpoint whose namespace is not `/`-shaped — VMS `DISK$USER:[DIR]FILE.TXT`, an MVS
+dataset name — there is no correct join to perform, and guessing per vendor is a different
+project. `walk()`, `get_tree()`, `put_tree()`, `rmtree()` and an atomic `put()` raise
+`CapabilityError` rather than building a path the server does not mean.
+
+**An absolute path asks nothing and costs nothing.** §6.2 also says a name starting with `/` is
+absolute and relative to the root of the filesystem, so a caller who passed one has already
+asserted the namespace the arithmetic assumes — no probe is sent at all. Only a *relative* path
+is in question, because that one is relative to the user's default directory, and whether that
+namespace uses `/` is the thing we cannot know without asking. The probe is one `REALPATH` of
+`.`, cached for the life of the session and readable as `sftp.server_root`.
+
+What still works on such a server is everything that does no arithmetic: `get()`, `stat()`,
+`open()`, `remove()`, `rename()` and `put(..., atomic=False)` pass your bytes through untouched.
+An atomic `put()` works too if you name the staging path yourself —
+`put(..., staging_name=b"staging/report.part")` — because a staging name containing a separator
+is used verbatim and no parent is derived from the target.
+
 ## Recursive upload, and removal
 
 ```python

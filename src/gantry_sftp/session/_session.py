@@ -436,6 +436,13 @@ class Session:
         Only definitive answers go in here. A server that refuses for some other reason has
         told us about one request, not about its capabilities."""
 
+        self._root: bytes | None = None
+        """This server's canonical form of ``.``, or ``None`` until something needed it.
+
+        Probed lazily and never at connect time, because most sessions never need it: an
+        operation given a ``/``-rooted path has its arithmetic defined by the draft and asks
+        nothing. See :meth:`_require_rooted_paths`."""
+
     @property
     def limits(self) -> ServerLimits:
         """What the server said it will accept, or all-``None`` if it said nothing."""
@@ -637,6 +644,63 @@ class Session:
                 request_id=reply.request_id,
             )
         return reply.entries[0].filename
+
+    async def _require_rooted_paths(self, path: bytes, *, feature: str) -> None:
+        """Refuse an operation whose path arithmetic this server's namespace does not fit.
+
+        Every remote path this library builds -- joining a child onto a directory, splitting a
+        staging file's parent off its target -- is ``/`` arithmetic on bytes. That is what
+        ``draft-ietf-secsh-filexfer-02`` §6.2 says to assume: *"File names are assumed to use
+        the slash ('/') character as a directory separator"*, and *"otherwise, no syntax is
+        defined for file names by this specification"*. There is therefore no correct way to
+        join a path in a namespace that is not ``/``-shaped -- VMS ``DISK$USER:[DIR]FILE.TXT``,
+        an MVS dataset name -- because the protocol does not describe one, and guessing per
+        vendor is a different project. So the answer is to refuse rather than to build a path
+        the server does not mean.
+
+        **An absolute path asks nothing and costs nothing.** §6.2 also says *"File names
+        starting with a slash are 'absolute', and are relative to the root of the file
+        system"* -- so a caller who passed one has already asserted the namespace this
+        arithmetic assumes, and no probe is sent. Only a relative path is in question, because
+        that one is *"relative to the user's default directory"*, and whether **that**
+        namespace uses ``/`` is the thing we cannot know without asking.
+
+        The probe is one ``REALPATH`` of ``.``, cached for the life of the session.
+
+        Args:
+            path: The remote path the operation was given, already encoded.
+            feature: What is being attempted, in the caller's terms, for the error.
+
+        Raises:
+            CapabilityError: If this server's default directory is not rooted at ``/``.
+        """
+        if path.startswith(b"/"):
+            return
+        if self._root is None:
+            self._root = await self.realpath(b".")
+        if self._root.startswith(b"/"):
+            return
+        refusal = CapabilityError(
+            f"{feature} builds remote paths by '/' arithmetic and this server's default "
+            f"directory is not rooted at '/': REALPATH of b'.' answered {self._root!r}. "
+            f"draft-ietf-secsh-filexfer-02 6.2 defines no other filename syntax, so joining "
+            f"or splitting {path!r} would produce a path this server does not mean. Pass an "
+            f"absolute '/'-rooted path, or drive the per-file operations yourself with paths "
+            f"you build",
+            feature=feature,
+            path=path,
+        )
+        refusal.add_note(self._server_note())
+        raise refusal
+
+    @property
+    def server_root(self) -> bytes | None:
+        """This server's canonical form of ``.``, if anything has needed to ask.
+
+        ``None`` means the question never came up, **not** that the server has no root: the
+        probe is lazy because an operation given an absolute path never needs it.
+        """
+        return self._root
 
     async def open(self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ) -> bytes:
         """Open a remote file and return its handle."""
@@ -1146,9 +1210,12 @@ class Session:
         Raises:
             NoSuchFileError: If the root does not exist. Note this is *also* what the server
                 answers for a path that exists and is not a directory.
+            CapabilityError: If ``path`` is relative and this server's default directory is
+                not rooted at ``/``, so descending would build paths it does not mean.
             ServerError: If the server refuses a listing.
         """
         root = _encode_path(path)
+        await self._require_rooted_paths(root, feature="walking a tree")
         pending: list[tuple[bytes, tuple[bytes, ...]]] = [(root, ())]
         while pending:
             directory, relative = pending.pop()
@@ -1446,7 +1513,12 @@ class Session:
         )
         if not atomic:
             return await self._put_in_place(upload, target)
-        staged = staged_path(target, staging_token(), name=_optional_path(staging_name))
+        staged_name = _optional_path(staging_name)
+        if staged_name is None or b"/" not in staged_name:
+            # A staging name carrying a separator is used verbatim, so no parent is derived
+            # from the target and there is nothing for a foreign namespace to break.
+            await self._require_rooted_paths(target, feature="atomic publish")
+        staged = staged_path(target, staging_token(), name=staged_name)
         return await self._put_atomically(upload, target, staged, require_atomic=require_atomic)
 
     # --- put, in its two shapes ------------------------------------------------------------
@@ -1907,11 +1979,14 @@ class Session:
         Raises:
             UnsafePathError: If a local name could not be a remote path component.
             OSError: If a local directory or file cannot be read.
-            CapabilityError: If a required guarantee is not available on this server.
+            CapabilityError: If a required guarantee is not available on this server, or if
+                ``remote_path`` is relative and this server's default directory is not rooted
+                at ``/``, so building the tree beneath it would produce paths it does not mean.
             ServerError: If the server refuses a directory or a file.
             TransferError: If a transfer fails partway.
         """
         root = _encode_path(remote_path)
+        await self._require_rooted_paths(root, feature="uploading a tree")
         await self._mkdir_parents(root)
         files = directories = transferred = 0
         skipped: list[Skipped] = []

@@ -107,7 +107,31 @@ async def report(sftp, remote: str, local: Path) -> None:
     print(f"complete={result.complete} (False just means something was skipped)")
     for skip in result.skipped:
         print(f"  not copied: {os.fsdecode(skip.path)} -- {skip.reason}")
+    await show_where_the_arithmetic_is_allowed(sftp, remote)
     print()
+
+
+async def show_where_the_arithmetic_is_allowed(sftp, remote: str) -> None:
+    """Why a walk can join paths at all, and when it refuses to.
+
+    Every remote path this library builds is `/` arithmetic on bytes, because
+    draft-ietf-secsh-filexfer-02 6.2 says to assume it -- "File names are assumed to use the
+    slash ('/') character as a directory separator", and "otherwise, no syntax is defined for
+    file names by this specification". On an endpoint whose namespace is not `/`-shaped, VMS
+    `DISK$USER:[DIR]FILE.TXT` or an MVS dataset name, there is no correct join to perform, so
+    `walk`/`get_tree`/`put_tree`/`rmtree` and an atomic `put` raise `CapabilityError` instead
+    of building a path the server does not mean.
+
+    An absolute path costs nothing to check: 6.2 also says a name starting with `/` is
+    absolute and relative to the root of the filesystem, so passing one asserts the namespace
+    and no probe is sent at all. Only a relative path needs asking, and that is one REALPATH
+    of `.`, cached for the session.
+    """
+    print(f"\nserver_root after an absolute walk: {sftp.server_root}  (None -- never asked)")
+    async with aclosing(sftp.walk(".")) as walker:
+        _ = await anext(aiter(walker))
+    print(f"server_root after a relative walk: {sftp.server_root!r}")
+    print(f"  starts with b'/', so joining onto {remote!r} is defined and the walk proceeds")
 
 
 if __name__ == "__main__":
