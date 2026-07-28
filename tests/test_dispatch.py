@@ -305,7 +305,7 @@ async def test_replies_reach_the_exchange_that_asked_even_out_of_order():
             with anyio.fail_after(DEADLINE):
                 second_reply = await second.receive()
                 first_reply = await first.receive()
-            group.cancel_scope.cancel()
+            dispatcher.close()
 
     assert isinstance(first_reply.request, Stat)
     assert first_reply.request.path == b"/first"
@@ -334,7 +334,7 @@ async def test_a_reply_with_no_waiter_left_is_counted_not_raised():
             group.start_soon(dispatcher.run)
             wire.push(AttrsReply(1, Attrs(size=1)))
             await wire.settle()
-            group.cancel_scope.cancel()
+            dispatcher.close()
 
     assert dispatcher.unclaimed == 1
     assert dispatcher.failure is None, "an unclaimed reply is not a connection failure"
@@ -351,6 +351,111 @@ async def test_retiring_an_exchange_leaves_no_route_behind():
 
     assert "routes=0" in repr(dispatcher)
     assert "exchanges=0" in repr(dispatcher)
+
+
+# --- the reader's lifetime ----------------------------------------------------------------
+
+
+def test_a_fresh_dispatcher_reports_that_nothing_is_reading():
+    assert "reader=unstarted" in repr(Dispatcher(Wire(), ready_codec()))  # type: ignore[arg-type]
+
+
+async def test_the_reader_ignores_cancellation_of_the_task_group_it_lives_in():
+    """The mechanism behind `tests/test_cancellation.py`, asserted where it lives.
+
+    A cancelled transfer cleans up under a shield: it sends a CLOSE and waits for the STATUS.
+    If the cancellation that triggered the cleanup also stopped the reader, that wait has
+    nobody left to satisfy it -- a full `request_timeout`, or forever when there is none
+    (D-34). So the reader is shielded and only `close()` ends it.
+
+    The nesting is `open_session`'s, and it is the whole of the bug: the caller's scope is
+    *outside* the task group the reader lives in, so one cancel reaches both the operation
+    and its router. A test that cancelled a scope beside the reader instead of around it
+    would pass against the broken code.
+
+    The `fail_after` is *inside* the shield deliberately. Outside it would be ignored, which
+    is what a shield is for, and this test would hang exactly the way the bug did.
+    """
+    codec = ready_codec()
+    wire = Wire()
+    dispatcher = Dispatcher(wire, codec)  # type: ignore[arg-type]
+    observed: list[object] = []
+
+    with dispatcher.exchange() as exchange:
+        caller = anyio.CancelScope()  # a `move_on_after` around the whole session
+        with caller:
+            async with anyio.create_task_group() as group:  # what `open_session` owns
+                group.start_soon(dispatcher.run)
+                try:
+                    await wire.settle()
+                    caller.cancel()
+                    await anyio.sleep_forever()
+                finally:
+                    # What `_close_quietly` does, in the same order and under the same
+                    # shield, followed by the `close()` that `open_session` does after it.
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            request_id = codec.allocate_request_id()
+                            await exchange.send(Stat(request_id, b"/late"))
+                            wire.push(AttrsReply(request_id, Attrs(size=9)))
+                            with anyio.fail_after(DEADLINE):
+                                observed.append(await exchange.receive())
+                            observed.append(repr(dispatcher))
+                        finally:
+                            # In its own `finally` so that a regression fails this test
+                            # rather than leaving a shielded reader nothing can stop.
+                            dispatcher.close()
+
+    reply, snapshot = observed
+    assert isinstance(reply.response, AttrsReply)  # type: ignore[union-attr]
+    assert reply.response.attrs.size == 9, "no reply was routed after the cancellation"
+    assert "reader=reading" in snapshot  # type: ignore[operator]
+    assert "reader=stopped" in repr(dispatcher)
+
+
+async def test_closing_before_the_reader_starts_stops_it_anyway():
+    """`close()` can land between `start_soon` and the reader's first tick.
+
+    It cancels a scope the reader has not created yet, so without the check in `run` the
+    reader would start with its only stop signal already spent -- and being shielded, would
+    then be a task group that never exits.
+
+    The wire is armed to fail rather than to block, so a regression here fails the test
+    instead of hanging the suite: a reader that read anything at all leaves a `failure`
+    behind to prove it.
+    """
+    codec = ready_codec()
+    wire = Wire()
+    wire.die(ConnectError("the reader read the transport after close() said not to"))
+    dispatcher = Dispatcher(wire, codec)  # type: ignore[arg-type]
+
+    with anyio.fail_after(DEADLINE):
+        async with anyio.create_task_group() as group:
+            group.start_soon(dispatcher.run)
+            dispatcher.close()
+
+    assert dispatcher.failure is None, "the reader read the transport after close()"
+    assert wire.waits == 0
+    assert "reader=stopped" in repr(dispatcher)
+
+
+async def test_a_dispatcher_refuses_a_second_reader():
+    """Two readers on one transport steal each other's frames, which is what this module
+    exists to prevent -- and now `close()` could only stop whichever of them registered last.
+    """
+    codec = ready_codec()
+    wire = Wire()
+    dispatcher = Dispatcher(wire, codec)  # type: ignore[arg-type]
+
+    with anyio.fail_after(DEADLINE):
+        async with anyio.create_task_group() as group:
+            group.start_soon(dispatcher.run)
+            await wire.settle()
+            with pytest.raises(StateError) as exc:
+                await dispatcher.run()
+            dispatcher.close()
+
+    assert exc.value.args[0] == "this dispatcher already has a reader; run() is called once"
 
 
 # --- failure reaches everyone -------------------------------------------------------------
@@ -412,7 +517,7 @@ async def test_the_reader_survives_a_protocol_violation_and_reports_it():
 
             with anyio.fail_after(DEADLINE), pytest.raises(ProtocolError) as exc:
                 _ = await exchange.receive()
-            group.cancel_scope.cancel()
+            dispatcher.close()
 
     assert exc.value.request_id == 4242
     assert isinstance(dispatcher.failure, ProtocolError)

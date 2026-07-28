@@ -1965,7 +1965,10 @@ class Session:
 
         Shielded from cancellation, because a cancelled nine-gigabyte upload is precisely
         when a staging file gets left behind, and it is still bounded: every request carries
-        ``request_timeout``, so a dead connection cannot make cleanup hang.
+        ``request_timeout``, so a dead connection cannot make cleanup hang. That bound only
+        means anything because the reader outlives the cancellation as well -- a ``REMOVE``
+        whose reply nobody can route waits out the whole timeout and then leaves the file
+        behind anyway. See :meth:`~gantry_sftp.session.Dispatcher.run`.
 
         The failure is recorded as a note on the original exception rather than swallowed or
         raised. Swallowing it means the caller never learns a file was left on the server;
@@ -1988,6 +1991,11 @@ async def _close_quietly(session: Session, handle: bytes) -> None:
     already on its way up, and *anything* raised here replaces the diagnosis with a
     housekeeping complaint. Cancellation is not caught -- it derives from ``BaseException``
     -- and cannot arrive anyway inside the shield.
+
+    The shield is half of what makes this work and the reader outliving the same cancellation
+    is the other half: this sends a ``CLOSE`` and waits for its ``STATUS``, so with the reader
+    gone it waits out ``request_timeout`` and, with no timeout set, forever. See
+    :meth:`~gantry_sftp.session.Dispatcher.run`.
 
     A free function rather than a method because :class:`DirectoryScan` needs it too, and
     two copies of a cleanup path is how one of them ends up not fixed.
@@ -2221,6 +2229,17 @@ async def open_session(
     an anyio task group wraps even a single failure in an ``ExceptionGroup``, and a caller
     who wrote ``except NoSuchFileError`` around this line would otherwise stop matching.
 
+    **Cancelling this block from outside is supported and bounded**, which is the spelling a
+    timeout reaches for::
+
+        with anyio.move_on_after(30):
+            async with open_session(transport) as sftp:
+                await sftp.get("/big.iso", "big.iso")
+
+    The transfer stops, its handle is closed on the server, and the block unwinds in about
+    one round trip -- not in ``request_timeout``, and not never. What buys that is the reader
+    ignoring the same cancellation: see :meth:`~gantry_sftp.session.Dispatcher.run`.
+
     Args:
         transport: A connected transport. Its lifetime is the caller's; this only drives it.
         request_timeout: Seconds for the handshake and each one-shot request.
@@ -2252,11 +2271,14 @@ async def open_session(
                     depth=depth,
                 )
             finally:
-                # Cancelling is the only way to stop a task parked in `transport.receive()`.
-                # `close()` first so that anything still trying to send during teardown gets
-                # a StateError naming the reason rather than hanging on a dead reader.
+                # Stops the reader, and is the only thing that does: it is shielded, so the
+                # cancellation that ends the body leaves it reading. That is what a cancelled
+                # transfer's shielded CLOSE needs -- somebody to route the reply it waits for
+                # -- and this line runs after the body has finished unwinding, which is after
+                # that cleanup. Cancelling `reader.cancel_scope` here would be a no-op now,
+                # and used to be the bug (D-34). It also refuses further sends, so anything
+                # still trying during teardown gets a StateError naming the reason.
                 dispatcher.close()
-                reader.cancel_scope.cancel()
     except BaseExceptionGroup as group:
         raise flatten_exception_group(group) from None
 

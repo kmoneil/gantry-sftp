@@ -65,6 +65,9 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
     mirrors production for the reason `flatten_exception_group` exists: a task group wraps
     even a single failure, and a lane whose assertions stopped matching would report a link
     problem as a nameless `ExceptionGroup`.
+
+    `close()` is what stops the reader, and cancelling `reader.cancel_scope` would not: the
+    reader is shielded (D-34).
     """
     dispatcher = Dispatcher(transport, codec)
     try:
@@ -74,7 +77,6 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
                 yield dispatcher
             finally:
                 dispatcher.close()
-                reader.cancel_scope.cancel()
     except BaseExceptionGroup as group:
         raise flatten_exception_group(group) from None
 

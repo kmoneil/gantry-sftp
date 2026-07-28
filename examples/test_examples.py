@@ -106,6 +106,22 @@ def test_the_concurrency_example_shows_transfers_actually_overlapping():
     assert "inside your task group: NoSuchFileError" in stdout
 
 
+def test_the_cancellation_example_shows_a_prompt_unwind_and_no_litter():
+    # Two claims, and the example is only worth having if it keeps demonstrating both: that
+    # the cancel landed while bytes were moving, and that unwinding did not cost the
+    # `request_timeout` it used to. A cancelled publish leaving its staging file behind is
+    # the other half -- invisible from the client, and exactly what the shield exists for.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "cancellation.py")
+    assert returncode == 0
+    assert "cancelled mid-transfer" in stdout
+    assert "cancelled mid-upload" in stdout
+    assert "left behind: none" in stdout
+    assert "the session still works" in stdout
+
+
 def test_the_connect_errors_example_classifies_rather_than_guesses():
     # The example exists to show that the failure reaches you as a *class*. With no arguments
     # it connects to a closed port, which is deliberately one of the cases we refuse to

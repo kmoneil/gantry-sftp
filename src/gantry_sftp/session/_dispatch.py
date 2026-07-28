@@ -29,6 +29,9 @@ Three properties are load-bearing
   stream at once, and an interleaved write would corrupt the frame anyway. Order between
   independent requests is not a protocol requirement -- ids correlate the replies -- so a lock
   around the write costs nothing but the hand-off.
+* **The reader outlives the cancellation that stops the operations.** Cleanup after a
+  cancelled transfer is shielded, and shielded cleanup that sends a request still needs
+  somebody to read the answer. See :meth:`Dispatcher.run`.
 
 What this does *not* do is bound concurrency. How many operations run at once is the caller's
 decision, made with an anyio task group; this only makes sure they do not tread on each other.
@@ -158,6 +161,8 @@ class Dispatcher:
         "_codec",
         "_exchanges",
         "_failure",
+        "_reader_scope",
+        "_reading",
         "_routes",
         "_send_lock",
         "_transport",
@@ -180,6 +185,9 @@ class Dispatcher:
         self._failure: BaseException | None = None
         self._closed = False
         self._unclaimed = 0
+        self._reader_scope: anyio.CancelScope | None = None
+        """The reader's own scope, so :meth:`close` can stop a task it did not start."""
+        self._reading = False
 
     @property
     def codec(self) -> Codec:
@@ -209,10 +217,18 @@ class Dispatcher:
 
     @override
     def __repr__(self) -> str:
-        """Report the routing state a stalled or leaking session would need."""
+        """Report the routing state a stalled or leaking session would need.
+
+        ``reader`` is here because it can no longer be inferred from the rest: the reader is
+        shielded, so a session whose task group was cancelled still has one, and a reader
+        nobody stopped is a task group that will not exit.
+        """
         state = "closed" if self._closed else "failed" if self._failure is not None else "open"
+        reader = (
+            "reading" if self._reading else "unstarted" if self._reader_scope is None else "stopped"
+        )
         return (
-            f"<Dispatcher {state} exchanges={len(self._exchanges)} "
+            f"<Dispatcher {state} reader={reader} exchanges={len(self._exchanges)} "
             f"routes={len(self._routes)} unclaimed={self._unclaimed}>"
         )
 
@@ -226,19 +242,46 @@ class Dispatcher:
         it rather than at the session's context manager -- with its own type intact instead
         of wrapped in an ``ExceptionGroup``.
 
-        Runs until cancelled, which is what :func:`~gantry_sftp.session.open_session` does
-        when its block ends: a blocking read cannot be stopped any other way.
+        **Runs until** :meth:`close` **stops it, and ambient cancellation deliberately does
+        not.** The loop is shielded, so cancelling the task group the reader lives in leaves
+        it reading; only ``close()`` ends it. That inversion is the fix for D-34, and the bug
+        it fixes is worth stating because the obvious spelling has it backwards. Cleanup
+        after a cancelled transfer is shielded -- a ``CLOSE`` for the handle, a ``REMOVE``
+        for the staging file -- and every one of those sends a request and waits for its
+        answer. If the same cancellation that triggered the cleanup also stopped the reader,
+        the answer has nobody to route it: the shielded wait then costs a full
+        ``request_timeout`` (30 s by default) and, with ``request_timeout=None``, never ends
+        at all. Measured before the fix, on both backends. A reader that cannot be cancelled
+        by accident is what makes the shields upstream mean what they say.
+
+        Raises:
+            StateError: If this dispatcher already had a reader. Two of them steal each
+                other's frames -- the failure this module exists to prevent -- and with the
+                shield, ``close()`` could only stop the second.
         """
-        try:
-            while True:
-                for event in self._codec.receive(await self._transport.receive()):
-                    self._route(event)
-        except Exception as error:
-            # Deliberately as broad as it can be without swallowing cancellation, which is
-            # a BaseException and is how this task is meant to end. Anything narrower would
-            # let an unforeseen failure kill the reader while every waiter stayed parked --
-            # a hang instead of an error, on the one task nobody is awaiting.
-            self._fail(error)
+        if self._reader_scope is not None:
+            raise StateError("this dispatcher already has a reader; run() is called once")
+        with anyio.CancelScope(shield=True) as scope:
+            # Synchronous from the check above to here, so two tasks cannot both pass it.
+            self._reader_scope = scope
+            if self._closed:
+                # `close()` landed between `start_soon` and this task's first tick, so it
+                # cancelled nothing. Without this the reader would start anyway, shielded,
+                # with the one thing that can stop it already spent.
+                return
+            self._reading = True
+            try:
+                while True:
+                    for event in self._codec.receive(await self._transport.receive()):
+                        self._route(event)
+            except Exception as error:
+                # Deliberately as broad as it can be without swallowing cancellation, which
+                # is a BaseException and is how this task is meant to end. Anything narrower
+                # would let an unforeseen failure kill the reader while every waiter stayed
+                # parked -- a hang instead of an error, on the one task nobody is awaiting.
+                self._fail(error)
+            finally:
+                self._reading = False
 
     def _route(self, event: Event) -> None:
         if not isinstance(event, Completed):  # pragma: no cover -- codec refuses a 2nd VERSION
@@ -263,8 +306,20 @@ class Dispatcher:
             exchange.fail(error)
 
     def close(self) -> None:
-        """Refuse further work. Does not stop the reader; cancelling ``run`` does that."""
+        """Refuse further work, and stop the reader. The only thing that stops the reader.
+
+        The two used to be separate -- this refused work, and the caller cancelled the task
+        group to end the reader. Under cancellation that ordering is impossible to get right
+        from the outside, because the cancel arrives at the reader and at the operation's
+        shielded cleanup simultaneously (see :meth:`run`). So the reader ignores ambient
+        cancellation and takes its instruction from here, where the session's ``finally`` can
+        give it *after* the cleanup it has to serve.
+
+        Idempotent, and safe before the reader starts or after it has stopped.
+        """
         self._closed = True
+        if self._reader_scope is not None:
+            self._reader_scope.cancel()
 
     # --- exchanges -------------------------------------------------------------------------
 

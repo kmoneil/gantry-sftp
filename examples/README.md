@@ -14,6 +14,7 @@ python examples/recursive_upload.py               # walk_local() + put_tree() + 
 python examples/resume.py                         # interrupt a transfer, then finish it
 python examples/retry.py                          # a link that drops, reconnected and resumed
 python examples/concurrent_transfers.py           # many transfers over one session
+python examples/cancellation.py                   # stop a transfer, and what it leaves behind
 python examples/connect_errors.py                 # why the connection failed, as a class
 ```
 
@@ -28,6 +29,7 @@ python examples/recursive_upload.py user@host /remote/dir
 python examples/resume.py user@host /remote/dir
 python examples/retry.py user@host /remote/dir
 python examples/concurrent_transfers.py user@host /remote/dir
+python examples/cancellation.py user@host /remote/dir
 python examples/connect_errors.py user@host
 ```
 
@@ -46,6 +48,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `resume.py`               | `get(resume=)`, `put(resume=)`, and the two refusals — a partial that cannot be a prefix, and atomic without a staging name |
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
+| `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |
 | `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
 
 ## What `atomic_publish.py` is actually showing

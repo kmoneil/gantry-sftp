@@ -557,6 +557,43 @@ Three things about that ladder are deliberate:
 
 `examples/connect_errors.py` runs this with no arguments.
 
+## Timeouts, and stopping a transfer
+
+```python
+with anyio.move_on_after(30):
+    async with open_ssh_transport("example.com", user="bob") as t, open_session(t) as sftp:
+        await sftp.get("/incoming/big.iso", "big.iso")
+```
+
+Two timeouts ship, and they bound different things:
+
+- **`request_timeout=30.0`** covers one round trip — the handshake, a `STAT`, an `OPEN`, a
+  `CLOSE`. A server that accepts the connection and then says nothing trips it.
+- **`idle_timeout=60.0`** covers a bulk transfer's *silence*, not its duration. A nine-hour
+  download over a slow link never trips it; sixty seconds with nothing arriving does.
+
+`None` for either means no bound at all. It is a legitimate thing to ask for, and it is never
+the default.
+
+Cancelling from outside — the `move_on_after` above, a task group whose sibling failed, Ctrl-C
+— stops the transfer, and then cleans up **before** the block finishes unwinding:
+
+- the remote handle is closed, and that is asserted against the server rather than against our
+  intention to send a `CLOSE`;
+- an interrupted `put` removes its staging file, so nothing is left in the directory a consumer
+  is watching;
+- the partial local file from a cancelled `get` stays, because that is what `resume=True`
+  continues from.
+
+Cleanup is shielded so it survives the cancellation that triggered it, and **the session's
+reader is shielded for the same reason** — cleanup sends requests, and something has to read
+the replies. When it was not, a cancelled transfer took a full `request_timeout` to unwind and,
+with `request_timeout=None`, never finished at all (fixed in 0.8, D-34). The reader stops when
+the `async with open_session(...)` block ends and at no other time; cancelling the task group
+it happens to run in deliberately does not stop it.
+
+`examples/cancellation.py` runs this with no arguments.
+
 ## Why it is faster, and where it is not
 
 Speed is not the objective — see above — but it is measurable, and a claim about it should

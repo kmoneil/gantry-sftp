@@ -30,6 +30,10 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
     even a single failure in an `ExceptionGroup`, so without it every
     `pytest.raises(TransferError)` in this suite would stop matching -- and the ones asserting
     on a message would fail with a group instead of proving anything.
+
+    `close()` is what stops the reader, and cancelling `reader.cancel_scope` would not: the
+    reader is shielded (D-34). Mirroring production matters here beyond tidiness -- a helper
+    that stopped the reader some other way would prove the fixture, not the library.
     """
     dispatcher = Dispatcher(transport, codec)
     try:
@@ -39,7 +43,6 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
                 yield dispatcher
             finally:
                 dispatcher.close()
-                reader.cancel_scope.cancel()
     except BaseExceptionGroup as group:
         raise flatten_exception_group(group) from None
 
