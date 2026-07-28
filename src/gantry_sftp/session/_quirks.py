@@ -108,6 +108,9 @@ PROFILES: Mapping[str, ServerProfile] = {
         # directory, RENAME onto an existing target, CREAT|EXCL on an existing file, RMDIR of
         # a non-empty directory, REMOVE of a directory -- with the single word "Failure". The
         # message is a constant function of the status code and carries nothing beyond it.
+        # The CREAT|EXCL row is now a test rather than this comment: D-16, in
+        # live-tests/test_matrix.py, where the refusal atomic publish depends on is asserted
+        # together with the word each server uses for it.
         informative_messages=False,
     ),
     "asyncssh": ServerProfile(
@@ -121,7 +124,11 @@ PROFILES: Mapping[str, ServerProfile] = {
     "paramiko": ServerProfile(
         name="paramiko",
         description="paramiko's SFTPServer",
-        # Measured: "Failure" for every provoked condition, as OpenSSH.
+        # Measured: "Failure" for every provoked condition, as OpenSSH. Note what this row can
+        # and cannot claim -- paramiko maps an errno to a code and a message, but the errno
+        # comes from a filesystem handler the caller supplies, which in live-tests is ours.
+        # The *text* is paramiko's and is what this flag records; the *condition* is not, which
+        # is why matrix.HANDLER_IS_OURS excludes it from the behavioural assertions.
         informative_messages=False,
     ),
 }

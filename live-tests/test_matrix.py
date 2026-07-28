@@ -23,11 +23,23 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 import pytest
 from matrix import SERVER_NAMES, MatrixServer, running_server, unavailable_reason
 from sshd import REDIRECTED_HOME, STEERING
 
-from gantry_sftp.codec import CheckFileReply, decode
+from gantry_sftp.codec import (
+    CheckFileReply,
+    Codec,
+    Completed,
+    Handle,
+    Negotiated,
+    Open,
+    OpenFlag,
+    StatusCode,
+    Write,
+    decode,
+)
 from gantry_sftp.exceptions import NoSuchFileError, ServerError
 from gantry_sftp.session import Session, SizeCheck, open_session, parse_vendor_id
 from gantry_sftp.transport import open_ssh_transport
@@ -550,3 +562,196 @@ async def test_only_asyncssh_reports_a_version_because_only_it_says_one(server: 
     else:
         assert profile.version is None
         assert profile.label == server.name
+
+
+# --- the claim atomic publish rests on: CREAT|EXCL refuses an existing file --------------------
+
+
+async def test_creat_excl_creates_a_file_that_is_not_there(server: MatrixServer):
+    """The control, and without it the refusal below proves nothing.
+
+    A server that refused *every* ``OPEN`` would pass the exclusion test for the wrong reason.
+    This is the half that says ``CREAT|EXCL`` is a working way to create a file at all.
+    """
+    skip_where_the_handler_is_ours(server)
+    target = server.root / "excl-fresh.bin"
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL)
+        await sftp.close(handle)
+
+    assert target.exists()
+
+
+async def test_creat_excl_refuses_a_file_that_is_already_there(server: MatrixServer):
+    """D-16, and it is the assumption the whole staging design is built on.
+
+    ``put`` writes to ``.name.<token>.part`` and renames it over the target. Two publishers
+    that generate the same token must not both open the staging file and interleave their
+    writes into it, and ``EXCL`` is the only thing standing between them -- v3 has no
+    ``EEXIST``, so a server that ignored ``EXCL`` would produce a file of the wrong length
+    with no status code anywhere saying why.
+
+    Until now that claim was backed by a comment in ``session/_quirks.py`` recording that the
+    condition had been provoked by hand. A comment is not a test, and the rule this repo
+    applies to quirks profiles -- ship the fixture or do not ship the profile -- applies at
+    least as hard to a protocol assumption an entire feature rests on.
+    """
+    skip_where_the_handler_is_ours(server)
+    target = server.root / "excl-taken.bin"
+    target.write_bytes(b"already here")
+
+    async with connected(server) as sftp:
+        with pytest.raises(ServerError) as exc:
+            _ = await sftp.open(str(target), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL)
+
+    # v3 has no EEXIST, so this is the catch-all -- which is exactly why the *message* below
+    # is the only thing that could ever distinguish it from any other refusal.
+    assert exc.value.code == int(StatusCode.FAILURE)
+    assert target.read_bytes() == b"already here"
+
+
+EXPECTED_EXCL_TEXT = {
+    "openssh": b"Failure",
+    "asyncssh": b"File exists",
+}
+"""What each server says when ``EXCL`` refuses. Two of three; paramiko's condition is ours.
+
+The pair that makes ``ServerProfile.informative_messages`` a measurement: OpenSSH's word is
+a constant function of the status code and carries nothing, asyncssh's is ``strerror`` text.
+"""
+
+
+async def test_the_words_for_an_existing_file_are_the_profiles_evidence(server: MatrixServer):
+    """D-6, asked where it actually matters: on a ``FAILURE``, not on ``NO_SUCH_FILE``.
+
+    The register filed D-6 as "how many servers truncate the ``STATUS`` tail", worried that
+    the quirks layer's only input for disambiguating the catch-all might not be there at all.
+    Every server here sends it, and the tail is present and non-empty on all three -- so the
+    premise the profiles are built on holds for everything this matrix can start.
+
+    **The answer is worse than truncation and less obvious.** OpenSSH's tail is present and
+    says ``Failure`` for five distinct conditions, so it is a constant, not information. A
+    missing field announces itself; a field that is always the same word does not.
+    """
+    skip_where_the_handler_is_ours(server)
+    target = server.root / "excl-words.bin"
+    target.write_bytes(b"already here")
+
+    async with connected(server) as sftp:
+        with pytest.raises(ServerError) as exc:
+            _ = await sftp.open(str(target), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL)
+
+    assert exc.value.message, "the STATUS tail is absent, and D-6's original worry was real"
+    assert exc.value.message == EXPECTED_EXCL_TEXT[server.name]
+
+
+async def test_a_failure_tail_is_present_on_every_server_including_the_wrapped_one(
+    server: MatrixServer,
+):
+    """The half of D-6 that paramiko *can* answer, and the reason it is a separate test.
+
+    Whether the condition arises is our handler's business on paramiko; what text a status
+    carries is paramiko's. So the tail question is askable of all three even where the
+    filesystem question is not.
+    """
+    async with connected(server) as sftp:
+        with pytest.raises(ServerError) as exc:
+            _ = await sftp.stat(b"/definitely/not/here")
+
+    assert exc.value.message, "STATUS arrived with no tail at all"
+
+
+# --- D-15: does a server whose replies nobody reads stop reading us? --------------------------
+
+CHANNEL_WINDOW = 2 * 1024 * 1024
+"""OpenSSH's per-channel window, measured by the netem lane and recorded in DESIGN.md 5.1."""
+
+UNDRAINED_REQUEST_BYTES = 2 * CHANNEL_WINDOW
+"""How many bytes of ``WRITE`` to push without reading a single reply.
+
+Twice the window on purpose. The window is the most data that can be in flight unacknowledged,
+so pushing twice it and finishing proves the server consumed at least a window's worth **while
+its own replies went unread** -- which is the deadlock condition, stated as something a test
+can observe rather than as a story about buffering.
+"""
+
+UNDRAINED_DEADLINE = 60.0
+"""A bound, not a performance assertion. Reaching it *is* the card's other outcome."""
+
+SEND_CHUNK = 64 * 1024
+
+
+async def receive_until(transport: object, codec: Codec, wanted: type) -> object:
+    """Read from ``transport`` until an event of ``wanted`` arrives, and return it.
+
+    ``wanted`` is a codec *event* -- :class:`Negotiated` or :class:`Completed` -- not a packet
+    class. VERSION and every reply are absorbed into events rather than surfaced as packets, so
+    waiting on ``Version`` or ``Handle`` here waits forever, which is exactly how this helper
+    was first written.
+    """
+    while True:
+        for event in codec.receive(await transport.receive()):  # type: ignore[attr-defined]
+            if isinstance(event, wanted):
+                return event
+
+
+async def test_a_server_whose_replies_go_unread_keeps_reading_our_requests(
+    server: MatrixServer,
+):
+    """D-15 closes by being dropped with evidence, against all three implementations.
+
+    ``session/_upload.py`` sends and receives concurrently. The textbook justification is
+    deadlock -- fill the server's input while the server, blocked writing replies nobody
+    drains, stops reading. That was **retracted in 0.4** because it could not be reproduced
+    against a real ``sftp-server`` on a pipe, and the card stayed open on the possibility that
+    another implementation, or a real SSH channel with its own windowing, would differ.
+
+    Neither does, and there is a reason it cannot for an upload specifically: **a ``WRITE``
+    request is always larger on the wire than the ``STATUS`` it produces** -- 33 bytes of
+    header plus payload against roughly 21 bytes of reply -- and both directions are bounded by
+    the same channel window. So the unread-reply backlog is strictly smaller than the request
+    backlog that created it, and the client's own send blocks first, every time. The
+    justification was not merely unproven; for this direction it was the wrong mechanism.
+
+    Deliberately driven below the session, because a session **cannot** express the condition:
+    :class:`~gantry_sftp.session.Dispatcher` owns ``receive`` and drains continuously. Batched
+    into few large sends rather than one ``await`` per packet -- same bytes on the wire, and an
+    ``await`` per request made this test slower than the whole rest of the lane put together.
+
+    A timeout here is not a flake and not a bug. It is the finding the card asked for, and it
+    would mean restoring the docstring ``_upload.py`` gave up. The concurrent design keeps its
+    other justifications regardless: bounded memory on both sides, and a failure surfacing when
+    it happens rather than after the whole file is queued.
+    """
+    connect = dict(server.connect)
+    host = str(connect.pop("host"))
+    target = server.root / "undrained.bin"
+    payload = b"x" * 64
+
+    async with open_ssh_transport(host, **connect) as transport:
+        codec = Codec()
+        await transport.send(codec.initiate())
+        _ = await receive_until(transport, codec, Negotiated)
+
+        open_id = codec.allocate_request_id()
+        flags = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
+        await transport.send(codec.send(Open(open_id, str(target).encode(), flags)))
+        opened = await receive_until(transport, codec, Completed)
+        assert isinstance(opened.response, Handle), opened.response  # type: ignore[attr-defined]
+        handle: bytes = opened.response.handle  # type: ignore[attr-defined]
+
+        queued = bytearray()
+        offset = 0
+        while len(queued) < UNDRAINED_REQUEST_BYTES:
+            request_id = codec.allocate_request_id()
+            queued += codec.send(Write(request_id, handle, offset=offset, data=payload))
+            offset += len(payload)
+
+        # From here nothing is read: every STATUS the server sends piles up unread.
+        with anyio.fail_after(UNDRAINED_DEADLINE):
+            view = memoryview(queued)
+            for start in range(0, len(view), SEND_CHUNK):
+                await transport.send(view[start : start + SEND_CHUNK])
+
+    assert len(queued) > CHANNEL_WINDOW
+    assert codec.outstanding == offset // len(payload)
