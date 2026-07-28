@@ -16,6 +16,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+import gantry_sftp
 from gantry_sftp.codec import (
     Close,
     Codec,
@@ -296,6 +297,72 @@ async def test_a_missing_ssh_executable_is_a_clear_connect_error(tmp_path: Path)
         await _open_and_close(open_ssh_transport("h", ssh_executable=str(missing)))
     assert exc.value.args[0].startswith(f"could not run {str(missing)!r}:")
     assert exc.value.argv[0] == str(missing)
+
+
+async def test_the_password_never_reaches_a_dumped_stack_frame(tmp_path: Path):
+    """A traceback reporter that captures locals must not capture the secret.
+
+    Keeping the password out of argv is two thirds of the job. ``open_ssh_transport`` and
+    ``_open_process_transport`` are ``@asynccontextmanager`` generators, so their frames --
+    and the environment dictionary in them -- stay alive for the whole connection, and a
+    reporter that walks frame locals renders every one of them with ``repr``. Sentry does
+    that by default; so do ``pytest --showlocals``, ``rich`` and IPython.
+
+    The walk below is exactly what those reporters do.
+    """
+    canary = "hunter2-CANARY-must-not-appear"
+    missing = tmp_path / "definitely-not-here"
+
+    with pytest.raises(ConnectError) as exc:
+        await _open_and_close(open_ssh_transport("h", ssh_executable=str(missing), password=canary))
+
+    # The surfaces a caller sees directly.
+    assert canary not in str(exc.value)
+    assert canary not in repr(exc.value)
+    assert not any(canary in argument for argument in exc.value.argv)
+
+    # And the one they see through a reporter. Only *this library's* frames are asserted on:
+    # the caller's own frame holds the plaintext they passed in and always will, which is
+    # their boundary to draw, not ours.
+    # Taken from the package, not from `open_ssh_transport.__globals__`: the name is the
+    # wrapper `asynccontextmanager` built, so its globals are contextlib's and a filter built
+    # from them silently matches nothing -- a test that passes because it looked nowhere.
+    package = str(Path(gantry_sftp.__file__).parent)
+    leaks: list[str] = []
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code.co_filename.startswith(package):
+            leaks += [
+                f"{Path(frame.f_code.co_filename).name}:{traceback.tb_lineno} "
+                f"in {frame.f_code.co_name}() local {name!r}"
+                for name, value in frame.f_locals.items()
+                if canary in repr(value)
+            ]
+        traceback = traceback.tb_next
+    assert leaks == [], "password rendered by a frame-locals dump: " + "; ".join(leaks)
+
+
+async def test_the_child_still_receives_the_real_secret(tmp_path: Path):
+    """The redaction must not have redacted it on the way to ``ssh`` as well.
+
+    A guard on the fix rather than on the bug: a ``repr`` that hides the password is only
+    correct while the password still arrives intact, and a mistake in that direction would
+    look exactly like a server rejecting the credential.
+    """
+    canary = "hunter2-CANARY-must-arrive"
+    recorder = tmp_path / "recorder"
+    seen = tmp_path / "seen.txt"
+    recorder.write_text(
+        f'#!/bin/sh\nprintf "%s" "${{GANTRY_SFTP_ASKPASS_ANSWER}}" > "{seen}"\nexit 255\n'
+    )
+    recorder.chmod(0o700)
+
+    async with open_ssh_transport("h", ssh_executable=str(recorder), password=canary) as transport:
+        with pytest.raises(ConnectError):
+            await transport.receive()
+
+    assert seen.read_text() == canary
 
 
 async def test_a_hostile_host_is_refused_before_anything_is_spawned():
@@ -587,3 +654,37 @@ async def test_a_caller_supplied_askpass_suppresses_the_hint(fake_ssh: Path, mon
         with pytest.raises(ConnectError) as exc:
             await transport.receive()
     assert exc.value.hint == ""
+
+
+@pytest.mark.skipif(not Path("/usr/bin/ssh").exists(), reason="ssh not installed")
+def test_ssh_matches_option_names_case_insensitively_and_takes_the_first():
+    """Characterisation of ssh(1), not of us. It is why option merging folds case.
+
+    Two facts, and the bug needed both: keyword names are case-insensitive, and a repeated
+    keyword resolves to the *first* ``-o`` on the command line. ``build_ssh_argv`` sorts its
+    options, and in ASCII every uppercase letter sorts before every lowercase one -- so before
+    the fold, ``STRICTHOSTKEYCHECKING=no`` from a caller arrived ahead of our
+    ``StrictHostKeyChecking=yes`` and won, silently.
+
+    If a future OpenSSH ever changed either fact, this failing is how we would find out.
+    """
+
+    def resolved(*options: str) -> str:
+        result = subprocess.run(
+            ["/usr/bin/ssh", "-G", "-F", "/dev/null", *options, "example.com"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        line = next(
+            line for line in result.stdout.splitlines() if line.startswith("stricthostkeychecking")
+        )
+        return line.split()[1]
+
+    # Case-insensitive: a spelling we never emit still sets the same keyword.
+    assert resolved("-o", "STRICTHOSTKEYCHECKING=no") == "false"
+    # First wins, in both orders -- so argv position decides, which is what made the sort
+    # order load-bearing and the bug silent.
+    assert resolved("-o", "STRICTHOSTKEYCHECKING=no", "-o", "StrictHostKeyChecking=yes") == "false"
+    assert resolved("-o", "StrictHostKeyChecking=yes", "-o", "STRICTHOSTKEYCHECKING=no") == "true"

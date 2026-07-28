@@ -789,9 +789,35 @@ guess.
 
 **What the library will not do**: write your password to a file, put it on a command line, read
 it from one, or log it. Anything that can carry it is checked — `repr()` of the transport, the
-captured stderr, `ConnectError.argv`, and the rendered exception — and `tests/test_askpass.py`
-runs the helper against passwords built to break a shell (`$(...)`, backticks, `%s%n`, `-n`,
-embedded quotes) to prove what comes back out is what went in.
+captured stderr, `ConnectError.argv`, the rendered exception, and the **frame locals** a
+traceback reporter captures — and `tests/test_askpass.py` runs the helper against passwords
+built to break a shell (`$(...)`, backticks, `%s%n`, `-n`, embedded quotes) to prove what comes
+back out is what went in.
+
+That last surface is the least obvious one. The environment dictionary carrying the secret is a
+local variable in an `@asynccontextmanager` generator, so its frame stays alive for the whole
+connection — and Sentry captures frame locals by default, as do `pytest --showlocals`, `rich`
+tracebacks and IPython's verbose mode. Every one of them renders a local with `repr()`, so the
+secret is held in a `str` subclass whose `repr()` is `'<redacted>'`. It is still an ordinary
+string everywhere it has to be one, so `ssh` receives it intact. What that does **not** cover,
+stated plainly: a reporter that calls `str()` rather than `repr()`, a core dump, and
+`/proc/<pid>/environ` — the last being the deliberate trade that buys not being in argv.
+
+### `options=` matches names the way `ssh` does
+
+Option names are matched **case-insensitively**, because that is how `ssh` reads them. An
+override spelled `stricthostkeychecking` or `STRICTHOSTKEYCHECKING` replaces the shipped
+`StrictHostKeyChecking` rather than joining it on the command line, and warns exactly as the
+canonical spelling does.
+
+This is not cosmetic. `ssh` resolves a repeated keyword to the **first** `-o` on the line, and
+this library emits its options sorted — where ASCII puts every uppercase letter before every
+lowercase one. Matching on exact case therefore let `STRICTHOSTKEYCHECKING=no` land ahead of
+the default and silently win, with no `InsecureOptionWarning`, because the warning was reading
+the default under its own spelling. The same shape defeated `PermitLocalCommand=no` and the
+`BatchMode` contradiction check above. Measured against OpenSSH 10.0p2; pinned by
+`tests/test_transport.py::test_ssh_matches_option_names_case_insensitively_and_takes_the_first`,
+which characterises `ssh` rather than us, so a change in that behaviour fails loudly.
 
 ### Arming your own askpass helper
 

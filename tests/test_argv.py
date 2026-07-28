@@ -17,6 +17,7 @@ from gantry_sftp.transport import (
     PASSWORD_AUTH_OPTIONS,
     build_ssh_argv,
     options_for_password_auth,
+    password_auth_hint,
     resolve_ssh_executable,
 )
 
@@ -133,6 +134,67 @@ def test_restating_the_default_does_not_warn():
 
 def test_overriding_an_unrelated_option_does_not_warn():
     build_ssh_argv("h", options={"Compression": "yes"})
+
+
+# --- ssh matches option names case-insensitively, and so must we --------------------------
+#
+# The bug this section pins: `_merged_options` keyed on exact case, so a differently-cased
+# override did not replace the default -- it landed *beside* it. argv is sorted and in ASCII
+# every uppercase letter sorts before every lowercase one, so `STRICTHOSTKEYCHECKING=no`
+# arrived ahead of our `StrictHostKeyChecking=yes`, and ssh takes the first of a repeated
+# keyword. Measured against OpenSSH 10.0p2: host-key checking went off, and the warning below
+# never fired because it read the default under its own spelling and saw "yes".
+#
+# Every test here is parametrized over the spelling axis rather than written once in the
+# canonical one, because a proof written in a value's canonical spelling cannot catch a
+# canonicalization bug.
+
+SPELLINGS_OF_STRICT_HOST_KEY_CHECKING = [
+    pytest.param("StrictHostKeyChecking", id="canonical"),
+    pytest.param("STRICTHOSTKEYCHECKING", id="upper-sorts-before-canonical"),
+    pytest.param("stricthostkeychecking", id="lower-sorts-after-canonical"),
+    pytest.param("StricthostkeyChecking", id="mixed"),
+]
+
+
+@pytest.mark.parametrize("spelling", SPELLINGS_OF_STRICT_HOST_KEY_CHECKING)
+def test_weakening_strict_host_key_checking_warns_however_it_is_spelled(spelling: str):
+    with pytest.warns(InsecureOptionWarning) as record:
+        build_ssh_argv("h", options={spelling: "no"})
+    assert "may be intercepted" in str(record[0].message)
+
+
+@pytest.mark.parametrize("spelling", SPELLINGS_OF_STRICT_HOST_KEY_CHECKING)
+def test_a_case_variant_replaces_the_default_rather_than_racing_it(spelling: str):
+    # One entry per keyword. Two would let argv order decide the value, which is how the
+    # override won silently in one direction and was silently dropped in the other.
+    with pytest.warns(InsecureOptionWarning):
+        argv = build_ssh_argv("h", options={spelling: "no"})
+    emitted = [value for flag, value in itertools.pairwise(argv) if flag == "-o"]
+    strictness = [value for value in emitted if value.lower().startswith("stricthostkey")]
+    assert strictness == [f"{spelling}=no"]
+
+
+@pytest.mark.parametrize(
+    "spelling", ["PermitLocalCommand", "PERMITLOCALCOMMAND", "permitlocalcommand"]
+)
+def test_re_enabling_local_command_cannot_hide_behind_a_spelling(spelling: str):
+    # PermitLocalCommand=no is what stops an ssh_config LocalCommand from running a program on
+    # *this* machine. A second entry would have let the caller's `yes` sort ahead of it.
+    argv = build_ssh_argv("h", options={spelling: "yes"})
+    emitted = [value for flag, value in itertools.pairwise(argv) if flag == "-o"]
+    local_command = [value for value in emitted if value.lower().startswith("permitlocal")]
+    assert local_command == [f"{spelling}=yes"]
+
+
+def test_two_case_variants_from_the_caller_still_collapse_to_one():
+    # Not just default-versus-override: the caller can collide with themselves, and ssh would
+    # again take whichever sorted first rather than whichever was meant.
+    argv = build_ssh_argv("h", options={"Compression": "yes", "COMPRESSION": "no"})
+    emitted = [value for flag, value in itertools.pairwise(argv) if flag == "-o"]
+    assert [value for value in emitted if value.lower().startswith("compression")] == [
+        "COMPRESSION=no"
+    ]
 
 
 # --- argument injection ------------------------------------------------------------------
@@ -317,6 +379,48 @@ def test_a_password_with_batchmode_yes_is_refused_as_the_contradiction_it_is(spe
 
 def test_saying_batchmode_no_alongside_a_password_is_agreement_not_contradiction():
     assert options_for_password_auth({"BatchMode": "no"})["BatchMode"] == "no"
+
+
+@pytest.mark.parametrize("spelling", ["BatchMode", "BATCHMODE", "batchmode", "BatchMODE"])
+def test_the_batchmode_contradiction_is_refused_however_it_is_spelled(spelling: str):
+    # The same case-folding bug reached this guard too, and the consequence here was quieter
+    # than a missing warning: `BATCHMODE=yes` sorted ahead of our `BatchMode=no`, ssh took the
+    # first, the askpass helper was suppressed, and the password was never sent. The user got
+    # a bare `Permission denied` -- and `password_auth_hint` stayed silent as well, because it
+    # read the shadowed entry back off argv and saw `no`.
+    with pytest.raises(ValueError) as exc:
+        options_for_password_auth({spelling: "yes"})
+    assert exc.value.args[0] == (
+        f"password= needs BatchMode=no, but options set BatchMode={'yes'!r}; "
+        f"BatchMode=yes suppresses the askpass helper outright, so ssh would never ask "
+        f"for the password and the connection would fail with 'Permission denied'"
+    )
+
+
+@pytest.mark.parametrize("spelling", ["BatchMode", "BATCHMODE", "batchmode"])
+def test_the_password_path_emits_one_batchmode_however_it_is_spelled(spelling: str):
+    argv = build_ssh_argv("h", options=options_for_password_auth({spelling: "no"}))
+    emitted = [value for flag, value in itertools.pairwise(argv) if flag == "-o"]
+    assert [value for value in emitted if value.lower().startswith("batchmode")] == [
+        f"{spelling}=no"
+    ]
+
+
+@pytest.mark.parametrize("spelling", ["BatchMode", "BATCHMODE", "batchmode"])
+def test_the_hint_sees_batchmode_switched_off_however_it_was_spelled(spelling: str):
+    # The direction that discriminates. Turning BatchMode *off* under a variant spelling must
+    # be read as off: before the fold argv carried both the default `BatchMode=yes` and the
+    # caller's variant, and the exact-match lookup found the default -- so the hint blamed
+    # BatchMode on a connection where the caller had already switched it off, and prescribed a
+    # fix that would have changed nothing.
+    argv = build_ssh_argv("h", options={spelling: "no"})
+    hint = password_auth_hint(
+        "user@h: Permission denied (keyboard-interactive,password).",
+        argv=argv,
+        askpass_armed=False,
+    )
+    assert "BatchMode=yes suppresses the askpass helper" not in hint
+    assert "no askpass helper was configured" in hint
 
 
 def test_the_password_options_layer_over_the_security_defaults_rather_than_replacing_them():

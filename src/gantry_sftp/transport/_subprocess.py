@@ -34,7 +34,11 @@ from gantry_sftp.transport._argv import (
     build_ssh_argv,
     options_for_password_auth,
 )
-from gantry_sftp.transport._askpass import ASKPASS_ARMING_VARIABLES, askpass_environment
+from gantry_sftp.transport._askpass import (
+    ASKPASS_ARMING_VARIABLES,
+    Secret,
+    askpass_environment,
+)
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
 from gantry_sftp.transport._diagnosis import classify_failure, password_auth_hint
 
@@ -445,6 +449,12 @@ async def open_ssh_transport(
         NotImplementedError: If ``password`` is given on Windows.
         ConnectError: If ``ssh`` cannot be executed at all.
     """
+    # Rebound rather than copied to a new name, because it is *this* binding that leaks: this
+    # function is an @asynccontextmanager generator, so its frame -- and every local in it --
+    # stays alive for the whole connection and is what a frame-locals dumper walks. See
+    # :class:`~gantry_sftp.transport._askpass.Secret`.
+    if password is not None:
+        password = Secret(password)
     argv = build_ssh_argv(
         host,
         user=user,

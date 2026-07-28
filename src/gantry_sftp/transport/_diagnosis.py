@@ -117,15 +117,24 @@ def _option_value(argv: Sequence[str], name: str) -> str | None:
 
     Read back off argv rather than taken from the caller's ``options`` mapping, so the
     diagnosis describes what was actually sent to ``ssh`` rather than what we meant to send.
-    Both spellings are handled -- ``-o Name=value`` and ``-oName=value`` -- because argv is
+    Both separations are handled -- ``-o Name=value`` and ``-oName=value`` -- because argv is
     not always ours.
+
+    The **name** is matched case-insensitively for the same reason ``ssh`` does it that way:
+    :func:`~gantry_sftp.transport.build_ssh_argv` preserves whatever spelling the caller used,
+    so a connection built from ``{"BATCHMODE": "no"}`` carries ``-o BATCHMODE=no`` and an
+    exact-match lookup would report the option as absent -- turning a hint that names the
+    cause into no hint at all.
     """
-    prefix = f"{name}="
+    prefix = f"{name}=".lower()
+    width = len(prefix)
     for index, argument in enumerate(argv):
-        if argument == "-o" and index + 1 < len(argv) and argv[index + 1].startswith(prefix):
-            return argv[index + 1][len(prefix) :]
-        if argument.startswith("-o") and argument[2:].startswith(prefix):
-            return argument[2 + len(prefix) :]
+        if argument == "-o" and index + 1 < len(argv):
+            following = argv[index + 1]
+            if following[:width].lower() == prefix:
+                return following[width:]
+        if argument[:2] == "-o" and argument[2 : 2 + width].lower() == prefix:
+            return argument[2 + width :]
     return None
 
 

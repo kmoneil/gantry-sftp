@@ -96,6 +96,39 @@ def test_the_environment_carries_the_secret_and_arms_the_helper():
         assert env["SSH_ASKPASS_REQUIRE"] == "force"
 
 
+@pytest.mark.parametrize("password", HOSTILE_PASSWORDS)
+def test_the_environment_does_not_render_the_secret(password):
+    # The environment dictionary is a live local for the whole connection, and a frame-locals
+    # dumper renders every local with `repr`. So `repr` is the boundary, and it is the one
+    # that was open: Sentry captures locals by default, and so do `pytest --showlocals`,
+    # `rich` tracebacks and IPython's verbose mode.
+    with askpass_environment(password) as env:
+        assert password not in repr(env[ASKPASS_ANSWER_VARIABLE])
+
+
+def test_rendering_the_whole_environment_does_not_disclose_the_secret():
+    # The value-level assertion above cannot be written over the hostile set as a whole-dict
+    # check: `-n` and `plain` occur inside inherited variables like LS_COLORS, so a substring
+    # search would fail on the environment rather than on us. A canary settles it instead.
+    canary = "hunter2-CANARY-must-not-appear"
+    with askpass_environment(canary) as env:
+        assert canary not in repr(env)
+        assert "'<redacted>'" in repr(env)
+
+
+def test_the_redacted_secret_is_still_a_string_everywhere_it_must_be():
+    # The redaction is a `repr` that lies; everything else about the value has to keep telling
+    # the truth, or `ssh` gets the wrong password and the failure looks like a bad credential.
+    with askpass_environment("secret") as env:
+        answer = env[ASKPASS_ANSWER_VARIABLE]
+        assert isinstance(answer, str)
+        assert answer == "secret"
+        assert f"{answer}" == "secret"
+        assert dict(env)[ASKPASS_ANSWER_VARIABLE] == "secret"
+        # And the child -- the only consumer that matters -- reads it back intact.
+        assert run_helper(env).stdout == "secret\n"
+
+
 def test_the_helper_is_executable_by_its_owner_and_nobody_else():
     with askpass_environment("secret") as env:
         helper = Path(env["SSH_ASKPASS"])

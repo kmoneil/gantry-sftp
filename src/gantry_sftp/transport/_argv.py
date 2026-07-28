@@ -158,17 +158,69 @@ def _validate_option(name: str, value: str) -> None:
         raise ValueError(f"ssh option name may not contain whitespace: {name!r}")
 
 
+def _fold_options(base: Mapping[str, str], overrides: Mapping[str, str]) -> dict[str, str]:
+    """Layer ``overrides`` over ``base``, matching names the way ``ssh`` does.
+
+    ``ssh`` keyword names are **case-insensitive**, and when the same keyword is given twice
+    the **first** ``-o`` on the command line wins -- both measured against OpenSSH 10.0p2.
+    :func:`build_ssh_argv` emits ``sorted()`` argv, and in ASCII every uppercase letter sorts
+    before every lowercase one, so an override spelled ``STRICTHOSTKEYCHECKING`` used to land
+    *ahead* of our ``StrictHostKeyChecking`` and win -- while every check below went on reading
+    the default under its canonical spelling and saw nothing wrong. That silently defeated the
+    :class:`~gantry_sftp.exceptions.InsecureOptionWarning`, the ``PermitLocalCommand=no``
+    defence, and the ``BatchMode`` contradiction guard in
+    :func:`options_for_password_auth`.
+
+    Folding on the keyword keeps exactly one entry per option, so an override *replaces* the
+    default instead of racing it. The caller's spelling is preserved, because ``ssh`` accepts
+    any of them and a command line that echoes back what was asked for is easier to debug.
+
+    Args:
+        base: Defaults to start from.
+        overrides: The caller's options, matched against ``base`` case-insensitively.
+
+    Returns:
+        One entry per ssh keyword.
+    """
+    merged = dict(base)
+    held = {name.lower(): name for name in merged}
+    for name, value in overrides.items():
+        previous = held.get(name.lower())
+        if previous is not None:
+            del merged[previous]
+        held[name.lower()] = name
+        merged[name] = value
+    return merged
+
+
+def _value_of(options: Mapping[str, str], keyword: str) -> str:
+    """Read an option the way ``ssh`` would, ignoring how the caller spelled it.
+
+    Args:
+        options: Options already folded by :func:`_fold_options`, so the keyword appears once.
+        keyword: The canonical spelling to look for.
+
+    Returns:
+        The value under that keyword.
+
+    Raises:
+        StopIteration: If the keyword is absent. Callers only ask about keywords their own
+            defaults define, so an absence is a bug here rather than a caller error.
+    """
+    folded = keyword.lower()
+    return next(value for name, value in options.items() if name.lower() == folded)
+
+
 def _merged_options(overrides: Mapping[str, str] | None) -> dict[str, str]:
     """Apply caller overrides over the defaults, warning about the dangerous ones."""
-    options = dict(DEFAULT_SSH_OPTIONS)
     if not overrides:
-        return options
+        return dict(DEFAULT_SSH_OPTIONS)
 
     for name, value in overrides.items():
         _validate_option(name, value)
-        options[name] = value
+    options = _fold_options(DEFAULT_SSH_OPTIONS, overrides)
 
-    strictness = options["StrictHostKeyChecking"]
+    strictness = _value_of(options, "StrictHostKeyChecking")
     if strictness != DEFAULT_SSH_OPTIONS["StrictHostKeyChecking"]:
         # Overridable, but never quietly: this is the check that stops a machine-in-the-
         # middle from reading every byte of the transfer.
@@ -190,7 +242,9 @@ def options_for_password_auth(options: Mapping[str, str] | None) -> dict[str, st
 
     Args:
         options: The caller's ``-o`` overrides, or ``None``. Takes precedence over
-            :data:`PASSWORD_AUTH_OPTIONS` for every name except ``BatchMode``.
+            :data:`PASSWORD_AUTH_OPTIONS` for every name except ``BatchMode``. Names are
+            matched the way ``ssh`` matches them, which is case-insensitively -- see
+            :func:`_fold_options` for what spelling the guard below used to miss.
 
     Returns:
         Options to hand to :func:`build_ssh_argv`, which still layers them over
@@ -201,10 +255,8 @@ def options_for_password_auth(options: Mapping[str, str] | None) -> dict[str, st
             the same call. That is a contradiction rather than a preference: the connection
             would fail with ``Permission denied`` and nothing in the message would say why.
     """
-    merged = dict(PASSWORD_AUTH_OPTIONS)
-    if options:
-        merged.update(options)
-    batch_mode = merged["BatchMode"]
+    merged = _fold_options(PASSWORD_AUTH_OPTIONS, options or {})
+    batch_mode = _value_of(merged, "BatchMode")
     if batch_mode.strip().lower() != "no":
         raise ValueError(
             f"password= needs BatchMode=no, but options set BatchMode={batch_mode!r}; "

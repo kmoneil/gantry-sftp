@@ -44,12 +44,42 @@ import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import override
 
 __all__ = [
     "ASKPASS_ANSWER_VARIABLE",
     "ASKPASS_ARMING_VARIABLES",
     "askpass_environment",
 ]
+
+
+class Secret(str):
+    """A password that does not render itself, so a dumped stack frame cannot show it.
+
+    Keeping the secret out of argv and out of the helper file is only two thirds of the job.
+    The environment dictionary that carries it is a **local variable** in
+    :func:`askpass_environment` and in the transport's opener, both of which are
+    ``@asynccontextmanager`` generators -- so their frames stay alive for the whole connection
+    and are exactly what a frame-locals dumper walks. Sentry captures locals by default, and so
+    do ``pytest --showlocals``, ``rich`` tracebacks and IPython's verbose mode. Every one of
+    them renders a local with :func:`repr`, so ``repr`` is the boundary to defend.
+
+    This is still a real :class:`str` everywhere it has to be one: ``ssh`` receives the actual
+    secret through the child's environment, and comparisons against a plain ``str`` behave
+    normally.
+
+    **What it does not cover**, stated so nobody reads it as more than it is: a reporter that
+    calls :func:`str` rather than :func:`repr`, a core dump, and ``/proc/<pid>/environ`` all
+    still see the value. The last of those is the deliberate trade this module documents at the
+    top -- owner-and-root readable is the price of not putting it in argv.
+    """
+
+    __slots__ = ()
+
+    @override
+    def __repr__(self) -> str:
+        return "'<redacted>'"
+
 
 ASKPASS_ANSWER_VARIABLE = "GANTRY_SFTP_ASKPASS_ANSWER"
 """Environment variable the helper reads the secret from.
@@ -115,7 +145,9 @@ def askpass_environment(
     Args:
         password: The secret. It is placed in the returned environment under
             :data:`ASKPASS_ANSWER_VARIABLE` and nowhere else -- never in argv, never in a
-            file, never in a log.
+            file, never in a log. It is wrapped in :class:`Secret` on the way in, so the
+            environment dictionary can be rendered by a traceback reporter without disclosing
+            it.
         env: Base environment for the child. ``None`` means inherit this process's, which is
             what ``open_ssh_transport`` does when no ``env`` is given -- and it has to be
             materialised here, because a child that gets an explicit environment does not
@@ -149,7 +181,9 @@ def askpass_environment(
         child_env = dict(os.environ if env is None else env)
         child_env["SSH_ASKPASS"] = str(helper)
         child_env["SSH_ASKPASS_REQUIRE"] = "force"
-        child_env[ASKPASS_ANSWER_VARIABLE] = password
+        # Wrapped, not stored raw: this dictionary is a live local for the whole connection
+        # and is what a frame-locals dumper prints. See :class:`Secret`.
+        child_env[ASKPASS_ANSWER_VARIABLE] = Secret(password)
         yield child_env
     finally:
         # ignore_errors because failing to clean up a temporary file must not replace the

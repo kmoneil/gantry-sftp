@@ -31,9 +31,11 @@ import getpass
 import os
 import socket
 import sys
+from pathlib import Path
 
 import anyio
 
+import gantry_sftp
 from gantry_sftp.exceptions import AuthenticationError, ConnectError
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import (
@@ -68,6 +70,32 @@ def read_password() -> str:
             f"no terminal to prompt on: set {PASSWORD_VARIABLE} in the environment instead"
         )
     return getpass.getpass("password: ")
+
+
+def dumped_frames(error: BaseException) -> str:
+    """Render *the library's* frame locals the way a traceback reporter would.
+
+    The surface nobody looks at. Sentry captures frame locals by default, and so do
+    ``pytest --showlocals``, ``rich`` tracebacks and IPython's verbose mode -- all of them by
+    calling ``repr()`` on every local. The environment dictionary carrying the secret is a
+    local in an ``@asynccontextmanager`` generator, so its frame is alive for the whole
+    connection and lands in exactly that dump.
+
+    Only ``gantry_sftp``'s own frames are rendered, and the boundary is the point rather than
+    a convenience: *this* function's caller holds the plaintext in a local called ``secret``
+    and always will, because it is the thing being passed in. What the library controls is
+    what happens to it afterwards -- and after it crosses the boundary it is only ever held in
+    a form that does not render itself.
+    """
+    package = str(Path(gantry_sftp.__file__).parent)
+    rendered = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code.co_filename.startswith(package):
+            rendered += [f"{name}={value!r}" for name, value in frame.f_locals.items()]
+        traceback = traceback.tb_next
+    return "\n".join(rendered)
 
 
 def show_what_the_password_path_changes() -> None:
@@ -110,6 +138,7 @@ async def against_a_closed_port() -> None:
         # the machine; it never shows the password, because the password was never there.
         print(f"  password anywhere in argv:      {secret in ' '.join(error.argv)}")
         print(f"  password anywhere in the error: {secret in str(error)}")
+        print(f"  password in any dumped frame:   {secret in dumped_frames(error)}")
         print()
         print(f"and the connection failed for its own reason: {type(error).__name__}")
         for line in (error.stderr or "(nothing)").strip().splitlines():
