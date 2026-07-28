@@ -23,7 +23,7 @@ import os
 import socket
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,28 +64,90 @@ def unavailable_reason() -> str | None:
     return None
 
 
+STEERING = (
+    # The agent. This is the one that actually bites: if the developer is running an agent,
+    # `ssh` offers the keys it holds, so a test that means to fail with the *wrong* key can
+    # quietly succeed with the right one and the assertion that we surface `Permission
+    # denied` verifies nothing. Measured against a real agent holding the right key --
+    # `test_ssh_environment.py` has the truth table, including the row that authenticates.
+    "SSH_AUTH_SOCK",
+    # Kept for tidiness, and deliberately NOT described as steering. Measured: `ssh` and
+    # `ssh-add` locate the agent through `SSH_AUTH_SOCK` alone -- with only `SSH_AGENT_PID`
+    # set, `ssh-add -l` answers "Could not open a connection to your authentication agent".
+    # It is removed because a pid pointing at an agent the child cannot reach is misleading,
+    # not because leaving it would change what `ssh` does.
+    "SSH_AGENT_PID",
+    # The passphrase-prompt helper, and -- the part a list written from memory misses -- the
+    # two variables that ARM it. `ssh` runs an askpass helper when a display is available, so
+    # `DISPLAY` or `WAYLAND_DISPLAY` alone is sufficient; and clearing `SSH_ASKPASS` does not
+    # disarm it, because this binary has `/usr/bin/ssh-askpass` compiled in as the default.
+    # Measured: with an encrypted key the server accepts, `DISPLAY=:0` and
+    # `WAYLAND_DISPLAY=wayland-0` each make the helper run and the connection AUTHENTICATE.
+    # `WAYLAND_DISPLAY` appears nowhere in ssh(1); it is in the binary.
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    # `ssh` execs `$SHELL -c "exec <command>"` for `ProxyCommand`, `LocalCommand`, `Match
+    # exec` and the `ProxyUseFdpass` dialer; `/bin/sh` is only the fallback when this is
+    # unset. Measured with a marker script in `SHELL`, which duly ran with
+    # `argv=-c exec /bin/echo hello`. Removing it makes "the proxy runs under /bin/sh" true
+    # instead of "the proxy runs under whatever shell the developer happens to use".
+    "SHELL",
+    # Path to the helper `ssh` forks for a security-key (`-sk`) identity. Sourced from the
+    # installed binary's own strings and from OpenSSH's `ssh-sk-client.c`, NOT measured:
+    # provoking it needs a hardware token. Removed because it is the same class as
+    # `SSH_ASKPASS` -- an executable path taken from the environment -- and because
+    # over-removal costs nothing here.
+    "SSH_SK_HELPER",
+)
+"""Every environment variable that changes what ``ssh`` does, with the evidence for each.
+
+Sourced against OpenSSH 10.0p2 rather than recalled. Two of these were absent from the list
+this module shipped with, and the reason is instructive: the original four were the names a
+person remembers, and the ones that were missing are the *gates* rather than the mechanisms.
+"""
+
+REDIRECTED_HOME = "/nonexistent-home-for-live-tests"
+"""Where ``HOME`` is pointed. See :func:`scrubbed_ssh_env` for what this does and does not do.
+
+Public because it is the one *positive* signal that a connection's ``env`` came from
+:func:`scrubbed_ssh_env` rather than from ``os.environ``. Absence assertions cannot say that:
+on a runner where none of :data:`STEERING` happens to be set, "none of these names is present"
+is equally true of an unscrubbed environment. This value is never present by accident.
+"""
+
+
 def scrubbed_ssh_env() -> dict[str, str]:
     """An environment with everything that steers ``ssh`` removed.
 
-    ``SSH_AUTH_SOCK`` is the one that actually bites. If the developer is running an agent,
-    ``ssh`` may offer the keys it holds -- so a test that means to fail with the *wrong* key
-    can quietly succeed with the right one, and the assertion that we surface
-    ``Permission denied`` verifies nothing at all. ``IdentitiesOnly=yes`` already covers this,
-    which is exactly why removing the variable too is worth doing: two independent defences,
-    and this one costs a dict comprehension.
+    :data:`STEERING` is the list and carries the evidence for each name. What follows is the
+    part that is easy to get wrong, and that this module got wrong until 0.8.
 
-    ``HOME`` is redirected for the same reason it always is -- it drags ``~/.ssh/config``
-    along with it, and a test that reads the developer's real config passes on their machine
-    and proves nothing. This repo has already watched an unguarded probe surface a macOS-only
-    ``UseKeychain`` key on Linux.
+    **Redirecting ``HOME`` does not stop ``ssh`` reading the developer's ``~/.ssh``.** That
+    was the stated reason for doing it here, and it is false. ``ssh`` resolves ``~`` from the
+    password database, not from ``$HOME``. Measured on OpenSSH 10.0p2: with ``HOME`` pointed
+    at an empty directory, ``ssh -v`` still reads ``/home/dev/.ssh/config`` -- emitting the
+    very ``UseKeychain`` errors DESIGN.md §4.3 cites as the incident that motivated this
+    function -- and still loads ``/home/dev/.ssh/id_rsa`` and ``id_ed25519`` as candidate
+    identities. **``-F`` is the defence**, which is why :func:`client_kwargs` passes
+    ``os.devnull`` unconditionally and why a test now asserts that it does.
+
+    The redirect is kept, with its real and much narrower scope stated: ``HOME`` is inherited
+    by the children ``ssh`` spawns -- ``ProxyCommand``, ``LocalCommand``, an askpass helper --
+    and it expands inside ``-o`` values, where ``ControlPath=${HOME}/...`` is the case that
+    matters. Measured: ``HOME=/zzz-fake-home`` yields ``controlpath /zzz-fake-home/cp-dev``.
 
     It matters for the benchmark too, and for a second reason: an ``ssh_config`` carrying
     ``Compression yes`` or a ``ControlMaster`` socket would change the number without changing
-    the code, and the report would name a link profile it was not actually measured on.
+    the code, and the report would name a link profile it was not actually measured on. That
+    is ``-F``'s doing as well.
+
+    Returns:
+        A filtered copy. ``os.environ`` is not touched.
     """
-    steering = {"SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "SSH_AGENT_PID"}
-    env = {k: v for k, v in os.environ.items() if k not in steering}
-    env["HOME"] = "/nonexistent-home-for-live-tests"
+    env = {k: v for k, v in os.environ.items() if k not in STEERING}
+    env["HOME"] = REDIRECTED_HOME
     return env
 
 
@@ -106,19 +168,66 @@ class SSHServer:
     wrong_identity_file: Path
     empty_known_hosts: Path
     root: Path
+    applied_directives: tuple[str, ...] = ()
+    """Which of :data:`OPTIONAL_DIRECTIVES` this ``sshd`` actually accepted.
+
+    Reported rather than assumed because :func:`_write_config` drops them *silently* when
+    ``sshd -t`` refuses the config -- for any reason, not only an old ``sshd``. A lane that
+    depends on one of them, as the agent-rescue lane depends on ``PerSourcePenalties no``,
+    can then assert its precondition instead of being diagnosed later as a key-exchange
+    reset in an unrelated test.
+    """
 
     def connect_options(self) -> dict[str, str]:
         """Options that pin this test server and nothing else.
 
         ``IdentitiesOnly`` matters: without it ``ssh`` will also offer whatever the agent
         holds, so a test meant to fail on a wrong key can accidentally succeed on the
-        developer's real one.
+        developer's real one. It is the first of two independent defences and the scrubbed
+        environment is the second; ``test_ssh_environment.py`` proves each holds alone, and
+        asserts this dict still carries it -- deleting the line used to leave the whole live
+        suite green, because the other defence covered for it.
         """
         return {
             "UserKnownHostsFile": str(self.known_hosts),
             "IdentitiesOnly": "yes",
-            "GlobalKnownHostsFile": "/dev/null",
+            "GlobalKnownHostsFile": os.devnull,
         }
+
+
+def client_kwargs(
+    *, port: int, identity_file: str | Path, options: Mapping[str, str]
+) -> dict[str, object]:
+    """The connection arguments every suite here must use, assembled in one place.
+
+    Three call sites need these -- :func:`connect_kwargs` for the OpenSSH server, and the
+    asyncssh and paramiko servers in :mod:`matrix` -- and the two that are not
+    :func:`connect_kwargs` used to spell out ``config_file`` and ``env`` for themselves.
+    That is precisely the arrangement this module's docstring exists to prevent: with more
+    than one spelling of "how this suite connects", one of them eventually stops being
+    scrubbed and nothing goes red.
+
+    ``env`` is the second of two independent defences against an agent supplying a key the
+    test never meant to offer; ``IdentitiesOnly`` in the caller's options is the first.
+    ``test_ssh_environment.py`` proves each one holds without the other, and proves the
+    hazard is real by removing both.
+
+    Args:
+        port: Port the server is listening on.
+        identity_file: Private key to authenticate with, passed as ``-i``.
+        options: ``-o`` options pinning this server. Copied, not aliased.
+
+    Returns:
+        Arguments ready to splat into
+        :func:`~gantry_sftp.transport.open_ssh_transport`, host excluded.
+    """
+    return {
+        "port": port,
+        "identity_file": str(identity_file),
+        "config_file": os.devnull,
+        "env": scrubbed_ssh_env(),
+        "options": dict(options),
+    }
 
 
 def connect_kwargs(server: SSHServer, **overrides: object) -> dict[str, object]:
@@ -134,15 +243,7 @@ def connect_kwargs(server: SSHServer, **overrides: object) -> dict[str, object]:
     supplied = overrides.pop("options", {})
     assert isinstance(supplied, dict)
     options.update(supplied)
-    kwargs: dict[str, object] = {
-        "port": server.port,
-        "identity_file": str(server.identity_file),
-        "config_file": os.devnull,
-        # An agent holding a working key would make the wrong-key test pass for the wrong
-        # reason. IdentitiesOnly already covers it; this is the second, independent defence.
-        "env": scrubbed_ssh_env(),
-        "options": options,
-    }
+    kwargs = client_kwargs(port=server.port, identity_file=server.identity_file, options=options)
     kwargs.update(overrides)
     return kwargs
 
@@ -205,8 +306,14 @@ def _config_is_valid(sshd: str, config: Path, host_key: Path) -> bool:
 
 def _write_config(
     root: Path, *, sshd: str, host_key: Path, authorized_keys: Path, sftp_server: str
-) -> Path:
-    """Write an sshd config, dropping optional directives this sshd does not understand."""
+) -> tuple[Path, tuple[str, ...]]:
+    """Write an sshd config, dropping optional directives this sshd does not understand.
+
+    Returns:
+        The config path, and which of :data:`OPTIONAL_DIRECTIVES` survived. The second half
+        is returned rather than discarded because dropping one is silent and its absence
+        surfaces much later, in a different test, as a connection reset during key exchange.
+    """
     base = (
         "ListenAddress 127.0.0.1",
         f"HostKey {host_key}",
@@ -224,10 +331,10 @@ def _write_config(
     for extras in (OPTIONAL_DIRECTIVES, ()):
         config.write_text("\n".join((*base, *extras)) + "\n")
         if _config_is_valid(sshd, config, host_key):
-            return config
+            return config, extras
     # Neither spelling validated: leave the plain one and let startup report the real reason,
     # which will be more specific than anything guessed here.
-    return config
+    return config, ()
 
 
 def _scan_host_key(port: int, root: Path) -> Path:
@@ -280,7 +387,7 @@ def running_sshd(root: Path) -> Iterator[SSHServer]:
     authorized_keys.write_bytes(identity.with_suffix(".pub").read_bytes())
 
     port = free_port()
-    config = _write_config(
+    config, applied_directives = _write_config(
         root,
         sshd=sshd,
         host_key=host_key,
@@ -307,6 +414,7 @@ def running_sshd(root: Path) -> Iterator[SSHServer]:
                 wrong_identity_file=wrong_identity,
                 empty_known_hosts=empty_known_hosts,
                 root=root,
+                applied_directives=applied_directives,
             )
         finally:
             process.terminate()

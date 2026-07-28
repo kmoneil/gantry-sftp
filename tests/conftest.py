@@ -97,8 +97,9 @@ def sftp_server_binary() -> Path:
     return path
 
 
-# The environment-scrubbing helper that used to live here moved to live-tests/conftest.py,
-# where something actually spawns ssh against a server that can authenticate it. Nothing in
-# tests/ reaches an ssh_config -- every ssh here either passes `config_file=os.devnull` or
-# fails before a connection is attempted -- so keeping a fixture nobody used was decoration
-# that looked like a safeguard.
+# The environment-scrubbing helper that used to live here now lives in live-tests/sshd.py,
+# where something actually spawns ssh against a server that can authenticate it, and where
+# live-tests/test_ssh_environment.py asserts what it does. Nothing in tests/ reaches an
+# ssh_config: the ssh calls here either pass `config_file=os.devnull`, run a fake ssh that
+# is a script and reads no config at all, or fail during argv validation before a process
+# exists. So keeping a fixture nobody used was decoration that looked like a safeguard.

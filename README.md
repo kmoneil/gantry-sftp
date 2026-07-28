@@ -720,6 +720,47 @@ default. They pull in `cryptography`, `pynacl` and `bcrypt` — Python cryptogra
 what this project exists not to need, and a `uv sync` that installed it would make that claim
 harder to check than it should be.
 
+### The controlled `ssh` environment
+
+Every `ssh` these suites spawn gets `-F /dev/null` and an environment with `SSH_AUTH_SOCK`,
+`SSH_AGENT_PID`, `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `DISPLAY`, `WAYLAND_DISPLAY`, `SHELL` and
+`SSH_SK_HELPER` removed. That is not hygiene for its own sake. Without it, a developer with an
+agent running has that agent supply a working key to the test that means to fail with the
+*wrong* one — and the assertion that we surface `Permission denied` verifies nothing while
+staying green.
+
+`live-tests/test_ssh_environment.py` proves it, and the interesting half is *how*. It reads the
+child's environment directly rather than inferring it from behaviour: `ProxyCommand` is executed
+by the `ssh` client and inherits its environment verbatim, so a proxy that dumps its own
+`os.environ` reports what `ssh` was handed rather than what we meant to hand it. Then it
+reproduces the hazard, with a real `ssh-agent` holding the *right* key while the connection is
+made with the *wrong* one:
+
+| parent environment | `IdentitiesOnly` | result |
+| --- | --- | --- |
+| scrubbed | `yes` | `Permission denied (publickey)` |
+| scrubbed | absent | `Permission denied (publickey)` |
+| agent visible | `yes` | `Permission denied (publickey)` |
+| agent visible | absent | **authenticates** |
+
+Two independent defences, each sufficient on its own. The bottom row is what stops the other
+three being four ways of saying "the connection failed for some reason".
+
+Writing those proofs corrected two beliefs this repository had been running on, both measured
+against OpenSSH 10.0p2:
+
+- **Redirecting `HOME` does not keep your `~/.ssh` out of a test run.** `ssh` resolves `~` from
+  the password database, not from `$HOME` — with `HOME` pointed at an empty directory it still
+  reads the real `~/.ssh/config` and still loads the real default identities. **`-F` is the
+  defence**, and nothing asserted it either. The redirect stays for its real and narrower scope:
+  it is inherited by the children `ssh` spawns, and it expands inside `-o` values such as
+  `ControlPath=${HOME}/…`.
+- **Clearing `SSH_ASKPASS` does not disarm the askpass helper.** `/usr/bin/ssh-askpass` is
+  compiled in as the default, and the variables that *arm* it are `DISPLAY` and
+  `WAYLAND_DISPLAY` — either alone is enough to make a passphrase-protected key authenticate
+  through a helper. Both were missing from the set; `WAYLAND_DISPLAY` appears nowhere in
+  `ssh(1)`.
+
 ### The netem lane
 
 `live-tests/test_netem_pipelining.py` is where every claim about pipelining is made, because

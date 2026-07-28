@@ -217,11 +217,11 @@ def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
             f"asyncssh {asyncssh.__version__}",
             {
                 "host": "127.0.0.1",
-                "port": port,
-                "identity_file": str(client_key),
-                "config_file": os.devnull,
-                "env": sshd.scrubbed_ssh_env(),
-                "options": _client_options(root / "asyncssh_known_hosts"),
+                **sshd.client_kwargs(
+                    port=port,
+                    identity_file=client_key,
+                    options=_client_options(root / "asyncssh_known_hosts"),
+                ),
             },
             root,
         )
@@ -265,11 +265,11 @@ def _running_paramiko(root: Path) -> Iterator[MatrixServer]:
             f"paramiko {paramiko.__version__}",
             {
                 "host": "127.0.0.1",
-                "port": port,
-                "identity_file": str(client_key_path),
-                "config_file": os.devnull,
-                "env": sshd.scrubbed_ssh_env(),
-                "options": _client_options(root / "paramiko_known_hosts"),
+                **sshd.client_kwargs(
+                    port=port,
+                    identity_file=client_key_path,
+                    options=_client_options(root / "paramiko_known_hosts"),
+                ),
             },
             root,
         )

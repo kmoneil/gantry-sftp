@@ -18,12 +18,14 @@ processes to prove nothing about anyio.
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 from matrix import SERVER_NAMES, MatrixServer, running_server, unavailable_reason
+from sshd import REDIRECTED_HOME, STEERING
 
 from gantry_sftp.codec import CheckFileReply, decode
 from gantry_sftp.exceptions import NoSuchFileError, ServerError
@@ -60,6 +62,31 @@ async def connected(server: MatrixServer) -> AsyncIterator[Session]:
 
 
 # --- what every implementation agrees on -------------------------------------------------------
+
+
+def test_every_server_in_the_matrix_is_reached_with_both_defences(server: MatrixServer):
+    """The sweep half of D-35: three constructors, one standard, asserted per server.
+
+    ``matrix.py`` builds its own connection arguments for asyncssh and paramiko, and used to
+    spell out ``config_file`` and ``env`` itself. They now go through
+    :func:`sshd.client_kwargs`, and this is what keeps them there -- a construction site is a
+    per-field decision nobody re-reads, and the failure mode is one server quietly being
+    reached with the developer's agent and ``ssh_config`` in play while the other two are not.
+
+    ``live-tests/test_ssh_environment.py`` proves what each of these three settings buys.
+
+    **The ``HOME`` line is the one that does the work, and the absence check alone would be a
+    test that could not fail.** On a runner where none of the steering names happens to be set
+    -- a bare CI container, which is the default -- "none of these names is present" is equally
+    true of ``dict(os.environ)``, so a site reverted to an unscrubbed environment would stay
+    green. The redirect is never present by accident, so it is a positive statement that this
+    dict came from the scrubber. Measured: with the asyncssh site reverted to
+    ``dict(os.environ)`` and ``SHELL`` unset, the whole live suite was 117 passed / 10 skipped.
+    """
+    assert server.connect["config_file"] == os.devnull
+    assert server.connect["options"]["IdentitiesOnly"] == "yes"
+    assert server.connect["env"]["HOME"] == REDIRECTED_HOME
+    assert [name for name in STEERING if name in server.connect["env"]] == []
 
 
 async def test_every_server_negotiates_version_3(server: MatrixServer):
