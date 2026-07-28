@@ -27,7 +27,7 @@ from matrix import SERVER_NAMES, MatrixServer, running_server, unavailable_reaso
 
 from gantry_sftp.codec import CheckFileReply, decode
 from gantry_sftp.exceptions import NoSuchFileError, ServerError
-from gantry_sftp.session import Session, open_session, parse_vendor_id
+from gantry_sftp.session import Session, SizeCheck, open_session, parse_vendor_id
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -89,6 +89,73 @@ async def test_a_file_round_trips_through_every_server(server: MatrixServer, tmp
 
     assert remote.read_bytes() == payload
     assert local.read_bytes() == payload
+
+
+async def test_rung_3_is_satisfied_by_every_server(server: MatrixServer, tmp_path: Path):
+    """DESIGN.md 6's size check, against three implementations instead of one.
+
+    Whether a `STAT` reply carries a size is per-implementation, and it decides whether rung 3
+    reports `MATCHED` or silently degrades to `UNAVAILABLE`. Until 0.8 this had been measured
+    against OpenSSH's `sftp-server` and nowhere else, so "the check happens" was a claim about
+    one server. `UNAVAILABLE` on any row here would mean uploads through that endpoint are not
+    being size-checked at all -- reported, but by a value nobody was asserting.
+
+    **What the paramiko row is and is not.** Its filesystem handler is this repo's
+    (`matrix._ParamikoHandler.stat` calls `SFTPAttributes.from_stat`), so the *value* is ours
+    and this is not evidence about paramiko's filesystem behaviour. It is still evidence about
+    paramiko's `SFTPServer`: whether the size flag survives its ATTRS encoding, and whether our
+    client reads it back out. That half is not ours, so the row runs rather than skipping --
+    with the line drawn here instead of left for a reader to assume.
+    """
+    payload = b"id,total\n1,42\n" * 91  # 1274 bytes: not a round number, not one packet
+    source = tmp_path / "upload.csv"
+    source.write_bytes(payload)
+    remote = server.root / "verified.csv"
+
+    async with connected(server) as sftp:
+        result = await sftp.put(source, str(remote))
+
+    assert result.size_check is SizeCheck.MATCHED, (
+        f"{server.name} did not report a size, so rung 3 degraded to "
+        f"{result.size_check.value} -- uploads through it are unchecked"
+    )
+    assert result.transferred == len(payload)
+    assert remote.read_bytes() == payload
+
+
+async def test_rung_3_reaches_whole_trees_through_every_server(
+    server: MatrixServer, tmp_path: Path
+):
+    """`put_tree` and `get_tree` inherit the check by delegation -- proven here, not read.
+
+    `tests/test_verification.py` proves the tree paths *fail* on a truncation, using a server
+    built to lie. It cannot prove they do not misfire, because every scripted case there would
+    also pass against an implementation that raised unconditionally. This is that other half,
+    and it is run against three servers rather than one because "does this endpoint report a
+    size" is exactly the fact that differs between them.
+
+    `TreeResult` carries no `size_check` -- see the decision recorded in
+    `tests/test_verification.py` -- so what a tree can assert is that it completed, which it
+    cannot do if any file's check fired.
+    """
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    for index in range(3):
+        (source / f"part-{index}.bin").write_bytes(bytes((index + 7,)) * (500 + index))
+    remote_root = server.root / "tree-up"
+    landing = tmp_path / "landing"
+
+    async with connected(server) as sftp:
+        up = await sftp.put_tree(source, str(remote_root))
+        down = await sftp.get_tree(str(remote_root), landing)
+
+    assert up.files == 3, f"{server.name}: {up.skipped}"
+    assert up.complete
+    assert down.files == 3, f"{server.name}: {down.skipped}"
+    assert down.complete
+    for index in range(3):
+        name = f"part-{index}.bin"
+        assert (landing / name).read_bytes() == (source / name).read_bytes()
 
 
 async def test_a_missing_file_is_reported_as_no_such_file_everywhere(server: MatrixServer):

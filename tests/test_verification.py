@@ -16,6 +16,13 @@ Neither half is evidence without the other.
 What this does *not* test is content, because the check does not verify content. It is a
 length comparison: it catches truncation and nothing else, and the docstrings say so in those
 words rather than letting "verified" be read into it.
+
+``get_tree`` and ``put_tree`` get the same treatment as of D-71, for the reason the tree
+section below states: they inherit the check by *delegation*, which is a property of the
+current call graph rather than a guarantee, and nothing here would have noticed it breaking.
+The matching does-it-not-misfire half for trees is in ``live-tests/test_matrix.py``, against
+all three server implementations rather than one -- whether an endpoint reports a size at all
+is exactly the sort of thing that differs between them.
 """
 
 from __future__ import annotations
@@ -36,8 +43,12 @@ from gantry_sftp.codec import (
     Handle,
     Init,
     LStat,
+    Name,
+    NameEntry,
     Open,
+    OpenDir,
     Read,
+    ReadDir,
     Stat,
     Status,
     StatusCode,
@@ -60,6 +71,11 @@ class LyingServer:
     length and the bytes do not match it. ``stated_size`` is what every STAT reports;
     ``content`` is what a READ will actually yield, and writes are counted rather than kept so
     an upload's stated size can be made to disagree with the local file's.
+
+    ``entries`` makes it serve a single flat directory, which is what the ``get_tree`` cases
+    need: one batch of NAME entries then EOF. ``opened`` records every OPEN filename in order,
+    so a test can assert a tree *stopped* rather than merely that it raised -- the difference
+    between an error propagating and an error being collected into ``skipped``.
     """
 
     def __init__(
@@ -69,13 +85,17 @@ class LyingServer:
         stated_size: int | None = None,
         no_size: bool = False,
         refuse_stat: bool = False,
+        entries: tuple[bytes, ...] = (),
     ) -> None:
         self.content = content
         self.stated_size = len(content) if stated_size is None else stated_size
         self.no_size = no_size
         self.refuse_stat = refuse_stat
+        self.entries = entries
         self.written = bytearray()
         self.kinds: list[str] = []
+        self.opened: list[bytes] = []
+        self._drained: set[bytes] = set()
         self._splitter = FrameSplitter()
         self._outbox = bytearray()
         self._has_output = anyio.Event()
@@ -109,17 +129,53 @@ class LyingServer:
         )
         self._handle(packet)
 
+    def _stat(self, rid: int) -> None:
+        if self.refuse_stat:
+            self._reply(Status(rid, StatusCode.PERMISSION_DENIED, b"no stat for you"))
+        elif self.no_size:
+            self._reply(AttrsReply(rid, Attrs()))
+        else:
+            self._reply(AttrsReply(rid, Attrs(size=self.stated_size)))
+
+    def _readdir(self, rid: int, handle: bytes) -> None:
+        """One batch of :attr:`entries` then EOF, keyed on the handle.
+
+        A NAME with no entries would also mean end-of-directory, but sending EOF is what the
+        reference server does and the zero-count NAME has its own test elsewhere.
+        """
+        if handle in self._drained:
+            self._reply(Status(rid, StatusCode.EOF))
+            return
+        self._drained.add(handle)
+        self._reply(
+            Name(
+                rid,
+                tuple(
+                    NameEntry(
+                        name,
+                        b"-rw-r--r-- 1 u g " + name,
+                        # 0o100644 -- the file-*type* bits are what matter, not the permission
+                        # bits: `entry_kind` reads S_ISREG off this same field, and a bare
+                        # 0o644 would classify every entry as OTHER and make the walk skip the
+                        # whole directory rather than descend into it.
+                        Attrs(size=self.stated_size, permissions=0o100644),
+                    )
+                    for name in self.entries
+                ),
+            )
+        )
+
     def _handle(self, packet: object) -> None:
         rid = packet.request_id  # type: ignore[union-attr]
         if isinstance(packet, Stat | LStat):
-            if self.refuse_stat:
-                self._reply(Status(rid, StatusCode.PERMISSION_DENIED, b"no stat for you"))
-            elif self.no_size:
-                self._reply(AttrsReply(rid, Attrs()))
-            else:
-                self._reply(AttrsReply(rid, Attrs(size=self.stated_size)))
+            self._stat(rid)
         elif isinstance(packet, Open):
+            self.opened.append(packet.filename)
             self._reply(Handle(rid, b"h"))
+        elif isinstance(packet, OpenDir):
+            self._reply(Handle(rid, b"d"))
+        elif isinstance(packet, ReadDir):
+            self._readdir(rid, packet.handle)
         elif isinstance(packet, Read):
             chunk = self.content[packet.offset : packet.offset + packet.length]
             if chunk:
@@ -331,6 +387,92 @@ async def test_an_in_place_upload_is_checked_too(tmp_path: Path):
     assert exc.value.args[0] == (
         "uploaded 14 bytes but b'/incoming/report.csv' is 3 bytes on the server; "
         "the transfer was truncated or the file changed underneath it"
+    )
+
+
+# --- whole trees --------------------------------------------------------------------------
+#
+# D-71. `get_tree` and `put_tree` inherit rung 3 by delegation -- they call `get` and `put` per
+# file -- and until 0.8 that inheritance was established by reading the code rather than by a
+# test. A later change giving either its own inner transfer loop would drop the check silently
+# and every test above would still pass. These are the tests that would go red.
+#
+# Note what shape the proof has to take: `TreeResult` carries no `size_check`, so a tree cannot
+# *report* the verdict, only fail on it. Both cases therefore assert the raise -- and assert the
+# tree stopped, because an error that gets swallowed into `skipped` would satisfy a bare
+# `pytest.raises` on the wrong grounds.
+
+
+async def test_a_truncated_file_fails_put_tree_and_stops_it(tmp_path: Path):
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    (source / "a.csv").write_bytes(b"id,total\n1,42\n")  # 14 bytes
+    (source / "b.csv").write_bytes(b"id,total\n2,17\n")  # 14 bytes
+    server = LyingServer(stated_size=9)  # accepts the writes, then claims it holds 9
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as exc:
+            _ = await sftp.put_tree(source, b"/incoming", atomic=False)
+
+    assert exc.value.args[0] == (
+        "uploaded 14 bytes but b'/incoming/a.csv' is 9 bytes on the server; "
+        "the transfer was truncated or the file changed underneath it"
+    )
+    # The second file was never opened. That is the assertion that separates "the check ran and
+    # the error propagated" from "the check ran and put_tree carried on to the next file".
+    assert server.opened == [b"/incoming/a.csv"]
+
+
+async def test_a_short_file_fails_get_tree_and_stops_it(tmp_path: Path):
+    # The server lists two files and claims 14 bytes for each, then serves 9. The first one is
+    # short, so the tree must fail on it rather than write a truncated file and continue.
+    server = LyingServer(content=b"id,total\n", stated_size=14, entries=(b"a.csv", b"b.csv"))
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as exc:
+            _ = await sftp.get_tree(b"/outgoing", tmp_path / "landing")
+
+    assert exc.value.args[0] == (
+        "b'/outgoing/a.csv' is 14 bytes but the download ended after 9; "
+        "it was truncated or the file shrank underneath it"
+    )
+    assert server.opened == [b"/outgoing/a.csv"]
+
+
+async def test_a_tree_whose_server_will_not_stat_is_not_reported_as_unverified(
+    tmp_path: Path,
+):
+    """The decision D-71 asked for, recorded as a test so it cannot drift into an accident.
+
+    ``put`` distinguishes "the lengths agreed" from "the server would not say" -- that is why
+    :class:`SizeCheck` has two values rather than being a boolean. ``put_tree`` **discards
+    that**: it keeps ``result.transferred`` from each :class:`UploadResult` and drops
+    ``size_check``, so a tree of ten thousand files onto a server that refuses every ``STAT``
+    completes with ``complete is True`` and no indication that rung 3 never happened.
+
+    That is a real loss of information and it is deliberate for now. ``TreeResult`` is shared by
+    ``get_tree``, ``put_tree`` and ``rmtree``; only ``put_tree`` has a per-file verdict to
+    aggregate, because ``get`` returns an ``int`` and ``rmtree`` moves no bytes. A field that
+    can only be populated honestly by one of three constructors is a worse trap than the
+    silence -- it would read as "verified" on the two paths that never set it.
+
+    What would change the decision: a caller who needs the distinction, or ``get`` growing a
+    result object of its own. Until then this test pins the behaviour so the gap is visible in
+    the suite rather than only in a card.
+    """
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    (source / "a.csv").write_bytes(b"id,total\n1,42\n")
+    server = LyingServer(refuse_stat=True)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put_tree(source, b"/incoming", atomic=False)
+
+    assert result.files == 1
+    assert result.transferred == 14
+    assert result.complete, "a refused STAT is not a skipped file"
+    assert not hasattr(result, "size_check"), (
+        "TreeResult grew a size-check field -- update this test and the reasoning above"
     )
 
 
