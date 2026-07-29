@@ -34,6 +34,7 @@ from gantry_sftp.transport._diagnosis import (
     HOST_KEY_MARKERS,
     INTERACTIVE_AUTH_METHODS,
     classify_failure,
+    missing_executable_hint,
     password_auth_hint,
 )
 from gantry_sftp.transport._subprocess import (
@@ -63,6 +64,7 @@ __all__ = [
     "build_ssh_argv",
     "classify_failure",
     "find_sftp_server",
+    "missing_executable_hint",
     "open_local_server_transport",
     "open_ssh_transport",
     "options_for_password_auth",

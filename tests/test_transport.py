@@ -299,6 +299,38 @@ async def test_a_missing_ssh_executable_is_a_clear_connect_error(tmp_path: Path)
     assert exc.value.argv[0] == str(missing)
 
 
+async def test_a_missing_ssh_executable_carries_the_hint_that_says_what_to_install(
+    tmp_path: Path,
+):
+    """D-89. The message says what happened; the hint says what to do about it.
+
+    This is the failure most likely to be somebody's first experience of the library -- the
+    requirement is satisfied on every developer machine and absent from most slim images, so
+    it passes locally and fails on first deploy. ``could not run 'ssh': No such file or
+    directory`` is diagnosable only by a reader who already knows the answer, which makes the
+    hint the whole fix. Asserted through a real spawn rather than by unit-testing the hint
+    alone, because the wiring is the half that can be forgotten.
+    """
+    missing = tmp_path / "definitely-not-here"
+    with pytest.raises(ConnectError) as exc:
+        await _open_and_close(open_ssh_transport("h", ssh_executable=str(missing)))
+    assert "does not implement SSH" in exc.value.hint
+    assert "apt-get install openssh-client" in exc.value.hint
+    assert "distroless or scratch" in exc.value.hint
+
+
+async def test_a_spawn_failure_with_stderr_does_not_get_an_installation_hint(fake_ssh: Path):
+    """The binary ran, so nothing about installing one is relevant.
+
+    Guards the direction that matters: a hint keyed too loosely would tell every reader whose
+    connection failed for any reason to install a package they already have.
+    """
+    async with open_ssh_transport("example.com", ssh_executable=str(fake_ssh)) as transport:
+        with pytest.raises(ConnectError) as exc:
+            await transport.receive()
+    assert "apt-get" not in exc.value.hint
+
+
 async def test_the_password_never_reaches_a_dumped_stack_frame(tmp_path: Path):
     """A traceback reporter that captures locals must not capture the secret.
 

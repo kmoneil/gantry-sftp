@@ -70,7 +70,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, where an error lands once you fan out — and `get_tree(concurrency=)`, which is a bounded pool rather than the same thing with a loop, plus `resume=` over a finished tree |
 | `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |
-| `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
+| `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, OpenSSH's stderr verbatim, and the two cases where `hint` says what to do -- including a missing `ssh` client, where there is no stderr at all |
 | `password_auth.py`        | `password=`, the `SSH_ASKPASS` helper it writes, why `BatchMode` has to be relaxed, and the proof that the secret reaches neither argv nor the exception |
 | `observability.py`        | the three loggers, a frame dump of a real transfer, the session counters, and a filename that tries to forge a log record |
 | `server_capabilities.py`  | `session.profile`, the advertised extension list, and `check_file()` refusing — with the rung-3 fallback that every real endpoint takes |

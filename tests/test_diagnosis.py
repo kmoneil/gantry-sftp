@@ -12,6 +12,8 @@ The live proof that these classes really are raised end to end is in
 
 from __future__ import annotations
 
+import errno
+
 import pytest
 
 from gantry_sftp.exceptions import AuthenticationError, ConnectError, HostKeyError
@@ -19,6 +21,7 @@ from gantry_sftp.transport import (
     INTERACTIVE_AUTH_METHODS,
     build_ssh_argv,
     classify_failure,
+    missing_executable_hint,
     password_auth_hint,
 )
 
@@ -250,3 +253,50 @@ def test_a_hinted_failure_is_still_classified_as_an_authentication_error(stderr)
     # The hint is additional state, not a reclassification. `except AuthenticationError` must
     # keep matching.
     assert classify_failure(stderr) is AuthenticationError
+
+
+# --- The failure with no stderr to classify (D-89) ----------------------------------------
+#
+# Every other hint in this module reads text OpenSSH produced. This one exists because there
+# is no text: `exec` failed, so nothing ran, so there is no banner and nothing to match on.
+# The only inputs are the executable name and an errno.
+
+
+def test_a_missing_ssh_names_the_requirement_the_package_and_the_escape_hatch():
+    hint = missing_executable_hint("ssh", errno_value=errno.ENOENT)
+    # The requirement, stated as what the library is rather than as a caveat -- this is the
+    # sentence the reader in a broken container has to be able to act on.
+    assert "does not implement SSH" in hint
+    assert "runs the OpenSSH client as a subprocess" in hint
+    # All three package managers, because sys.platform cannot tell them apart.
+    assert "apt-get install openssh-client" in hint
+    assert "apk add openssh-client" in hint
+    assert "dnf install openssh-clients" in hint
+    # The override, for an ssh that exists somewhere PATH does not reach.
+    assert "ssh_executable=" in hint
+    # And the case where "install it" is not an answer at all.
+    assert "distroless or scratch" in hint
+
+
+def test_the_missing_hint_quotes_the_executable_it_actually_tried():
+    # A Windows absolute path from resolve_ssh_executable's branch must appear as itself: the
+    # reader needs to know *which* ssh was looked for, not that "ssh" was.
+    windows = r"C:\Windows\System32\OpenSSH\ssh.exe"
+    assert repr(windows) in missing_executable_hint(windows, errno_value=errno.ENOENT)
+
+
+def test_a_present_but_unexecutable_ssh_gets_a_different_hint():
+    # Distinct from absent: telling somebody to install a binary they already have sends them
+    # to fix the wrong thing.
+    hint = missing_executable_hint("/usr/bin/ssh", errno_value=errno.EACCES)
+    assert "exists but could not be executed" in hint
+    assert "apt-get" not in hint
+    assert hint == missing_executable_hint("/usr/bin/ssh", errno_value=errno.EPERM)
+
+
+@pytest.mark.parametrize("errno_value", [errno.ENOMEM, errno.EMFILE, errno.EAGAIN, None])
+def test_a_spawn_failure_that_is_not_about_the_binary_gets_no_hint(errno_value):
+    # The third state, decided rather than defaulted. Out of memory, out of file descriptors
+    # and a platform that supplied no errno are all real, and none of them is fixed by
+    # installing openssh-client -- so inventing advice would send the reader somewhere wrong.
+    assert missing_executable_hint("ssh", errno_value=errno_value) == ""

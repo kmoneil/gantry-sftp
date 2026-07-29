@@ -38,6 +38,7 @@ keyed on a server implementation is the wrong place to record what our own subpr
 
 from __future__ import annotations
 
+import errno
 from collections.abc import Sequence
 from typing import Final
 
@@ -179,6 +180,56 @@ def password_auth_hint(stderr: str, *, argv: Sequence[str], askpass_armed: bool)
         "the prompt: no askpass helper was configured, and ssh cannot prompt when its "
         "input is a pipe. Pass password=... to open_ssh_transport()"
     )
+
+
+def missing_executable_hint(argv0: str, *, errno_value: int | None) -> str:
+    """Explain a spawn that failed before any SSH existed to produce stderr.
+
+    **This is the one failure with no stderr to carry**, which makes the hint the only place an
+    answer can go. ``ssh`` never ran, so there is no banner, no ``Permission denied`` and no
+    text to classify -- just an ``OSError`` from ``exec``. It is also the most likely first
+    failure this library ever shows anybody: the requirement is satisfied on every developer
+    workstation and absent from most slim container images, so it passes locally and fails on
+    first deploy, in front of somebody who adopted the library last week.
+
+    **No attempt is made to guess the platform's package manager, because it cannot be
+    guessed.** ``sys.platform`` is ``"linux"`` for Debian, Alpine and RHEL alike, and they
+    disagree about both the package name and the command. Naming all three costs one line and
+    is right everywhere; branching on ``sys.platform`` would be wrong roughly two times in
+    three. The image classes with no package manager at all are named for the same reason --
+    "install it" is not actionable on ``scratch``, and a reader there needs to know the answer
+    is a different base image rather than a different command.
+
+    Args:
+        argv0: The executable that could not be run, as it was passed to ``exec``. Either a
+            bare ``ssh`` resolved through ``PATH`` or an absolute path from
+            :func:`resolve_ssh_executable`'s Windows branch.
+        errno_value: ``OSError.errno``, or ``None`` when the platform did not supply one.
+
+    Returns:
+        One sentence naming the cause and the fix, or ``""`` for any failure that is not
+        about the executable itself. Three states, and the third is deliberate: a spawn can
+        fail for reasons that have nothing to do with the binary -- out of memory, a process
+        limit, a read-only ``/proc`` -- and inventing installation advice for those would send
+        a reader to fix something that was never broken.
+    """
+    if errno_value == errno.ENOENT:
+        return (
+            f"{argv0!r} was not found. This library does not implement SSH -- it runs the "
+            f"OpenSSH client as a subprocess -- so an ssh client is a hard requirement. "
+            f"Install it (Debian/Ubuntu: apt-get install openssh-client; Alpine: apk add "
+            f"openssh-client; RHEL/Fedora: dnf install openssh-clients), or pass "
+            f"ssh_executable=... if it is installed somewhere PATH does not reach. A "
+            f"distroless or scratch image has no package manager and cannot run this "
+            f"transport at all."
+        )
+    if errno_value in (errno.EACCES, errno.EPERM):
+        return (
+            f"{argv0!r} exists but could not be executed. Check that it is executable and "
+            f"that nothing -- a mount option, a sandbox, or a security policy -- is "
+            f"preventing this process from running it."
+        )
+    return ""
 
 
 def classify_failure(stderr: str) -> type[ConnectError]:

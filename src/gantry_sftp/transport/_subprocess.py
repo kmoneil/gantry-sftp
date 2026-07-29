@@ -43,7 +43,11 @@ from gantry_sftp.transport._askpass import (
     askpass_environment,
 )
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
-from gantry_sftp.transport._diagnosis import classify_failure, password_auth_hint
+from gantry_sftp.transport._diagnosis import (
+    classify_failure,
+    missing_executable_hint,
+    password_auth_hint,
+)
 
 __all__ = [
     "LOGGED_ENVIRONMENT_VARIABLES",
@@ -380,6 +384,7 @@ async def _open_process_transport(
         raise ConnectError(
             f"could not run {argv[0]!r}: {exc.strerror or exc}",
             argv=tuple(argv),
+            hint=missing_executable_hint(argv[0], errno_value=exc.errno),
         ) from exc
 
     transport = SubprocessTransport(process, argv, stderr, askpass_armed=askpass_armed)

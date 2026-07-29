@@ -31,6 +31,51 @@ no `ssh_config` to reimplement badly, no SSHv2 stack to maintain — plus the co
 the field genuinely needs and no existing option ships: atomic publish, a zip-slip defence,
 errors that carry state, and extension fallbacks that are tested rather than assumed.
 
+## What it needs — read this before you install it
+
+That architecture has a price and it is a single sentence: **this library does not implement
+SSH, so it needs an SSH client.** `pip install gantry-sftp` does not put one there. It is the
+same sentence as the reason to use it, so it is here rather than at the bottom.
+
+- **Python 3.13+**
+- **An `ssh` binary on `PATH`** — `openssh-client`. Not a soft dependency, not vendored, and
+  not optional.
+- **A POSIX host, for transfers.** `get` / `put` / `get_tree` / `put_tree` need
+  offset-addressed local I/O and raise `NotImplementedError` on Windows, before anything is
+  sent. Everything that only talks to the far end works there — see
+  [Requirements](#requirements) for why, and for the full list.
+
+**Your machine already satisfies this and your container probably does not**, which is the
+failure worth pre-empting: it passes locally, then fails on first deploy. Check the image you
+actually deploy rather than trusting a table:
+
+```console
+$ ssh -V          # any version; we do not require a recent one
+OpenSSH_10.0p2 ...
+```
+
+Add it in a Dockerfile with whichever your base image uses:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client  # Debian/Ubuntu
+RUN apk add --no-cache openssh-client                                            # Alpine
+RUN dnf install -y openssh-clients                                               # RHEL/Fedora
+```
+
+`python:3.13-slim` and Alpine images generally need one of those; full `python:3.13` and the
+Airflow images generally already have `ssh`. Those are guidance, not guarantees — no CI job
+here verifies a base image's contents, so the `ssh -V` check above is the authoritative
+answer for your image and the sentence you should trust.
+
+**Where this library cannot run at all:** `scratch`, distroless images, and managed runtimes
+with no package manager, such as the AWS Lambda Python runtime. There is no `ssh` to install
+and no way to install one, so the answer is a different base image — a Lambda *container*
+image can install `openssh-client` and works fine. This is stated plainly rather than
+hedged, because finding it out after adopting a library is worse than finding it out now.
+
+If `ssh` is missing, you get a `ConnectError` whose `hint` says all of the above — see
+[When the connection fails](#when-the-connection-fails).
+
 ## Status
 
 **Pre-alpha, and honest about it.** Nothing is published and the API will change. What
@@ -1270,8 +1315,29 @@ Three things about that ladder are deliberate:
 
 `ConnectError.hint` is the one thing on these errors that is *ours* rather than OpenSSH's, and
 it is separate from `stderr` for that reason — merging them would put words in the server's
-mouth. It is set only where this client's own configuration made the failure inevitable, and
-the case it exists for is the one the stderr cannot explain:
+mouth. It is set only where this client's own configuration or environment made the failure
+inevitable, and **there are exactly two such cases: the ones OpenSSH cannot explain itself.**
+
+The first is when there is no stderr at all, because `ssh` never ran:
+
+```
+ConnectError: could not run 'ssh': No such file or directory
+hint: 'ssh' was not found. This library does not implement SSH -- it runs the OpenSSH client
+as a subprocess -- so an ssh client is a hard requirement. Install it (Debian/Ubuntu:
+apt-get install openssh-client; Alpine: apk add openssh-client; RHEL/Fedora: dnf install
+openssh-clients), or pass ssh_executable=... if it is installed somewhere PATH does not
+reach. A distroless or scratch image has no package manager and cannot run this transport
+at all.
+```
+
+`could not run 'ssh': No such file or directory` is diagnosable only by a reader who already
+knows the answer, and this is the failure most likely to be somebody's *first* experience of
+the library — see [What it needs](#what-it-needs--read-this-before-you-install-it). A binary
+that exists but will not execute gets a different hint, and a spawn that failed for a reason
+that is nothing to do with the binary — out of memory, out of file descriptors — gets none,
+because installing a package would not fix it.
+
+The second is when the stderr is real and says the wrong thing:
 
 ```
 AuthenticationError: connection closed by the remote end (exit status 255)
@@ -1664,7 +1730,10 @@ pressure. The thing that would buy throughput is a second connection.
   platform-independent and works there. A Windows fallback is open work, not a decision
   against it.
 - An `ssh` binary on `PATH` (`openssh-client`). Windows ships one at
-  `%SystemRoot%\System32\OpenSSH\ssh.exe`; slim Docker images frequently do not.
+  `%SystemRoot%\System32\OpenSSH\ssh.exe`. **The container story, the install commands and
+  the platforms where this cannot run are on the first screen**, under
+  [What it needs](#what-it-needs--read-this-before-you-install-it), rather than repeated here
+  — one copy, so the two cannot drift.
 - `openssh-server` — **only** to run the real-server test lane, never at runtime.
 
 ## Development

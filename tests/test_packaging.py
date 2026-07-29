@@ -13,6 +13,7 @@ compliance scan.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ from pathlib import Path
 import pytest
 
 import gantry_sftp
+from gantry_sftp.transport import missing_executable_hint
 
 ROOT = Path(__file__).resolve().parent.parent
 LICENCE = ROOT / "LICENSE"
@@ -130,3 +132,31 @@ def test_the_built_version_comes_from_the_package(distribution: tuple[Path, Path
     wheel, sdist = distribution
     assert wheel.name.startswith(f"gantry_sftp-{gantry_sftp.__version__}-")
     assert sdist.name == f"gantry_sftp-{gantry_sftp.__version__}.tar.gz"
+
+
+# --- The README is a shipped artifact, so its facts are asserted too (D-89) ----------------
+
+
+def test_the_readme_and_pyproject_agree_on_the_python_floor():
+    """Two hand-maintained copies of the same number, and one of them is the first thing a
+    reader sees. `requires-python` is what actually refuses an install; the README line is what
+    somebody plans around, and a reader who plans around the wrong one finds out from pip.
+    """
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert 'requires-python = ">=3.13"' in pyproject
+    assert "**Python 3.13+**" in readme
+    assert "- Python 3.13+" in readme
+
+
+def test_the_readme_quotes_the_missing_ssh_hint_exactly_as_the_code_produces_it():
+    """The hint is quoted verbatim in the README, which makes it a two-place fact.
+
+    It is the highest-value sentence in the document -- the one a reader in a broken container
+    acts on -- so a reworded hint that leaves the README behind is the drift worth catching.
+    Whitespace is normalised because the README reflows it to the page width; wording is not.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    produced = " ".join(missing_executable_hint("ssh", errno_value=errno.ENOENT).split())
+    quoted = " ".join(readme.split())
+    assert f"hint: {produced}" in quoted

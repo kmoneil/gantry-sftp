@@ -1,6 +1,7 @@
 """Why the connection failed, answered by an exception class instead of a substring search.
 
-    python examples/connect_errors.py                  # a refused connection, no network
+    python examples/connect_errors.py                  # a refused connection and a missing
+                                                       # ssh client -- no network either way
     python examples/connect_errors.py user@host        # against a real server over ssh
 
 paramiko answers this question with ``Error reading SSH protocol banner``. OpenSSH knew exactly
@@ -25,6 +26,9 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import tempfile
+import textwrap
+from pathlib import Path
 
 import anyio
 
@@ -58,6 +62,31 @@ def report(error: ConnectError) -> None:
     for line in (error.stderr or "(nothing)").strip().splitlines():
         print(f"    | {line}")
 
+    # The hint is ours rather than OpenSSH's, and it is empty for most failures -- it is set
+    # only where our own configuration or environment made the failure inevitable. Printing it
+    # unconditionally would teach the wrong shape, so branch on it the way a caller should.
+    if error.hint:
+        print("  and we can add:")
+        for line in textwrap.wrap(error.hint, width=76):
+            print(f"    > {line}")
+
+
+async def missing_ssh_client() -> None:
+    """Show the failure that needs no network, no server and no credentials.
+
+    This is the one most likely to be somebody's first experience of the library, because the
+    requirement is satisfied on every developer machine and absent from most slim container
+    images: it passes locally and fails on first deploy. ``could not run ...`` on its own is
+    diagnosable only by a reader who already knows the answer, so the hint is the whole fix.
+    """
+    print("pointing ssh_executable at something that does not exist")
+    nowhere = Path(tempfile.gettempdir()) / "gantry-sftp-no-such-ssh"
+    try:
+        async with open_ssh_transport("example.com", ssh_executable=str(nowhere)):
+            print("  unexpectedly connected")
+    except ConnectError as error:
+        report(error)
+
 
 async def main() -> None:
     destination = sys.argv[1] if len(sys.argv) > 1 else None
@@ -83,9 +112,15 @@ async def main() -> None:
             print(f"connected: {sftp!r}")
     except ConnectError as error:
         report(error)
-        return
+    else:
+        print("no error to report")
 
-    print("no error to report")
+    if destination is None:
+        # Second case, and the one worth showing even though it looks trivial: it is the
+        # failure a reader is most likely to meet first, and the only one where the hint is
+        # the entire diagnosis because there is no stderr to read.
+        print()
+        await missing_ssh_client()
 
 
 if __name__ == "__main__":

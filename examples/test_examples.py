@@ -138,6 +138,24 @@ def test_the_connect_errors_example_classifies_rather_than_guesses():
     assert "AuthenticationError" not in stdout
     assert "HostKeyError" not in stdout
 
+    # D-89's half: the missing-client case, where there is no stderr at all and the hint is
+    # therefore the entire diagnosis. Both halves of that pairing are asserted, because
+    # "(nothing)" next to actionable advice is the whole point the output makes.
+    assert "ssh said:" in stdout
+    assert "(nothing)" in stdout
+
+    # The hint is wrapped for the terminal, so it is reassembled before matching rather than
+    # asserted line by line -- otherwise a reworded sentence moves the wrap and fails a test
+    # that has nothing to say about wrapping.
+    hint = " ".join(
+        line.strip().removeprefix(">").strip()
+        for line in stdout.splitlines()
+        if line.strip().startswith(">")
+    )
+    assert "does not implement SSH" in hint
+    assert "apt-get install openssh-client" in hint
+    assert "cannot run this transport at all" in hint
+
 
 def test_the_password_example_proves_the_secret_is_not_on_the_command_line():
     """The example's claim is a security property, so the property is what gets pinned.
