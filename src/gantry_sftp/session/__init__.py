@@ -52,6 +52,13 @@ from gantry_sftp.session._localtree import (
     remote_component,
     walk_local,
 )
+from gantry_sftp.session._mode import (
+    CREATE_BITS,
+    PERMISSION_BITS,
+    Mode,
+    local_mode,
+    resolve_mode,
+)
 from gantry_sftp.session._publish import (
     DEFAULT_PUBLISH,
     MAX_STAGED_NAME_LENGTH,
@@ -108,6 +115,7 @@ from gantry_sftp.session._verify import (
 
 __all__ = [
     "CHECK_FILE_BLOCK_SIZE",
+    "CREATE_BITS",
     "DEFAULT_ATTEMPTS",
     "DEFAULT_BACKOFF",
     "DEFAULT_BACKOFF_MAX",
@@ -119,6 +127,7 @@ __all__ = [
     "DOT_ENTRIES",
     "LIMITS_EXTENSION",
     "MAX_STAGED_NAME_LENGTH",
+    "PERMISSION_BITS",
     "PREFERRED_READ_LENGTH",
     "PREFERRED_WRITE_LENGTH",
     "PROFILES",
@@ -136,6 +145,7 @@ __all__ = [
     "Exchange",
     "GlobMatch",
     "LocalWalkEntry",
+    "Mode",
     "ProgressCallback",
     "Publish",
     "PublishMechanism",
@@ -165,6 +175,7 @@ __all__ = [
     "join_remote",
     "local_child",
     "local_dir_entry",
+    "local_mode",
     "modified_at",
     "negotiate_transfer_sizes",
     "open_session",
@@ -173,6 +184,7 @@ __all__ = [
     "read_request_overhead",
     "remote_component",
     "remote_component_reason",
+    "resolve_mode",
     "split_parent",
     "staged_path",
     "staging_token",

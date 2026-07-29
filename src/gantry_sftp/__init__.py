@@ -13,8 +13,9 @@ What exists today, from a distribution a user actually installed::
         await sftp.get("/incoming/data.parquet", "data.parquet")
 
 :mod:`gantry_sftp.transport` opens the connection, :mod:`gantry_sftp.session` is the API --
-``get`` / ``put`` (atomic by default, resumable, verifiable), ``listdir`` / ``scandir`` /
-``walk``, ``get_tree`` / ``put_tree`` / ``rmtree``, ``with_reconnect``, and several transfers
+``get`` / ``put`` (atomic by default, resumable, verifiable, and able to carry a file's mode
+and timestamps rather than inventing new ones), ``listdir`` / ``scandir`` / ``walk``,
+``get_tree`` / ``put_tree`` / ``rmtree``, ``chmod``, ``with_reconnect``, and several transfers
 at once over one connection. :mod:`gantry_sftp.codec` is the sans-I/O protocol layer
 underneath, public because a frame dumper and a fuzz harness need it. Typed errors are
 re-exported here; every one carries state rather than a string.

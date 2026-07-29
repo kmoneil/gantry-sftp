@@ -33,6 +33,7 @@ import asyncio
 import os
 import secrets
 import socket
+import stat
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -444,6 +445,22 @@ if paramiko is not None:
             except OSError as error:
                 return paramiko.SFTPServer.convert_errno(error.errno)
 
+        def chattr(self, attr: Any) -> int:
+            """FSETSTAT on the handle: unimplemented in paramiko, so it answers OP_UNSUPPORTED.
+
+            Implemented for the same reason ``stat`` above is: without it the mode row would
+            report "paramiko cannot set permissions", which is a fact about this thirty-line
+            handler and not about paramiko. With it, what the row measures is the part that *is*
+            paramiko's -- whether the PERMISSIONS flag survives its ATTRS decode and arrives here.
+            """
+            if getattr(attr, "st_mode", None) is None:
+                return paramiko.SFTP_OK
+            try:
+                os.fchmod(self.readfile.fileno(), stat.S_IMODE(attr.st_mode))
+            except OSError as error:
+                return paramiko.SFTPServer.convert_errno(error.errno)
+            return paramiko.SFTP_OK
+
     class _ParamikoHandler(paramiko.SFTPServerInterface):
         """The filesystem half of paramiko's SFTP server.
 
@@ -480,8 +497,13 @@ if paramiko is not None:
                 return paramiko.SFTPServer.convert_errno(error.errno)
 
         def open(self, path: str, flags: int, attr: Any) -> Any:
+            # `attr.st_mode` rather than a hardcoded 0o666: an OPEN carrying PERMISSIONS is how
+            # this library keeps an uploaded file from ever existing world-readable, and a
+            # handler that discarded it would make the matrix report that as unsupported.
+            requested = getattr(attr, "st_mode", None)
+            mode = 0o666 if requested is None else stat.S_IMODE(requested)
             try:
-                descriptor = os.open(path, flags, 0o666)
+                descriptor = os.open(path, flags, mode)
             except OSError as error:
                 return paramiko.SFTPServer.convert_errno(error.errno)
             writing = bool(flags & (os.O_WRONLY | os.O_RDWR))
@@ -521,6 +543,16 @@ if paramiko is not None:
         def rmdir(self, path: str) -> int:
             try:
                 Path(path).rmdir()
+            except OSError as error:
+                return paramiko.SFTPServer.convert_errno(error.errno)
+            return paramiko.SFTP_OK
+
+        def chattr(self, path: str, attr: Any) -> int:
+            """SETSTAT on a path. Same argument as the handle's ``chattr`` above."""
+            if getattr(attr, "st_mode", None) is None:
+                return paramiko.SFTP_OK
+            try:
+                Path(path).chmod(stat.S_IMODE(attr.st_mode))
             except OSError as error:
                 return paramiko.SFTPServer.convert_errno(error.errno)
             return paramiko.SFTP_OK

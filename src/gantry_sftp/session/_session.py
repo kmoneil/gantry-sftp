@@ -117,6 +117,14 @@ from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_t
 from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
 from gantry_sftp.session._localtree import remote_component, walk_local
+from gantry_sftp.session._mode import (
+    CREATE_BITS,
+    PERMISSION_BITS,
+    Mode,
+    create_bits,
+    local_mode,
+    resolve_mode,
+)
 from gantry_sftp.session._platform import NO_FOLLOW, require_local_io
 from gantry_sftp.session._pool import for_each_bounded
 from gantry_sftp.session._publish import (
@@ -287,6 +295,9 @@ class _Upload:
     resume: bool = False
     preserve_times: bool = False
     verify: Verify = Verify.SIZE
+    # Already resolved to a number by `put`: `Mode.PRESERVE` needs the local file, and reading
+    # it once at the top beats every helper below deciding again whether to stat.
+    mode: int | None = None
 
 
 class DirectoryScan:
@@ -751,6 +762,42 @@ class Session:
             return reply.attrs
         raise _unexpected(reply, expected="ATTRS", path=encoded)
 
+    async def chmod(self, path: bytes | str, mode: int) -> None:
+        """Set the permission bits of ``path``.
+
+        ``SETSTAT`` carrying **only** ``PERMISSIONS``, and the single flag is the decision
+        rather than an economy. OpenSSH's ``process_setstat`` walks the ATTRS flags in order --
+        ``SIZE`` to ``truncate``, ``PERMISSIONS`` to ``chmod``, ``ACMODTIME`` to ``utimes``,
+        ``UIDGID`` to ``chown`` -- applying each in turn and recording only the *last* failure
+        in the single ``STATUS`` it sends back. So a multi-field ``SETSTAT`` that fails has
+        already applied the fields before the failing one, and the answer does not say which
+        field it was. One field per call makes a refusal unambiguous and leaves nothing else
+        moved.
+
+        **This follows symlinks**, because ``SETSTAT`` is ``chmod(2)`` and that is what
+        ``chmod(2)`` does -- the same default as :func:`os.chmod`. Where the path may be a
+        symlink planted by someone else, that is a chmod of whatever it points at. The
+        extension that does not follow is ``lsetstat@openssh.com``; it is not implemented here
+        and v3 offers no fallback for it, so there is nothing to degrade to and this method
+        does not pretend otherwise.
+
+        Args:
+            path: What to modify. Followed if it is a symlink.
+            mode: Permission bits. Masked to ``0o7777``, which is what ``chmod(2)`` takes and
+                what OpenSSH applies (``a.perm & 07777``); the file-type bits an ``st_mode``
+                carries are not permissions and are dropped rather than sent.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            PermissionDeniedError: If the server will not change it.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(path)
+        await self._expect_status(
+            SetStat(self._next(), encoded, Attrs(permissions=mode & PERMISSION_BITS)),
+            path=encoded,
+        )
+
     async def realpath(self, path: bytes | str = b".") -> bytes:
         """Canonicalise ``path`` on the server.
 
@@ -841,10 +888,32 @@ class Session:
         """
         return self._root
 
-    async def open(self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ) -> bytes:
-        """Open a remote file and return its handle."""
+    async def open(
+        self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None
+    ) -> bytes:
+        """Open a remote file and return its handle.
+
+        Args:
+            path: What to open.
+            pflags: Access and creation flags.
+            mode: Permission bits for a file this call **creates**, or ``None`` to leave it to
+                the server. Ignored by the server when the file already exists, exactly as
+                ``open(2)``'s mode argument is, so this is not a way to change an existing
+                file's permissions -- :meth:`chmod` is.
+
+                ``None`` is not neutral and it is worth knowing what it means: OpenSSH's
+                ``process_open`` reads this ATTRS for ``PERMISSIONS`` and nothing else,
+                defaulting to ``0666`` when the flag is absent, so a file created without it
+                arrives ``0666 & ~umask`` -- world-readable under the usual umask.
+
+        Raises:
+            NoSuchFileError: If the path does not exist and was not to be created.
+            PermissionDeniedError: If the server will not open it.
+            ServerError: For any other refusal.
+        """
         encoded = _encode_path(path)
-        reply = await self.request(Open(self._next(), encoded, pflags, EMPTY_ATTRS))
+        attrs = EMPTY_ATTRS if mode is None else Attrs(permissions=mode)
+        reply = await self.request(Open(self._next(), encoded, pflags, attrs))
         if isinstance(reply, Handle):
             return reply.handle
         raise _unexpected(reply, expected="HANDLE", path=encoded)
@@ -1377,6 +1446,7 @@ class Session:
         resume: bool = False,
         verify_size: bool = True,
         preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
     ) -> int:
         """Download ``remote_path`` to ``local_path``.
 
@@ -1434,6 +1504,25 @@ class Session:
                 :attr:`~gantry_sftp.session.DirEntry.modified` or ``stat()`` first if you need
                 to know whether there was a timestamp to preserve. v3 carries seconds, so
                 sub-second precision is lost whatever this is set to.
+            mode: Permission bits for the local file. ``None`` -- the default -- leaves it at
+                the ``0o600`` this library creates every download with, so a downloaded file is
+                private to you unless you say otherwise.
+
+                An integer sets them exactly. :data:`~gantry_sftp.session.Mode.PRESERVE` carries
+                the *remote* file's bits across, from the ``STAT`` ``get`` already makes, so it
+                costs no round trip.
+
+                Applied to the open **descriptor** after the last write, for both the reasons
+                ``preserve_times`` is: a re-open of the path would hand a second chance to
+                whatever ``no_follow`` refused, and a mode carrying setuid or setgid should not
+                be on a file that is still partial. The creation mode stays ``0o600`` whatever
+                this is set to, so widening happens only once the content is there.
+
+                **Unlike the upload side, a server that reports no permissions is an error
+                here.** ``Mode.PRESERVE`` with nothing to preserve would otherwise leave the
+                file at ``0o600`` and report success, which looks identical to having preserved
+                a ``0o600`` file -- so it raises instead. A terse server therefore fails on the
+                first file rather than silently mirroring a tree at the wrong permissions.
 
         Returns:
             Bytes written **by this call**. On a resume that is the remainder, not the file's
@@ -1442,6 +1531,9 @@ class Session:
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O -- today,
                 Windows. Raised before anything is sent; see :mod:`._platform`.
+            TypeError: If ``mode`` is neither an octal mode nor
+                :data:`~gantry_sftp.session.Mode.PRESERVE`.
+            ValueError: If ``mode`` is out of range.
             NoSuchFileError: If the remote path does not exist.
             ServerError: If the server refuses.
             TransferError: If the transfer fails partway, if ``resume`` cannot establish a
@@ -1450,8 +1542,10 @@ class Session:
         """
         require_local_io("get()")
         encoded = _encode_path(remote_path)
+        requested_mode = resolve_mode(mode, caller="get()")
         with operation(session_logger, "get", remote=encoded, local=local_path) as record:
             attributes = await self.stat(encoded)
+            local_bits = _download_mode(requested_mode, attributes, encoded)
             start = _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
             # DESIGN.md 6's gate, on the direction that is usually assumed safe. The local
             # partial being *ours* makes its length trustworthy; it does not make its contents a
@@ -1465,6 +1559,14 @@ class Session:
                 # the gate rather than before it -- this is the case that adopts the entire file
                 # and returns success having verified nothing, which makes it the one most worth
                 # gating, not the one to skip for a round trip.
+                #
+                # The mode is still applied, and skipping it here would be the silent wrong
+                # answer this argument exists to prevent: the destination the caller named
+                # exists, they said what permissions it should have, and "it was already there"
+                # is not an answer to that. The partial was not necessarily left by this
+                # library, so its mode is not necessarily the 0o600 a download creates.
+                if local_bits is not None:
+                    _chmod_local(local_path, local_bits, no_follow=no_follow)
                 record["bytes"] = 0
                 record["adopted"] = start
                 return 0
@@ -1481,6 +1583,7 @@ class Session:
                     no_follow=no_follow,
                     start_offset=start,
                     times=attributes.times if preserve_times else None,
+                    mode=local_bits,
                 )
             except BaseException:
                 # Closing is not optional: a leaked handle counts against max-open-handles and
@@ -1521,6 +1624,7 @@ class Session:
         no_follow: bool,
         start_offset: int = 0,
         times: Times | None = None,
+        mode: int | None = None,
     ) -> int:
         """Open the local destination and let the scheduler fill it.
 
@@ -1533,10 +1637,12 @@ class Session:
         writes already go to explicit offsets, so keeping the first ``start_offset`` bytes is
         a matter of not deleting them.
 
-        ``times`` is applied to the **descriptor**, not to the path, and only once every write
-        has landed. Both halves matter: a write updates mtime, so stamping earlier would be
-        undone by the transfer itself; and re-opening the path to stamp it would hand a second
-        chance to whatever the ``O_NOFOLLOW`` above exists to refuse.
+        ``times`` and ``mode`` are applied to the **descriptor**, not to the path, and only once
+        every write has landed. Both halves matter: a write updates mtime, so stamping earlier
+        would be undone by the transfer itself; and re-opening the path to stamp it would hand a
+        second chance to whatever the ``O_NOFOLLOW`` above exists to refuse. The creation mode
+        stays ``0o600`` regardless of ``mode``, so the widening -- if it is a widening -- happens
+        only once there is a complete file to widen.
         """
         flags = _LOCAL_WRITE_FLAGS if not start_offset else _LOCAL_RESUME_FLAGS
         fd = os.open(local_path, flags | (NO_FOLLOW if no_follow else 0), 0o600)
@@ -1553,6 +1659,8 @@ class Session:
                 remote_path=remote_path,
                 start_offset=start_offset,
             )
+            if mode is not None:
+                os.fchmod(fd, mode)
             if times is not None:
                 os.utime(fd, (times.atime, times.mtime))
         finally:
@@ -1965,6 +2073,7 @@ class Session:
         max_depth: int | None = None,
         progress: ProgressCallback | None = None,
         preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
         resume: bool = False,
         concurrency: int = 1,
     ) -> TreeResult:
@@ -2002,6 +2111,21 @@ class Session:
                 **The destination directory you named is not stamped**, only directories this
                 call creates inside it. Restamping a directory the caller already had would be
                 a side effect on something they did not ask to have modified.
+            mode: Permission bits for each downloaded file, as :meth:`get` describes them.
+                ``None`` leaves every file at the ``0o600`` a download creates.
+
+                **An integer applies to files only; only**
+                :data:`~gantry_sftp.session.Mode.PRESERVE` **carries directories too.** A file
+                mode applied to a directory is usually unusable -- ``0o600`` on a directory
+                cannot be entered, so the tree would be complete and unreadable -- and inventing
+                a second mapping from a file mode to a directory mode would be a guess. A
+                caller who wants both names both: pass ``mode=`` for the files and
+                :meth:`chmod` the directories.
+
+                Directory modes are applied **after** the walk, for the reason the timestamps
+                are: a directory created ``0o500`` cannot have files written into it, so its
+                real mode has to wait until everything inside it has arrived. As with the
+                timestamps, the destination directory you named is left alone.
             resume: Continue an interrupted tree instead of re-transferring it. Forwarded to
                 :meth:`get` per file, so it inherits that method's guarantees exactly: an
                 already-complete file costs one ``STAT`` and moves nothing, a partial one
@@ -2038,6 +2162,7 @@ class Session:
         """
         require_local_io("get_tree()")
         _check_tree_concurrency(concurrency, progress=progress, caller="get_tree")
+        requested_mode = resolve_mode(mode, caller="get_tree()")
         destination = _ensure_directory(Path(local_path), parents=True)
         state = _DownloadState()
 
@@ -2059,6 +2184,7 @@ class Session:
                         no_follow=True,
                         resume=resume,
                         preserve_times=preserve_times,
+                        mode=requested_mode,
                     )
                 )
 
@@ -2068,6 +2194,7 @@ class Session:
                     destination=destination,
                     max_depth=max_depth,
                     preserve_times=preserve_times,
+                    mode=requested_mode,
                     state=state,
                 ),
                 transfer,
@@ -2075,6 +2202,7 @@ class Session:
             )
 
             _stamp_local_directories(state.directory_times)
+            _chmod_local_directories(state.directory_modes)
             result = TreeResult(
                 len(state.moved), state.directories, sum(state.moved), tuple(state.skipped)
             )
@@ -2093,6 +2221,7 @@ class Session:
         destination: Path,
         max_depth: int | None,
         preserve_times: bool,
+        mode: int | Mode | None,
         state: _DownloadState,
     ) -> AsyncGenerator[_TreeDownload]:
         """Walk the remote tree and hand out one settled file at a time.
@@ -2117,6 +2246,7 @@ class Session:
                     entry,
                     local_directory=local_directory,
                     preserve_times=preserve_times,
+                    mode=mode,
                     state=state,
                 )
                 for child in entry.files:
@@ -2183,6 +2313,7 @@ class Session:
         publish: Publish | None = None,
         resume: bool = False,
         preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
         verify: Verify = Verify.SIZE,
         progress: ProgressCallback | None = None,
         depth: int | None = None,
@@ -2278,6 +2409,28 @@ class Session:
                 that refuses it does **not** fail the upload -- the bytes are the payload -- and
                 :attr:`~gantry_sftp.session.UploadResult.times` says which happened. v3 carries
                 seconds, so sub-second precision is lost whatever this is set to.
+            mode: Permission bits for the published file. ``None`` -- the default -- leaves them
+                to the server, which for OpenSSH means ``0666 & ~umask``: **world-readable under
+                the usual umask**, because the ``OPEN`` carries no ``PERMISSIONS`` and
+                ``process_open`` defaults to ``0666`` when it is absent.
+
+                An integer sets them exactly. :data:`~gantry_sftp.session.Mode.PRESERVE` carries
+                the local file's own bits across, which is what a mirror or a deploy wants.
+
+                **The mode is on the file before anyone can open it by its published name.** It
+                rides on the ``OPEN`` that creates the staging file -- narrowed to ``0o777``
+                there, so a setuid file never exists half-written -- and the exact bits land via
+                an ``FSETSTAT`` on the handle before the rename that publishes it. In place,
+                where there is no rename, they land before the first byte is written. Neither
+                order leaves a window in which the destination is more permissive than asked.
+
+                **A server that refuses it fails the upload**, unlike ``preserve_times``, and
+                the asymmetry is deliberate: a file published with the wrong timestamps is
+                cosmetically wrong, while one published world-readable when ``0o600`` was asked
+                for is the exact failure the argument exists to prevent, reported as success. On
+                the atomic path the refusal arrives before the rename, so the staging file is
+                discarded and the destination is never replaced.
+                :attr:`~gantry_sftp.session.UploadResult.mode` reports what was set.
             progress: Called with ``(transferred, total)`` as writes are acknowledged. On a
                 resume the first call reports the offset it started from, not zero.
             depth: Requests in flight, overriding the session default. Each one holds a full
@@ -2305,15 +2458,22 @@ class Session:
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O -- today,
                 Windows. Raised before anything is sent; see :mod:`._platform`.
-            ValueError: If a ``require_*`` flag contradicts the flag it strengthens.
+            TypeError: If ``mode`` is neither an octal mode nor
+                :data:`~gantry_sftp.session.Mode.PRESERVE`.
+            ValueError: If a ``require_*`` flag contradicts the flag it strengthens, or if
+                ``mode`` is out of range.
             CapabilityError: If a required guarantee is not available on this server.
             PermissionDeniedError: If the server will not create or write the file.
-            ServerError: For any other refusal.
+            ServerError: For any other refusal, including a refused ``mode``.
             TransferError: If the transfer fails partway, or if the published length
                 disagrees with the local file's.
         """
         require_local_io("put()")
         target = _encode_path(remote_path)
+        # Before the OPEN and before anything is sent, so a bad `mode=` costs no round trip and
+        # no staging file. `PRESERVE` resolves here because this is where the local file is
+        # named; every helper below takes a number or nothing.
+        requested_mode = resolve_mode(mode, caller="put()")
         policy = publish_from_legacy(publish, legacy, caller="put")
         _check_publish_flags(
             atomic=policy.atomic,
@@ -2353,6 +2513,7 @@ class Session:
             # is not a rung raises `ValueError` listing the three, which is what a silently
             # unverified upload would otherwise cost.
             verify=Verify(verify),
+            mode=local_mode(local_path) if requested_mode is Mode.PRESERVE else requested_mode,
         )
         with operation(session_logger, "put", local=local_path, remote=target) as record:
             result = await self._publish_upload(upload, target, policy)
@@ -2447,8 +2608,21 @@ class Session:
         # The sibling refusals in `_upload_resume_offset` are at this same point for the same
         # reason, and a gate that first truncates what it is about to reject is not a gate.
         resume_check = await self._gate_resume(target, upload.local_path, start, upload.verify)
-        handle = await self.open(target, _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS)
-        transferred, durability, times = await self._fill_and_close(
+        handle = await self.open(
+            target,
+            _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS,
+            mode=create_bits(upload.mode),
+        )
+        if upload.mode is not None:
+            # **Before the first byte, and only on this path.** `open(2)` applies its mode
+            # argument to a file it *creates* and ignores it for one that already exists, so
+            # writing in place over an existing destination would otherwise fill it while it
+            # still wore whatever permissions it had before -- the window `mode=` exists to
+            # close, in the one case where the OPEN cannot close it. The staged path has no
+            # equivalent: its file is always new, `EXCL` proves it, and nothing can open the
+            # destination by name until the rename.
+            await self._set_mode(handle, upload.mode & CREATE_BITS, path=target)
+        transferred, durability, times, published_mode = await self._fill_and_close(
             upload, handle, target, start_offset=start
         )
         # After the fact, necessarily: in place, the destination *is* the file being written,
@@ -2469,6 +2643,7 @@ class Session:
             times,
             content_check,
             resume_check,
+            mode=published_mode,
         )
 
     async def _put_atomically(
@@ -2494,19 +2669,22 @@ class Session:
         # is the caller's named file under `resume=`, is possibly another publisher's, and is
         # the only evidence of what went wrong. Refusing must not also destroy.
         resume_check = await self._gate_resume(staged, upload.local_path, start, upload.verify)
-        handle = await self._open_staging_file(staged, target, resume=upload.resume)
+        handle = await self._open_staging_file(
+            staged, target, resume=upload.resume, mode=create_bits(upload.mode)
+        )
         try:
             if upload.require_fsync:
                 # Inside the try, so a refusal takes the staging file with it. One round trip,
                 # paid only by a caller who demanded durability against a server that did not
                 # claim it -- and it saves that caller a whole upload when the answer is no.
                 await self._probe_durability(handle, staged)
-            # The times land on the *staging* handle, inside `_fill_and_close`, which is the
-            # only place they can: `rename(2)` does not alter a file's mtime, so setting them
+            # The times and the mode land on the *staging* handle, inside `_fill_and_close`,
+            # which is the only place they can: `rename(2)` alters neither, so setting them
             # before the publish is what makes the published file carry them. Setting them
             # after the rename would need a second round trip to a path that a consumer can
-            # already see, and would briefly publish a file with the wrong timestamps.
-            transferred, durability, times = await self._fill_and_close(
+            # already see, and would briefly publish a file with the wrong timestamps -- or,
+            # for the mode, with permissions the caller explicitly asked it not to have.
+            transferred, durability, times, published_mode = await self._fill_and_close(
                 upload, handle, staged, start_offset=start
             )
             # Before the rename, deliberately. Checking the *destination* afterwards would
@@ -2557,9 +2735,12 @@ class Session:
             content_check,
             resume_check,
             staged_at=staged,
+            mode=published_mode,
         )
 
-    async def _open_staging_file(self, staged: bytes, target: bytes, *, resume: bool) -> bytes:
+    async def _open_staging_file(
+        self, staged: bytes, target: bytes, *, resume: bool, mode: int | None = None
+    ) -> bytes:
         """Create the staging file, or fail in a way that names what to do about it.
 
         Kept separate because **a failed OPEN must not reach the cleanup path**: nothing of
@@ -2575,9 +2756,14 @@ class Session:
         entire point and ``EXCL`` exists to refuse exactly that. What is lost with it is the
         collision check -- so this only happens when the caller named the staging file
         themselves, which is enforced a layer up in :func:`_check_publish_flags`.
+
+        ``mode`` is the *creation* mode, so the staging file is never briefly more permissive
+        than the destination it is going to become. On a resume it does nothing, which is
+        correct rather than a gap: the file already exists, ``open(2)`` ignores the mode for
+        one that does, and the exact bits land on the handle before the publish either way.
         """
         try:
-            return await self.open(staged, _RESUME_FLAGS if resume else _STAGE_FLAGS)
+            return await self.open(staged, _RESUME_FLAGS if resume else _STAGE_FLAGS, mode=mode)
         except SFTPError as refusal:
             refusal.add_note(
                 f"{staged!r} is the staging file for {target!r}. Publishing atomically needs "
@@ -2623,23 +2809,49 @@ class Session:
             refusal.add_note(self._server_note())
             raise refusal
 
+    async def _set_mode(self, handle: bytes, mode: int, *, path: bytes) -> None:
+        """Set an open handle's permission bits, and fail the upload if the server will not.
+
+        ``FSETSTAT`` carrying **only** ``PERMISSIONS``. One flag per call for the reason
+        :meth:`chmod` gives: ``process_fsetstat`` applies the flags in sequence and reports a
+        single status, so a multi-field call that fails has already applied part of itself and
+        does not say which part.
+
+        **No ``suppress`` here, unlike :meth:`_set_times` and :meth:`_set_directory_times`.**
+        Those degrade because timestamps are metadata and the bytes are the payload. A mode is
+        not in that category: the caller asked for it because the file must not be readable by
+        whoever the default would let read it, and publishing anyway while reporting success is
+        the failure ``mode=`` exists to prevent. On the atomic path this raises before the
+        rename, so the staging file is discarded and the destination is left alone.
+        """
+        await self._expect_status(
+            FSetStat(self._next(), handle, Attrs(permissions=mode)), path=path
+        )
+
     async def _fill_and_close(
         self, upload: _Upload, handle: bytes, path: bytes, *, start_offset: int = 0
-    ) -> tuple[int, Durability, TimePreservation]:
-        """Push the file through an open handle, set its times, flush it, and close it.
+    ) -> tuple[int, Durability, TimePreservation, int | None]:
+        """Push the file through an open handle, set its metadata, flush it, and close it.
 
         Everything except the write happens while the handle is still open, because that is
         the only time it can: ``fsync@openssh.com`` on a closed handle answers
         ``NO_SUCH_FILE``, and a handle is the only thing ``FSETSTAT`` can address.
 
-        **Times before the flush**, so the metadata the caller asked to preserve is inside the
+        **Mode, then times, then the flush**, so the metadata the caller asked for is inside the
         durability barrier rather than outside it. Getting this order backwards would flush the
         bytes and then modify the inode, which is a narrower window than the one ``fsync``
         exists to close but is the same class of mistake.
 
+        **The mode lands only now, after the content is complete**, and that is what the
+        ``0o777`` narrowing on the creating ``OPEN`` is for: setuid, setgid and sticky are
+        deliberately withheld until there is a finished file to apply them to, because a setuid
+        file that exists half-written is privileged before it is finished. The ordinary bits are
+        already correct from birth -- ``umask`` can only clear them, so a file created with the
+        requested mode is never *more* permissive than what lands here.
+
         Both publish paths route through here, which is what makes one insertion cover them
-        both -- and on the atomic path the handle is the *staging* file's, so the times are set
-        before the rename that publishes it.
+        both -- and on the atomic path the handle is the *staging* file's, so the mode and the
+        times are set before the rename that publishes it.
         """
         try:
             transferred = await upload_handle(
@@ -2653,6 +2865,8 @@ class Session:
                 remote_path=path,
                 start_offset=start_offset,
             )
+            if upload.mode is not None:
+                await self._set_mode(handle, upload.mode, path=path)
             times = await self._set_times(upload, handle)
             durability = await self._flush(upload, handle)
         except BaseException:
@@ -2662,7 +2876,7 @@ class Session:
             await _close_quietly(self, handle)
             raise
         await self.close(handle)
-        return transferred, durability, times
+        return transferred, durability, times, upload.mode
 
     async def _upload_resume_offset(self, upload: _Upload, path: bytes) -> int:
         """How much of ``path`` the server already holds, if we are allowed to trust it.
@@ -2730,6 +2944,29 @@ class Session:
         for path, times in entries:
             with suppress(ServerError):
                 await self._expect_status(SetStat(self._next(), path, Attrs(times=times)))
+
+    async def _set_directory_modes(self, entries: Sequence[tuple[bytes, int]]) -> None:
+        """Set remote directory modes, once every file inside them has been written.
+
+        **After, necessarily**, and for a stronger reason than :meth:`_set_directory_times`
+        has: a directory created ``0o500`` would refuse the uploads that belong in it, so its
+        source mode cannot be applied on the way down. Nothing here depends on order --
+        changing a nested directory's mode does not touch its parent's.
+
+        ``SETSTAT`` on the path rather than ``FSETSTAT``, because no handle is held: a directory
+        handle comes from ``OPENDIR`` and exists to be read. One flag per call, for the reason
+        :meth:`chmod` gives.
+
+        A refusal is swallowed per directory, matching the timestamps and *not* matching a
+        file's mode, which fails the upload. The difference is what the caller asked for: a file
+        mode is the thing ``mode=`` controls, and a directory mode is carried along beside it.
+        The tree's files are the payload and they are already published.
+        """
+        for path, mode in entries:
+            with suppress(ServerError):
+                await self._expect_status(
+                    SetStat(self._next(), path, Attrs(permissions=mode & PERMISSION_BITS))
+                )
 
     async def _set_times(self, upload: _Upload, handle: bytes) -> TimePreservation:
         """Stamp the open handle with the local file's times, or report why not.
@@ -2957,6 +3194,7 @@ class Session:
         max_depth: int | None = None,
         publish: Publish | None = None,
         preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
         progress: ProgressCallback | None = None,
         resume: bool = False,
         concurrency: int = 1,
@@ -3001,6 +3239,21 @@ class Session:
 
                 **The root you named is not stamped**, only directories this call creates
                 under it, matching :meth:`get_tree`.
+            mode: Permission bits for each uploaded file, as :meth:`put` describes them.
+                ``None`` leaves every file to the server, which for OpenSSH is
+                ``0666 & ~umask`` -- so a tree delivered without this is a tree of
+                world-readable files.
+
+                **An integer applies to files only; only**
+                :data:`~gantry_sftp.session.Mode.PRESERVE` **carries directories too**, in a
+                final pass after every file has been written. Both halves match
+                :meth:`get_tree`, and for the same two reasons: a file mode on a directory is
+                usually unusable, and a directory created with its source's restrictive mode
+                could not have been written into.
+
+                A refused *file* mode fails the tree, as it fails a single :meth:`put`. A
+                refused *directory* mode does not -- the files are the payload and they are
+                already published.
             progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
                 each one. A tree-wide total would need the whole walk up front. **Refused with
                 ``concurrency`` above 1** -- see :meth:`get_tree` for why.
@@ -3075,6 +3328,7 @@ class Session:
                 "so they would all stage under one name and overwrite each other. Leave it "
                 "unset to get a generated hidden sibling per file."
             )
+        requested_mode = resolve_mode(mode, caller="put_tree()")
         await self._require_rooted_paths(root, feature="uploading a tree")
         await self._mkdir_parents(root)
         directories = 0
@@ -3084,6 +3338,10 @@ class Session:
         # Collected during the walk and applied after it -- see _set_directory_times. Local
         # `stat` is free, so this costs nothing until the final pass.
         directory_times: list[tuple[bytes, Times]] = []
+        # Same collection and the same final pass, plus one reason the timestamps do not have:
+        # a directory created with a restrictive source mode could not have its files written
+        # into it. Only `Mode.PRESERVE` fills this -- an integer `mode=` is a file mode.
+        directory_modes: list[tuple[bytes, int]] = []
 
         with operation(session_logger, "put_tree", local=local_path, remote=root) as record:
 
@@ -3103,6 +3361,8 @@ class Session:
                         directories += 1
                         if preserve_times:
                             directory_times.append((remote_directory, _local_times(entry.path)))
+                        if requested_mode is Mode.PRESERVE:
+                            directory_modes.append((remote_directory, local_mode(entry.path)))
                     skipped.extend(entry.skipped)
                     for name in entry.files:
                         yield _TreeUpload(
@@ -3116,6 +3376,7 @@ class Session:
                     item.remote,
                     publish=policy,
                     preserve_times=preserve_times,
+                    mode=requested_mode,
                     progress=progress,
                     resume=resume,
                 )
@@ -3127,6 +3388,7 @@ class Session:
             await for_each_bounded(produce(), transfer, concurrency=concurrency)
 
             await self._set_directory_times(directory_times)
+            await self._set_directory_modes(directory_modes)
             record["files"] = len(moved)
             record["directories"] = directories
             record["bytes"] = sum(moved)
@@ -3403,6 +3665,50 @@ def _local_times(path: Path | str) -> Times:
     return Times(atime=int(stat_result.st_atime), mtime=int(stat_result.st_mtime))
 
 
+def _download_mode(mode: int | Mode | None, attributes: Attrs, remote_path: bytes) -> int | None:
+    """What permission bits a download should end up with, or ``None`` to leave 0o600 alone.
+
+    Raises:
+        TransferError: If :data:`Mode.PRESERVE` was asked for and the server reported no
+            permissions at all. **Absent is not zero and it is not a default**: v3 ATTRS makes
+            every field optional and a server is entitled to send none of them, so there is
+            genuinely nothing to preserve. Leaving the file at its 0o600 creation mode and
+            returning success would be indistinguishable from having preserved a 0o600 file,
+            which is the shape of wrong answer this whole argument exists to remove. Raised
+            before the first ``READ``, so a terse server costs no transfer.
+    """
+    if mode is None:
+        return None
+    if mode is not Mode.PRESERVE:
+        return mode
+    if attributes.permissions is None:
+        raise TransferError(
+            f"mode=Mode.PRESERVE was asked for but the server sent no permissions for "
+            f"{remote_path!r}, so there is nothing to preserve; pass an explicit mode= or "
+            f"leave it unset to keep the 0o600 a download creates",
+            transferred=0,
+            offset=0,
+            remote_path=remote_path,
+        )
+    return attributes.permissions & PERMISSION_BITS
+
+
+def _chmod_local(path: Path | str, mode: int, *, no_follow: bool) -> None:
+    """Apply a mode to a local file that is already complete, without following a link to it.
+
+    Used only where there is no open descriptor to hand -- a resumed download that finds the
+    file already whole. Everywhere else the mode goes onto the descriptor the transfer is
+    already holding, which is stronger; here the ``O_NOFOLLOW`` is re-applied on a fresh
+    read-only open so that a symlink swapped in since the containment check still cannot
+    redirect the ``chmod`` onto whatever it points at.
+    """
+    fd = os.open(path, os.O_RDONLY | (NO_FOLLOW if no_follow else 0))
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def _stamp_local_directories(entries: Sequence[tuple[Path, Times]]) -> None:
     """Apply remote directory times locally, once everything inside them has been written.
 
@@ -3418,6 +3724,24 @@ def _stamp_local_directories(entries: Sequence[tuple[Path, Times]]) -> None:
     for path, times in entries:
         with suppress(OSError):
             os.utime(path, (times.atime, times.mtime))
+
+
+def _chmod_local_directories(entries: Sequence[tuple[Path, int]]) -> None:
+    """Apply remote directory modes locally, once everything inside them has been written.
+
+    **After, necessarily**, and for a stronger reason than the timestamps have: a directory
+    created ``0o500`` cannot have a file written into it, so applying a source mode on the way
+    down would fail the transfers underneath it. Deepest-last is not required either -- changing
+    a nested directory's mode does not affect its parent's -- so no order is imposed.
+
+    A failure is swallowed per directory, for the reason :func:`_stamp_local_directories` gives:
+    the files are the payload and they have all arrived. That is the opposite of what a *file*'s
+    mode does, which fails the transfer, and the difference is that a file's mode is what the
+    caller asked to control while a directory's is carried along with it.
+    """
+    for path, mode in entries:
+        with suppress(OSError):
+            path.chmod(mode)
 
 
 def _download_resume_offset(local_path: Path | str, size: int | None, remote_path: bytes) -> int:
@@ -3503,6 +3827,10 @@ class _DownloadState:
     # directory's times come from its *parent's* listing, which READDIR already returned, so
     # this costs no round trip.
     directory_times: list[tuple[Path, Times]] = field(default_factory=list)
+    # Same collection, same listing, same after-the-walk pass -- and for a second reason on top
+    # of the timestamps': a directory created 0o500 cannot have files written into it, so its
+    # real mode has to wait until everything inside it has arrived.
+    directory_modes: list[tuple[Path, int]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3526,13 +3854,21 @@ def _settle_directory(
     *,
     local_directory: Path,
     preserve_times: bool,
+    mode: int | Mode | None,
     state: _DownloadState,
 ) -> None:
     """Create one walked directory locally and record what it contributes to the report.
 
-    The root is deliberately not counted or stamped: the caller named it, so creating it is
-    :meth:`Session.get_tree`'s own ``_ensure_directory`` and restamping it would be a side
+    The root is deliberately not counted, stamped or chmodded: the caller named it, so creating
+    it is :meth:`Session.get_tree`'s own ``_ensure_directory`` and modifying it would be a side
     effect on something they did not ask to have modified.
+
+    **Only ``Mode.PRESERVE`` reaches directories.** An explicit integer is a *file* mode, and
+    applying it here would make ``mode=0o600`` produce a tree nothing can descend into. A
+    directory the server declined to report permissions for is skipped rather than raising, which
+    is the opposite of what a *file* does under ``PRESERVE`` -- the file is the payload and a
+    silently wrong mode on it is the failure being prevented, while a directory whose mode could
+    not be carried leaves a readable tree and a listing that says what was skipped.
     """
     if entry.relative:
         _ = _ensure_directory(local_directory)
@@ -3543,6 +3879,15 @@ def _settle_directory(
             (local_child(local_directory, child.filename), child.attrs.times)
             for child in entry.directories
             if child.attrs.times is not None
+        )
+    if mode is Mode.PRESERVE:
+        state.directory_modes.extend(
+            (
+                local_child(local_directory, child.filename),
+                child.attrs.permissions & PERMISSION_BITS,
+            )
+            for child in entry.directories
+            if child.attrs.permissions is not None
         )
     state.skipped.extend(entry.skipped)
 

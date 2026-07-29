@@ -9,9 +9,11 @@ reads with :func:`os.pread` from a worker thread, and both are documented Unix-o
 CPython. That is not an implementation detail waiting to be swapped: writing at an explicit
 offset is *why* writes need no ordering, why a short ``READ`` can be re-queued instead of
 restarting the transfer, and why the upload side can read concurrently with no seek position
-to serialise on. Stamping timestamps has the same shape -- ``os.utime`` on a **descriptor**
-rather than a path, which :data:`os.supports_fd` gates, and which is deliberate because
-re-opening the path to stamp it would hand a second chance to whatever ``O_NOFOLLOW`` refused.
+to serialise on. Stamping metadata has the same shape -- ``os.utime`` and ``os.fchmod`` on a
+**descriptor** rather than a path, which is deliberate because re-opening the path to stamp it
+would hand a second chance to whatever ``O_NOFOLLOW`` refused. Each is probed the way it can
+be: ``os.utime`` is universal and takes a descriptor only where :data:`os.supports_fd` says so,
+while ``os.fchmod`` either exists or does not.
 
 So the four transfer operations refuse on such a platform, in one place, naming what is
 missing -- rather than raising ``AttributeError: module 'os' has no attribute 'pwrite'`` four
@@ -66,6 +68,8 @@ def missing_local_io() -> tuple[str, ...]:
     missing = [f"os.{name}" for name in _OFFSET_IO if not hasattr(os, name)]
     if os.utime not in os.supports_fd:
         missing.append("os.utime on a descriptor")
+    if not hasattr(os, "fchmod"):
+        missing.append("os.fchmod")
     return tuple(missing)
 
 

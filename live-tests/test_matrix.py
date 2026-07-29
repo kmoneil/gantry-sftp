@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -219,6 +220,41 @@ async def test_a_missing_file_is_reported_as_no_such_file_everywhere(server: Mat
     async with connected(server) as sftp:
         with pytest.raises(NoSuchFileError):
             _ = await sftp.stat(b"/definitely/not/here")
+
+
+async def test_an_uploaded_file_is_never_world_readable_through_any_server(
+    server: MatrixServer, tmp_path: Path
+):
+    """D-56a's claim, against three implementations rather than one.
+
+    ``mode=`` is the only way to deliver a file that is not ``0666 & ~umask``, and it depends on
+    two things a server may or may not do: read ``PERMISSIONS`` out of the ``OPEN``'s ATTRS, and
+    honour an ``FSETSTAT`` carrying only that flag. Neither is an extension, so there is no
+    advertisement to consult and nothing to degrade to -- a server that ignored both would
+    publish the file world-readable and report success, which is exactly what this argument
+    exists to prevent. If any row here fails, the answer is a documented refusal on that server,
+    not a silent downgrade.
+
+    **What the paramiko row is and is not**, on the same line the rung-3 test draws:
+    :class:`matrix._ParamikoHandler` is ours, so ``os.open``'s mode and ``os.fchmod`` are our
+    code. What is paramiko's -- and what this measures -- is whether the ``PERMISSIONS`` flag
+    survives its ATTRS decode and reaches the handler at all.
+    """
+    payload = b"-----BEGIN PRIVATE KEY-----\n"
+    source = tmp_path / "key.pem"
+    source.write_bytes(payload)
+    remote = server.root / "delivered.pem"
+
+    async with connected(server) as sftp:
+        result = await sftp.put(source, str(remote), mode=0o600)
+
+    assert result.mode == 0o600
+    assert stat.S_IMODE(remote.stat().st_mode) == 0o600, (
+        f"{server.name} published the file as "
+        f"{stat.S_IMODE(remote.stat().st_mode):#o} rather than 0o600 -- an upload through it "
+        f"cannot deliver a private file"
+    )
+    assert remote.read_bytes() == payload
 
 
 HANDLER_IS_OURS = frozenset({"paramiko"})

@@ -359,6 +359,12 @@ class UploadResult:
         staged_at: The temp path the bytes were written to first, or ``None`` when they were
             written straight to :attr:`remote_path`. Kept because a failure leaves it behind
             and something has to be able to name it.
+        mode: The permission bits the published file was given, or ``None`` when ``mode=`` was
+            not passed and they were left to the server -- which for OpenSSH means
+            ``0666 & ~umask``. A number rather than an enum because there is no third outcome
+            to name: a server that refuses the mode fails the upload rather than reporting a
+            downgrade, unlike :attr:`times`, so this either says what was set or says nothing
+            was asked for.
     """
 
     transferred: int
@@ -370,6 +376,7 @@ class UploadResult:
     content_check: ContentCheck = ContentCheck.SKIPPED
     resume_check: ResumeCheck = ResumeCheck.SKIPPED
     staged_at: bytes | None = None
+    mode: int | None = None
 
     @property
     def atomic(self) -> bool:

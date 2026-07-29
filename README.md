@@ -796,6 +796,87 @@ structured field, which is exact.
 
 `examples/preserve_times.py` runs all of this.
 
+## Permissions
+
+**An uploaded file is created world-readable unless you say otherwise, and that is the
+server's default rather than a choice this library makes.** OpenSSH's `process_open` reads the
+`OPEN`'s attributes for `PERMISSIONS` and nothing else, defaulting to `0666` when the flag is
+absent — so with the usual `umask 022` a delivered file lands `0644`. A download is the other
+way round: this library creates every local file `0600`, so a file is never briefly readable
+while it is being written.
+
+```python
+await sftp.put("key.pem", "/remote/key.pem", mode=0o600)  # exactly these bits
+await sftp.put_tree("build", "/srv/app", mode=Mode.PRESERVE)  # each file's own bits
+await sftp.get("/remote/key.pem", "key.pem", mode=0o600)  # and on the way down
+```
+
+`mode=` takes an octal mode, `Mode.PRESERVE` (or the string `"preserve"`) to carry the source
+file's own bits across, or `None` — the default — to leave them alone.
+`UploadResult.mode` reports what was set.
+
+**One argument rather than two**, because `mode=0o600` and a `preserve_mode=True` would be
+mutually exclusive by nature: one parameter makes the contradiction unrepresentable instead of
+refusing it at runtime.
+
+### The mode is on the file before anything can open it by name
+
+This is the part worth knowing, because a `chmod` after the fact does not give you it. The
+bits ride on the `OPEN` that creates the staging file, and the exact mode lands via `FSETSTAT`
+on the open handle **before** the rename that publishes it — so there is no instant at which
+the destination exists at the wrong permissions. Writing in place needs one extra step, since
+`open(2)` applies its mode argument only to a file it *creates*: there the mode is set after
+the open and before the first byte.
+
+setuid, setgid and sticky are withheld from the creating `OPEN` and applied only once the
+content is complete. A setuid file that exists half-written is privileged before it is
+finished.
+
+### A refused mode fails the transfer
+
+Unlike `preserve_times`, which degrades and reports. The asymmetry is deliberate: a file
+published with the wrong dates is cosmetically wrong, and one published world-readable when
+`0o600` was asked for is the failure the argument exists to prevent, reported as success. On
+the atomic path the refusal arrives before the rename, so the destination is never replaced.
+
+Measured against OpenSSH 10.0p2, asyncssh 2.24.0 and paramiko 5.0.0: **all three honour it**,
+so no fallback path exists to document.
+
+### On a tree
+
+An integer `mode=` applies to **files only**. `Mode.PRESERVE` carries directories too, in a
+pass after every file has been transferred.
+
+```python
+await sftp.put_tree("build", "/srv/app", mode=0o640)  # files 0640, dirs untouched
+await sftp.get_tree("/srv/app", "build", mode=Mode.PRESERVE)  # files and dirs both mirrored
+```
+
+A file mode on a directory is usually unusable — `0o600` on a directory cannot be entered — so
+applying one there would leave a complete tree nothing can read. And the final pass is not
+tidiness: a directory created `0o500` cannot have files written into it, so applying a source
+mode on the way down fails every transfer underneath it. A refused *directory* mode does not
+fail the tree; the files are the payload and are already published.
+
+### `chmod`
+
+```python
+await sftp.chmod("/remote/report.csv", 0o640)
+```
+
+**It follows symlinks**, because `SETSTAT` is `chmod(2)` — the same default as `os.chmod`.
+Where the path may be a symlink somebody else planted, that is a chmod of whatever it points
+at. The extension that does not follow is `lsetstat@openssh.com`; it is not implemented here,
+and v3 offers no fallback, so there is nothing to degrade to and this is said rather than
+implied away.
+
+It sends `PERMISSIONS` and nothing else, deliberately. OpenSSH's `process_setstat` walks the
+attribute flags in sequence — size, permissions, times, owner — applying each and reporting
+only the last failure in one status. So a multi-field `SETSTAT` that fails has already applied
+part of itself and does not say which part. One field per call makes a refusal unambiguous.
+
+`examples/permissions.py` runs all of this.
+
 ## Which server is at the other end
 
 ```python
