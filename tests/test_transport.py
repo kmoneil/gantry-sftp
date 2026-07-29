@@ -27,7 +27,7 @@ from gantry_sftp.codec import (
     PacketType,
     Read,
 )
-from gantry_sftp.exceptions import ConnectError, flatten_exception_group
+from gantry_sftp.exceptions import ConnectError, _flatten_exception_group
 from gantry_sftp.transport import (
     ASKPASS_ARMING_VARIABLES,
     StderrBuffer,
@@ -519,12 +519,12 @@ async def test_the_group_is_flattened_all_the_way_down():
     # transports would be theatre, and the property is about the unwrapper.
     inner = ConnectError("the real one")
     nested = BaseExceptionGroup("outer", [BaseExceptionGroup("inner", [inner])])
-    assert flatten_exception_group(nested) is inner
+    assert _flatten_exception_group(nested) is inner
 
 
 def test_flattening_leaves_a_plain_exception_alone():
     error = ConnectError("not a group")
-    assert flatten_exception_group(error) is error
+    assert _flatten_exception_group(error) is error
 
 
 # --- passwords: where the secret goes, and what a refusal says ----------------------------

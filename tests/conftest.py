@@ -16,7 +16,7 @@ import anyio
 import pytest
 
 from gantry_sftp.codec import Codec
-from gantry_sftp.exceptions import flatten_exception_group
+from gantry_sftp.exceptions import _flatten_exception_group
 from gantry_sftp.session import Dispatcher
 from gantry_sftp.transport import Transport
 
@@ -50,7 +50,7 @@ async def running_dispatcher(
             finally:
                 dispatcher.close()
     except BaseExceptionGroup as group:
-        raise flatten_exception_group(group) from None
+        raise _flatten_exception_group(group) from None
 
 
 async def negotiate(transport: Transport) -> Codec:

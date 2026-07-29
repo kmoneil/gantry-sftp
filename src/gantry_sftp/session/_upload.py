@@ -52,7 +52,7 @@ from gantry_sftp.exceptions import (
     ProtocolError,
     TransferError,
     TransferTimeoutError,
-    flatten_exception_group,
+    _flatten_exception_group,
 )
 from gantry_sftp.session._dispatch import Dispatcher, Exchange
 from gantry_sftp.session._download import (
@@ -213,7 +213,7 @@ class _Uploader:
                 await self._finished.wait()
                 task_group.cancel_scope.cancel()
         except BaseExceptionGroup as group:
-            raise flatten_exception_group(group) from None
+            raise _flatten_exception_group(group) from None
 
         if self._progress is not None:
             self._progress(self._span.start + self._acknowledged, self._span.end)

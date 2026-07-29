@@ -109,7 +109,7 @@ from gantry_sftp.exceptions import (
     TransferError,
     TransferTimeoutError,
     UnsupportedError,
-    flatten_exception_group,
+    _flatten_exception_group,
 )
 from gantry_sftp.session._dispatch import Dispatcher
 from gantry_sftp.session._download import (
@@ -166,7 +166,14 @@ from gantry_sftp.session._verify import (
 )
 from gantry_sftp.transport import Transport
 
-__all__ = ["DEFAULT_REQUEST_TIMEOUT", "LIMITS_EXTENSION", "Session", "open_session"]
+__all__ = [
+    "DEFAULT_REQUEST_TIMEOUT",
+    "DEFAULT_SESSION_OPTIONS",
+    "LIMITS_EXTENSION",
+    "Session",
+    "SessionOptions",
+    "open_session",
+]
 
 DEFAULT_REQUEST_TIMEOUT = 30.0
 """Seconds a single round trip may take before it is abandoned.
@@ -202,6 +209,47 @@ _LOCAL_RESUME_FLAGS = os.O_WRONLY | os.O_CREAT
 Not ``O_APPEND``: every write goes to an explicit offset with ``os.pwrite``, and ``O_APPEND``
 would ignore those offsets and redirect every reply to the end of the file -- which for
 out-of-order pipelined replies means a file assembled in arrival order. Silently, and wrong.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionOptions:
+    """How a session schedules and how long it waits: the three tunables, as one type.
+
+    A parameter object where ``pyproject.toml`` normally argues against one -- and the argument
+    it makes is about the *connection* entry points, where ``host`` and ``identity_file`` are
+    genuinely unrelated. These three are not: they are one scheduling policy, which is the same
+    reasoning that made ``Publish`` a type in 0.9 rather than five arguments.
+
+    It exists because :func:`~gantry_sftp.connect` fuses two signatures that together come to
+    thirteen arguments against a ceiling of ten, and the ssh half is precisely the half that
+    cannot be grouped. Grouping the half that *is* one concept is what makes the fused entry
+    point fit without an exemption.
+
+    :func:`open_session` keeps its three flat keyword arguments and is unchanged -- it takes a
+    transport rather than a host, so it was never near the ceiling.
+
+    Attributes:
+        request_timeout: Seconds for the handshake, for each one-shot request, and for each
+            write -- including the wait for the connection's send lock. ``None`` waits forever,
+            which also makes teardown unbounded against a peer that has stopped answering.
+        idle_timeout: Seconds of total silence during a bulk transfer. A large transfer over a
+            slow link is healthy so long as bytes keep arriving, so this fires only on silence.
+        depth: Default requests in flight per transfer. Raising it past the default buys
+            nothing: one session is one channel is one 2 MiB window.
+    """
+
+    request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT
+    idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT
+    depth: int = DEFAULT_PIPELINE_DEPTH
+
+
+DEFAULT_SESSION_OPTIONS = SessionOptions()
+"""The tunables :func:`open_session` uses when it is not told otherwise.
+
+A module-level singleton so it can be a default argument without a mutable-default hazard --
+:class:`SessionOptions` is frozen -- and so ``session is DEFAULT_SESSION_OPTIONS`` is a usable
+question.
 """
 
 _LOGGED_EXTENSIONS = 12
@@ -495,6 +543,17 @@ class Session:
     def limits(self) -> ServerLimits:
         """What the server said it will accept, or all-``None`` if it said nothing."""
         return self._limits
+
+    @property
+    def depth(self) -> int:
+        """Requests this session keeps in flight per transfer, unless a call overrides it.
+
+        Readable because it was previously visible only inside ``repr()``, which made
+        "did my tunable take effect" a question answerable by string-matching a diagnostic --
+        and :func:`~gantry_sftp.connect` gave callers a second way to set it, so there are now
+        two spellings whose agreement someone will want to check.
+        """
+        return self._depth
 
     @property
     def extensions(self) -> Mapping[bytes, bytes]:
@@ -4367,7 +4426,7 @@ async def open_session(
                 # still trying during teardown gets a StateError naming the reason.
                 dispatcher.close()
     except BaseExceptionGroup as group:
-        raise flatten_exception_group(group) from None
+        raise _flatten_exception_group(group) from None
 
 
 async def _read_version(transport: Transport, codec: Codec) -> None:

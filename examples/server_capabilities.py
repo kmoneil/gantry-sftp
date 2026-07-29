@@ -29,7 +29,8 @@ from pathlib import Path
 
 import anyio
 
-from gantry_sftp.codec import EXTENSION_CHECK_FILE, OpenFlag
+from gantry_sftp import OpenFlag
+from gantry_sftp.codec import EXTENSION_CHECK_FILE
 from gantry_sftp.exceptions import ServerError, UnsupportedError
 from gantry_sftp.session import Session, open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport

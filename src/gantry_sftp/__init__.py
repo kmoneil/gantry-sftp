@@ -6,11 +6,18 @@ and an ergonomics layer.
 
 What exists today, from a distribution a user actually installed::
 
-    from gantry_sftp.transport import open_ssh_transport
-    from gantry_sftp.session import open_session
+    from gantry_sftp import connect
+
+    async with connect("example.com", user="bob") as sftp:
+        await sftp.get("/incoming/data.parquet", "data.parquet")
+
+:func:`~gantry_sftp.connect` opens the connection and the session together. The two-call
+spelling is unchanged and is what to use when their lifetimes differ::
+
+    from gantry_sftp import open_session, open_ssh_transport
 
     async with open_ssh_transport("example.com", user="bob") as t, open_session(t) as sftp:
-        await sftp.get("/incoming/data.parquet", "data.parquet")
+        ...
 
 :mod:`gantry_sftp.transport` opens the connection, :mod:`gantry_sftp.session` is the API --
 ``get`` / ``put`` (atomic by default, resumable, verifiable, and able to carry a file's mode
@@ -28,6 +35,8 @@ sending readers to files they could not obtain (D-47). The README is what ships.
 
 from __future__ import annotations
 
+from gantry_sftp._connect import connect
+from gantry_sftp.codec import Attrs, OpenFlag, Owner, Times
 from gantry_sftp.exceptions import (
     AuthenticationError,
     CapabilityError,
@@ -48,27 +57,66 @@ from gantry_sftp.exceptions import (
     UnsafePathError,
     UnsupportedError,
 )
+from gantry_sftp.session import (
+    DirEntry,
+    EntryKind,
+    Mode,
+    Publish,
+    Session,
+    SessionOptions,
+    Skipped,
+    SkipReason,
+    TreeResult,
+    UploadResult,
+    Verify,
+    WalkEntry,
+    is_retryable,
+    open_session,
+    with_reconnect,
+)
+from gantry_sftp.transport import open_ssh_transport
 
 __all__ = [
+    "Attrs",
     "AuthenticationError",
     "CapabilityError",
     "ConnectError",
     "DestinationCollisionError",
+    "DirEntry",
+    "EntryKind",
     "HostKeyError",
     "InsecureOptionWarning",
+    "Mode",
     "NoSuchFileError",
+    "OpenFlag",
+    "Owner",
     "PathCollision",
     "PermissionDeniedError",
     "ProtocolError",
+    "Publish",
     "SFTPError",
     "SFTPWarning",
     "ServerError",
+    "Session",
+    "SessionOptions",
+    "SkipReason",
+    "Skipped",
     "StateError",
+    "Times",
     "TransferError",
     "TransferTimeoutError",
+    "TreeResult",
     "UnsafePathError",
     "UnsupportedError",
+    "UploadResult",
+    "Verify",
+    "WalkEntry",
     "__version__",
+    "connect",
+    "is_retryable",
+    "open_session",
+    "open_ssh_transport",
+    "with_reconnect",
 ]
 
 __version__ = "0.0.0"

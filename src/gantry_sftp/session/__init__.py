@@ -99,9 +99,11 @@ from gantry_sftp.session._retry import (
 )
 from gantry_sftp.session._session import (
     DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SESSION_OPTIONS,
     LIMITS_EXTENSION,
     DirectoryScan,
     Session,
+    SessionOptions,
     open_session,
     raise_for_status,
 )
@@ -124,6 +126,7 @@ __all__ = [
     "DEFAULT_PIPELINE_DEPTH",
     "DEFAULT_PUBLISH",
     "DEFAULT_REQUEST_TIMEOUT",
+    "DEFAULT_SESSION_OPTIONS",
     "DOT_ENTRIES",
     "LIMITS_EXTENSION",
     "MAX_STAGED_NAME_LENGTH",
@@ -153,6 +156,7 @@ __all__ = [
     "ServerLimits",
     "ServerProfile",
     "Session",
+    "SessionOptions",
     "SizeCheck",
     "SkipReason",
     "Skipped",

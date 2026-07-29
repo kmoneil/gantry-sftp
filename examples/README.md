@@ -51,6 +51,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 
 | Example                   | Shows                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `quickstart.py`           | the shortest program that moves a file: `connect()` in one call, and a whole session's worth of types imported from `gantry_sftp` with nothing reaching into `gantry_sftp.codec` |
 | `download.py`             | `get()`, the progress callback, and where the pipelining happens                                       |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |

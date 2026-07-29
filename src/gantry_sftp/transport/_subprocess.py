@@ -30,7 +30,7 @@ import anyio
 from anyio.abc import Process
 
 from gantry_sftp._logging import mask_environment, transport_logger
-from gantry_sftp.exceptions import ConnectError, flatten_exception_group
+from gantry_sftp.exceptions import ConnectError, _flatten_exception_group
 from gantry_sftp.transport._argv import (
     DEFAULT_SUBSYSTEM,
     build_ssh_argv,
@@ -408,7 +408,7 @@ async def _open_process_transport(
             # never matches, which is the natural spelling and the one the README documents.
             # Re-raising the flattened exception is safe with @asynccontextmanager: it is the
             # same object contextlib threw in, so the `async with` propagates it normally.
-            raise flatten_exception_group(group) from None
+            raise _flatten_exception_group(group) from None
     finally:
         # The task group cannot outlive the process object, and a failure anywhere above
         # must not leave a child running.

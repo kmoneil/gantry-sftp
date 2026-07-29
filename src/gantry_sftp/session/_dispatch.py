@@ -20,7 +20,7 @@ Three properties are load-bearing
   returns. Letting it raise instead would surface a connection failure as an
   ``ExceptionGroup`` from the ``async with open_session(...)`` line -- at the *session's*
   boundary rather than at the call that failed -- and would report it twice, once to the
-  waiter and once to the task group. See :func:`~gantry_sftp.exceptions.flatten_exception_group`
+  waiter and once to the task group. See :func:`~gantry_sftp.exceptions._flatten_exception_group`
   for why a group at a public boundary is a bug rather than a detail.
 * **A failure reaches every waiter.** Concurrent fan-out means a dead connection can have
   several tasks parked on it, and one that is never woken is a hang. Every exchange is

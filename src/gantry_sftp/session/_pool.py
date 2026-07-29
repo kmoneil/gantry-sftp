@@ -33,7 +33,7 @@ from contextlib import aclosing
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream
 
-from gantry_sftp.exceptions import flatten_exception_group
+from gantry_sftp.exceptions import _flatten_exception_group
 
 __all__ = ["for_each_bounded"]
 
@@ -97,7 +97,7 @@ async def for_each_bounded[T](
                 async for item in items:
                     await send.send(item)
     except BaseException as error:
-        raise flatten_exception_group(error) from None
+        raise _flatten_exception_group(error) from None
 
 
 async def _worker[T](

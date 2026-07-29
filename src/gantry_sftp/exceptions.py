@@ -487,7 +487,7 @@ class CapabilityError(SFTPError):
         return " ".join(parts).replace(" )", ")")
 
 
-def flatten_exception_group(error: BaseException) -> BaseException:
+def _flatten_exception_group(error: BaseException) -> BaseException:
     """Reduce an ``ExceptionGroup`` to the first thing that actually went wrong.
 
     An anyio task group raises ``ExceptionGroup`` **even for a single failure**, which quietly

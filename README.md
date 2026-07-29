@@ -45,6 +45,9 @@ exists today:
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
+- **one call to connect**: `connect(host, ...)` opens the `ssh` connection and a session over
+  it, and `from gantry_sftp import ...` reaches every entry point and value type — so no
+  program needs an import from `gantry_sftp.codec`, the layer the design calls internal
 - a session with `stat`, `lstat`, `fstat`, `realpath`, `open`/`close`, `mkdir`, `rmdir`,
   `remove`, `rename`, `posix_rename`, `fsync`, `chmod` / `chown` / `utime` / `truncate`,
   `readlink` / `symlink`, `supports()`, `listdir()` / streaming `scandir()`, and
@@ -95,15 +98,11 @@ It moves files:
 
 ```python
 import anyio
-from gantry_sftp.session import open_session
-from gantry_sftp.transport import open_ssh_transport
+from gantry_sftp import connect
 
 
 async def main():
-    async with (
-        open_ssh_transport("example.com", user="bob") as transport,
-        open_session(transport) as sftp,
-    ):
+    async with connect("example.com", user="bob") as sftp:
         await sftp.get("/remote/data.parquet", "data.parquet")
         result = await sftp.put("report.csv", "/remote/report.csv")
         print(result.mechanism, result.atomic)  # posix-rename True
@@ -112,10 +111,40 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: the fsspec adapter, `SFTPPath`, or the generated sync API. The
-names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not exist yet — `open_session` is
-the current spelling, and concurrency is spelled with your own task group rather than a
-`concurrency=` argument.
+One import, one call. `connect()` opens the `ssh` connection and the session together and
+closes both when the block exits.
+
+**The two-call spelling is not deprecated and is what to reach for when the connection's
+lifetime differs from the session's** — running two sessions over one connection, or handing a
+transport to something else:
+
+```python
+from gantry_sftp import open_session, open_ssh_transport
+
+async with (
+    open_ssh_transport("example.com", user="bob") as transport,
+    open_session(transport) as sftp,
+):
+    ...
+```
+
+Session tunables go through `SessionOptions`, because `connect()` is already at this
+project's argument ceiling with the `ssh` arguments alone:
+
+```python
+from gantry_sftp import SessionOptions, connect
+
+async with connect("host", user="bob", session=SessionOptions(depth=16)) as sftp:
+    ...
+```
+
+`connect()` is **not** a reconnect recipe — see [Reconnect and retry](#reconnect-and-retry), where
+`with_reconnect` takes a callable producing a *transport*, because a retry rebuilds the session
+over a new connection.
+
+Not yet: the fsspec adapter, `SFTPPath`, or the generated sync API. `put_many()` from
+DESIGN.md's §8 sketch does not exist — concurrency is spelled with your own task group, or with
+`get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
 
 ## Matching names: `glob`
 

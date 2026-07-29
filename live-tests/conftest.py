@@ -27,7 +27,7 @@ from sshd import (
 )
 
 from gantry_sftp.codec import Codec, CodecState, StatusCode
-from gantry_sftp.exceptions import ServerError, flatten_exception_group
+from gantry_sftp.exceptions import ServerError, _flatten_exception_group
 from gantry_sftp.session import Dispatcher
 from gantry_sftp.transport import Transport, open_ssh_transport
 
@@ -91,7 +91,7 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
 
     What `open_session` does, minus the handshake, for the lanes that drive `download_handle`
     directly because they need knobs the session deliberately does not expose. The flatten
-    mirrors production for the reason `flatten_exception_group` exists: a task group wraps
+    mirrors production for the reason `_flatten_exception_group` exists: a task group wraps
     even a single failure, and a lane whose assertions stopped matching would report a link
     problem as a nameless `ExceptionGroup`.
 
@@ -108,7 +108,7 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
             finally:
                 dispatcher.close()
     except BaseExceptionGroup as group:
-        raise flatten_exception_group(group) from None
+        raise _flatten_exception_group(group) from None
 
 
 @pytest.fixture(params=["asyncio", "trio"])
