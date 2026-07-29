@@ -20,9 +20,13 @@ which spellings are which. Write safety comes from ``resume``'s own checks -- a 
 offset, and a refusal when it cannot establish one -- not from new machinery here.
 
 What is *not* here: retrying an individual request inside a live connection. A server that
-answers one READ with a transient ``FAILURE`` still fails the transfer. That is registered in
-``_plans/deferred.md`` rather than half-built, because the v3 catch-all makes "transient"
-undecidable without the quirks layer -- see :func:`is_retryable`.
+answers one READ with a transient ``FAILURE`` still fails the transfer, and the reason is not
+that nobody got to it. v3's ``FAILURE`` is a catch-all: a permission problem, a full disk, a
+name collision and a momentary appliance hiccup all arrive as the same code, and OpenSSH's
+message for every one of them is the constant word ``Failure``. So "transient" is undecidable
+on the reference server, not merely undecided, and a retry that guessed would turn every
+terminal error into three slow ones with the same message. It becomes decidable for the subset
+of servers that put a ``strerror`` in the message -- see :func:`is_retryable`.
 """
 
 from __future__ import annotations

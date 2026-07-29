@@ -4,10 +4,12 @@ Errors carry state, not strings. The rule from DESIGN.md 9 is that an error name
 failed, where, and what to do about it -- so every class here holds the structured facts a
 caller would otherwise have to recover by parsing a message.
 
-Only the classes something actually raises are defined. The rest of the hierarchy in
-DESIGN.md 9 (``ConnectionError``, ``ServerError``, ``TransferError`` and their children)
-lands with the layers that raise them; an exception class nobody raises is dead code that
-looks like API.
+**The whole hierarchy lives here**, in one module, which is not what this docstring used to
+say: it described the transport and session errors as landing "with the layers that raise
+them", and they were already ninety lines below it. One module is the right arrangement for a
+different reason -- an ``except`` ladder is written against the tree, so the tree should be
+readable in one place -- and the rule it was really stating survives: an exception class
+nobody raises is dead code that looks like API.
 """
 
 from __future__ import annotations
@@ -114,12 +116,17 @@ class ConnectError(SFTPError):
     match.
 
     Attributes:
-        stderr: OpenSSH's standard error, **verbatim and untruncated**. This is the whole
-            point of the class. ``Error reading SSH protocol banner`` is what paramiko
-            tells you when the real message was ``Permission denied (publickey)`` or
-            ``Host key verification failed`` -- the diagnosis was always there, and it was
-            thrown away. It is not parsed here either, because parsing it would mean
-            guessing, and the raw text is worth more than our guess about it.
+        stderr: OpenSSH's standard error, **verbatim**, and bounded: the first 8 KiB and the
+            last 56 KiB, with ``... [N bytes of stderr omitted] ...`` in between when a
+            chatty child overflows it. Both ends are kept because the first lines say what
+            was attempted and the last say how it ended, and ``ssh -vvv`` is exactly the
+            situation that overflows the cap. This is the whole point of the class.
+            ``Error reading SSH protocol banner`` is what paramiko tells you when the real
+            message was ``Permission denied (publickey)`` or ``Host key verification
+            failed`` -- the diagnosis was always there, and it was thrown away. It is not
+            parsed here either, because parsing it would mean guessing, and the raw text is
+            worth more than our guess about it. See
+            :class:`~gantry_sftp.transport.StderrBuffer` for the two limits as tunables.
         argv: The exact command that was run, with no shell involved. Useful in a bug
             report and safe to show: credentials never appear in argv (see
             ``SSH_ASKPASS``), which is itself a design constraint rather than a habit.

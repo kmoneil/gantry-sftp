@@ -80,10 +80,18 @@ enforced by it.
 DEFAULT_PIPELINE_DEPTH = 64
 """Requests in flight per file.
 
-Matches ``sftp(1)``'s ``-R`` default, which is the number this project exists to argue is
-too low in combination with a 32 KiB buffer. With a derived 255 KiB request size it already
-gives ~16 MiB in flight rather than 2 MiB. Adaptive ramping is a separate change and needs
-the netem lane to be honest about (see ``_plans/deferred.md`` D-3).
+Matches ``sftp(1)``'s ``-R`` default, which is the number this project exists to argue is too
+low **in combination with its 32 KiB buffer** -- 64 x 32768 is exactly the 2 MiB the channel
+window holds, so the reference client saturates it and stops.
+
+What this depth buys is not more bytes in flight. 64 requests of a derived 255 KiB is what we
+*issue*; what the connection can hold is the SSH channel window, measured at 2 MiB, and a
+window refilled by ``CHANNEL_WINDOW_ADJUST`` appears to sustain rather less than that. The
+point of issuing past it is that a server which clamps the request size still reaches the
+ceiling, and the ceiling is reached with room to spare rather than exactly.
+
+Raising this further does not raise throughput; it raises memory and issue-side work. The
+number that would is a second connection.
 """
 
 DEFAULT_IDLE_TIMEOUT = 60.0

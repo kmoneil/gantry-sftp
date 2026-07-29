@@ -1,10 +1,18 @@
 [project]
 name = "gantry-sftp"
-version = "0.0.0"
+# Single-sourced from the package, so `gantry_sftp.__version__` and the installed
+# distribution cannot name different releases in the same bug report. See
+# `[tool.hatch.version]` below and `tests/test_packaging.py`, which asserts they agree.
+dynamic = ["version"]
 description = "A modern Python SFTP library that does not implement SSH at all."
 readme = "README.md"
 requires-python = ">=3.13"
 license = "Apache-2.0"
+# The SPDX expression alone puts `License-Expression: Apache-2.0` in METADATA and ships no
+# grant text at all -- measured on a real build. Apache-2.0 section 4(a) requires the copy to
+# travel with the distribution, and a corporate compliance scan looks for the file, not the
+# identifier.
+license-files = ["LICENSE"]
 authors = [{ name = "Kevin O'Neil", email = "kevin@oneil.xyz" }]
 keywords = ["sftp", "ssh", "filexfer", "openssh", "file-transfer"]
 classifiers = [
@@ -20,12 +28,16 @@ dependencies = [
     "anyio>=4.14.2",
 ]
 
-[project.urls]
-Homepage = "https://github.com/kevinoneil/gantry-sftp"
+# No `[project.urls]`. There is no remote repository yet, and METADATA advertising a Homepage
+# that 404s is the same defect as a docstring pointing at a gitignored file: a reader is told
+# where to go and cannot get there. It comes back with the repository.
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/gantry_sftp/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gantry_sftp"]
@@ -216,6 +228,10 @@ xfail_strict = true
 filterwarnings = ["error"]
 markers = [
   "sftp_server: needs the OpenSSH sftp-server binary (ships in openssh-server)",
+  # `slow` is descriptive, not excluded: these build the distribution and take seconds rather
+  # than milliseconds, and they are in the default run because the defect they catch -- a wheel
+  # with an SPDX identifier and no licence text -- is invisible to every other test here.
+  "slow: builds a distribution; seconds rather than milliseconds",
 ]
 
 # ---------------------------------------------------------------------------

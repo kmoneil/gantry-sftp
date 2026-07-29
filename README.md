@@ -531,8 +531,9 @@ and expects `targetpath, linkpath`. We follow OpenSSH, because OpenSSH is what i
 Both orders are run against a live server in the test suite so the claim stays measured
 rather than remembered.
 
-`_plans/DESIGN.md` is canonical for intent and `_plans/progress.md` for what is actually
-built. Neither is committed.
+(The design and status documents this repository works from are deliberately not committed and
+are in no distribution, so nothing here sends you to them. What ships is this file, the
+docstrings, and `examples/`.)
 
 ## Verifying a transfer
 
@@ -628,6 +629,10 @@ and the width of the chosen algorithm, so a payload that does not divide evenly 
 was read off paramiko's implementation and off a captured frame, and it is committed as a
 golden fixture in both directions with a live test that re-runs the capture, because there is
 no document to notice a disagreement against.
+
+`examples/server_capabilities.py` runs this with no arguments, and shows the path you will
+almost certainly take: OpenSSH answers `OP_UNSUPPORTED`, and the example falls to the size
+check rather than pretending the question was answered.
 
 ## Timestamps
 
@@ -736,6 +741,9 @@ non-empty directory, `REMOVE` of a directory — produce this:
 transient failure from a permanent one by reading the message — the standard proposal, and
 the thing v3's catch-all `FAILURE` would need — cannot work on the reference server at all.
 That is why retry classifies on exception type rather than on message text.
+
+`examples/server_capabilities.py` prints the profile, the advertised extension list and the
+session `repr` against whatever you point it at.
 
 ## Authenticating
 
@@ -869,9 +877,15 @@ except ConnectError as e:
 ```
 
 paramiko answers this question with `Error reading SSH protocol banner`. OpenSSH knew exactly
-what went wrong and said so; `ConnectError.stderr` carries that text untouched, and the two
+what went wrong and said so; `ConnectError.stderr` carries that text unparsed, and the two
 questions people actually ask — "was that my key?" and "has the host changed?" — are answered
 by `except` rather than by string matching in your own code.
+
+It is **bounded**, which "untouched" used to imply it was not: the first 8 KiB and the last
+56 KiB, with `... [N bytes of stderr omitted] ...` marking the gap. Both ends, because the
+first lines say what was attempted and the last say how it ended — and `ssh -vvv` is precisely
+the case that overflows it. A hostile server also writes to that stream, so it is a buffer with
+a cap rather than a string with a promise.
 
 Three things about that ladder are deliberate:
 
@@ -935,8 +949,8 @@ A request is around thirty bytes and a pipe holds 64 KiB, so a sender could not 
 a session ran one transfer at a time. Once transfers share a connection, one upload's 255 KiB
 `WRITE` fills the pipe and every other task's write queues behind it, so an ordinary concurrent
 `get` against a peer that stopped draining hung forever with nothing to report it. Measured, not
-argued: `_plans/probes/` drove every sending path against a server that stops reading, and two of
-them never came back.
+argued: a probe drove every sending path against a server that stops reading, and two of them
+never came back.
 
 **A write that times out ends the connection**, rather than just the transfer, and that is
 deliberate. A write puts a whole frame on the wire; abandoning one part-way leaves the peer
@@ -1208,6 +1222,35 @@ kind of claim and is labelled as one. Nothing here is an unattributed "10× fast
 paramiko": every figure names its link, its server, its versions and the benchmark that
 produced it, and that benchmark re-runs.
 
+## Tunables, and what they default to
+
+Every knob this library has, with the number it ships as. There are four, and three of them
+you should not need.
+
+| Setting | Default | What it bounds | When to change it |
+| --- | --- | --- | --- |
+| `request_timeout` | `30.0` s | One round trip — the handshake, a `STAT`, an `OPEN`, a `CLOSE` — **and one write**, including the wait for the send lock | Raise for an appliance that thinks slowly; `None` for no bound at all |
+| `idle_timeout` | `60.0` s | A bulk transfer's *silence*, not its duration. A nine-hour download never trips it; sixty seconds with nothing arriving does | Raise if the far end legitimately pauses for minutes mid-transfer |
+| `depth` | `64` | Requests in flight per transfer | Lower it to bound memory on an upload (each in-flight request holds a payload); raising it does not raise throughput — see below |
+| request size | `261120` bytes | Payload per `READ`/`WRITE` | Not a parameter. Derived per connection from `limits@openssh.com`, clamped to what the server says it will accept |
+
+All three parameters are keyword arguments to `open_session()` (and to `with_reconnect()`,
+which forwards them). `None` for either timeout means no bound; it is a legitimate thing to
+ask for and it is never the default.
+
+**Why the request size is not 256 KiB.** It is the round number, and it is unachievable: the
+reference server reports `max-packet-length` 262144 and `max-read-length` 261120, because the
+packet also carries the type byte, the request id, the handle and the offset. Asking for the
+round number means being clamped on every single request forever. Worse, a frame *over* the
+packet limit is not refused — measured, `sftp-server` exits with no `STATUS` and an empty
+stderr, and the connection dies mid-write. So the size is derived, not defaulted.
+
+**Why raising `depth` past 64 does nothing.** 64 × 255 KiB is what the client *issues*; what
+the connection can hold is the SSH channel window, which is 2 MiB (measured — see below).
+Issuing past the ceiling is deliberate, so that a server which clamps the request size still
+reaches it, but the bytes in flight are the window's business. More depth buys memory
+pressure. The thing that would buy throughput is a second connection.
+
 ## Requirements
 
 - Python 3.13+
@@ -1364,7 +1407,7 @@ codec carries a `mutmut` run:
 It is a lane, not a pre-commit gate — it takes minutes, not seconds. A surviving mutant in
 `codec/` is a missing test, not a curiosity, and the survivors that are genuinely
 *equivalent* (no test can distinguish them) are listed with their reasons in
-`_plans/deferred.md` rather than suppressed, so a future run has a baseline to diff against
+a register rather than suppressed, so a future run has a baseline to diff against
 instead of a triage to redo.
 
 `mutmut` mutates only functions the tests call, and it mutates the copy of the library it
