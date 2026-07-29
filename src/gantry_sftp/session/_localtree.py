@@ -44,7 +44,7 @@ from pathlib import Path
 from gantry_sftp.codec import Attrs
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session._listing import DirEntry, EntryKind, entry_kind
-from gantry_sftp.session._recursive import Skipped, SkipReason
+from gantry_sftp.session._recursive import Skipped, SkipReason, remote_component_reason
 
 __all__ = [
     "LocalWalkEntry",
@@ -52,8 +52,6 @@ __all__ = [
     "remote_component",
     "walk_local",
 ]
-
-_DOT_NAMES = (b".", b"..")
 
 
 def remote_component(name: bytes) -> bytes:
@@ -73,7 +71,7 @@ def remote_component(name: bytes) -> bytes:
     Raises:
         UnsafePathError: If the name could not be one remote path component.
     """
-    reason = _remote_component_reason(name)
+    reason = remote_component_reason(name)
     if reason is None:
         return name
     raise UnsafePathError(
@@ -82,19 +80,6 @@ def remote_component(name: bytes) -> bytes:
         name=name,
         reason=reason,
     )
-
-
-def _remote_component_reason(name: bytes) -> str | None:
-    """Why ``name`` cannot be one remote path component, or ``None``."""
-    if not name:
-        return "an empty name"
-    if name in _DOT_NAMES:
-        return "a relative directory entry"
-    if b"/" in name:
-        return "a path separator"
-    if b"\x00" in name:
-        return "a NUL byte"
-    return None
 
 
 def local_dir_entry(name: bytes, stat_result: os.stat_result) -> DirEntry:

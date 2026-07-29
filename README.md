@@ -105,10 +105,54 @@ async def main():
 anyio.run(main)
 ```
 
-Not yet: `glob`, the fsspec adapter, `SFTPPath`, or the generated sync API. The
+Not yet: the fsspec adapter, `SFTPPath`, or the generated sync API. The
 names in DESIGN.md's §8 sketch (`connect()`, `put_many()`) do not exist yet — `open_session` is
 the current spelling, and concurrency is spelled with your own task group rather than a
 `concurrency=` argument.
+
+## Matching names: `glob`
+
+```python
+from contextlib import aclosing
+
+async with aclosing(sftp.glob("/incoming/*.csv")) as matches:
+    async for match in matches:
+        await sftp.get(match.path, local_dir / os.fsdecode(match.name))
+```
+
+`match.path` is a path **this library** built, by joining a name that was checked for
+separators and dot entries onto the prefix you typed. That is the reason to use `glob` rather
+than a `listdir` and an `fnmatch`: written by hand, that join is at your call site, and a
+server answering with `../../etc/x` is a path traversal you wrote yourself.
+
+**The dialect is `glob(3)`'s, because that is what `sftp(1)` uses** — it globs client-side
+through POSIX `glob(3)`, so this is the pattern language you already have. Three consequences
+differ from Python's `fnmatch`, which is what a reader would otherwise assume is underneath:
+
+- **`*` and `?` never cross `/`.** `fnmatch` matches `a/b.csv` against `*.csv`; this does not.
+- **A leading period must be matched explicitly.** `*.csv` does not match `.hidden.csv`; `.*.csv`
+  does. This is what keeps a glob over a drop directory from picking up half-written staging
+  files — including the dot-prefixed ones this library's own atomic publish creates.
+- **A backslash escapes**, as it does in `sftp(1)`, which passes no `GLOB_NOESCAPE`.
+
+`[abc]`, `[a-z]` and `[!a-z]` (also spelled `[^a-z]`) work. Brace expansion does not: `sftp(1)`
+applies it to `ls` and not to `get`, so there is no consistent behaviour to copy.
+
+| | |
+| --- | --- |
+| `**` | zero or more directory levels. An **addition** to what `sftp(1)` understands, so a pattern using it is not portable back to that client. Bounded by `max_depth=` |
+| trailing `/` | match directories only, as in a shell |
+| `case_sensitive=False` | fold ASCII case in the names being matched. Not the directory you typed — folding that would mean listing `/` to find out whether `/Incoming` is `/incoming`. Non-ASCII bytes are never folded: a remote name is bytes of unstated encoding |
+
+Matching runs on **bytes**, because a remote name need not be valid UTF-8 and a lossy decode
+makes two distinct names match one pattern. Symlinks match but are never descended into, the
+same as in `walk`. Nothing is accumulated — matches are yielded as they are found — so it is an
+async generator and you close it, exactly as with `walk`. A directory in the pattern's path that
+does not exist matches nothing; one that exists and **cannot be read** raises, which is a
+deliberate divergence from `glob(3)`: answering "no matches" when the truth is "I was not
+allowed to look" is a partial success wearing a complete one's clothes.
+
+Runnable: `examples/glob_patterns.py`.
 
 ## Many transfers, one connection
 

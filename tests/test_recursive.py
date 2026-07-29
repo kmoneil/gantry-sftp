@@ -211,11 +211,33 @@ class TreeServer:
     def _on_realpath(self, packet: RealPath) -> None:
         self._reply(Name(packet.request_id, (NameEntry(self.root, self.root, Attrs()),)))
 
+    def _resolve(self, path: bytes) -> bytes:
+        """Anchor a relative path to this server's root, the way a real server does.
+
+        Needed because a walk rooted at ``.`` builds ``./sub`` *client-side* -- the path
+        arithmetic is ours, so the server is asked about ``.`` and ``./sub`` however it
+        resolves them. Without this the fake answers ``NO_SUCH_FILE`` to all of them and a test
+        of a relative operation would be measuring the fake's ignorance.
+
+        **The resolved form only wins if it names something**, which keeps trees keyed on a
+        bare relative path (``RELATIVE_TREE``) working: those model a server whose default
+        directory makes ``incoming`` resolve to exactly that key, and re-anchoring them would
+        move the fixture rather than fix the fake. ``..`` is deliberately not implemented --
+        nothing here relies on it, and a fake that invented traversal semantics would be
+        proving a behaviour the library never asks for.
+        """
+        if path.startswith(b"/"):
+            return path
+        stem = path[2:] if path.startswith(b"./") else path
+        candidate = self.root if path == b"." else join_remote(self.root, stem)
+        return candidate if candidate in self.tree or candidate in self.files else path
+
     def _on_opendir(self, packet: OpenDir) -> None:
+        resolved = self._resolve(packet.path)
         if (refusal := self.refuse.get("opendir")) is not None:
             self._reply(Status(packet.request_id, refusal, refusal.name.encode("ascii")))
-        elif packet.path in self.tree:
-            self._reply(Handle(packet.request_id, self._handle_for(packet.path)))
+        elif resolved in self.tree:
+            self._reply(Handle(packet.request_id, self._handle_for(resolved)))
         else:
             # What a real server answers for a plain file too: ENOTDIR is remapped.
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
@@ -247,7 +269,7 @@ class TreeServer:
         self._reply(Status(packet.request_id, StatusCode.OK))
 
     def _on_stat(self, packet) -> None:
-        attrs = self._attrs_for(packet.path)
+        attrs = self._attrs_for(self._resolve(packet.path))
         if attrs is None:
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
         else:

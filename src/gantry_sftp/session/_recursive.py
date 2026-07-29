@@ -28,15 +28,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session._listing import DirEntry
 
 __all__ = [
+    "GlobMatch",
     "SkipReason",
     "Skipped",
     "TreeResult",
     "WalkEntry",
+    "check_listed_name",
     "join_remote",
+    "remote_component_reason",
 ]
+
+_DOT_NAMES = (b".", b"..")
 
 
 def join_remote(parent: bytes, name: bytes) -> bytes:
@@ -49,6 +55,62 @@ def join_remote(parent: bytes, name: bytes) -> bytes:
     if not parent or parent.endswith(b"/"):
         return parent + name
     return parent + b"/" + name
+
+
+def remote_component_reason(name: bytes) -> str | None:
+    """Why ``name`` cannot be one remote path component, or ``None`` if it can.
+
+    Shared by both directions, which is the point of it living here beside
+    :func:`join_remote` rather than in either side's module: the upload path asks it of a
+    *local* filename before sending it, and a listing asks it of a name the *server* sent
+    before joining it. Same predicate, opposite threat models, and two copies of it would
+    have drifted.
+    """
+    if not name:
+        return "an empty name"
+    if name in _DOT_NAMES:
+        return "a relative directory entry"
+    if b"/" in name:
+        return "a path separator"
+    if b"\x00" in name:
+        return "a NUL byte"
+    return None
+
+
+def check_listed_name(name: bytes, *, directory: bytes) -> bytes:
+    """Refuse a name a *server* sent that must not be joined onto a remote path.
+
+    The direction that matters: everything out of ``READDIR`` is chosen by the far end, and a
+    name carrying ``/`` or ``..`` would silently turn one directory's listing into a path
+    somewhere else in the namespace. On an honest server this never fires -- POSIX filenames
+    cannot contain ``/`` -- so it costs one comparison per entry and refuses only a server that
+    is lying about its own directory.
+
+    It is not the zip-slip defence, which is :func:`~gantry_sftp.session.check_component` and
+    guards the *local* destination. This one guards the remote path arithmetic, so that a path
+    handed back to a caller is one this library built out of validated parts rather than one
+    the server steered.
+
+    Args:
+        name: One entry name, exactly as the server sent it.
+        directory: The listing it came from, for the error message.
+
+    Returns:
+        ``name`` unchanged, so this reads as a pass-through at the call site.
+
+    Raises:
+        UnsafePathError: If the name could not be one remote path component.
+    """
+    reason = remote_component_reason(name)
+    if reason is None:
+        return name
+    raise UnsafePathError(
+        f"refusing the server-supplied name {name!r} in the listing of {directory!r}: "
+        f"it contains {reason}, so it is not one path component and this server is not "
+        f"describing its own directory truthfully",
+        name=name,
+        reason=reason,
+    )
 
 
 class SkipReason:
@@ -99,6 +161,32 @@ class WalkEntry:
     directories: tuple[DirEntry, ...]
     files: tuple[DirEntry, ...]
     skipped: tuple[Skipped, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GlobMatch:
+    """One entry a pattern matched.
+
+    Carries the **path** rather than only the name, and that is the security half of
+    :meth:`Session.glob` rather than a convenience: the whole reason a caller reaches for a
+    glob instead of a hand-rolled ``listdir`` plus match is so that the join from a
+    server-supplied name to a path they will feed to ``get`` happens here, once, against a
+    validated component -- not at every call site.
+
+    Attributes:
+        path: Full remote path, built by joining validated components onto the pattern's own
+            literal prefix. Safe to pass straight to :meth:`Session.get`.
+        entry: The listing entry, so the kind and any attributes the server volunteered are
+            available without a second round trip.
+    """
+
+    path: bytes
+    entry: DirEntry
+
+    @property
+    def name(self) -> bytes:
+        """The matched entry's own name, without its directory."""
+        return self.entry.filename
 
 
 @dataclass(frozen=True, slots=True)

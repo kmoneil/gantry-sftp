@@ -73,11 +73,14 @@ from gantry_sftp.session._quirks import (
     parse_vendor_id,
 )
 from gantry_sftp.session._recursive import (
+    GlobMatch,
     Skipped,
     SkipReason,
     TreeResult,
     WalkEntry,
+    check_listed_name,
     join_remote,
+    remote_component_reason,
 )
 from gantry_sftp.session._retry import (
     DEFAULT_ATTEMPTS,
@@ -131,6 +134,7 @@ __all__ = [
     "Durability",
     "EntryKind",
     "Exchange",
+    "GlobMatch",
     "LocalWalkEntry",
     "ProgressCallback",
     "Publish",
@@ -151,6 +155,7 @@ __all__ = [
     "accessed_at",
     "check_component",
     "check_contained",
+    "check_listed_name",
     "decode_name",
     "download_handle",
     "entry_kind",
@@ -167,6 +172,7 @@ __all__ = [
     "raise_for_status",
     "read_request_overhead",
     "remote_component",
+    "remote_component_reason",
     "split_parent",
     "staged_path",
     "staging_token",

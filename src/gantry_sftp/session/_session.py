@@ -112,6 +112,7 @@ from gantry_sftp.session._download import (
     ProgressCallback,
     download_handle,
 )
+from gantry_sftp.session._glob import RECURSIVE, match_component, split_pattern
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
 from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
@@ -131,10 +132,12 @@ from gantry_sftp.session._publish import (
 )
 from gantry_sftp.session._quirks import ServerProfile, identify
 from gantry_sftp.session._recursive import (
+    GlobMatch,
     Skipped,
     SkipReason,
     TreeResult,
     WalkEntry,
+    check_listed_name,
     join_remote,
 )
 from gantry_sftp.session._upload import upload_handle
@@ -1666,6 +1669,293 @@ class Session:
         except ServerError:
             return EntryKind.UNKNOWN
 
+    async def glob(
+        self,
+        pattern: bytes | str,
+        *,
+        max_depth: int | None = None,
+        case_sensitive: bool = True,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Match a pattern against remote names, streaming each match as it is found.
+
+        The one-line task a transfer script is usually written for::
+
+            async with aclosing(sftp.glob("/incoming/*.csv")) as matches:
+                async for match in matches:
+                    await sftp.get(match.path, local_dir / os.fsdecode(match.name))
+
+        **The dialect is `glob(3)`'s, because that is what `sftp(1)` uses** -- it globs
+        client-side through POSIX ``glob(3)``, so this is the pattern language a user of the
+        reference client already has. In particular ``*`` and ``?`` do not cross ``/``, and a
+        leading period must be matched **explicitly**: ``*`` does not match ``.hidden``, which
+        is what keeps a glob over a drop directory from picking up half-written staging files,
+        including the ones this library's own atomic publish creates. ``[abc]``, ``[a-z]`` and
+        ``[!a-z]`` (also spelled ``[^a-z]``) are supported, a backslash escapes the next
+        character, and an unterminated ``[`` is a literal bracket. Brace expansion is **not**
+        supported -- `sftp(1)` itself only applies it to ``ls`` and not to ``get`` -- and
+        neither is ``~``, which is a server-side path expansion rather than a pattern.
+
+        ``**`` matches zero or more directory levels. It is an **addition** to what `sftp(1)`
+        understands, so a pattern using it is not portable back to that client; it is here
+        because every ecosystem a caller arrives from has it. A trailing ``**`` means
+        ``**/*``, and a trailing ``/`` restricts the match to directories, both as in a shell.
+
+        **A name the server sends is validated before it becomes part of a path.** That is the
+        reason to use this rather than a hand-rolled ``listdir`` plus match: the join happens
+        here, once, against a component checked for separators and dot entries, so
+        :attr:`GlobMatch.path` is a path this library built rather than one the server steered.
+        A server that answers a listing with a name containing ``/`` gets an
+        :class:`~gantry_sftp.exceptions.UnsafePathError` rather than a quietly wrong path.
+
+        **Symlinks are matched but never descended into**, exactly as in :meth:`walk` and for
+        the same reason: following them needs loop detection this library deliberately does not
+        have. A symlink to a directory therefore matches ``/x/*`` and is not searched by
+        ``/x/*/*``.
+
+        Memory is one listing batch per pattern component, not one per directory in the tree,
+        because nothing is accumulated -- matches are yielded as they are found. It is an async
+        generator, so close it rather than dropping it, exactly as :meth:`walk` documents.
+
+        Args:
+            pattern: The pattern, absolute or relative. A pattern with no magic in it is a
+                path, and yields one match if it exists and nothing if it does not.
+            max_depth: How far ``**`` may descend below the point it appears, or ``None`` for
+                no limit. Ignored by a pattern that does not use ``**``, since every other
+                component consumes exactly one level. The bound exists because an infinite tree
+                is something a hostile server can simply answer with.
+            case_sensitive: Match case exactly. Pass ``False`` on a server whose filesystem
+                folds case -- Windows-hosted, macOS, several appliances -- where a sensitive
+                match will otherwise miss files the *server* considers the same name. Folding
+                is ASCII-only: a remote name is bytes of unstated encoding, and folding a byte
+                above 127 would be folding part of a character in an encoding nobody has
+                established. This library cannot detect the server's behaviour, which is why
+                this is an argument rather than a guess.
+
+                **It folds the names being matched, not the directory you typed.** In
+                ``/incoming/*.csv`` the ``/incoming`` is named to the server as written and
+                ``*.csv`` is matched case-insensitively. Folding the directory part too would
+                mean listing ``/`` to find out whether ``/Incoming`` is ``/incoming`` -- a
+                round trip per level for a question the caller did not ask. A wholly literal
+                pattern is still matched rather than named, so ``/x/report.csv`` does find
+                ``REPORT.CSV``; accepting the argument and silently doing nothing was the bug
+                the live test caught here.
+
+        Yields:
+            One :class:`~gantry_sftp.session.GlobMatch` per matching entry, in the order the
+            server listed each directory -- which is not guaranteed to be sorted, and is not
+            sorted here, because sorting means accumulating and accumulating is what
+            :meth:`listdir` is for.
+
+        Raises:
+            UnsafePathError: If the server sends a name that cannot be one path component.
+            CapabilityError: If ``pattern`` is relative and this server's default directory is
+                not rooted at ``/``, so joining would build paths it does not mean.
+            ServerError: If the server refuses a listing of a directory the pattern reached.
+                A directory that does not exist is **not** an error -- it matches nothing, the
+                same as a name that does not match. **This is a deliberate divergence from**
+                ``glob(3)``, which passes no error function and therefore skips a directory it
+                cannot read: silently, and indistinguishably from that directory being empty.
+                A glob that answers "no matches" when it means "I was not allowed to look" is
+                the shape of partial success this library refuses everywhere else, so an
+                unreadable directory in the pattern's path is raised rather than swallowed.
+        """
+        encoded = _encode_path(pattern)
+        await self._require_rooted_paths(encoded, feature="globbing")
+        base, components, directories_only = split_pattern(encoded, case_sensitive=case_sensitive)
+        if not components:
+            literal = await self._glob_literal(base, directories_only=directories_only)
+            if literal is not None:
+                yield literal
+            return
+        async with aclosing(
+            self._glob_in(
+                base,
+                components,
+                max_depth=max_depth,
+                case_sensitive=case_sensitive,
+                directories_only=directories_only,
+            )
+        ) as found:
+            async for match in found:
+                yield match
+
+    async def _glob_literal(self, path: bytes, *, directories_only: bool) -> GlobMatch | None:
+        """Resolve a pattern that turned out to have no magic in it.
+
+        One ``LSTAT``. ``LSTAT`` rather than ``STAT`` so a symlink stays a symlink, matching
+        what the matching path does for every other component; and a missing path is ``None``
+        rather than an error, because a pattern matching nothing is the ordinary case and a
+        literal pattern is still a pattern.
+        """
+        try:
+            attributes = await self.lstat(path)
+        except (NoSuchFileError, ServerError):
+            return None
+        entry = DirEntry(filename=path.rpartition(b"/")[2], longname=b"", attrs=attributes)
+        if directories_only and entry_kind(attributes) is not EntryKind.DIRECTORY:
+            return None
+        return GlobMatch(path, entry)
+
+    async def _glob_in(
+        self,
+        directory: bytes,
+        components: tuple[bytes, ...],
+        *,
+        max_depth: int | None,
+        case_sensitive: bool,
+        directories_only: bool,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Match ``components`` against the contents of one directory, descending as needed.
+
+        Recursive, and the recursion depth is the number of pattern components rather than the
+        depth of the tree -- so it is bounded by something the caller wrote, not by something
+        the server can answer with. One directory handle is open per level for the same reason.
+
+        **Every inner generator is wrapped in ``aclosing``, including this module's own.** An
+        ``async for`` does not close the generator it iterates, so a chain of them abandoned
+        part-way -- by a caller that stopped early, or by
+        :func:`~gantry_sftp.session.check_listed_name` refusing a name mid-listing -- leaves
+        each link to the garbage collector. trio does not finalise those, and it surfaces as
+        ``Exception ignored in: <async_generator object ...>`` at some unrelated later point.
+        This is the idiom :meth:`walk` tells *callers* to use, applied to the callers inside
+        this class; it was not theoretical, and the test that refuses a hostile name is what
+        found it.
+        """
+        head, rest = components[0], components[1:]
+        if head == RECURSIVE:
+            async with aclosing(
+                self._glob_recursive(
+                    directory,
+                    rest,
+                    max_depth=max_depth,
+                    case_sensitive=case_sensitive,
+                    directories_only=directories_only,
+                )
+            ) as found:
+                async for match in found:
+                    yield match
+            return
+
+        async with aclosing(self._glob_listing(directory)) as entries:
+            async for entry in entries:
+                name = check_listed_name(entry.filename, directory=directory)
+                if not match_component(head, name, case_sensitive=case_sensitive):
+                    continue
+                path = join_remote(directory, name)
+                if rest:
+                    async with aclosing(
+                        self._glob_descend(
+                            path,
+                            entry,
+                            rest,
+                            max_depth=max_depth,
+                            case_sensitive=case_sensitive,
+                            directories_only=directories_only,
+                        )
+                    ) as deeper:
+                        async for match in deeper:
+                            yield match
+                elif not directories_only or await self._is_glob_directory(path, entry):
+                    yield GlobMatch(path, entry)
+
+    async def _glob_listing(self, directory: bytes) -> AsyncGenerator[DirEntry]:
+        """List one directory for a glob, where "not there" means "matches nothing".
+
+        A pattern naming a directory that does not exist matches nothing, exactly as a name
+        that does not match matches nothing -- ``/root/absent/*.csv`` is not an error, it is an
+        empty result. **And the same is true of a path component that exists and is not a
+        directory**, which falls out of the protocol rather than needing a second case:
+        ``OPENDIR`` on a plain file answers ``NO_SUCH_FILE`` because ``ENOTDIR`` is remapped.
+
+        Only that status is swallowed. ``PERMISSION_DENIED`` on a directory the pattern reached
+        is raised, because a glob that answers "no matches" when it means "I was not allowed to
+        look" is a partial success wearing a complete one's clothes -- which is the shape this
+        library refuses everywhere else, and is where it diverges from ``glob(3)``.
+
+        The ``NO_SUCH_FILE`` can only come from the ``OPENDIR`` this opens: a ``READDIR`` past
+        the end answers ``EOF``, which :meth:`scandir` turns into the end of the iteration.
+        """
+        try:
+            async with self.scandir(directory or b".") as entries:
+                async for entry in entries:
+                    yield entry
+        except NoSuchFileError:
+            return
+
+    async def _glob_descend(
+        self,
+        path: bytes,
+        entry: DirEntry,
+        rest: tuple[bytes, ...],
+        *,
+        max_depth: int | None,
+        case_sensitive: bool,
+        directories_only: bool,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Continue matching inside a matched entry, if it is a directory we may enter."""
+        if not await self._is_glob_directory(path, entry):
+            return
+        async with aclosing(
+            self._glob_in(
+                path,
+                rest,
+                max_depth=max_depth,
+                case_sensitive=case_sensitive,
+                directories_only=directories_only,
+            )
+        ) as found:
+            async for match in found:
+                yield match
+
+    async def _glob_recursive(
+        self,
+        directory: bytes,
+        rest: tuple[bytes, ...],
+        *,
+        max_depth: int | None,
+        case_sensitive: bool,
+        directories_only: bool,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Match the components after a ``**`` at this directory and at every descendant.
+
+        Driven by :meth:`walk`, which is where the bounded traversal, the symlink policy and
+        the ``max_depth`` refusal already live -- reimplementing the descent here would be a
+        second place for those three decisions to be made differently.
+
+        A trailing ``**`` is ``**/*``: it matches everything below its position, at every
+        level, which is what a shell with ``globstar`` does and what the alternative -- a
+        pattern that matches only directories, or only the root -- would surprise a caller
+        with.
+        """
+        remaining = rest or (b"*",)
+        async with aclosing(self.walk(directory or b".", max_depth=max_depth)) as walker:
+            async for visited in walker:
+                # `walk(b".")` reports `.` and `./sub`; a relative pattern's other components
+                # join onto `b""` and produce `sub`. Left alone, one pattern would answer in
+                # two spellings depending on whether it happened to contain `**`.
+                reached = visited.path if directory else _strip_dot_prefix(visited.path)
+                async with aclosing(
+                    self._glob_in(
+                        reached,
+                        remaining,
+                        max_depth=max_depth,
+                        case_sensitive=case_sensitive,
+                        directories_only=directories_only,
+                    )
+                ) as found:
+                    async for match in found:
+                        yield match
+
+    async def _is_glob_directory(self, path: bytes, entry: DirEntry) -> bool:
+        """Whether a matched entry is a directory this glob may look inside.
+
+        :meth:`_settle_kind` rather than a bare attribute read, so an entry the server sent no
+        permissions for costs one ``LSTAT`` instead of being guessed at -- and ``LSTAT`` is
+        what keeps a symlink a symlink, which is what makes "matched but never descended into"
+        true rather than aspirational.
+        """
+        return await self._settle_kind(path, entry) is EntryKind.DIRECTORY
+
     async def get_tree(
         self,
         remote_path: bytes | str,
@@ -3035,6 +3325,19 @@ def _encode_path(path: bytes | str) -> bytes:
     cannot re-send what it was just given cannot operate on those files at all.
     """
     return path if isinstance(path, bytes) else path.encode("utf-8", "surrogateescape")
+
+
+def _strip_dot_prefix(path: bytes) -> bytes:
+    """Drop the ``./`` a walk rooted at ``.`` prefixes onto every path below it.
+
+    Only the prefix a walk this library started is responsible for -- a server that genuinely
+    returns a name beginning with a dot keeps it, because ``.hidden`` is an ordinary filename
+    and ``..`` never reaches here (a listing excludes it and
+    :func:`~gantry_sftp.session.check_listed_name` refuses it).
+    """
+    if path == b".":
+        return b""
+    return path[2:] if path.startswith(b"./") else path
 
 
 def _unexpected(reply: Response, *, expected: str, path: bytes | None = None) -> SFTPError:
