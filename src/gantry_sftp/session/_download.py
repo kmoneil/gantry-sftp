@@ -75,10 +75,23 @@ low **in combination with its 32 KiB buffer** -- 64 x 32768 is exactly the 2 MiB
 window holds, so the reference client saturates it and stops.
 
 What this depth buys is not more bytes in flight. 64 requests of a derived 255 KiB is what we
-*issue*; what the connection can hold is the SSH channel window, measured at 2 MiB, and a
-window refilled by ``CHANNEL_WINDOW_ADJUST`` appears to sustain rather less than that. The
-point of issuing past it is that a server which clamps the request size still reaches the
-ceiling, and the ceiling is reached with room to spare rather than exactly.
+*issue*; what the connection can hold is the SSH channel window, measured at 2 MiB. The point
+of issuing past it is that a server which clamps the request size still reaches the ceiling,
+and the ceiling is reached with room to spare rather than exactly.
+
+**The window is reachable, but not on a connection's first transfer.** A depth this deep puts
+more than an initial TCP congestion window in flight immediately, so the opening round trips
+are spent waiting for that window to open rather than for the server. The same 16 MiB download
+runs **1.35x faster as a connection's second transfer than as its first**, at both 50 ms and
+200 ms RTT, reaching about **82% of what the 2 MiB channel window implies** once the three
+metadata round trips ``get`` makes -- ``STAT``, ``OPEN``, ``CLOSE`` -- are subtracted
+(``benchmarks/``, ``tc netem``-shaped loopback against OpenSSH 10.0p2, 2026-07-29; D-23).
+
+That cost belongs to the transport rather than to this scheduler, and it is paid once per
+connection: a session that moves several files amortises it, which is an argument for
+``ControlMaster`` and for reusing a session, not for a different depth here. An earlier
+version of this note blamed the shortfall on ``CHANNEL_WINDOW_ADJUST`` refilling the window at
+half rate. That was a hypothesis, it was never measured, and it was wrong.
 
 Raising this further does not raise throughput; it raises memory and issue-side work. The
 number that would is a second connection.

@@ -165,6 +165,45 @@ class GantryClient(Client):
             elapsed = time.perf_counter() - started
         return elapsed, result.transferred
 
+    async def download_warm(
+        self, remote: Path, local: Path, *, warmups: int = 1
+    ) -> tuple[float, int]:
+        """The same download, timed as a connection's *second* transfer rather than its first.
+
+        Not part of :class:`Client`, and not a comparison: it exists to separate this
+        library's scheduling from the transport's congestion control. Every other row here
+        opens a fresh connection per sample -- deliberately, see the class docstring -- so
+        every other row times a transfer that spends its opening round trips in TCP slow
+        start. That is honest for a cross-library comparison, because all three pay it; it is
+        misleading as a measure of what the pipeline can sustain, because a deep pipeline asks
+        for more than an initial congestion window immediately and then waits for it to open.
+
+        D-81 measured the gap one layer up (6.0 round trips for a 768 KiB transfer as a
+        connection's first, 1.0 as its fourth) and this row is the same question asked of the
+        benchmark's own 16 MiB scenario, which had never been measured any way but cold.
+
+        The connection is closed inside the call like every other method's, so the ``ssh``
+        child is reaped and its CPU counted -- but the session CPU therefore covers the
+        discarded warmup transfers too, which is why this row's CPU column is not comparable
+        with the cold row's. The caveats say so; the wall clock is what this row is for.
+
+        Args:
+            remote: File to fetch.
+            local: Destination, overwritten by each warmup and finally by the timed run.
+            warmups: Transfers to perform and discard before timing one. One is enough --
+                D-81 measured the congestion window open by the second transfer.
+
+        Returns:
+            ``(wall_seconds, bytes_moved)`` for the timed transfer only.
+        """
+        async with self._transport() as transport, open_session(transport) as sftp:
+            for _ in range(warmups):
+                await sftp.get(str(remote), local)
+            started = time.perf_counter()
+            written = await sftp.get(str(remote), local)
+            elapsed = time.perf_counter() - started
+        return elapsed, written
+
     async def upload_atomic(self, local: Path, remote: Path) -> tuple[float, int]:
         """Upload with the staging file, the flush and the rename this library defaults to.
 

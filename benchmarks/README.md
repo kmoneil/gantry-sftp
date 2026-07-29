@@ -35,6 +35,7 @@ unshaped profile needs no `tc` at all and runs in a plain checkout.
 | connect and close | the handshake alone. Two of the three libraries do key exchange in Python; this is the row that isolates it, and it is what you subtract from the CPU column of the others |
 | download 16 MiB | the latency-bound case. 16 MiB is eight times the 2 MiB channel window, so a client that fills the window is distinguishable from one that does not |
 | upload 16 MiB (in place) | the other direction, with our atomic publish and fsync **off**, because that is the work the other two libraries do |
+| download 16 MiB, one connection | not a comparison. The same download timed as a connection's first transfer and as its second, because every other row here opens a fresh connection per sample and therefore times TCP slow start along with the transfer (D-23) |
 | download N × 8 KiB, sequential | the round-trip-bound case. Sequential for all three — see below |
 | upload N × 8 KiB, sequential | the same case in the direction the matrix used to miss entirely. Both 16 MiB upload rows move one file, so a per-file round trip rounds to nothing in them; this is the only row a cost paid *per file* can appear in, and `put_tree` over a drop directory is the workload it stands for |
 | download N × 8 KiB, one connection | not a comparison. Our own sequential path against our own overlapped one, same files, same connection |
@@ -94,6 +95,12 @@ Each one could have gone the other way, so each one is written down:
   scenario rather than a penalty silently applied to the comparison.
 - **Connections are not reused between samples.** Connecting once and looping hides the cost of
   connecting, which for two of these three libraries is a key exchange performed in Python.
+  **The consequence is worth stating, because it went four drafts unnoticed** (D-23): every
+  cross-library row here is therefore a connection's *first* transfer, and a deep pipeline spends
+  its opening round trips in TCP slow start rather than waiting on the server. That is fair —
+  all three pay it — but it is not what a pipeline sustains, and reading these rows as a
+  sustained rate is how D-23 came to be filed against our own scheduler for a cost belonging to
+  the transport. `download 16 MiB, one connection` is the row that separates the two.
 - **Every scenario verifies the bytes it moved.** A client that returns fast and wrong fails;
   it does not win.
 

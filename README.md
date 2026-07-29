@@ -1125,6 +1125,21 @@ form of this: a session that transfers several files pays it once, and `ControlM
 this README recommends for the connect cost — pays it once for every session that shares the
 control socket.
 
+The benchmark's own headline scenario says the same thing in throughput. A 16 MiB download,
+same file and same connection, timed as that connection's first transfer and as its second:
+
+| RTT | first transfer | second transfer | |
+| --- | -------------- | --------------- | --- |
+| 50 ms | 18.4 MiB/s | 24.8 MiB/s | **1.35× faster** |
+| 200 ms | 4.7 MiB/s | 6.3 MiB/s | **1.35× faster** |
+
+(`benchmarks/`, `tc netem`-shaped loopback against OpenSSH 10.0p2, 2026-07-29.) The warm figure
+is about 82% of what the 2 MiB channel window implies, once the three round trips `get` spends
+on `STAT`, `OPEN` and `CLOSE` are subtracted — so **the ceiling is reachable, and reaching it is
+a property of reusing the connection** rather than of tuning anything. Every cross-library row
+below is a first transfer, for all three libraries, because the benchmark opens a fresh
+connection per sample so that the cost of connecting is not hidden.
+
 ### The ceiling, which is not ours
 
 The same lane found where the formula stops. Throughput follows **bytes in flight** rather

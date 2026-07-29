@@ -23,13 +23,20 @@ from pathlib import Path
 import anyio
 import pytest
 
-_BENCHMARKS = Path(__file__).resolve().parent.parent / "benchmarks"
-if str(_BENCHMARKS) not in sys.path:
-    # Appended, not inserted. `benchmarks/` has its own `conftest.py`, and putting the
-    # directory at the front of `sys.path` would let it win a name lookup against anything
-    # the default run already imported. Nothing else is called `_harness`, so the end of the
-    # path resolves it just as well and cannot shadow.
-    sys.path.append(str(_BENCHMARKS))
+_ROOT = Path(__file__).resolve().parent.parent
+_BENCHMARKS = _ROOT / "benchmarks"
+# `live-tests/` too, because `_clients` imports `sshd` from it -- the server helper lives in a
+# module rather than a conftest precisely so two suites can share it, and importing it starts
+# nothing: it is stdlib-only and spawns `sshd` when a caller asks, not at import. Without this
+# the `_clients` test below fails on `ModuleNotFoundError: sshd`, which reads like a missing
+# dependency rather than a missing path entry.
+for _extra in (_BENCHMARKS, _ROOT / "live-tests"):
+    if str(_extra) not in sys.path:
+        # Appended, not inserted. `benchmarks/` has its own `conftest.py`, and putting the
+        # directory at the front of `sys.path` would let it win a name lookup against anything
+        # the default run already imported. Nothing else is called `_harness`, so the end of the
+        # path resolves it just as well and cannot shadow.
+        sys.path.append(str(_extra))
 
 from _harness import (  # noqa: E402
     Comparison,
@@ -192,6 +199,57 @@ async def test_warmups_are_discarded_and_repeats_are_kept():
     assert [s.wall_seconds for s in result.samples] == [3.0, 4.0, 5.0]
     assert result.wall_seconds == 4.0
     assert result.bytes_moved == 100
+
+
+@pytest.mark.anyio
+async def test_the_warm_download_row_times_a_later_transfer_and_not_the_first(monkeypatch):
+    """D-23's row must not time its own warmup, or it publishes cold numbers as warm.
+
+    The failure this guards is silent and it produces a *number*: a ``download_warm`` that
+    performed no warmup, or that started its clock before one, would report a connection's
+    first transfer under a label saying it was the second -- and the conclusion drawn from
+    that row is precisely that the two differ. Nothing downstream could notice.
+
+    Driven against a fake session rather than a server: what is under test is which ``get``
+    the stopwatch spans, which is this method's own arithmetic and needs no bytes to move.
+    """
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    import _clients  # noqa: PLC0415
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.gets = 0
+
+        async def get(self, remote: str, local: Path) -> int:
+            self.gets += 1
+            # The warmups are slow and the timed transfer is fast, which is the opposite of
+            # reality and the point: if the clock spanned a warmup the elapsed time could not
+            # come out below its duration.
+            await anyio.sleep(0.05 if self.gets <= 2 else 0.0)
+            return self.gets
+
+    session = FakeSession()
+
+    @asynccontextmanager
+    async def fake_transport():
+        yield object()
+
+    @asynccontextmanager
+    async def fake_open_session(_transport):
+        yield session
+
+    monkeypatch.setattr(_clients.GantryClient, "_transport", lambda self: fake_transport())
+    monkeypatch.setattr(_clients, "open_session", fake_open_session)
+
+    client = _clients.GantryClient(server=None)  # type: ignore[arg-type]
+    elapsed, moved = await client.download_warm(Path("/remote"), Path("/local"), warmups=2)
+
+    assert session.gets == 3, "two warmups and one timed transfer"
+    # The byte count belongs to the timed run, not to a warmup and not to their sum. Returning
+    # the sum is the mistake that would make the row's MiB/s three times the truth.
+    assert moved == 3
+    assert elapsed < 0.05, f"the clock spanned a warmup: {elapsed:.3f}s"
 
 
 @pytest.mark.anyio

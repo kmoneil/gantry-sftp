@@ -99,6 +99,14 @@ CAVEATS = (
     "upload rows move one file, so a round trip added to every `put` -- as the size check "
     "did -- rounds to nothing there. At 8 KiB the number is round trips, so that row is the "
     "one that can catch it.",
+    "**Every cross-library row is a connection's first transfer.** Connections are not reused "
+    "across samples, so the comparison rows all include TCP slow start -- fairly, since all "
+    "three clients pay it, but it is not what a pipeline sustains once the congestion window "
+    "is open. The `download 16 MiB, one connection` row measures that difference against "
+    "ourselves (D-23), and its CPU column is **not** comparable with the cold row's: the "
+    "session it is measured in also moved the discarded warmup transfer, so its `CPU s/MiB` "
+    "counts roughly twice the bytes the row credits. Wall clock and MiB/s are what that row "
+    "is for.",
     "The `concurrent` small-file row is **gantry-sftp against gantry-sftp**, like the atomic "
     "publish row: same files, same one connection, sequential versus overlapped. It is not a "
     "claim about the other two libraries.",
@@ -210,6 +218,53 @@ async def _scenario_download(
     for client in clients:
         produced = workdir / f"{client.name}-large.bin"
         assert _identical(produced, source), f"{client.name} downloaded the wrong bytes"
+    return measurements
+
+
+async def _scenario_download_warm(
+    clients: Sequence[Client], source: Path, workdir: Path
+) -> list[Measurement]:
+    """The 16 MiB download as a connection's first transfer and as its second (D-23).
+
+    Us against us, like the atomic-publish and concurrency rows, and for a reason specific to
+    this one: the cross-library rows open a fresh connection per sample on purpose, so *every*
+    published number in this matrix times a transfer through TCP slow start. That keeps the
+    comparison fair -- all three clients pay it -- but it means the matrix has never measured
+    what this library's pipeline sustains once the congestion window is open, and D-23 was
+    filed against the resulting figure: 40-50% of the 2 MiB channel window's implied ceiling,
+    flat across a 40x range of RTT. Flat is the signature of a fixed number of round trips
+    added to a transfer whose own cost is counted in round trips, which is what slow start is.
+
+    So this row is the card's measurement, on the card's own scenario. The cold half is
+    re-measured here rather than reused from the cross-library row above, for the same reason
+    the concurrency row re-measures its sequential half: otherwise the two are comparable only
+    if nothing about the link drifted in between.
+    """
+    gantry = next((c for c in clients if isinstance(c, GantryClient)), None)
+    if gantry is None:  # pragma: no cover - gantry_sftp is always importable here
+        return []
+    cold = workdir / "gantry-cold.bin"
+    warm = workdir / "gantry-warm.bin"
+    scenario = "download 16 MiB, one connection"
+    measurements = [
+        await take_samples(
+            lambda: gantry.download(source, cold),
+            scenario=scenario,
+            client="gantry-sftp (connection's first)",
+            repeats=REPEATS,
+        ),
+        await take_samples(
+            lambda: gantry.download_warm(source, warm),
+            scenario=scenario,
+            client="gantry-sftp (connection's second)",
+            repeats=REPEATS,
+        ),
+    ]
+    # Both halves verified. A warm path that returned early -- or reused a stale local file
+    # from its own discarded warmup without re-fetching -- would report the speedup this row
+    # exists to find, for work it did not do.
+    for produced in (cold, warm):
+        assert _identical(produced, source), f"{produced.name} holds the wrong bytes"
     return measurements
 
 
@@ -432,6 +487,15 @@ async def test_benchmark_profile(
             baseline_client=BASELINE,
         ),
     ]
+    warm = await _scenario_download_warm(clients, large, tmp_path)
+    if warm:
+        sections.append(
+            render_scenario(
+                "download 16 MiB, one connection",
+                warm,
+                baseline_client="gantry-sftp (connection's first)",
+            )
+        )
     if profile.small_files:
         sections.append(
             render_scenario(
