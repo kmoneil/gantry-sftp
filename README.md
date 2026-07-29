@@ -151,6 +151,19 @@ over a new connection.
 DESIGN.md's §8 sketch does not exist — concurrency is spelled with your own task group, or with
 `get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
 
+**The biggest thing missing is a file object, and it is worth being blunt about because it is not
+a convenience.** Every transfer here moves a *whole file between a remote path and a local path*.
+There is no way to read a byte range, no `read(n)` / `seek()` / `write()`, no append, and no way
+to send a transfer anywhere other than the filesystem — no `BytesIO` destination, no streaming a
+remote file into a parser or a hash without staging it on disk first. `Session.open()` returns a
+handle you can `fstat`, `fsync`, `truncate` and `close`, and not read. So if your file does not
+fit the whole-file shape, **this library cannot do your job yet and paramiko or asyncssh can** —
+both have a file-like object, and neither hides it. It is the next thing being built, and it is
+also what the fsspec adapter and `SFTPPath` are waiting on: an fsspec filesystem needs a
+byte-range fetch, and `Path.open` / `read_bytes` / `write_bytes` are most of what a path is for.
+The same slice is bringing `exists()`, `isdir()`, `isfile()`, `getsize()` and `makedirs()`, which
+also do not exist — today those are `stat()` in a `try` block.
+
 ## No event loop
 
 ```python
