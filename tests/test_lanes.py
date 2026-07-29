@@ -147,9 +147,10 @@ def test_the_workflow_asks_for_no_more_than_read_access() -> None:
 
 
 def test_the_windows_job_reports_rather_than_gates() -> None:
-    # os.pread and os.pwrite are documented Unix-only and the data path calls both, so the
-    # transfer rows cannot pass on Windows. When that changes, this assertion is the thing
-    # that says the job may now block a change.
+    # Transfers are POSIX-only by decision, not by omission (see session/_platform.py), so
+    # every row that moves bytes fails on Windows. When the out-of-scope rows are marked --
+    # or a fallback lands -- this assertion is the thing that says the job may now block a
+    # change, and it has to be edited deliberately for that to happen.
     assert "continue-on-error: ${{ matrix.os == 'windows-latest' }}" in WORKFLOW_TEXT
 
 

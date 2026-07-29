@@ -109,7 +109,6 @@ from gantry_sftp.session._dispatch import Dispatcher
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
-    NO_FOLLOW,
     ProgressCallback,
     download_handle,
 )
@@ -117,6 +116,7 @@ from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_t
 from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
 from gantry_sftp.session._localtree import remote_component, walk_local
+from gantry_sftp.session._platform import NO_FOLLOW, require_local_io
 from gantry_sftp.session._publish import (
     Durability,
     Publish,
@@ -1436,12 +1436,15 @@ class Session:
             size, and on a resume of an already-complete file it is ``0``.
 
         Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O -- today,
+                Windows. Raised before anything is sent; see :mod:`._platform`.
             NoSuchFileError: If the remote path does not exist.
             ServerError: If the server refuses.
             TransferError: If the transfer fails partway, if ``resume`` cannot establish a
                 safe offset, or if ``verify_size`` finds fewer bytes arrived than the server
                 said there were.
         """
+        require_local_io("get()")
         encoded = _encode_path(remote_path)
         with operation(session_logger, "get", remote=encoded, local=local_path) as record:
             attributes = await self.stat(encoded)
@@ -1707,6 +1710,8 @@ class Session:
             Counts, bytes, and every entry that was skipped with the reason it was.
 
         Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O -- today,
+                Windows. Raised before the walk starts; see :mod:`._platform`.
             UnsafePathError: If a server-supplied name would escape the destination.
             DestinationCollisionError: If two remote names resolved to one local file. Raised
                 at the end rather than on contact, so everything transferable still transfers;
@@ -1715,6 +1720,7 @@ class Session:
             ServerError: If the server refuses.
             TransferError: If a transfer fails partway.
         """
+        require_local_io("get_tree()")
         destination = _ensure_directory(Path(local_path), parents=True)
         ledger = DestinationLedger()
         files = directories = transferred = 0
@@ -1930,6 +1936,8 @@ class Session:
             truncation and nothing else; it is not a hash.
 
         Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O -- today,
+                Windows. Raised before anything is sent; see :mod:`._platform`.
             ValueError: If a ``require_*`` flag contradicts the flag it strengthens.
             CapabilityError: If a required guarantee is not available on this server.
             PermissionDeniedError: If the server will not create or write the file.
@@ -1937,6 +1945,7 @@ class Session:
             TransferError: If the transfer fails partway, or if the published length
                 disagrees with the local file's.
         """
+        require_local_io("put()")
         target = _encode_path(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put")
         _check_publish_flags(
@@ -2632,6 +2641,8 @@ class Session:
             Counts, bytes, and every entry that was skipped with the reason it was.
 
         Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O -- today,
+                Windows. Raised before the walk starts; see :mod:`._platform`.
             UnsafePathError: If a local name could not be a remote path component.
             ValueError: If ``publish`` carries a ``staging_name``, which one tree's many files
                 cannot share.
@@ -2642,6 +2653,7 @@ class Session:
             ServerError: If the server refuses a directory or a file.
             TransferError: If a transfer fails partway.
         """
+        require_local_io("put_tree()")
         root = _encode_path(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put_tree")
         if policy.staging_name is not None:

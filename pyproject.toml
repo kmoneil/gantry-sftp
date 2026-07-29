@@ -15,9 +15,15 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Kevin O'Neil", email = "kevin@oneil.xyz" }]
 keywords = ["sftp", "ssh", "filexfer", "openssh", "file-transfer"]
+# `Operating System :: POSIX` is a scope statement, not an omission. The data path places
+# every payload with `os.pwrite` and reads with `os.pread`, both documented Unix-only, and
+# `preserve_times` stamps a descriptor rather than a path -- so transfers cannot run on
+# Windows and refuse there rather than crashing. The `ssh` transport and every remote-only
+# operation are platform-independent; see README "Requirements" and `session/_platform.py`.
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Intended Audience :: Developers",
+  "Operating System :: POSIX",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",

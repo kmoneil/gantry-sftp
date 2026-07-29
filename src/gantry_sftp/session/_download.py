@@ -62,20 +62,10 @@ from gantry_sftp.session._dispatch import Dispatcher, Exchange
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_PIPELINE_DEPTH",
-    "NO_FOLLOW",
     "ProgressCallback",
     "Span",
     "download_handle",
 ]
-
-NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
-"""``O_NOFOLLOW`` where the platform has it, and ``0`` where it does not.
-
-Windows has no equivalent, so the flag silently becomes nothing there rather than the open
-failing. That is a documented weakness rather than a hidden one: on Windows the containment
-check in ``_localpath`` is the whole defence, and it is checked before the open rather than
-enforced by it.
-"""
 
 DEFAULT_PIPELINE_DEPTH = 64
 """Requests in flight per file.

@@ -1261,6 +1261,17 @@ pressure. The thing that would buy throughput is a second connection.
 ## Requirements
 
 - Python 3.13+
+- **A POSIX host.** Transfers need offset-addressed local I/O — `get` places every payload
+  with `os.pwrite` at the offset its request asked for, `put` reads with `os.pread` from a
+  worker thread, and `preserve_times` stamps a descriptor rather than a path. All three are
+  Unix-only in CPython, and they are not incidental: writing at an explicit offset is why
+  writes need no ordering and why a short `READ` is re-queued rather than restarting the
+  transfer. On Windows `get` / `get_tree` / `put` / `put_tree` raise `NotImplementedError`
+  naming what is missing, before anything is sent and before any local file is touched.
+  Everything that talks only to the far end — connecting, `listdir`, `scandir`, `walk`,
+  `stat`, `realpath`, `rename`, `remove`, `mkdir`, `rmdir`, `rmtree`, `check_file` — is
+  platform-independent and works there. A Windows fallback is open work, not a decision
+  against it.
 - An `ssh` binary on `PATH` (`openssh-client`). Windows ships one at
   `%SystemRoot%\System32\OpenSSH\ssh.exe`; slim Docker images frequently do not.
 - `openssh-server` — **only** to run the real-server test lane, never at runtime.
@@ -1325,11 +1336,12 @@ of the work and none of it needs a remote — and because a Windows job is the o
 can settle whether `resolve_ssh_executable`'s `SysNative`-before-`System32` probe is right. It
 is unit-tested with injected inputs and has never executed on Windows.
 
-That Windows job **reports rather than gates**, and not out of caution. `os.pread` and
-`os.pwrite` are documented Unix-only and the data path calls both — `get` places every payload
-with `os.pwrite`, `put` reads with `os.pread` — so the transfer rows cannot pass there until
-that has a fallback. The job stays in the matrix because what is wanted from it is the list of
-*what else* breaks, and no amount of reading the code produces that list.
+That Windows job **reports rather than gates**, and not out of caution. Transfers are
+POSIX-only (see Requirements) and refuse there, so every test that moves bytes fails on
+Windows by design. Making that job gate needs the out-of-scope rows marked as such, and
+marking them before a single Windows run has happened would be guessing at which ones they
+are. The job stays in the matrix because what is wanted from it is exactly that list, and no
+amount of reading the code produces it.
 
 ### The controlled `ssh` environment
 

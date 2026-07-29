@@ -63,12 +63,13 @@ jobs:
   # implements a SysNative-before-System32 probe for Windows OpenSSH that has never executed
   # on Windows, and `tests/test_argv.py` covers it only with injected inputs.
   #
-  # Windows does not gate, and the reason is not caution. `os.pread` and `os.pwrite` are
-  # documented Unix-only, and the data path calls both -- `session/_download.py` places every
-  # payload with `os.pwrite` and `session/_upload.py` reads with `os.pread`. So the transfer
-  # rows cannot pass on Windows until that has a fallback, and a job that is known to fail
-  # for a known reason should report rather than block. It stays in the matrix because what
-  # we want from it is the list of what else breaks, which no amount of reading will produce.
+  # Windows does not gate, and the reason is not caution. Transfers are POSIX-only: the data
+  # path needs `os.pread`/`os.pwrite` and `preserve_times` needs `os.utime` on a descriptor,
+  # all three Unix-only, so `get`/`get_tree`/`put`/`put_tree` refuse there by design (see
+  # `session/_platform.py`). Every test that moves bytes therefore fails on Windows, and a
+  # job known to fail for a known reason should report rather than block. Making it gate
+  # means marking the out-of-scope rows, and doing that before a single Windows run would be
+  # guessing at which ones they are -- which is what this job exists to stop being a guess.
   # ---------------------------------------------------------------------------
   fast:
     runs-on: ${{ matrix.os }}
