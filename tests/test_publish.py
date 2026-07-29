@@ -635,10 +635,14 @@ async def test_without_posix_rename_an_existing_target_costs_a_remove_first(sour
     assert result.mechanism is PublishMechanism.REMOVE_RENAME
     assert not result.atomic
     assert result.durability is Durability.UNAVAILABLE
+    # The whole exchange, in order. `fsync@openssh.com` is in it against a server that
+    # advertises nothing, and that is D-51: advertisement is a claim and the answer is a
+    # fact, so both extensions are attempted and the refusals are what get recorded.
     assert server.kinds() == [
         "Init",
         "Open",
         "Write",
+        "fsync@openssh.com",
         "Close",
         "Stat",
         "posix-rename@openssh.com",
@@ -988,6 +992,11 @@ async def test_contradictory_flags_are_refused_rather_than_reconciled(
 async def test_a_server_without_fsync_reports_no_durability_rather_than_claiming_it(
     source: Path,
 ):
+    """It is *asked*, and the refusal is what produces UNAVAILABLE (D-51).
+
+    This used to assert that nothing was sent, because the flush was gated on advertisement.
+    That is the same answer for this server and the wrong one for the server below.
+    """
     server = PublishingServer(extensions=(POSIX_RENAME_NAME,))
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
@@ -995,7 +1004,46 @@ async def test_a_server_without_fsync_reports_no_durability_rather_than_claiming
     assert result.durability is Durability.UNAVAILABLE
     assert not result.durable
     assert result.atomic, "atomicity and durability are separate claims"
-    assert "fsync@openssh.com" not in server.kinds()
+    assert server.kinds().count("fsync@openssh.com") == 1
+
+
+async def test_a_server_that_implements_fsync_without_advertising_it_gets_a_flush(source: Path):
+    """The endpoints DESIGN.md 7 is about: they advertise nothing and implement some of it.
+
+    Gating the flush on the advertisement reported `durability=unavailable` for every upload
+    to a server that would have flushed on request -- under-claiming a guarantee the caller
+    was given, which is the mirror of the failure this ladder exists to prevent.
+    """
+    server = PublishingServer(extensions=(), implements=(FSYNC_NAME,))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
+
+    assert result.durability is Durability.FSYNCED
+    assert result.durable
+    assert server.fsynced == [STAGED]
+
+
+async def test_an_unsupported_fsync_is_remembered_for_the_session(source: Path, tmp_path: Path):
+    """Asked once, never twice -- the same rule the posix-rename cache has always had.
+
+    The cache is the reason attempting costs nothing in aggregate.
+
+    An `OP_UNSUPPORTED` is a definitive answer about the server, so the second upload spends
+    no round trip on it -- which is what makes "attempt rather than trust the advertisement"
+    affordable on a link where a round trip is 200 ms.
+    """
+    second = tmp_path / "second.csv"
+    _ = second.write_bytes(b"id,total\n2,7\n")
+    server = PublishingServer(extensions=(), implements=())
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        first = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
+        again = await sftp.put(second, b"/home/user/second.csv", publish=Publish(atomic=False))
+        assert sftp.refuses(EXTENSION_FSYNC), "the refusal was not recorded"
+
+    assert first.durability is Durability.UNAVAILABLE
+    assert again.durability is Durability.UNAVAILABLE
+    assert server.kinds().count("fsync@openssh.com") == 1
 
 
 async def test_fsync_can_be_switched_off_and_says_it_was_skipped(source: Path):
@@ -1031,19 +1079,80 @@ async def test_require_fsync_turns_a_refused_flush_into_a_failure(source: Path):
     assert STAGED not in server.files, "the staging file was left behind"
 
 
-async def test_require_fsync_refuses_a_server_that_does_not_advertise_it(source: Path):
+async def test_require_fsync_probes_before_the_bytes_and_refuses_on_the_answer(source: Path):
+    """A demand for a guarantee is answered by asking, not by reading the advertisement.
+
+    The probe is an `fsync` on the staging file the moment it is opened and before it holds
+    anything: idempotent, invisible to everyone else, and definitive. So the refusal still
+    costs no upload -- the property the old advertisement check had -- while being right about
+    a server that implements the extension without listing it.
+    """
     server = PublishingServer(extensions=(POSIX_RENAME_NAME,))
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(CapabilityError) as exc:
             _ = await sftp.put(source, TARGET, publish=Publish(require_fsync=True))
 
     assert exc.value.args[0] == (
-        "require_fsync=True but this server does not advertise fsync@openssh.com, so nothing "
-        "can promise the bytes reached stable storage"
+        "require_fsync=True and this server did not perform fsync@openssh.com when asked, so "
+        "nothing can promise the bytes reached stable storage"
     )
     assert exc.value.feature == "durable upload"
     assert exc.value.missing == (EXTENSION_FSYNC,)
-    assert "Open" not in server.kinds(), "bytes were moved before the refusal"
+    assert "Write" not in server.kinds(), "bytes were moved before the refusal"
+    assert not server.files, "the staging file was left behind"
+
+
+async def test_require_fsync_succeeds_where_the_server_implements_it_unadvertised(source: Path):
+    """The transfer this used to refuse outright."""
+    server = PublishingServer(extensions=(), implements=(FSYNC_NAME,))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, TARGET, publish=Publish(require_fsync=True))
+
+    assert result.durability is Durability.FSYNCED
+    assert bytes(server.files[TARGET]) == b"id,total\n1,42\n"
+
+
+async def test_a_known_refusal_makes_require_fsync_refuse_before_anything(
+    source: Path, tmp_path: Path
+):
+    """Once the answer is known, the refusal is free and moves back to the top of `put`."""
+    second = tmp_path / "second.csv"
+    _ = second.write_bytes(b"id,total\n2,7\n")
+    server = PublishingServer(extensions=(), implements=())
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
+        sent = len(server.kinds())
+        with pytest.raises(CapabilityError) as exc:
+            _ = await sftp.put(
+                second, b"/home/user/second.csv", publish=Publish(require_fsync=True)
+            )
+
+    assert exc.value.args[0] == (
+        "require_fsync=True and this server has already answered OP_UNSUPPORTED for "
+        "fsync@openssh.com, so nothing can promise the bytes reached stable storage"
+    )
+    assert len(server.kinds()) == sent, "the refusal cost a round trip it did not need"
+
+
+async def test_in_place_require_fsync_refuses_after_the_bytes_and_says_so(source: Path):
+    """The documented asymmetry: in place there is no cheap moment to refuse at.
+
+    Opening the destination has already truncated it, so a probe that then refused would
+    destroy the caller's file to report a capability that was never going to be used. The
+    honest report is the one after the write: the data is there and complete, and only the
+    guarantee is missing.
+    """
+    server = PublishingServer(extensions=(), implements=())
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(CapabilityError) as exc:
+            _ = await sftp.put(source, TARGET, publish=Publish(atomic=False, require_fsync=True))
+
+    assert exc.value.args[0] == (
+        "require_fsync=True and this server did not perform fsync@openssh.com, so nothing can "
+        "promise the bytes reached stable storage"
+    )
+    assert bytes(server.files[TARGET]) == b"id,total\n1,42\n", "the bytes were written"
 
 
 async def test_the_flush_reaches_the_staging_file_not_the_destination(source: Path):

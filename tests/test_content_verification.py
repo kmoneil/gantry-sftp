@@ -94,6 +94,11 @@ class HashingServer:
     which is what a server with no algorithm in common does. It must degrade to "unavailable",
     never to "verified" and never to a failed transfer.
 
+    ``advertises`` and ``implements`` are separate because D-51 turns on the difference. This
+    library now *asks* rather than reading the advertisement, so "does not list it" and "does
+    not have it" produce different exchanges and must be modelled separately -- a fake that
+    conflated them would agree with a client that skipped the question.
+
     Writes land in :attr:`holds` at their offset, so the file grows the way a real one does and
     rung 3 keeps passing -- which is the point, since every failure here has to be one rung 3
     cannot see. ``corrupts`` breaks that link: the bytes are counted and discarded, so the
@@ -106,11 +111,13 @@ class HashingServer:
         *,
         holds: bytes = b"",
         advertises: bool = True,
+        implements: bool | None = None,
         refuses_check: bool = False,
         corrupts: bool = False,
     ) -> None:
         self.holds = bytearray(holds)
         self.advertises = advertises
+        self.implements = advertises if implements is None else implements
         self.refuses_check = refuses_check
         self.corrupts = corrupts
         self.written = bytearray()
@@ -157,6 +164,9 @@ class HashingServer:
         """Hash what this server *holds*, blocked exactly the way paramiko blocks it."""
         request = CheckFile.from_extended(packet)
         self.checks.append(request)
+        if not self.implements:
+            self._reply(Status(request.request_id, StatusCode.OP_UNSUPPORTED, b"Unsupported"))
+            return
         if self.refuses_check:
             self._reply(Status(request.request_id, StatusCode.FAILURE, b"No supported hash types"))
             return
@@ -349,7 +359,7 @@ async def test_a_resume_degrades_to_unavailable_where_the_server_has_no_check_fi
     stronger claim was not made.
     """
     payload = b"correct " * 16
-    server = HashingServer(holds=payload[:64], advertises=False)
+    server = HashingServer(holds=payload[:64], advertises=False, implements=False)
     source = tmp_path / "right.bin"
     source.write_bytes(payload)
 
@@ -360,7 +370,10 @@ async def test_a_resume_degrades_to_unavailable_where_the_server_has_no_check_fi
 
     assert result.resume_check is ResumeCheck.UNAVAILABLE
     assert bytes(server.written) == payload[64:]
-    assert server.checks == [], "nothing should be sent to a server that did not advertise it"
+    # Asked once and refused, rather than not asked (D-51). The old assertion here was that
+    # nothing reached the wire, which is the same answer for this server and the wrong one for
+    # a server that implements the extension and does not list it.
+    assert len(server.checks) == 1
 
 
 async def test_a_server_that_advertises_and_then_refuses_is_unavailable_not_a_failure(
@@ -517,6 +530,55 @@ async def test_verify_hash_is_unavailable_rather_than_passed_without_the_extensi
         )
 
     assert result.content_check is ContentCheck.UNAVAILABLE
+
+
+async def test_verify_hash_reaches_a_server_that_implements_it_without_advertising(
+    tmp_path: Path,
+):
+    """Rung 1 against the population it is most likely to be available on and least likely to
+    be advertised by (D-51).
+
+    Gating on the advertisement meant a server that would have hashed the file was reported
+    as unable to -- the caller asked for content verification, the server could do it, and the
+    answer came back "unavailable" without anyone asking.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload, advertises=False, implements=True)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(
+            source, b"/incoming/file.bin", publish=Publish(atomic=False), verify=Verify.HASH
+        )
+
+    assert result.content_check is ContentCheck.HASHED
+    assert len(server.checks) == 1
+
+
+async def test_a_refused_check_file_is_asked_once_for_the_whole_session(tmp_path: Path):
+    """Two uploads, one question. The cache is what makes attempting affordable.
+
+    Verification asks per file, so without this every upload in a batch spends an OPEN, an
+    EXTENDED and a CLOSE to be told the same thing -- three round trips per file, 200 ms each
+    on the profile the netem lane measures, for an answer that cannot have changed.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload, advertises=False, implements=False)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        first = await sftp.put(
+            source, b"/incoming/one.bin", publish=Publish(atomic=False), verify=Verify.HASH
+        )
+        second = await sftp.put(
+            source, b"/incoming/two.bin", publish=Publish(atomic=False), verify=Verify.HASH
+        )
+
+    assert first.content_check is ContentCheck.UNAVAILABLE
+    assert second.content_check is ContentCheck.UNAVAILABLE
+    assert len(server.checks) == 1, "the second upload re-asked a settled question"
 
 
 async def test_verify_reread_reads_the_bytes_back_and_compares_them(tmp_path: Path):

@@ -423,11 +423,18 @@ result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
 | `remove-rename` | No extension, and the destination existed                 | **No** — a window with no file  |
 | `in-place`      | You passed `Publish(atomic=False)`                        | **No** — the classic behaviour  |
 
-`posix-rename` is attempted whether or not the server advertised it, because endpoints
-under-advertise and the cost of asking is one round trip — `OP_UNSUPPORTED` is a definitive
-answer and is remembered for the session. `require_atomic` is the exception: it is answered
-from what the server advertised, because a demand for a guarantee should not be answered by an
-experiment that costs a nine-gigabyte upload first.
+**Every extension is attempted rather than assumed absent**, because endpoints under-advertise
+and the answer is worth more than the claim. The cost of asking is one round trip and it is paid
+once: `OP_UNSUPPORTED` is a definitive answer and is remembered for the session, so the second
+upload does not ask again. `sftp.refuses(name)` is that memory, next to `sftp.supports(name)`,
+which is still only what the server *said*.
+
+`require_atomic` is the exception, and the reason is that `posix-rename` cannot be probed — you
+do not discover rename support by renaming something, so a demand for that guarantee is answered
+from the advertisement rather than by an experiment that costs a nine-gigabyte upload first.
+`require_fsync` **can** be probed, and is: an `fsync` on the staging file the moment it is
+opened and before it holds anything is idempotent and touches nothing else, so the refusal
+still costs no upload while being right about a server that flushes and never said so.
 
 Refusing to downgrade is one flag, and it fails before moving any bytes where it can:
 
@@ -491,7 +498,7 @@ result.resume_check  # matched | unavailable | skipped
 
 | | when it runs | what it costs |
 | --- | --- | --- |
-| rung 1 | automatically, where the server advertises `check-file` | one `OPEN`/`EXTENDED`/`CLOSE`, no payload |
+| rung 1 | automatically, where the server *performs* `check-file` — asked, not assumed from the advertisement | one `OPEN`/`EXTENDED`/`CLOSE`, no payload; a refusal is remembered for the session |
 | rung 2 | only under `verify=Verify.REREAD` | re-reads the whole adopted prefix |
 | neither | the default case — `resume_check` is `unavailable` | nothing, and the claim stays the weak one |
 

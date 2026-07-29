@@ -36,7 +36,7 @@ import hashlib
 import logging
 import os
 import tempfile
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,7 +52,6 @@ from gantry_sftp.codec import (
     EXTENSION_FSYNC,
     EXTENSION_POSIX_RENAME,
     LIMITS_NAME,
-    POSIX_RENAME_NAME,
     Attrs,
     AttrsReply,
     CheckFile,
@@ -633,16 +632,87 @@ class Session:
     def supports(self, extension: bytes | str) -> bool:
         """Whether the server *advertised* an extension.
 
-        Advertisement only. Absence is not proof: DESIGN.md 4.2 makes capability detection
-        advertisement **plus** an optional probe, because endpoints implement extensions they
-        never list -- and the probe is only ever sent for read-only or idempotent ones, since
-        you do not discover ``posix-rename`` support by renaming something.
+        Advertisement only, and **absence here is not proof of absence**: endpoints implement
+        extensions they never list, which is most of DESIGN.md 4.2. So this is the cheap
+        question rather than the true one, and the library does not decide anything on it
+        alone -- ``posix-rename`` and ``fsync`` are attempted whether or not they appear here,
+        and what the server *answers* is what gets recorded (:meth:`refuses`).
+
+        Every name OpenSSH is known to advertise has an ``EXTENSION_*`` constant, including
+        the ones this library does not implement, so asking about one never means typing a
+        wire string by hand.
 
         Args:
             extension: Wire name, as ``bytes`` or as one of the ``EXTENSION_*`` constants.
         """
         name = extension.encode("ascii") if isinstance(extension, str) else extension
         return name in self._codec.extensions
+
+    def refuses(self, extension: bytes | str) -> bool:
+        """Whether this server has answered ``OP_UNSUPPORTED`` for an extension, this session.
+
+        The *definitive* half of capability detection, and the reason it exists separately
+        from :meth:`supports`: an advertisement is a claim, and this is an answer. Only
+        ``OP_UNSUPPORTED`` lands here. A refusal for any other reason -- permissions, a
+        read-only directory, a file it does not like -- is a fact about one request rather
+        than about the server, and caching it would turn one bad path into a capability this
+        session never tries again.
+
+        Cached per session because there is nowhere else to put it: extensions are negotiated
+        per connection, and a new connection has to ask again.
+
+        Args:
+            extension: Wire name, as ``bytes`` or as one of the ``EXTENSION_*`` constants.
+        """
+        name = extension.encode("ascii") if isinstance(extension, str) else extension
+        return name in self._unsupported
+
+    async def _attempt_extension(
+        self, extension: str, attempt: Callable[[], Awaitable[object]]
+    ) -> bool:
+        """Send an extension request that has a fallback, and say whether it was performed.
+
+        **The one place an ``OP_UNSUPPORTED`` is recorded**, so that "we already asked" is a
+        property of the session rather than of whichever call site remembered to check. Before
+        this, the cache had exactly one reader and one writer, both inside the posix-rename
+        path, and ``fsync`` and ``check-file`` neither consulted nor populated it (D-51).
+
+        ``False`` means the server did not do it, for one of three reasons, and the difference
+        matters at the call site rather than here:
+
+        * it already answered ``OP_UNSUPPORTED`` this session -- no round trip is made;
+        * it answers ``OP_UNSUPPORTED`` now -- recorded, so the next call is free;
+        * it refused for some other reason **while not advertising** the extension -- in which
+          case we do not know what we just asked of it, so the fallback stands and nothing is
+          cached, because that answer was not definitive.
+
+        A refusal from a server that *did* advertise the extension propagates instead. It is
+        telling us about this operation -- the path, the permissions -- and falling through to
+        a fallback that will fail the same way only buries the explanation.
+
+        Args:
+            extension: Wire name of the extension being attempted.
+            attempt: Sends the request. Called at most once.
+
+        Returns:
+            Whether the server performed it.
+
+        Raises:
+            ServerError: For a non-``OP_UNSUPPORTED`` refusal of an advertised extension.
+        """
+        if self.refuses(extension):
+            return False
+        advertised = self.supports(extension)
+        try:
+            _ = await attempt()
+        except UnsupportedError:
+            self._unsupported.add(extension.encode("ascii"))
+            return False
+        except ServerError:
+            if advertised:
+                raise
+            return False
+        return True
 
     # --- operations ----------------------------------------------------------------------
 
@@ -1069,12 +1139,20 @@ class Session:
             The algorithm the server chose, and one digest per block.
 
         Raises:
-            UnsupportedError: If the server does not implement the extension.
+            UnsupportedError: If the server does not implement the extension. Raised without a
+                round trip once this server has answered that in this session -- verification
+                asks per file, and re-asking a settled question is a round trip per file for an
+                answer that cannot have changed.
             ServerError: If it refuses -- including ``FAILURE`` when it supports none of the
                 algorithms offered, and ``BAD_MESSAGE`` for an unknown handle.
             ProtocolError: If the reply is not a well-formed check-file answer, or names an
                 algorithm whose digest size does not divide the bytes it sent.
         """
+        if self.refuses(EXTENSION_CHECK_FILE):
+            raise UnsupportedError(
+                f"this server has already answered OP_UNSUPPORTED for {EXTENSION_CHECK_FILE}",
+                code=StatusCode.OP_UNSUPPORTED,
+            )
         request = CheckFile(
             self._next(),
             handle,
@@ -1084,6 +1162,11 @@ class Session:
             block_size=block_size,
         )
         reply = await self.request(request.to_extended())
+        if isinstance(reply, Status) and reply.code is StatusCode.OP_UNSUPPORTED:
+            # Recorded here rather than by catching the exception `_unexpected` raises two
+            # lines down: the status is the definitive answer, and reading it where it arrives
+            # keeps the recording next to the fact rather than next to the error handling.
+            self._unsupported.add(EXTENSION_CHECK_FILE.encode("ascii"))
         if not isinstance(reply, ExtendedReplyPacket):
             raise _unexpected(reply, expected="EXTENDED_REPLY")
 
@@ -1123,7 +1206,11 @@ class Session:
         the wire means "to the end of the file" rather than "nothing". Sending it would hash
         the whole file and compare it against no local blocks at all.
         """
-        if not self.supports(EXTENSION_CHECK_FILE):
+        if self.refuses(EXTENSION_CHECK_FILE):
+            # Asked once per session, not once per file. Advertisement is not consulted here
+            # any more (D-51): the endpoints most likely to under-advertise are the ones where
+            # rung 1 is worth having, and the cost of finding out is one exchange for the whole
+            # session -- against the OPEN and CLOSE below, which this pays per file anyway.
             return None
         if length == 0:
             return True
@@ -1860,10 +1947,15 @@ class Session:
             resume=resume,
             staging_name=policy.staging_name,
         )
-        if policy.require_fsync and not self.supports(EXTENSION_FSYNC):
+        # Refused here only when the answer is already *known* -- this server answered
+        # OP_UNSUPPORTED earlier in the session. It used to refuse on advertisement, which is a
+        # claim rather than an answer, and got it wrong on the endpoints this library is aimed
+        # at: they advertise nothing and implement some of it (D-51). The unknown case is
+        # settled by a probe on the staging handle, before any bytes move.
+        if policy.require_fsync and self.refuses(EXTENSION_FSYNC):
             refusal = CapabilityError(
-                f"require_fsync=True but this server does not advertise {EXTENSION_FSYNC}, "
-                f"so nothing can promise the bytes reached stable storage",
+                f"require_fsync=True and this server has already answered OP_UNSUPPORTED for "
+                f"{EXTENSION_FSYNC}, so nothing can promise the bytes reached stable storage",
                 feature="durable upload",
                 missing=(EXTENSION_FSYNC,),
                 path=target,
@@ -2028,6 +2120,11 @@ class Session:
         resume_check = await self._gate_resume(staged, upload.local_path, start, upload.verify)
         handle = await self._open_staging_file(staged, target, resume=upload.resume)
         try:
+            if upload.require_fsync:
+                # Inside the try, so a refusal takes the staging file with it. One round trip,
+                # paid only by a caller who demanded durability against a server that did not
+                # claim it -- and it saves that caller a whole upload when the answer is no.
+                await self._probe_durability(handle, staged)
             # The times land on the *staging* handle, inside `_fill_and_close`, which is the
             # only place they can: `rename(2)` does not alter a file's mtime, so setting them
             # before the publish is what makes the published file carry them. Setting them
@@ -2113,6 +2210,42 @@ class Session:
                 f"directly instead, or staging_name= to put the staging file elsewhere."
             )
             raise
+
+    async def _probe_durability(self, handle: bytes, path: bytes) -> None:
+        """Settle whether this server can flush, before the upload rather than after it.
+
+        DESIGN.md 4.2 says capability detection is advertisement **plus an optional probe**,
+        and this is the one probe the library sends. It is here because this is the one place
+        a probe is both safe and free: an ``fsync`` on a staging file that was created moments
+        ago and holds nothing is idempotent, touches nobody else's data, and answers the
+        question a ``require_fsync`` caller asked for a definite answer to.
+
+        **Only on the atomic path**, and the asymmetry is deliberate rather than an oversight.
+        In place, the destination has already been opened -- truncated, usually -- by the time
+        a handle exists, so refusing here would destroy the caller's file to report a
+        capability that was never going to be used. There the honest moment is after the
+        bytes: the data is written and complete, and only the guarantee is missing, which is
+        what :meth:`_flush` raises.
+
+        Skipped when the server advertises the extension: the claim is enough to proceed on,
+        and a server that then answers ``OP_UNSUPPORTED`` is caught by :meth:`_flush` with the
+        upload already discarded by the staging path's cleanup.
+
+        Raises:
+            CapabilityError: If the server did not perform it.
+        """
+        if self.supports(EXTENSION_FSYNC):
+            return
+        if not await self._attempt_extension(EXTENSION_FSYNC, lambda: self.fsync(handle)):
+            refusal = CapabilityError(
+                f"require_fsync=True and this server did not perform {EXTENSION_FSYNC} when "
+                f"asked, so nothing can promise the bytes reached stable storage",
+                feature="durable upload",
+                missing=(EXTENSION_FSYNC,),
+                path=path,
+            )
+            refusal.add_note(self._server_note())
+            raise refusal
 
     async def _fill_and_close(
         self, upload: _Upload, handle: bytes, path: bytes, *, start_offset: int = 0
@@ -2250,20 +2383,48 @@ class Session:
         return TimePreservation.PRESERVED
 
     async def _flush(self, upload: _Upload, handle: bytes) -> Durability:
-        """Flush the handle, reporting what was possible rather than promising what was not."""
+        """Flush the handle, reporting what was possible rather than promising what was not.
+
+        **Attempted rather than pre-judged on advertisement** (D-51). This used to return
+        ``UNAVAILABLE`` without sending anything when ``fsync@openssh.com`` was not in the
+        server's list -- which under-reports durability on exactly the population this library
+        is aimed at, since the enterprise endpoints of DESIGN.md 7 advertise nothing and
+        implement some of it. The cost of asking is one round trip, once per session: an
+        ``OP_UNSUPPORTED`` is cached, so the second upload does not ask again.
+
+        It is also what makes the policy consistent. ``posix-rename`` has always been
+        attempted regardless of advertisement, on the argument that advertisement is a claim
+        and the answer is a fact; there was never a reason for ``fsync`` to be judged
+        differently, only an asymmetry nobody had noticed.
+        """
         if not upload.fsync:
             return Durability.SKIPPED
-        if not self.supports(EXTENSION_FSYNC):
-            return Durability.UNAVAILABLE
         try:
-            await self.fsync(handle)
+            flushed = await self._attempt_extension(EXTENSION_FSYNC, lambda: self.fsync(handle))
         except ServerError:
             # Advertised and then refused. The bytes may still be in a cache, which the
             # result says; a caller who cannot accept that asked for require_fsync.
             if upload.require_fsync:
                 raise
             return Durability.UNAVAILABLE
-        return Durability.FSYNCED
+        if flushed:
+            return Durability.FSYNCED
+        if upload.require_fsync:
+            # Two ways here, and neither is the atomic path's ordinary one. An in-place upload
+            # never probes -- opening the destination has already truncated it, so there is no
+            # cheap moment left to refuse at, and the honest report is that the bytes are
+            # written and the guarantee is not. Or a server that *advertised* the extension
+            # answered OP_UNSUPPORTED when asked, in which case the claim was false and the
+            # staging file is about to be discarded. See `_probe_durability`.
+            refusal = CapabilityError(
+                f"require_fsync=True and this server did not perform {EXTENSION_FSYNC}, "
+                f"so nothing can promise the bytes reached stable storage",
+                feature="durable upload",
+                missing=(EXTENSION_FSYNC,),
+            )
+            refusal.add_note(self._server_note())
+            raise refusal
+        return Durability.UNAVAILABLE
 
     # --- publishing --------------------------------------------------------------------------
 
@@ -2298,19 +2459,9 @@ class Session:
         have no idea what we just asked of it, so the fallback stands. That answer is *not*
         cached: it was not definitive.
         """
-        if POSIX_RENAME_NAME in self._unsupported:
-            return False
-        advertised = self.supports(EXTENSION_POSIX_RENAME)
-        try:
-            await self.posix_rename(staged, target)
-        except UnsupportedError:
-            self._unsupported.add(POSIX_RENAME_NAME)
-            return False
-        except ServerError:
-            if advertised:
-                raise
-            return False
-        return True
+        return await self._attempt_extension(
+            EXTENSION_POSIX_RENAME, lambda: self.posix_rename(staged, target)
+        )
 
     async def _publish_by_plain_rename(
         self, staged: bytes, target: bytes, *, require_atomic: bool

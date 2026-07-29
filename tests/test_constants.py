@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from gantry_sftp import codec
 from gantry_sftp.codec import (
     MAX_STATUS_CODE,
     NO_REQUEST_ID,
@@ -25,6 +26,7 @@ from gantry_sftp.codec import (
     PacketType,
     StatusCode,
     WireReader,
+    _constants,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "openssh_version_frame.bin"
@@ -101,6 +103,66 @@ def test_check_file_is_not_advertised(version_frame: bytes):
     _, extensions = decode_version_frame(version_frame)
     names = {name for name, _ in extensions}
     assert not any(name.startswith("check-file") for name in names)
+
+
+# --- the three enumerations that have to agree ------------------------------------------
+
+
+def extension_constants() -> dict[str, str]:
+    """Every ``EXTENSION_*`` constant defined in the codec's constants module."""
+    return {
+        name: getattr(_constants, name) for name in dir(_constants) if name.startswith("EXTENSION_")
+    }
+
+
+def test_there_are_extension_constants_to_check():
+    # Guards the guard: a rename of the prefix would make every test below vacuous by
+    # iterating an empty mapping.
+    assert len(extension_constants()) >= len(OPENSSH_ADVERTISED_EXTENSIONS)
+
+
+def test_every_extension_constant_is_public_from_its_own_module():
+    """Three enumerations of these names existed and none of them agreed (D-52).
+
+    Twelve constants were defined, six were in this module's ``__all__``, and four reached the
+    package. A caller asking ``supports()`` about one of the other eight had to hand-type the
+    wire string -- which is the exact mistake ``copy-data@openssh.com`` is in this file to
+    memorialise, and it fails silently: the name never matches, the fallback runs forever, and
+    a test written against the same wrong spelling passes.
+    """
+    missing = sorted(set(extension_constants()) - set(_constants.__all__))
+    assert missing == [], f"defined but not in _constants.__all__: {missing}"
+
+
+def test_every_extension_constant_is_public_from_the_package():
+    missing = sorted(set(extension_constants()) - set(codec.__all__))
+    assert missing == [], f"in _constants.__all__ but not exported by gantry_sftp.codec: {missing}"
+    unimportable = sorted(name for name in extension_constants() if not hasattr(codec, name))
+    assert unimportable == [], f"exported in __all__ but not importable: {unimportable}"
+
+
+def test_every_advertised_name_has_a_constant():
+    """The advertisement table and the constants are one set, not two.
+
+    A name in the table with no constant is a name somebody will type by hand at the call
+    site, which is the same failure from the other direction.
+    """
+    by_value = {value: name for name, value in extension_constants().items()}
+    orphans = [name for name, _ in OPENSSH_ADVERTISED_EXTENSIONS if name not in by_value]
+    assert orphans == [], f"advertised with no constant: {orphans}"
+
+
+def test_the_wire_name_constants_derive_from_the_string_ones():
+    """``codec/_extensions.py`` spells four of these as bytes. Derived, never re-typed.
+
+    Two spellings of one wire string is how the suffix bug happens; this asserts the bytes
+    forms are the ASCII encoding of the strings rather than independent literals that happen
+    to match today.
+    """
+    assert codec.EXTENSION_POSIX_RENAME.encode("ascii") == codec.POSIX_RENAME_NAME
+    assert codec.EXTENSION_FSYNC.encode("ascii") == codec.FSYNC_NAME
+    assert codec.EXTENSION_LIMITS.encode("ascii") == codec.LIMITS_NAME
+    assert codec.EXTENSION_CHECK_FILE.encode("ascii") == codec.CHECK_FILE_NAME
 
 
 # --- the enums themselves --------------------------------------------------------------

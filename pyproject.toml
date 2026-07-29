@@ -276,4 +276,13 @@ venv = ".venv"
 source_paths = ["src/"]
 only_mutate = ["src/gantry_sftp/codec/*"]
 pytest_add_cli_args_test_selection = ["tests/"]
-pytest_add_cli_args = ["--ignore=tests/test_benchmark_harness.py"]
+# `tests/test_packaging.py` is ignored for the same reason and it is worth stating
+# separately, because the symptom is different: it resolves the repository root through
+# `Path(__file__).parent.parent`, which under mutmut is `mutants/` -- a tree with a
+# `pyproject.toml` in it and no `LICENSE`, so the licence assertions fail against a
+# directory that was never meant to be a distribution. It also mutates nothing: it builds
+# a wheel from the real source tree and cannot kill a codec mutant.
+pytest_add_cli_args = [
+    "--ignore=tests/test_benchmark_harness.py",
+    "--ignore=tests/test_packaging.py",
+]

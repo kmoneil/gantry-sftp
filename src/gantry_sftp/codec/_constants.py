@@ -13,10 +13,16 @@ from enum import IntEnum, IntFlag
 __all__ = [
     "EXTENSION_CHECK_FILE",
     "EXTENSION_COPY_DATA",
+    "EXTENSION_EXPAND_PATH",
+    "EXTENSION_FSTATVFS",
     "EXTENSION_FSYNC",
+    "EXTENSION_HARDLINK",
     "EXTENSION_HOME_DIRECTORY",
     "EXTENSION_LIMITS",
+    "EXTENSION_LSETSTAT",
     "EXTENSION_POSIX_RENAME",
+    "EXTENSION_STATVFS",
+    "EXTENSION_USERS_GROUPS_BY_ID",
     "OPENSSH_ADVERTISED_EXTENSIONS",
     "PROTOCOL_VERSION",
     "AttrFlag",
@@ -130,6 +136,16 @@ class AttrFlag(IntFlag):
 #
 # tests/test_constants.py asserts this tuple against a VERSION frame captured from a real
 # sftp-server, so the names are checked against the server rather than against themselves.
+
+# **Every name here is public, including the ones this library does not implement**, and the
+# rule is the one D-52 settled: a constant is a fact about what servers *say*, not a build list.
+# `Session.supports()` answers a question about the far end's advertisement, so a caller asking
+# about `statvfs@openssh.com` should never have to type it -- hand-typing a wire string is
+# exactly how `copy-data@openssh.com` happened. Which of these are *implemented* is a separate
+# question with a separate answer, in DESIGN.md 4.2's table.
+#
+# `tests/test_constants.py` asserts that this block, this module's `__all__` and the package's
+# exports name the same set, so the next extension cannot land in one of the three.
 
 EXTENSION_POSIX_RENAME = "posix-rename@openssh.com"
 EXTENSION_STATVFS = "statvfs@openssh.com"
