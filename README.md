@@ -142,7 +142,9 @@ async with connect("host", user="bob", session=SessionOptions(depth=16)) as sftp
 `with_reconnect` takes a callable producing a *transport*, because a retry rebuilds the session
 over a new connection.
 
-Not yet: the fsspec adapter, `SFTPPath`, or the generated sync API. `put_many()` from
+Not yet: the fsspec adapter, `SFTPPath`, or a blocking surface — **and the blocking one will be
+a portal facade rather than a generated twin**, decided in 0.10 after measuring that `unasync`
+cannot translate a background reader task, a cancel scope, or an async generator. `put_many()` from
 DESIGN.md's §8 sketch does not exist — concurrency is spelled with your own task group, or with
 `get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
 
