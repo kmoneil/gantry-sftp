@@ -6,6 +6,7 @@ directory, so there is no host to arrange, no key to install and no network invo
 real server either way; the only thing the local mode skips is `ssh`.
 
 ```bash
+python examples/blocking.py                       # the same library from a program with no event loop
 python examples/download.py                       # pipelined get(), with progress
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
 python examples/listing.py                        # listdir() and scandir(), and what a listing can't know
@@ -25,6 +26,7 @@ python examples/server_capabilities.py            # who is at the other end, and
 Pass a destination to run the same code against a real server:
 
 ```bash
+python examples/blocking.py user@host /remote/dir
 python examples/download.py user@host /remote/data.parquet
 python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
@@ -52,6 +54,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | Example                   | Shows                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `quickstart.py`           | the shortest program that moves a file: `connect()` in one call, and a whole session's worth of types imported from `gantry_sftp` with nothing reaching into `gantry_sftp.codec` |
+| `blocking.py`             | `gantry_sftp.sync`: a `with` instead of an `async with`, `walk` / `glob` as ordinary iterators, `scandir` still a context manager because it still holds a handle, a typed error crossing the thread flat — and `BoundPortal`, for several sessions on one loop or a backend other than asyncio |
 | `download.py`             | `get()`, the progress callback, and where the pipelining happens                                       |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |

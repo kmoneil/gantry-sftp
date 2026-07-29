@@ -81,6 +81,10 @@ exists today:
 - **password authentication** for the endpoint class that needs it, with the secret travelling
   through the child's environment and never through argv, where `ps` would show it to every
   user on the machine
+- **a blocking surface**: `gantry_sftp.sync` gives every one of the above to a program with no
+  event loop, as a facade over the async code rather than a second implementation of it — with
+  the parity between the two derived from the async signatures by a test, not maintained by
+  hand
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe — no ssh, no keys,
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
@@ -142,11 +146,106 @@ async with connect("host", user="bob", session=SessionOptions(depth=16)) as sftp
 `with_reconnect` takes a callable producing a *transport*, because a retry rebuilds the session
 over a new connection.
 
-Not yet: the fsspec adapter, `SFTPPath`, or a blocking surface — **and the blocking one will be
-a portal facade rather than a generated twin**, decided in 0.10 after measuring that `unasync`
-cannot translate a background reader task, a cancel scope, or an async generator. `put_many()` from
+**There is a blocking surface, and it is a facade rather than a generated twin** — see
+[No event loop](#no-event-loop). Not yet: the fsspec adapter or `SFTPPath`. `put_many()` from
 DESIGN.md's §8 sketch does not exist — concurrency is spelled with your own task group, or with
 `get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
+
+## No event loop
+
+```python
+from gantry_sftp.sync import connect
+
+with connect("example.com", user="bob") as sftp:
+    sftp.get("/remote/data.parquet", "data.parquet")
+    result = sftp.put("report.csv", "/remote/report.csv")
+    print(result.mechanism, result.atomic)  # posix-rename True
+```
+
+Same library, same `Session` methods, same arguments, same errors — `gantry_sftp.sync` is a
+facade over the async code, not a second implementation of it. The event loop runs on a
+background thread for the length of the block
+([`anyio.from_thread.start_blocking_portal`](https://anyio.readthedocs.io/en/stable/threads.html)),
+and every call is the identically named coroutine sent across the boundary.
+
+This is why that matters: **the alternative was generating the blocking API from the async one
+with `unasync`, and that mechanism cannot work here.** Token substitution has no sync
+`create_task_group`, so honouring it meant hand-writing a second concurrency runtime — threads
+for the reader and the reaper, `threading` locks, a selector transport, and a re-derivation of
+cancellation. `httpx` gets away with it because `httpcore` ships hand-written parallel backends
+under matching names; that seam does not exist here. So there is one scheduler, one reader, one
+set of retry rules, and a **parity test that derives the blocking signatures from the async
+ones** — a method added to `Session` and not to `SyncSession` fails the suite by name.
+
+Everything keeps its shape, including the parts that could not survive the boundary unchanged:
+
+| async | blocking |
+| --- | --- |
+| `async with connect(...) as sftp` | `with connect(...) as sftp` |
+| `await sftp.get(...)` | `sftp.get(...)` — returns the same `int` |
+| `async for entry in sftp.walk(...)` | `for entry in sftp.walk(...)` — an ordinary iterator |
+| `async with sftp.scandir(p) as entries` | `with sftp.scandir(p) as entries` — still a context manager, because it still holds a directory handle |
+| `except NoSuchFileError` | `except NoSuchFileError` — arrives flat, not in an `ExceptionGroup` |
+
+Breaking out of a `walk`, a `glob` or a `scandir` closes the handle **on the server**, not
+merely in Python: the suite asserts it by calling `close()` on the handle afterwards and
+requiring `NO_SUCH_FILE`, because "no complaint appeared" is the absence of evidence rather
+than evidence.
+
+The two-call spelling works the same way, and the transport carries the portal so both halves
+share one loop rather than starting two:
+
+```python
+from gantry_sftp.sync import open_session, open_ssh_transport
+
+with open_ssh_transport("example.com", user="bob") as transport:
+    with open_session(transport) as sftp:
+        ...
+```
+
+**Several connections, or a backend other than asyncio: own the portal.** The module-level
+entry points start one and stop it with the block, which is right for a script and wasteful for
+a job with ten connections — a thread and a loop apiece for loops that are idle between calls.
+
+```python
+from anyio.from_thread import start_blocking_portal
+from gantry_sftp.sync import BoundPortal
+
+with start_blocking_portal(backend="trio") as portal:   # or asyncio, the default
+    gantry = BoundPortal(portal)
+    with gantry.connect("a.example.com") as one, gantry.connect("b.example.com") as two:
+        one.get("/data.csv", "a.csv")
+        two.get("/data.csv", "b.csv")
+```
+
+**Many transfers over one connection is spelled with threads here.** A blocking caller has no
+task group, and a `SyncSession` is safe to share across one — each call posts to the same loop,
+so the fan-out lands on the one reader that already routes replies by request id:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+with connect("example.com", user="bob") as sftp, ThreadPoolExecutor(8) as pool:
+    pool.map(lambda name: sftp.get(f"/incoming/{name}", local / name), names)
+```
+
+Four things to know about the thread boundary:
+
+- **A `progress` callback runs on the portal's thread**, which is the one thread that cannot
+  wait on the portal. Calling back into the session from inside a callback is refused by anyio
+  with `RuntimeError: This method cannot be called from the event loop thread` — loudly rather
+  than as a deadlock. Count bytes and return.
+- **The session is shareable across threads; one `walk` or `glob` is not.** They come back as
+  ordinary Python generators, and a generator driven from two threads at once raises
+  `ValueError: generator already executing`. Iterate one per thread, or list it first.
+- **Using a session after its block has ended** raises `StateError` naming the block, rather
+  than anyio's complaint about a portal you never asked for.
+- **`with_reconnect` has no blocking form yet.** It takes a callable that receives a session,
+  so a blocking version has to run *your* function on the portal's thread and therefore needs a
+  third thread to re-enter from — a mechanism decision rather than a wrapper, and not one to
+  half-build. The async form is unaffected.
+
+Runnable: `examples/blocking.py`.
 
 ## Matching names: `glob`
 
@@ -1519,8 +1618,10 @@ you should not need.
 | request size | `261120` bytes | Payload per `READ`/`WRITE` | Not a parameter. Derived per connection from `limits@openssh.com`, clamped to what the server says it will accept |
 
 All three parameters are keyword arguments to `open_session()` (and to `with_reconnect()`,
-which forwards them). `None` for either timeout means no bound; it is a legitimate thing to
-ask for and it is never the default.
+which forwards them); `connect()` takes the same three as one `SessionOptions`, because the
+`ssh` arguments already spend this project's argument budget. The blocking surface spells both
+exactly the same way. `None` for either timeout means no bound; it is a legitimate thing to ask
+for and it is never the default.
 
 **Why the request size is not 256 KiB.** It is the round number, and it is unachievable: the
 reference server reports `max-packet-length` 262144 and `max-read-length` 261120, because the
