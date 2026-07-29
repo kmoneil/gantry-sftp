@@ -10,8 +10,11 @@ What the lane establishes, in order:
 
 1. The shaped link really has the round-trip time it was asked for. A benchmark that reports
    its own configuration has measured nothing.
-2. Depth is what moves throughput. Ten to eighteen times, measured, between depth 1 and
-   depth 64 on the same file over the same link.
+2. Depth is what moves throughput. Twenty-five to fifty times, measured, between depth 1 and
+   depth 64 on the same file over the same link -- once the connection is warm. On a
+   connection's *first* transfer it is five to thirteen times, because a deep pipeline spends
+   its opening round trips in TCP slow start; that is a fact about the transport rather than
+   about the scheduler, and separating the two is what :func:`fastest_download` exists for.
 3. At depth 1 the elapsed time *is* one round trip per request, within a couple of percent.
    That is the formula in DESIGN.md 5 verified rather than asserted.
 4. Throughput follows **bytes in flight**, not depth and not request size separately. Three
@@ -35,10 +38,12 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from netem import LOOPBACK as LOOPBACK_INTERFACE
 from netem import measure_rtt_ms, shape
 
 from conftest import connect, negotiate, running_dispatcher
@@ -103,18 +108,46 @@ class Transfer:
         )
 
 
-async def timed_download(
-    server, source: Path, target: Path, *, depth: int, read_length: int
-) -> Transfer:
-    """Download ``source`` to ``target`` at an explicit depth and request size, and time it.
+INITIAL_CONGESTION_WINDOW_PACKETS = 10
+"""Linux's initial congestion window, in packets -- RFC 6928's IW10, the default since 3.0.
 
-    Drives :func:`~gantry_sftp.session.download_handle` rather than ``Session.get`` because
-    the request size is derived from the server's limits there and is deliberately not a
-    public knob -- but it is one of the two variables under test, so this lane needs it. The
-    scheduler being exercised is the shipped one either way.
+Used to say which legs of a comparison can pay TCP slow start and which cannot, rather than
+timing them to find out. See :func:`initial_congestion_window_bytes`.
+"""
 
-    The clock starts after OPEN, so what is timed is the transfer rather than the SSH
-    handshake, which at 200 ms costs a second on its own and belongs to no depth.
+
+def initial_congestion_window_bytes() -> int:
+    """Bytes a fresh connection may put on loopback before it has to wait for an ACK.
+
+    The MTU is read rather than assumed: ``lo`` defaults to 65536 on Linux, which is what makes
+    an initial window here two orders larger than the 1500-byte case, and a container that sets
+    it differently would change which legs of this lane are slow-start-free.
+    """
+    mtu = int(Path("/sys/class/net", LOOPBACK_INTERFACE, "mtu").read_text())
+    return INITIAL_CONGESTION_WINDOW_PACKETS * mtu
+
+
+BEST_OF = 3
+"""Timed samples per leg in the rows that compare one measurement against another.
+
+The fastest is kept, and that is an estimator rather than a convenience: everything that
+perturbs a transfer on a busy machine -- a descheduled process, a competing test's I/O, a
+congestion window that opens slowly -- can only ever *add* time to it. Nothing makes the wire
+faster than the link allows. So the minimum of a few samples is the closest available estimate
+of what the link and the scheduler actually do, and it is what a threshold should be compared
+against. ``benchmarks/`` reports a median with a spread column beside it because its job is to
+describe a distribution; this lane asserts, so it wants the estimate rather than the shape.
+"""
+
+
+@asynccontextmanager
+async def opened_source(server, source: Path):
+    """Connect, negotiate, ``OPEN`` ``source``, and yield a running dispatcher for it.
+
+    Split out of :func:`timed_download` so that a leg can be measured several times over one
+    connection. That is not only cheaper -- it is what makes the samples comparable, since a
+    fresh connection spends its first transfers in TCP slow start (see
+    :func:`fastest_download`).
     """
     async with connect(server) as transport:
         codec = Codec()
@@ -128,30 +161,93 @@ async def timed_download(
                 opened = event.response
         assert isinstance(opened, Handle), opened
 
-        size = file_size(source)
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        started = time.perf_counter()
-        try:
-            async with running_dispatcher(transport, codec) as dispatcher:
-                written = await download_handle(
-                    dispatcher,
-                    opened.handle,
-                    fd,
-                    size=size,
-                    read_length=read_length,
-                    depth=depth,
-                )
-        finally:
-            os.close(fd)
-        elapsed = time.perf_counter() - started
+        async with running_dispatcher(transport, codec) as dispatcher:
+            yield dispatcher, opened.handle, file_size(source)
         await transport.send(codec.send(Close(codec.allocate_request_id(), opened.handle)))
+
+
+async def one_timed_read(
+    dispatcher, handle: bytes, source: Path, target: Path, *, size: int, depth: int, length: int
+) -> Transfer:
+    """Time one whole-file read over an already-open handle."""
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    started = time.perf_counter()
+    try:
+        written = await download_handle(
+            dispatcher, handle, fd, size=size, read_length=length, depth=depth
+        )
+    finally:
+        os.close(fd)
+    elapsed = time.perf_counter() - started
 
     assert written == size
     # Byte identity on every single timed run, not just the correctness tests. A fast wrong
     # answer is the failure mode a benchmark invites, and reassembling by matched offset is
     # exactly what latency makes hard.
     assert_identical(source, target)
-    return Transfer(elapsed=elapsed, size=size, depth=depth, read_length=read_length)
+    return Transfer(elapsed=elapsed, size=size, depth=depth, read_length=length)
+
+
+async def timed_download(
+    server, source: Path, target: Path, *, depth: int, read_length: int
+) -> Transfer:
+    """Download ``source`` to ``target`` at an explicit depth and request size, and time it.
+
+    Drives :func:`~gantry_sftp.session.download_handle` rather than ``Session.get`` because
+    the request size is derived from the server's limits there and is deliberately not a
+    public knob -- but it is one of the two variables under test, so this lane needs it. The
+    scheduler being exercised is the shipped one either way.
+
+    The clock starts after OPEN, so what is timed is the transfer rather than the SSH
+    handshake, which at 200 ms costs a second on its own and belongs to no depth.
+
+    **One sample on a fresh connection**, which is the honest measurement for a leg that
+    cannot fill a congestion window -- depth 1 is one 32 KiB request at a time. A leg that
+    *can* fill one wants :func:`fastest_download` instead.
+    """
+    async with opened_source(server, source) as (dispatcher, handle, size):
+        return await one_timed_read(
+            dispatcher, handle, source, target, size=size, depth=depth, length=read_length
+        )
+
+
+async def fastest_download(
+    server, source: Path, target: Path, *, depth: int, read_length: int
+) -> Transfer:
+    """The fastest of :data:`BEST_OF` reads over one warmed connection.
+
+    **Both halves of this are measurements rather than caution** (D-81), and the first one is
+    the more surprising. A pipelined leg on a *fresh* connection is dominated by TCP slow
+    start: the same 768 KiB transfer that takes 6.0 round trips as a connection's first
+    transfer takes **1.0** as its fourth, which is exactly what DESIGN.md 5's model predicts
+    and what the deep leg is supposed to demonstrate. An initial congestion window is around
+    ten packets, loopback's MTU is 65536, and a transfer that puts a megabyte in flight
+    therefore waits for the window to open -- a cost in *round trips*, so it is invisible at
+    5 ms and dominant at 200 ms. Measuring a fresh connection here does not measure our
+    scheduler; it measures Linux's congestion control, and it made this row's margin over its
+    own threshold 19% when the docstring implied 165%.
+
+    So the connection is warmed with one discarded transfer, and the remaining variance --
+    5-11% run to run, measured -- is handled by keeping the fastest of a few. See
+    :data:`BEST_OF` for why the fastest rather than the median.
+
+    The lockstep legs deliberately do *not* use this: one 32 KiB request at a time never fills
+    a congestion window, so there is nothing to warm, and
+    :func:`test_depth_is_the_knob_that_moves_throughput_under_latency` asserts that in the same
+    run rather than assuming it.
+    """
+    async with opened_source(server, source) as (dispatcher, handle, size):
+        # Discarded on purpose: this is the transfer that opens the congestion window.
+        _ = await one_timed_read(
+            dispatcher, handle, source, target, size=size, depth=depth, length=read_length
+        )
+        samples = [
+            await one_timed_read(
+                dispatcher, handle, source, target, size=size, depth=depth, length=read_length
+            )
+            for _ in range(BEST_OF)
+        ]
+    return min(samples, key=lambda transfer: transfer.elapsed)
 
 
 # The filesystem helpers below are plain functions rather than inline calls, for the reason
@@ -242,10 +338,23 @@ async def test_depth_is_the_knob_that_moves_throughput_under_latency(
     make: run this without shaping and both legs finish in milliseconds, the ratio collapses
     to noise, and a lockstep client passes.
 
-    Measured on this sandbox (OpenSSH 10.0p2, loopback netem, 32768-byte requests): 14.7x at
-    5 ms, 18.5x at 50 ms, 10.6x at 200 ms. The floor asserted here is 4x, which is a wide
-    margin on purpose -- the claim is that depth changes the *character* of the transfer, and
-    pinning a ratio to two significant figures would be pinning this machine's scheduler.
+    **The two legs are measured differently, and D-81 is why.** The lockstep leg is one
+    32 KiB request at a time, which never fills a congestion window, so a single sample on a
+    fresh connection is the right measurement -- and the assertion below proves that in this
+    run rather than trusting it, by checking the leg against the one-round-trip-per-request
+    model. The pipelined leg puts a megabyte in flight, which on a fresh connection means TCP
+    slow start: measured at 6.0 round trips as a connection's first transfer and 1.0 as its
+    fourth. Timing that cold was measuring Linux's congestion control, it left this row 19%
+    above its own floor at 200 ms, and it is what made the row flake. See
+    :func:`fastest_download`.
+
+    Measured on this sandbox (OpenSSH 10.0p2, loopback netem, 32768-byte requests,
+    2026-07-29), warmed as this row now measures it: **50.7x at 5 ms, 36.8x at 50 ms, 24.8x at
+    200 ms**. The same three legs on a cold connection: 13.0x, 7.6x, 5.0x -- which is what the
+    figures recorded here before D-81 were, and the difference between the two rows is TCP, not
+    us. The floor stays at 4x, wide on purpose: the claim is that depth changes the *character*
+    of the transfer, and pinning a ratio to two significant figures would be pinning this
+    machine's scheduler.
     """
     chunks = CHUNKS_AT_RTT[target_rtt]
     source = random_file(tmp_path / "source.bin", SFTP1_BUFFER_SIZE * chunks)
@@ -254,7 +363,24 @@ async def test_depth_is_the_knob_that_moves_throughput_under_latency(
     lockstep = await timed_download(
         ssh_server, source, tmp_path / "lockstep.bin", depth=1, read_length=SFTP1_BUFFER_SIZE
     )
-    pipelined = await timed_download(
+    # The check that comparing a cold leg against a warmed one is fair, and it is deliberately
+    # arithmetic rather than a second timing. A leg pays slow start only if it tries to put
+    # more on the wire than the initial congestion window allows; depth 1 has exactly one
+    # request outstanding, which is orders below it, so cold and warm are the same measurement
+    # for this leg. **The first version of this check timed the leg against the
+    # one-round-trip-per-request model instead, and it flaked at 50 ms under a saturating load
+    # generator at 1.99x** -- which is the whole of D-81 happening again inside its own fix: a
+    # threshold on a measurement that load can only inflate. What makes the asymmetry safe is a
+    # property of the window, so that is what is asserted.
+    assert lockstep.in_flight <= initial_congestion_window_bytes(), (
+        f"{link.describe()}: the depth-1 leg puts {lockstep.in_flight} bytes in flight, which "
+        f"no longer fits an initial congestion window of "
+        f"{initial_congestion_window_bytes()} bytes -- it can now pay TCP slow start, so "
+        f"timing it on a cold connection and the deep leg on a warm one is not a fair "
+        f"comparison"
+    )
+
+    pipelined = await fastest_download(
         ssh_server,
         source,
         tmp_path / "pipelined.bin",
@@ -319,6 +445,13 @@ async def test_throughput_follows_bytes_in_flight_not_depth_or_request_size(
     It also rules out an alternative explanation for the depth result above: if the gain came
     from concurrency in *our* code rather than from bytes on the wire, depth 16 would beat
     depth 2 at equal in-flight bytes. It does not.
+
+    **Every leg is the fastest of a few over a warmed connection** (D-81). All three put half a
+    mebibyte in flight, so all three pay TCP slow start on a fresh connection -- unequally,
+    because the shapes reach that half-mebibyte differently -- and this row compares them
+    against each other. Cold single samples put the spread at 1.03-1.22 against a 1.4 ceiling
+    on an *idle* machine; warmed, it is 1.05-1.13. The threshold did not move; the measurement
+    stopped carrying a variable the row is not about.
     """
     source = random_file(tmp_path / "source.bin", 8 * MEBIBYTE)
     link = shape_link(rtt_ms=50.0)
@@ -326,7 +459,7 @@ async def test_throughput_follows_bytes_in_flight_not_depth_or_request_size(
     in_flight = 512 * 1024
     shapes = ((32768, 16), (65536, 8), (261120, 2))
     transfers = [
-        await timed_download(
+        await fastest_download(
             ssh_server, source, tmp_path / f"out{depth}.bin", depth=depth, read_length=length
         )
         for length, depth in shapes
@@ -378,13 +511,16 @@ async def test_the_ceiling_is_opensshs_channel_window_and_not_our_pipeline(
     # off-by-a-rounding that makes a boundary test quietly assert the wrong side.
     past_window_depth = 4 * OPENSSH_CHANNEL_WINDOW // PREFERRED_READ_LENGTH + 1
 
-    quarter_window = await timed_download(
+    # Warmed and best-of-N for the same reason as the row above (D-81): all three legs put at
+    # least a congestion window in flight, so a fresh connection would price each of them
+    # partly in TCP slow start -- and this row's whole content is the three prices compared.
+    quarter_window = await fastest_download(
         ssh_server, source, tmp_path / "quarter.bin", depth=16, read_length=SFTP1_BUFFER_SIZE
     )
-    at_window = await timed_download(
+    at_window = await fastest_download(
         ssh_server, source, tmp_path / "at.bin", depth=64, read_length=SFTP1_BUFFER_SIZE
     )
-    past_window = await timed_download(
+    past_window = await fastest_download(
         ssh_server,
         source,
         tmp_path / "past.bin",

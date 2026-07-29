@@ -1110,10 +1110,20 @@ localhost, which is why it went unnoticed for two decades.
 
 That formula is now measured rather than argued. On a `tc netem`-shaped loopback link
 against OpenSSH 10.0p2, raising pipeline depth from 1 to 64 at a fixed 32768-byte request
-size transfers the same file **14.7× faster at 5 ms RTT, 18.5× at 50 ms and 10.6× at
-200 ms** — and on an unshaped link the same comparison is noise. At depth 1 the elapsed time
-*is* one round trip per request, within 3%. The lane is `live-tests/test_netem_pipelining.py`
-and it re-measures on every run.
+size transfers the same file **50.7× faster at 5 ms RTT, 36.8× at 50 ms and 24.8× at 200 ms**
+(2026-07-29) — and on an unshaped link the same comparison is noise. At depth 1 the elapsed
+time *is* one round trip per request, within 3%. The lane is
+`live-tests/test_netem_pipelining.py` and it re-measures on every run.
+
+**Those figures are for a connection that has already moved something**, and the difference
+is worth knowing because it is not ours. The same three comparisons on a connection's *first*
+transfer come out at 13.0×, 7.6× and 5.0×: a deep pipeline puts about a megabyte in flight
+immediately, which is more than an initial TCP congestion window, so its opening round trips
+are spent waiting for that window to open rather than for the server. Measured at six round
+trips for a 768 KiB transfer as a connection's first, and **one** as its fourth. The practical
+form of this: a session that transfers several files pays it once, and `ControlMaster` — which
+this README recommends for the connect cost — pays it once for every session that shares the
+control socket.
 
 ### The ceiling, which is not ours
 

@@ -28,7 +28,6 @@ from __future__ import annotations
 import functools
 import shutil
 import socket
-import statistics
 import subprocess
 import threading
 import time
@@ -64,8 +63,9 @@ _TC_TIMEOUT = 30.0
 _CONNECT_TIMEOUT = 30.0
 _JOIN_TIMEOUT = 30.0
 _RTT_SAMPLES = 9
-"""Round trips per measurement. Nine at 200 ms is under two seconds and the median of nine
-survives a retransmit, which is the point of taking more than one on a lossy profile."""
+"""Round trips per measurement. Nine at 200 ms is under two seconds, and nine is enough that the
+fastest of them is a real sample of the link rather than a lucky one -- see
+:func:`measure_rtt_ms` for why the fastest is what is reported."""
 
 
 def _tc_binary() -> str | None:
@@ -192,7 +192,7 @@ def release_loopback() -> None:
 
 
 def measure_rtt_ms(samples: int = _RTT_SAMPLES) -> float:
-    """Median round-trip time over a loopback TCP connection, in milliseconds.
+    """Fastest round-trip time over a loopback TCP connection, in milliseconds.
 
     TCP rather than ICMP on purpose: TCP is what carries the transfer, ``ping`` needs a raw
     socket or a permissive ``ping_group_range``, and a shaped link can in principle treat the
@@ -201,12 +201,24 @@ def measure_rtt_ms(samples: int = _RTT_SAMPLES) -> float:
     Nagle is disabled at both ends, so what is timed is one packet out and one packet back
     rather than the kernel's opinion about when to send a one-byte payload.
 
+    **The fastest rather than the median, changed in 0.9 by D-81.** A round trip's measured
+    time is the link's delay plus whatever the machine adds -- two scheduler wakeups, and on a
+    busy box a wait for a core. That addition is one-sided: nothing makes a packet arrive
+    before the link delivers it. So the minimum is the estimate of the link and the median is
+    an estimate of the link *plus the load*, which is exactly the confusion that made this lane
+    flake. Measured under a saturating load generator, the median put an unshaped loopback at
+    2.15 ms and a 5 ms profile at 31.5 ms; both readings failed rows whose job is to notice a
+    *link* that is not what was asked for, and neither was about the link.
+
+    A lossy profile is the case that argued for the median, and it argues for the minimum more
+    strongly: a retransmit should perturb the reading rather than define it, and taking the
+    fastest of nine is the strongest available version of that.
+
     Args:
-        samples: Round trips to time. The median is returned, so a retransmit on a lossy
-            profile perturbs it rather than defining it.
+        samples: Round trips to time.
 
     Returns:
-        Median RTT in milliseconds.
+        Fastest RTT in milliseconds.
     """
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -242,7 +254,7 @@ def measure_rtt_ms(samples: int = _RTT_SAMPLES) -> float:
     finally:
         listener.close()
         thread.join(timeout=_JOIN_TIMEOUT)
-    return statistics.median(timings)
+    return min(timings)
 
 
 @dataclass(frozen=True, slots=True)

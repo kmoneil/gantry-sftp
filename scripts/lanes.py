@@ -138,14 +138,18 @@ LANES: tuple[Lane, ...] = (
         needs=(
             "CAP_NET_ADMIN (docker run --cap-add=NET_ADMIN) and a way for this user to "
             "exercise it, plus openssh-server. It shapes lo, so it slows down everything "
-            "else running on the machine for as long as it holds a profile"
+            "else running on the machine for as long as it holds a profile -- and two "
+            "copies of this lane at once measure each other's link, which its first row "
+            "catches by measuring the RTT rather than restating it"
         ),
         reports_only=(
-            "its ratio rows compare measured throughput and flake when the machine is "
-            "busy (D-81); a lane that fails for reasons unrelated to the code teaches "
-            "people to re-run it, which is how the real regression gets waved through"
+            "its rows compare measured throughput, so they are only ever as steady as the "
+            "machine underneath them; each compared leg is now the fastest of a few over a "
+            "warmed connection (D-81), which took the flakes out, but a shared CI runner "
+            "still measures whoever else is on it, so this reports weekly rather than "
+            "gating a pull request"
         ),
-        takes="about 70 seconds",
+        takes="about 80 seconds",
     ),
     Lane(
         name="benchmarks",
