@@ -45,10 +45,14 @@ exists today:
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
-- a session with `stat`, `lstat`, `realpath`, `open`/`close`, `mkdir`, `rmdir`, `remove`,
-  `rename`, `posix_rename`, `fsync`, `supports()`, `listdir()` / streaming `scandir()`, and
+- a session with `stat`, `lstat`, `fstat`, `realpath`, `open`/`close`, `mkdir`, `rmdir`,
+  `remove`, `rename`, `posix_rename`, `fsync`, `chmod` / `chown` / `utime` / `truncate`,
+  `readlink` / `symlink`, `supports()`, `listdir()` / streaming `scandir()`, and
   pipelined `get()` / `put()`, with typed errors, timeouts on every wait, and a progress
   callback
+- **permissions that survive the transfer**: `mode=` and `Mode.PRESERVE` both directions, set
+  on the file before anything can open it by its published name — without it every upload
+  arrives `0666 & ~umask`, which is the server's default and used to be unchangeable
 - **recursive transfer both ways**: `walk()` and `get_tree()`, with the zip-slip defence that
   makes a hostile server's filenames safe to write, plus `put_tree()` and `rmtree()` — trees
   go up as well as down, and come back off again
@@ -858,24 +862,73 @@ tidiness: a directory created `0o500` cannot have files written into it, so appl
 mode on the way down fails every transfer underneath it. A refused *directory* mode does not
 fail the tree; the files are the payload and are already published.
 
-### `chmod`
+`examples/permissions.py` runs all of this.
+
+## Changing attributes, and links
 
 ```python
 await sftp.chmod("/remote/report.csv", 0o640)
+await sftp.chown("/remote/report.csv", uid=1000, gid=1000)
+await sftp.utime("/remote/report.csv", atime, mtime)  # whole seconds
+await sftp.truncate("/remote/report.csv", 0)
+
+attrs = await sftp.fstat(handle)  # the file you hold, not the name
+target = await sftp.readlink("/remote/current")
+await sftp.symlink("/remote/v2", "/remote/current")  # target first, like os.symlink
 ```
 
-**It follows symlinks**, because `SETSTAT` is `chmod(2)` — the same default as `os.chmod`.
-Where the path may be a symlink somebody else planted, that is a chmod of whatever it points
-at. The extension that does not follow is `lsetstat@openssh.com`; it is not implemented here,
-and v3 offers no fallback, so there is nothing to degrade to and this is said rather than
-implied away.
+**Each sends exactly one attribute flag, and that is a correctness decision rather than an
+economy.** OpenSSH's `process_setstat` walks the flags in sequence — size, permissions, times,
+owner — applying each and recording only the last failure in the single status it returns. So a
+multi-field `SETSTAT` that fails has *already applied* the fields before the failing one and
+does not say which. One field per call makes a refusal unambiguous and leaves nothing else
+moved.
 
-It sends `PERMISSIONS` and nothing else, deliberately. OpenSSH's `process_setstat` walks the
-attribute flags in sequence — size, permissions, times, owner — applying each and reporting
-only the last failure in one status. So a multi-field `SETSTAT` that fails has already applied
-part of itself and does not say which part. One field per call makes a refusal unambiguous.
+`chown` and `utime` set two values each because the wire pairs them: `UIDGID` and `ACMODTIME`
+are one flag apiece. To change a uid alone, read the gid back with `stat()` and send it
+unchanged.
 
-`examples/permissions.py` runs all of this.
+### These follow symlinks by default
+
+`SETSTAT` is `chmod(2)`/`chown(2)`/`utimes(2)` on a path, and all three follow — the same
+default as `os.chmod`. Where the path may be a symlink somebody else planted, that is an
+operation on whatever it points at.
+
+```python
+await sftp.utime("/remote/current", atime, mtime, follow_symlinks=False)
+```
+
+`follow_symlinks=False` uses `lsetstat@openssh.com`, and **where the server will not do it the
+call is refused** with a `CapabilityError` rather than quietly doing the following version.
+That is the opposite of how every other extension here degrades, and the reason is that there
+is nothing to degrade *to*: v3 has no non-following spelling, so the fallback would be to
+perform a different operation, on the target the caller was trying to avoid. OpenSSH and
+asyncssh advertise it; paramiko does not.
+
+**`chmod(follow_symlinks=False)` cannot work against a Linux server**, and the extension being
+present does not change that. Linux has no `lchmod`: `fchmodat(AT_SYMLINK_NOFOLLOW)` answers
+`ENOTSUP` — measured at the syscall level — because a symlink's own permission bits are
+meaningless to that kernel and always read `0o777`. It arrives as OpenSSH's contentless
+`Failure`, so the exception carries a note saying why. `utime` and `chown` on a link *do* work
+there: `utimensat` and `fchownat` both accept the flag. The limit is the mode's, not the
+extension's.
+
+`truncate` has no `follow_symlinks=` at all, for a related reason: `lsetstat` rejects a `SIZE`
+field outright with `BAD_MESSAGE` (`/* nonsensical for links */`), so a parameter there could
+only ever fail.
+
+### `readlink` returns attacker-controlled bytes
+
+A link target is whatever the person who made the link chose. It may be absolute, may climb
+with `..`, may not be valid UTF-8, and may point at nothing. None of that is validated, because
+every one of those is a legal symlink — so **do not join the result onto a local path** without
+the containment check `get_tree` uses. That is the zip-slip class, and `readlink` is the
+shortest route to it.
+
+A path that is *not* a symlink answers `BAD_MESSAGE`, which reads as "your frame was malformed"
+and here means `EINVAL`. See the status-code notes above.
+
+`examples/permissions.py` covers `chmod`; `examples/links.py` covers the rest.
 
 ## Which server is at the other end
 

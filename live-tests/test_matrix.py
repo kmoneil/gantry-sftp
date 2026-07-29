@@ -30,6 +30,7 @@ from matrix import SERVER_NAMES, MatrixServer, running_server, unavailable_reaso
 from sshd import REDIRECTED_HOME, STEERING
 
 from gantry_sftp.codec import (
+    EXTENSION_LSETSTAT,
     CheckFileReply,
     Codec,
     Completed,
@@ -42,6 +43,7 @@ from gantry_sftp.codec import (
     decode,
 )
 from gantry_sftp.exceptions import (
+    CapabilityError,
     NoSuchFileError,
     ServerError,
     TransferError,
@@ -255,6 +257,48 @@ async def test_an_uploaded_file_is_never_world_readable_through_any_server(
         f"cannot deliver a private file"
     )
     assert remote.read_bytes() == payload
+
+
+async def test_touching_a_symlink_itself_degrades_where_lsetstat_is_absent(server: MatrixServer):
+    """D-56b's degradation path, which is the *opposite* of every other extension here.
+
+    An absent extension normally means a documented fallback. ``lsetstat@openssh.com`` has none
+    to fall back to -- v3 offers no non-following ``SETSTAT`` at all, so "degrading" would mean
+    operating on the link's target, which is precisely what the caller asked to avoid. So the
+    absence is a :class:`CapabilityError` rather than a silent change of operation, and both
+    halves of that are asserted here: it works where the extension is, and refuses where it is
+    not, with the target unchanged either way.
+
+    ``utime`` rather than ``chmod`` deliberately. Linux has no ``lchmod``, so
+    ``lsetstat``'s *permissions* branch cannot succeed on any of these three however they are
+    configured -- see ``tests/test_attributes_and_links.py``. ``utimensat`` accepts
+    ``AT_SYMLINK_NOFOLLOW``, so the times branch is the one that can distinguish a server that
+    has the extension from one that does not.
+
+    Paramiko is the row that pays: it advertises only ``check-file``, and whether it answers an
+    unknown ``EXTENDED`` with ``OP_UNSUPPORTED`` rather than dropping the connection is its
+    protocol half, not our handler's.
+    """
+    target = server.root / "real.txt"
+    target.write_bytes(b"payload")
+    os.utime(target, (1_600_000_007, 1_600_000_000))
+    link = server.root / "alias.txt"
+    link.symlink_to(target)
+
+    async with connected(server) as sftp:
+        if not sftp.supports(EXTENSION_LSETSTAT):
+            with pytest.raises(CapabilityError) as refusal:
+                await sftp.utime(str(link), 1, 2, follow_symlinks=False)
+            assert refusal.value.missing == (EXTENSION_LSETSTAT,)
+            assert int(target.stat().st_mtime) == 1_600_000_000
+            return
+        await sftp.utime(str(link), 1, 2, follow_symlinks=False)
+
+    assert int(os.lstat(link).st_mtime) == 2
+    assert int(target.stat().st_mtime) == 1_600_000_000, (
+        f"{server.name} followed the symlink despite lsetstat@openssh.com -- the target's "
+        f"times were changed, which is the operation follow_symlinks=False exists to avoid"
+    )
 
 
 HANDLER_IS_OURS = frozenset({"paramiko"})

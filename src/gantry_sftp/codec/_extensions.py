@@ -30,10 +30,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Self
 
+from gantry_sftp.codec._attrs import EMPTY_ATTRS, Attrs, decode_attrs, encode_attrs
 from gantry_sftp.codec._constants import (
     EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
     EXTENSION_LIMITS,
+    EXTENSION_LSETSTAT,
     EXTENSION_POSIX_RENAME,
 )
 from gantry_sftp.codec._packets import Extended, ExtendedReply
@@ -44,10 +46,12 @@ __all__ = [
     "CHECK_FILE_NAME",
     "FSYNC_NAME",
     "LIMITS_NAME",
+    "LSETSTAT_NAME",
     "POSIX_RENAME_NAME",
     "CheckFile",
     "CheckFileReply",
     "Fsync",
+    "LSetStat",
     "PosixRename",
 ]
 
@@ -56,6 +60,9 @@ POSIX_RENAME_NAME = EXTENSION_POSIX_RENAME.encode("ascii")
 
 FSYNC_NAME = EXTENSION_FSYNC.encode("ascii")
 """``fsync@openssh.com`` as it appears on the wire."""
+
+LSETSTAT_NAME = EXTENSION_LSETSTAT.encode("ascii")
+"""``lsetstat@openssh.com`` as it appears on the wire."""
 
 CHECK_FILE_NAME = EXTENSION_CHECK_FILE.encode("ascii")
 """``check-file`` as it appears on the wire -- unsuffixed, which is paramiko's spelling."""
@@ -140,6 +147,64 @@ class PosixRename:
             request_id=request.request_id,
             oldpath=bytes(reader.read_string()),
             newpath=bytes(reader.read_string()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LSetStat:
+    """``lsetstat@openssh.com``: ``SETSTAT`` that does not follow a symlink.
+
+    The reason it is needed: plain ``SETSTAT`` is ``chmod(2)``/``chown(2)``/``utimes(2)`` on a
+    path, and all three follow. Where the path may be a symlink somebody else planted, that is
+    an operation on whatever it points at. **v3 offers no non-following spelling at all**, so
+    this extension is not an optimisation with a fallback -- its absence means the operation
+    cannot be performed, and the caller has to be told rather than quietly given the following
+    version.
+
+    Body layout, from ``PROTOCOL`` 4.7 and matching ``process_extended_lsetstat``::
+
+        string  "lsetstat@openssh.com"
+        string  path
+        ATTRS   attrs
+
+    **It refuses ``SIZE`` outright**, with ``BAD_MESSAGE`` and the comment
+    ``/* nonsensical for links */`` -- so this cannot carry a truncation and is not a drop-in
+    ``SETSTAT``. Mode, times and owner only. Read from the 10.0p2 source rather than inferred
+    from "it is like setstat", which is what ``PROTOCOL`` says and is not the whole truth.
+
+    Attributes:
+        request_id: Correlates the reply.
+        path: What to modify. Not followed if it is a symlink -- the point of the extension.
+        attrs: The fields to set. One flag per request, for the reason
+            :meth:`~gantry_sftp.session.Session.chmod` gives: the server applies them in
+            sequence and reports one status.
+    """
+
+    extension_name: ClassVar[bytes] = LSETSTAT_NAME
+
+    request_id: int
+    path: bytes
+    attrs: Attrs = EMPTY_ATTRS
+
+    def to_extended(self) -> Extended:
+        """Build the ``EXTENDED`` request that carries this attribute change."""
+        writer = WireWriter()
+        writer.write_string(self.path)
+        encode_attrs(writer, self.attrs)
+        return Extended(self.request_id, self.extension_name, writer.getvalue())
+
+    @classmethod
+    def from_extended(cls, request: Extended) -> Self:
+        """Read one back out of an ``EXTENDED`` request.
+
+        Raises:
+            ProtocolError: If the name does not match, or the body is truncated.
+        """
+        reader = _payload_of(request, cls.extension_name)
+        return cls(
+            request_id=request.request_id,
+            path=bytes(reader.read_string()),
+            attrs=decode_attrs(reader),
         )
 
 

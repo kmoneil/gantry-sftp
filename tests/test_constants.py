@@ -153,16 +153,32 @@ def test_every_advertised_name_has_a_constant():
 
 
 def test_the_wire_name_constants_derive_from_the_string_ones():
-    """``codec/_extensions.py`` spells four of these as bytes. Derived, never re-typed.
+    """``codec/_extensions.py`` spells some of these as bytes. Derived, never re-typed.
 
     Two spellings of one wire string is how the suffix bug happens; this asserts the bytes
     forms are the ASCII encoding of the strings rather than independent literals that happen
     to match today.
+
+    **Discovered rather than listed**, which is the D-52 lesson applied to D-52's own test. It
+    named its four explicitly, and adding a fifth (``LSETSTAT_NAME``, 0.10) left it passing
+    while covering four fifths of what it claimed to. A test that enumerates by hand is a
+    fifth enumeration to keep in step, which is the thing that card was about.
     """
-    assert codec.EXTENSION_POSIX_RENAME.encode("ascii") == codec.POSIX_RENAME_NAME
-    assert codec.EXTENSION_FSYNC.encode("ascii") == codec.FSYNC_NAME
-    assert codec.EXTENSION_LIMITS.encode("ascii") == codec.LIMITS_NAME
-    assert codec.EXTENSION_CHECK_FILE.encode("ascii") == codec.CHECK_FILE_NAME
+    pairs = {
+        name: f"{name.removeprefix('EXTENSION_')}_NAME"
+        for name in extension_constants()
+        if hasattr(codec, f"{name.removeprefix('EXTENSION_')}_NAME")
+    }
+    assert pairs, "no bytes spellings found -- this test would prove nothing"
+    for string_name, bytes_name in pairs.items():
+        assert getattr(codec, string_name).encode("ascii") == getattr(codec, bytes_name), (
+            f"{bytes_name} is not the ASCII encoding of {string_name}"
+        )
+    # And the count, so a bytes constant added under a name this rule cannot derive fails here
+    # rather than silently sitting outside the check.
+    exported = {name for name in codec.__all__ if name.endswith("_NAME")}
+    orphans = exported - set(pairs.values())
+    assert not orphans, f"a *_NAME constant is exported that no EXTENSION_* maps onto: {orphans}"
 
 
 # --- the enums themselves --------------------------------------------------------------

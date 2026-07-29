@@ -19,20 +19,29 @@ from hypothesis import strategies as st
 from gantry_sftp.codec import (
     EXTENSION_FSYNC,
     EXTENSION_LIMITS,
+    EXTENSION_LSETSTAT,
     EXTENSION_POSIX_RENAME,
     FSYNC_NAME,
     LIMITS_NAME,
+    LSETSTAT_NAME,
+    MAX_V3_TIMESTAMP,
     OPENSSH_ADVERTISED_EXTENSIONS,
     POSIX_RENAME_NAME,
+    AttrFlag,
+    Attrs,
     CheckFile,
     CheckFileReply,
     Extended,
     ExtendedReply,
     Fsync,
+    LSetStat,
     OpenFlag,
+    Owner,
     PacketType,
     PosixRename,
     StatusCode,
+    Times,
+    WireReader,
     WireWriter,
     decode,
     encode,
@@ -64,10 +73,13 @@ def test_the_bytes_names_are_the_advertised_names():
     assert EXTENSION_POSIX_RENAME.encode("ascii") == POSIX_RENAME_NAME
     assert EXTENSION_FSYNC.encode("ascii") == FSYNC_NAME
     assert EXTENSION_LIMITS.encode("ascii") == LIMITS_NAME
+    assert EXTENSION_LSETSTAT.encode("ascii") == LSETSTAT_NAME
     assert LIMITS_EXTENSION == LIMITS_NAME
 
 
-@pytest.mark.parametrize("name", [EXTENSION_POSIX_RENAME, EXTENSION_FSYNC, EXTENSION_LIMITS])
+@pytest.mark.parametrize(
+    "name", [EXTENSION_POSIX_RENAME, EXTENSION_FSYNC, EXTENSION_LIMITS, EXTENSION_LSETSTAT]
+)
 def test_every_name_we_use_is_one_a_real_server_advertises(name: str):
     advertised = {advertised_name for advertised_name, _ in OPENSSH_ADVERTISED_EXTENSIONS}
     assert name in advertised
@@ -76,6 +88,7 @@ def test_every_name_we_use_is_one_a_real_server_advertises(name: str):
 def test_the_class_attribute_and_the_module_constant_agree():
     assert PosixRename.extension_name == POSIX_RENAME_NAME
     assert Fsync.extension_name == FSYNC_NAME
+    assert LSetStat.extension_name == LSETSTAT_NAME
 
 
 # --- golden frames -----------------------------------------------------------------------
@@ -96,6 +109,18 @@ FSYNC_GOLDEN = frame(
     (9).to_bytes(4, "big"),
     string(b"fsync@openssh.com"),
     string(b"\x00\x00\x00\x00"),
+)
+
+# PROTOCOL 4.7: id, name, path, ATTRS. The ATTRS here is a flags word of PERMISSIONS alone
+# followed by the mode -- one flag, which is the rule every caller of this body follows,
+# because the server applies flags in sequence and reports one status for all of them.
+LSETSTAT_GOLDEN = frame(
+    bytes([PacketType.EXTENDED]),
+    (11).to_bytes(4, "big"),
+    string(b"lsetstat@openssh.com"),
+    string(b"/incoming/report.csv"),
+    (AttrFlag.PERMISSIONS).to_bytes(4, "big"),
+    (0o640).to_bytes(4, "big"),
 )
 
 
@@ -120,6 +145,32 @@ def test_fsync_decodes_from_its_golden_frame():
     packet = decode(memoryview(FSYNC_GOLDEN)[4:])
     assert isinstance(packet, Extended)
     assert Fsync.from_extended(packet) == Fsync(9, b"\x00\x00\x00\x00")
+
+
+def test_lsetstat_encodes_to_its_golden_frame():
+    request = LSetStat(11, b"/incoming/report.csv", Attrs(permissions=0o640))
+    assert encode(request.to_extended()) == LSETSTAT_GOLDEN
+
+
+def test_lsetstat_decodes_from_its_golden_frame():
+    packet = decode(memoryview(LSETSTAT_GOLDEN)[4:])
+    assert isinstance(packet, Extended)
+    assert LSetStat.from_extended(packet) == LSetStat(
+        11, b"/incoming/report.csv", Attrs(permissions=0o640)
+    )
+
+
+def test_the_lsetstat_body_puts_the_path_before_the_attrs():
+    """The one ordering a self-consistent encoder cannot get wrong on its own.
+
+    Both fields are variable-length and both are attacker-visible, so a transposed body would
+    round-trip through our own decoder and be read by a real server as a path made of the
+    ATTRS bytes. Asserted against the frame rather than against the class.
+    """
+    body = LSetStat(11, b"/incoming/report.csv", Attrs(permissions=0o640)).to_extended().data
+    reader = WireReader(memoryview(body))
+    assert bytes(reader.read_string()) == b"/incoming/report.csv"
+    assert reader.read_uint32() == AttrFlag.PERMISSIONS
 
 
 # --- check-file, captured from a server that really speaks it ------------------------------
@@ -255,6 +306,52 @@ def test_digests_that_do_not_divide_evenly_are_refused_rather_than_split():
 def test_posix_rename_round_trips(request_id: int, oldpath: bytes, newpath: bytes):
     original = PosixRename(request_id, oldpath, newpath)
     assert PosixRename.from_extended(original.to_extended()) == original
+
+
+@given(
+    request_id=st.integers(min_value=0, max_value=0xFFFFFFFF),
+    path=st.binary(max_size=64),
+    size=st.one_of(st.none(), st.integers(min_value=0, max_value=0xFFFFFFFFFFFFFFFF)),
+    permissions=st.one_of(st.none(), st.integers(min_value=0, max_value=0xFFFFFFFF)),
+    uid=st.integers(min_value=0, max_value=0xFFFFFFFF),
+    gid=st.integers(min_value=0, max_value=0xFFFFFFFF),
+    with_owner=st.booleans(),
+    times=st.one_of(
+        st.none(),
+        st.tuples(
+            st.integers(min_value=0, max_value=MAX_V3_TIMESTAMP),
+            st.integers(min_value=0, max_value=MAX_V3_TIMESTAMP),
+        ),
+    ),
+)
+def test_lsetstat_round_trips(
+    request_id: int,
+    path: bytes,
+    size: int | None,
+    permissions: int | None,
+    uid: int,
+    gid: int,
+    with_owner: bool,
+    times: tuple[int, int] | None,
+):
+    """Every combination of present and absent fields, not just the one-flag shape we send.
+
+    The library only ever sends a single flag, and a property written to match that would
+    exercise a quarter of the body encoder. A future caller -- or a server implementing this
+    for us to decode -- is entitled to any subset, and an ATTRS field is present-or-absent
+    rather than defaulted, so the interesting cases are the transitions.
+    """
+    original = LSetStat(
+        request_id,
+        path,
+        Attrs(
+            size=size,
+            owner=Owner(uid=uid, gid=gid) if with_owner else None,
+            permissions=permissions,
+            times=Times(*times) if times is not None else None,
+        ),
+    )
+    assert LSetStat.from_extended(original.to_extended()) == original
 
 
 @given(

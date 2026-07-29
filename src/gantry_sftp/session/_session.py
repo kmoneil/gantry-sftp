@@ -50,6 +50,7 @@ from gantry_sftp.codec import (
     EMPTY_ATTRS,
     EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
+    EXTENSION_LSETSTAT,
     EXTENSION_POSIX_RENAME,
     LIMITS_NAME,
     Attrs,
@@ -61,16 +62,20 @@ from gantry_sftp.codec import (
     CodecState,
     Completed,
     FSetStat,
+    FStat,
     Fsync,
     Handle,
+    LSetStat,
     LStat,
     MkDir,
     Name,
     Open,
     OpenDir,
     OpenFlag,
+    Owner,
     PosixRename,
     ReadDir,
+    ReadLink,
     RealPath,
     Remove,
     Rename,
@@ -81,6 +86,7 @@ from gantry_sftp.codec import (
     Stat,
     Status,
     StatusCode,
+    SymLink,
     Times,
     render_field,
 )
@@ -762,7 +768,73 @@ class Session:
             return reply.attrs
         raise _unexpected(reply, expected="ATTRS", path=encoded)
 
-    async def chmod(self, path: bytes | str, mode: int) -> None:
+    async def _set_one_attribute(
+        self, path: bytes, attrs: Attrs, *, follow_symlinks: bool, operation: str
+    ) -> None:
+        """Apply one ATTRS field to a path, following the symlink or refusing to.
+
+        **One field per call is the caller's job and this method's assumption.** OpenSSH's
+        ``process_setstat`` and ``process_extended_lsetstat`` both walk the flags in sequence,
+        applying each and recording only the last failure in the single ``STATUS`` they send
+        back -- so a multi-field call that fails has already applied the fields before the
+        failing one and does not say which. Every public caller here sends exactly one flag,
+        which makes a refusal unambiguous and leaves nothing else moved.
+
+        ``follow_symlinks=False`` needs ``lsetstat@openssh.com`` and **refuses without it**,
+        rather than degrading to the following version. That is the opposite of what most
+        extension use does here, and the reason is that there is nothing to degrade *to*: v3
+        has no non-following spelling, so the fallback would be to perform a different
+        operation than the one asked for, on a target the caller was trying to avoid.
+
+        Attempted even where the server did not advertise the extension, since endpoints
+        implement extensions they never list -- and an ``OP_UNSUPPORTED`` is cached, so a
+        second call in the same session costs no round trip.
+
+        Raises:
+            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
+            NoSuchFileError: If the path does not exist.
+            PermissionDeniedError: If the server will not change it.
+            ServerError: For any other refusal.
+        """
+        if follow_symlinks:
+            await self._expect_status(SetStat(self._next(), path, attrs), path=path)
+            return
+        try:
+            performed = await self._attempt_extension(
+                EXTENSION_LSETSTAT,
+                lambda: self._expect_status(
+                    LSetStat(self._next(), path, attrs).to_extended(), path=path
+                ),
+            )
+        except ServerError as refusal:
+            # OpenSSH's FAILURE carries no message worth reading -- five distinct conditions
+            # all render as "Failure" -- and for this one flag there is a specific, common and
+            # unfixable cause that the bare status sends a reader looking in the wrong place.
+            if attrs.permissions is not None:
+                refusal.add_note(
+                    "the server may be refusing because it cannot do this at all: Linux has "
+                    "no lchmod, so fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP and OpenSSH "
+                    "maps that to a contentless FAILURE. A symlink's own permission bits are "
+                    "ignored by the Linux kernel and are always 0o777, so there is nothing to "
+                    "set. The times and owner of a symlink can be set there; the mode cannot. "
+                    "Pass follow_symlinks=True to change what the link points at, if that is "
+                    "what you meant."
+                )
+            raise
+        if not performed:
+            unavailable = CapabilityError(
+                f"follow_symlinks=False needs {EXTENSION_LSETSTAT}, which this server will "
+                f"not perform, and filexfer v3 has no other way to {operation} a symlink "
+                f"without following it. Passing follow_symlinks=True would {operation} "
+                f"whatever {path!r} points at, which is a different operation",
+                feature=f"{operation} without following a symlink",
+                missing=(EXTENSION_LSETSTAT,),
+                path=path,
+            )
+            unavailable.add_note(self._server_note())
+            raise unavailable
+
+    async def chmod(self, path: bytes | str, mode: int, *, follow_symlinks: bool = True) -> None:
         """Set the permission bits of ``path``.
 
         ``SETSTAT`` carrying **only** ``PERMISSIONS``, and the single flag is the decision
@@ -774,18 +846,136 @@ class Session:
         field it was. One field per call makes a refusal unambiguous and leaves nothing else
         moved.
 
-        **This follows symlinks**, because ``SETSTAT`` is ``chmod(2)`` and that is what
+        **It follows symlinks by default**, because ``SETSTAT`` is ``chmod(2)`` and that is what
         ``chmod(2)`` does -- the same default as :func:`os.chmod`. Where the path may be a
-        symlink planted by someone else, that is a chmod of whatever it points at. The
-        extension that does not follow is ``lsetstat@openssh.com``; it is not implemented here
-        and v3 offers no fallback for it, so there is nothing to degrade to and this method
-        does not pretend otherwise.
+        symlink planted by someone else, that is a chmod of whatever it points at.
+        ``follow_symlinks=False`` uses ``lsetstat@openssh.com`` and **refuses** where the server
+        will not, rather than silently doing the following version: v3 has no other spelling, so
+        there is nothing to degrade to.
+
+        **On a Linux server that refusal is unconditional, and the extension being present does
+        not change it.** Linux has no ``lchmod``: ``fchmodat(AT_SYMLINK_NOFOLLOW)`` answers
+        ``ENOTSUP``, measured, so ``lsetstat``'s permissions branch cannot succeed there however
+        the server is configured. A symlink's own mode is meaningless to that kernel and always
+        reads ``0o777``. The refusal arrives as OpenSSH's contentless ``FAILURE`` and this
+        library attaches a note saying so. :meth:`utime` and :meth:`chown` *do* work on a link
+        there -- ``utimensat`` and ``fchownat`` accept the flag -- so this limit is the mode's
+        alone, not the extension's.
 
         Args:
-            path: What to modify. Followed if it is a symlink.
+            path: What to modify.
             mode: Permission bits. Masked to ``0o7777``, which is what ``chmod(2)`` takes and
                 what OpenSSH applies (``a.perm & 07777``); the file-type bits an ``st_mode``
                 carries are not permissions and are dropped rather than sent.
+            follow_symlinks: Whether to act on the link's target. ``False`` needs
+                ``lsetstat@openssh.com`` -- advertised by OpenSSH and asyncssh, absent from
+                paramiko -- **and** a server platform with ``lchmod``, which Linux is not.
+
+        Raises:
+            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
+            NoSuchFileError: If the path does not exist.
+            PermissionDeniedError: If the server will not change it.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(path)
+        await self._set_one_attribute(
+            encoded,
+            Attrs(permissions=mode & PERMISSION_BITS),
+            follow_symlinks=follow_symlinks,
+            operation="chmod",
+        )
+
+    async def chown(
+        self, path: bytes | str, uid: int, gid: int, *, follow_symlinks: bool = True
+    ) -> None:
+        """Set the numeric owner and group of ``path``.
+
+        **Both together or neither**, because ``UIDGID`` is one flag covering two fields --
+        there is no way to send a uid without a gid, so "leave the group alone" has to be
+        spelled by reading the current gid back with :meth:`stat` and sending it unchanged.
+        That is the wire's shape rather than ours; :class:`~gantry_sftp.codec.Owner` exists to
+        make the pairing visible instead of leaving two loose integers.
+
+        **Numeric ids only.** Turning them into names needs
+        ``users-groups-by-id@openssh.com``, which is not implemented here, and the display
+        string in ``longname`` is not a source -- it is rendered by the server, in the server's
+        name resolution, for a human.
+
+        Args:
+            path: What to modify.
+            uid: Numeric user id.
+            gid: Numeric group id.
+            follow_symlinks: Whether to act on the link's target. ``False`` needs
+                ``lsetstat@openssh.com``.
+
+        Raises:
+            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
+            NoSuchFileError: If the path does not exist.
+            PermissionDeniedError: If the server will not change it -- which is the common
+                answer, since changing a file's owner is root's privilege on every ordinary
+                Unix server.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(path)
+        await self._set_one_attribute(
+            encoded,
+            Attrs(owner=Owner(uid=uid, gid=gid)),
+            follow_symlinks=follow_symlinks,
+            operation="chown",
+        )
+
+    async def utime(
+        self, path: bytes | str, atime: int, mtime: int, *, follow_symlinks: bool = True
+    ) -> None:
+        """Set the access and modification times of ``path``, in whole seconds.
+
+        **Both together or neither**, for the same reason :meth:`chown` pairs its two: they
+        share one ``ACMODTIME`` flag.
+
+        v3 carries ``uint32`` seconds, so sub-second precision does not exist here and a value
+        that does not fit is refused rather than truncated -- see
+        :data:`~gantry_sftp.codec.MAX_V3_TIMESTAMP`. Whether the *transfer* methods carry times
+        across is ``preserve_times=``; this is the standalone call, for a file already there.
+
+        Args:
+            path: What to modify.
+            atime: Access time, seconds since the epoch.
+            mtime: Modification time, seconds since the epoch.
+            follow_symlinks: Whether to act on the link's target. ``False`` needs
+                ``lsetstat@openssh.com``.
+
+        Raises:
+            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
+            NoSuchFileError: If the path does not exist.
+            PermissionDeniedError: If the server will not change it.
+            ServerError: For any other refusal.
+            ValueError: If either value does not fit filexfer v3's ``uint32`` seconds.
+        """
+        encoded = _encode_path(path)
+        await self._set_one_attribute(
+            encoded,
+            Attrs(times=Times(atime=atime, mtime=mtime)),
+            follow_symlinks=follow_symlinks,
+            operation="utime",
+        )
+
+    async def truncate(self, path: bytes | str, size: int) -> None:
+        """Set the length of ``path``, discarding anything past it or zero-filling to reach it.
+
+        ``SETSTAT`` carrying only ``SIZE``, which OpenSSH answers with ``truncate(2)``.
+
+        **There is no ``follow_symlinks=False`` here, and its absence is the server's decision
+        rather than an omission.** ``process_extended_lsetstat`` rejects ``SIZE`` outright --
+        ``BAD_MESSAGE``, with the comment ``/* nonsensical for links */`` -- so the extension
+        every other method on this page uses for the non-following case cannot carry a
+        truncation at all. A parameter that could only ever fail would be worse than not having
+        one.
+
+        Args:
+            path: What to modify. Followed if it is a symlink, necessarily.
+            size: The new length in bytes. Growing a file this way makes a hole rather than
+                writing zeroes, so the space is not reserved and a later write can still fail
+                with ``ENOSPC``.
 
         Raises:
             NoSuchFileError: If the path does not exist.
@@ -793,8 +983,91 @@ class Session:
             ServerError: For any other refusal.
         """
         encoded = _encode_path(path)
+        await self._expect_status(SetStat(self._next(), encoded, Attrs(size=size)), path=encoded)
+
+    async def fstat(self, handle: bytes) -> Attrs:
+        """Attributes of an open handle.
+
+        The handle-addressed :meth:`stat`, and the difference is worth the method: a path can
+        be replaced between the ``OPEN`` and the ``STAT``, so asking the handle is asking about
+        the file this session actually has open rather than about whatever currently answers to
+        that name.
+
+        Raises:
+            ServerError: If the server refuses -- which includes a handle it does not know, and
+                a server that does not implement ``FSTAT`` on a directory handle.
+        """
+        reply = await self.request(FStat(self._next(), handle))
+        if isinstance(reply, AttrsReply):
+            return reply.attrs
+        raise _unexpected(reply, expected="ATTRS")
+
+    async def readlink(self, path: bytes | str) -> bytes:
+        """Read the target of a symlink, without following it.
+
+        **The answer is attacker-controlled and is returned raw.** A link target is an
+        arbitrary byte string chosen by whoever created the link -- it may be absolute, may
+        climb with ``..``, may not be valid UTF-8, and may name something that does not exist.
+        Nothing is validated here because there is nothing to validate against: every one of
+        those is a legal symlink. **Do not join it onto a local path** without the containment
+        check :meth:`get_tree` uses; that is the zip-slip class, and this method is the
+        shortest route to it.
+
+        **A path that is not a symlink answers ``BAD_MESSAGE``**, not ``FAILURE`` and not
+        ``NO_SUCH_FILE``. That code reads as "the frame you sent was malformed" and here means
+        ``EINVAL`` -- OpenSSH maps ``EINVAL`` and ``ENAMETOOLONG`` onto it, so the status that
+        looks like a bug in this library is how ``readlink`` says "that is not a link".
+        Measured, and in DESIGN 13.
+
+        Returns:
+            The link target exactly as the server sent it.
+
+        Raises:
+            ProtocolError: If the server answers with something other than a NAME, or with a
+                NAME carrying any number of names other than one. Same strictness as
+                :meth:`realpath` and for the same reason: ``send_names`` sends exactly one, so
+                a different count is a server we do not understand rather than a choice to make.
+            NoSuchFileError: If the path does not exist.
+            ServerError: If the path is not a symlink (``BAD_MESSAGE``), or for any other
+                refusal.
+        """
+        encoded = _encode_path(path)
+        reply = await self.request(ReadLink(self._next(), encoded))
+        if not isinstance(reply, Name):
+            raise _unexpected(reply, expected="NAME", path=encoded)
+        if len(reply.entries) != 1:
+            raise ProtocolError(
+                f"READLINK of {encoded!r} answered with {len(reply.entries)} names, "
+                f"and a link has exactly one target",
+                request_id=reply.request_id,
+            )
+        return reply.entries[0].filename
+
+    async def symlink(self, target: bytes | str, link_path: bytes | str) -> None:
+        """Create a symlink at ``link_path`` pointing at ``target``.
+
+        Argument order matches :func:`os.symlink` -- target first, then the name being created
+        -- which is **not** the order these fields take on the wire. OpenSSH sends
+        ``targetpath`` then ``linkpath`` where ``draft-ietf-secsh-filexfer-02`` specifies the
+        reverse, and the reference implementation is what binds: sending the draft order
+        against a real ``sftp-server`` returns ``FAILURE`` and creates nothing. That reversal
+        lives in :class:`~gantry_sftp.codec.SymLink`'s encoder, checked against a server, and
+        not here.
+
+        ``target`` is not resolved, checked, or required to exist. A dangling symlink is a
+        legal thing to create and some deployments create one deliberately.
+
+        Args:
+            target: What the link should point at.
+            link_path: The name to create.
+
+        Raises:
+            PermissionDeniedError: If the server will not create it.
+            ServerError: For any other refusal, including a name that is already taken.
+        """
+        encoded = _encode_path(link_path)
         await self._expect_status(
-            SetStat(self._next(), encoded, Attrs(permissions=mode & PERMISSION_BITS)),
+            SymLink(self._next(), targetpath=_encode_path(target), linkpath=encoded),
             path=encoded,
         )
 

@@ -69,10 +69,12 @@ from gantry_sftp.codec._extensions import (
     CHECK_FILE_NAME,
     FSYNC_NAME,
     LIMITS_NAME,
+    LSETSTAT_NAME,
     POSIX_RENAME_NAME,
     CheckFile,
     CheckFileReply,
     Fsync,
+    LSetStat,
     PosixRename,
 )
 from gantry_sftp.codec._framing import DEFAULT_MAX_FRAME_LENGTH, FrameSplitter
@@ -131,6 +133,7 @@ __all__ = [
     "EXTENSION_USERS_GROUPS_BY_ID",
     "FSYNC_NAME",
     "LIMITS_NAME",
+    "LSETSTAT_NAME",
     "MAX_FIELD_BYTES",
     "MAX_STATUS_CODE",
     "MAX_V3_TIMESTAMP",
@@ -157,6 +160,7 @@ __all__ = [
     "Fsync",
     "Handle",
     "Init",
+    "LSetStat",
     "LStat",
     "MkDir",
     "Name",
