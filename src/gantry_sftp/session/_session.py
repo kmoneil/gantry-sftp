@@ -3122,6 +3122,14 @@ async def open_session(
     one round trip -- not in ``request_timeout``, and not never. What buys that is the reader
     ignoring the same cancellation: see :meth:`~gantry_sftp.session.Dispatcher.run`.
 
+    **One round trip is what it costs against a peer that is still answering**, and cleanup is
+    shielded, so cancelling again does not hurry it. Against one that is not, the unwind costs
+    ``request_timeout`` instead -- the cleanup ``CLOSE`` waits that long for its answer, and if
+    the peer has stopped reading its socket the write itself waits that long for the send lock
+    and the pipe. ``request_timeout=None`` opts out of both, which makes teardown unbounded
+    there by construction: a shield is what makes the cleanup reliable, and nothing outside can
+    cancel through one. It is a legitimate thing to ask for and it is not the default.
+
     Args:
         transport: A connected transport. Its lifetime is the caller's; this only drives it.
         request_timeout: Seconds for the handshake, for each one-shot request, and for each

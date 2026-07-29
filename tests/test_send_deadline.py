@@ -87,25 +87,48 @@ class StallingServer:
 
     ``stall_on`` picks the packet type that wedges it, so a test can get a transfer genuinely
     under way before the pipe fills.
+
+    **The wedge latches, and that is the whole model** (D-81). Blocking only the call being
+    stalled makes the stall end when our send deadline cancels that call, so the *next* frame
+    is served normally -- a peer that resumes draining the moment we give up. No peer does
+    that, and the real-pipe rows at the bottom of this module do not: they ``SIGSTOP`` an
+    `sftp-server`, which stays stopped. A fake that recovers where the real one does not is a
+    fake confirming what its author believed, and here it cost a flake -- the second uploader's
+    ``OPEN`` slipped through the recovered server into a race between its own deadline and the
+    connection failure the first uploader had just recorded.
+
+    ``wedge=False`` restores the recovering behaviour for the one row that needs it, and that
+    row says why.
     """
 
-    def __init__(self, *, stall_on: type[Packet] | None = None, stall_after: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        stall_on: type[Packet] | None = None,
+        stall_after: int = 1,
+        wedge: bool = True,
+    ) -> None:
         self.stall_on = stall_on
         self.stall_after = stall_after
         self.seen = 0
         self.stalled = anyio.Event()
         self.sent: list[Packet] = []
+        self._wedge = wedge
+        self._wedged = False
         self._splitter = FrameSplitter()
         self._outbox = bytearray()
         self._has_output = anyio.Event()
 
     async def send(self, data: bytes | memoryview) -> None:
+        if self._wedged:
+            await anyio.sleep_forever()
         for frame in self._splitter.feed(data):
             packet = decode(frame)
             self.sent.append(packet)
             if self.stall_on is not None and isinstance(packet, self.stall_on):
                 self.seen += 1
                 if self.seen >= self.stall_after:
+                    self._wedged = self._wedge
                     self.stalled.set()
                     await anyio.sleep_forever()
             self._reply(packet)
@@ -239,10 +262,24 @@ async def test_a_second_sender_behind_the_held_lock_reports_rather_than_queueing
     **What the assertion below records, because it surprised the recon:** the second operation
     is stopped at its ``OPEN`` rather than at its ``WRITE``. Every transfer's first move is a
     one-shot request, and those are bounded by ``Session.request`` whether or not a write has a
-    deadline of its own -- so the second uploader never gets far enough to queue on the lock as
-    a *sender*. The case where the acquire deadline is the only bound is a transfer that
-    already holds its handle: a download issuing its next ``READ`` while an upload holds the
-    lock. Defence in depth, and cheap, but not the thing this test proves.
+    deadline of its own. The case where the acquire deadline is the only bound is a transfer
+    that already holds its handle -- a download issuing its next ``READ`` while an upload holds
+    the lock -- and it is
+    :func:`test_a_sender_parked_on_the_lock_is_bounded_from_when_it_started_waiting` below.
+
+    **Why the second uploader's message is deterministic, since this row flaked once (D-81).**
+    It reported the *first* uploader's exception instead of its own -- the same object, handed
+    to every exchange when a timed-out write finishes the connection. That was reproducible at
+    about 1 run in 30 with a probe, and the cause was the fake rather than the library: the
+    server used to serve the next frame normally once our deadline cancelled the send it was
+    stalling, so the second ``OPEN`` went out into the window between the first uploader's
+    ``_fail`` and its own deadline, and whichever of two sub-millisecond scheduling sequences
+    finished first decided the message. ``StallingServer`` now stays wedged, so the second
+    uploader is still inside its own ``OPEN`` when the deadlines fire, and *which* deadline
+    that is follows from entry order rather than from timing: ``Session.request`` enters its
+    scope before :meth:`Dispatcher._write` enters the send scope, both for ``request_timeout``
+    seconds, so the outer deadline is strictly the earlier one -- and anyio delivers a
+    cancellation to the outermost scope whose deadline has passed, on both backends.
     """
     source = tmp_path / "upload.bin"
     _ = source.write_bytes(os.urandom(100))
@@ -274,6 +311,60 @@ async def test_a_second_sender_behind_the_held_lock_reports_rather_than_queueing
     # quiet" one -- a queued sender that waited out the stall would have said that instead.
 
 
+async def test_a_sender_parked_on_the_lock_is_bounded_from_when_it_started_waiting():
+    """The case the row above names and cannot reach: the acquire deadline as the only bound.
+
+    A request that already holds its handle -- the ``READ`` a download issues after the first
+    one -- goes out through :meth:`Dispatcher.round_trip`, which has no deadline of its own on
+    purpose. So the send scope is the whole bound, and *where the scope starts* is the entire
+    question: inside covers the wait for the lock, outside starts counting only once the lock
+    is free.
+
+    Both spellings report, which is why the elapsed time is asserted and not just the message.
+    With the acquire inside, this reports one ``SEND_TIMEOUT`` after it began waiting. With the
+    acquire outside it would report one ``SEND_TIMEOUT`` after the *holder* gave up, which is
+    two of them from here -- so the threshold sits halfway between, a quarter of a second from
+    either, rather than being a number picked to pass.
+    """
+    server = StallingServer(stall_on=Write)
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    reported: list[str] = []
+    waited: list[float] = []
+
+    async def holder(dispatcher: Dispatcher) -> None:
+        # Total, because a child of a task group that raises turns every assertion below into
+        # an ExceptionGroup mismatch rather than a failure that names itself.
+        with anyio.move_on_after(WATCHDOG), pytest.raises(TransferTimeoutError):
+            _ = await dispatcher.round_trip(Write(codec.allocate_request_id(), HANDLE, 0, b"x"))
+
+    async def parked(dispatcher: Dispatcher) -> None:
+        began = anyio.current_time()
+        with anyio.move_on_after(WATCHDOG):
+            try:
+                _ = await dispatcher.round_trip(Read(codec.allocate_request_id(), HANDLE, 0, 32768))
+            except TransferTimeoutError as error:
+                reported.append(error.args[0])
+                waited.append(anyio.current_time() - began)
+
+    with anyio.fail_after(WATCHDOG):
+        async with (
+            running_dispatcher(server, codec, send_timeout=SEND_TIMEOUT) as dispatcher,  # type: ignore[arg-type]
+            anyio.create_task_group() as group,
+        ):
+            group.start_soon(holder, dispatcher)
+            await server.stalled.wait()
+            group.start_soon(parked, dispatcher)
+
+    # Its own message, naming its own frame -- 26 bytes for a READ with a one-byte handle, the
+    # same arithmetic the download row above pins. The holder's WRITE message would mean it had
+    # been handed the shared connection failure instead of reaching its own deadline.
+    assert reported == [
+        f"the connection did not accept 26 bytes of Read within {SEND_TIMEOUT}s; "
+        f"the peer has stopped reading and the stream can no longer be trusted"
+    ]
+    assert SEND_TIMEOUT <= waited[0] < SEND_TIMEOUT * 1.5
+
+
 async def test_a_timed_out_send_ends_the_connection_rather_than_the_operation(tmp_path: Path):
     """The load-bearing decision, and the reason it is not "fail this transfer and carry on".
 
@@ -303,8 +394,18 @@ async def test_no_send_timeout_means_no_bound_at_all(tmp_path: Path):
 
     Spelled as "still blocked when we stopped waiting" rather than as a hang, because a test
     that proves the absence of a timeout by hanging is a test that cannot fail.
+
+    **The one row that keeps a recovering server** (``wedge=False``), and the reason is the
+    claim itself. With no deadlines *and* a peer that stays wedged, the shielded ``CLOSE`` this
+    block's teardown sends takes :meth:`Dispatcher._write`'s no-deadline branch and blocks
+    forever -- and no cancel scope can end it, because the shield is what makes the cleanup
+    reliable in the first place. That is the honest consequence of ``request_timeout=None``,
+    it is now written down in :func:`~gantry_sftp.session.open_session`, and it cannot be
+    asserted here: a test proving it would have to hang to do so. This row's subject is the
+    absence of a bound on the *transfer*, which the recovering server proves without wedging
+    the suite.
     """
-    server = StallingServer(stall_on=Read, stall_after=2)
+    server = StallingServer(stall_on=Read, stall_after=2, wedge=False)
     with anyio.move_on_after(1.0) as scope:
         async with session(server, request_timeout=None, idle_timeout=None) as sftp:
             _ = await sftp.get(b"/remote/file.bin", tmp_path / "out.bin")

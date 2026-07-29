@@ -949,7 +949,11 @@ Two timeouts ship, and they bound different things:
   download over a slow link never trips it; sixty seconds with nothing arriving does.
 
 `None` for either means no bound at all. It is a legitimate thing to ask for, and it is never
-the default.
+the default. It covers *teardown* as well, which is the half worth knowing: cleanup after a
+cancelled transfer is shielded so that it survives the cancellation that triggered it, and a
+shield is not cancellable from outside — so with `request_timeout=None` and a peer that has
+stopped reading its socket, leaving the `async with` block waits forever on the cleanup
+`CLOSE`. `request_timeout` is the only thing that bounds it.
 
 **The write half was unbounded until 0.9, and "in practice it cannot block" is why** (D-40).
 A request is around thirty bytes and a pipe holds 64 KiB, so a sender could not fill it — while

@@ -16,6 +16,11 @@ so it still runs, and the reader is shielded too so there is still somebody to r
 replies that cleanup waits for. Without the second half the first one hangs: the shielded
 CLOSE waits out `request_timeout` for an answer nobody is left to route.
 
+`request_timeout` is also the *only* bound teardown has, because a shield is not cancellable
+from outside. Against a peer that has stopped reading its socket, `request_timeout=None` means
+leaving the block waits on that CLOSE forever — which is what asking for no bound at all asks
+for, and it is never the default.
+
 This run cancels from the progress callback instead of after a wall-clock deadline, so it
 lands mid-transfer every time rather than most of the time. It is the same cancellation.
 """
