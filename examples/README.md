@@ -62,7 +62,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `preserve_times.py`       | `preserve_times=` both directions, `UploadResult.times`, `entry.modified` — and why `longname` cannot carry a usable date |
 | `verify_content.py`       | `verify=Verify.HASH` / `Verify.REREAD`, `content_check`, `resume_check` — and a resume that passes the size check while publishing a corrupt file |
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
-| `concurrent_transfers.py` | many `get()`s over one session, measured overlap, and where an error lands once you fan out            |
+| `concurrent_transfers.py` | many `get()`s over one session, measured overlap, where an error lands once you fan out — and `get_tree(concurrency=)`, which is a bounded pool rather than the same thing with a loop, plus `resume=` over a finished tree |
 | `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |
 | `connect_errors.py`       | `AuthenticationError` / `HostKeyError` / `ConnectError`, and OpenSSH's stderr verbatim                 |
 | `password_auth.py`        | `password=`, the `SSH_ASKPASS` helper it writes, why `BatchMode` has to be relaxed, and the proof that the secret reaches neither argv nor the exception |

@@ -5,8 +5,10 @@
 
 One session, many transfers. SFTP correlates replies by request id, so a single channel can
 carry several operations at once; this library reads that channel in one task and hands each
-reply to whichever transfer asked for it. Concurrency is therefore the caller's to choose --
-an `anyio` task group -- rather than something the library decides for you.
+reply to whichever transfer asked for it. For individual files, concurrency is the caller's to
+choose -- an `anyio` task group -- rather than something the library decides for you. For a
+*tree*, `get_tree(concurrency=)` does it for you, and the last section here shows why that is
+a separate thing rather than the same thing with a loop around it.
 
 Two reasons to want it, and they are different:
 
@@ -133,6 +135,56 @@ async def run(sftp: Session, remotes: list[str], workdir: Path) -> None:
     await show_how_a_failure_arrives(sftp, remotes[0], workdir)
 
 
+async def show_tree_concurrency(sftp: Session, source: str, workdir: Path) -> None:
+    """The same idea for a whole tree, where the fan-out is not yours to write.
+
+    A task group over `get` is right for a list of files you already have. A tree is different
+    in one way that matters: **you do not have the list**, the server does, and its size is the
+    server's choice. `group.start_soon(...)` inside the walk creates a task per entry, so a peer
+    answering with a million names creates a million tasks -- which is why `concurrency=` feeds a
+    bounded worker pool from the walk instead, and the walk blocks while every worker is busy.
+
+    Two things it refuses, both on purpose:
+
+    * `progress=` above `concurrency=1`. The callback carries no file identity, so several
+      workers reporting at once is several counters interleaved into one stream.
+    * Resuming an upload atomically. Each file stages under a name generated fresh per call,
+      so a previous run's partial cannot be found again.
+    """
+    sequential_into = workdir / "tree-sequential"
+    concurrent_into = workdir / "tree-concurrent"
+
+    started = time.perf_counter()
+    one = await sftp.get_tree(source, sequential_into)
+    sequential_seconds = time.perf_counter() - started
+
+    started = time.perf_counter()
+    many = await sftp.get_tree(source, concurrent_into, concurrency=8)
+    concurrent_seconds = time.perf_counter() - started
+
+    print(f"\n{one.files} files as a tree")
+    print(f"  concurrency=1: {sequential_seconds:.3f}s")
+    print(f"  concurrency=8: {concurrent_seconds:.3f}s")
+    assert (many.files, many.transferred) == (one.files, one.transferred), (
+        "the concurrent tree moved a different number of bytes, which is the lost-update bug "
+        "`transferred += await ...` produces once workers finish inside one another's awaits"
+    )
+    print(f"  same {many.files} files, same {many.transferred} bytes")
+
+    # Resume: everything is already there, so the second pass moves nothing at all. This is the
+    # nine-gigabyte mirror interrupted at 95%, which used to re-transfer all of it.
+    again = await sftp.get_tree(source, concurrent_into, resume=True, concurrency=8)
+    print(f"  resumed over the finished copy: {again.files} files, {again.transferred} bytes moved")
+    assert again.transferred == 0, "a complete tree re-transferred its own bytes"
+
+    try:
+        _ = await sftp.get_tree(
+            source, workdir / "nope", progress=lambda _t, _n: None, concurrency=4
+        )
+    except ValueError as error:
+        print(f"\n  progress= with concurrency>1 is refused:\n    {error}")
+
+
 async def main() -> None:
     destination = sys.argv[1] if len(sys.argv) > 1 else None
     remote_dir = sys.argv[2] if len(sys.argv) > 2 else None
@@ -153,6 +205,7 @@ async def main() -> None:
                 open_session(transport) as sftp,
             ):
                 await run(sftp, remotes, workdir)
+                await show_tree_concurrency(sftp, str(source_dir), workdir)
         else:
             if remote_dir is None:
                 sys.exit("usage: python examples/concurrent_transfers.py user@host /remote/dir")

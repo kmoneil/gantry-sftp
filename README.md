@@ -58,7 +58,10 @@ exists today:
   name folding, so it covers Unicode normalisation and Windows trailing dots for free
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
-- **resume**, both directions, opt-in and labelled with what it actually proves
+- **resume**, both directions, opt-in and labelled with what it actually proves — on single
+  files and, as of 0.10, on whole trees
+- **trees transfer concurrently on request**: `get_tree(concurrency=8)` feeds a bounded worker
+  pool from the walk, so the peak task count is the worker count rather than the tree's size
 - **reconnect and retry**: `with_reconnect()` runs an operation against a fresh session when
   the link drops, with a classification that refuses to retry a failed authentication
 - **server identification**: the session names which SFTP implementation it is talking to,
@@ -183,10 +186,46 @@ Three things worth knowing before you fan out:
 - **One operation is one consumer.** Two tasks may each run a `get`; two tasks driving *the
   same* `get` is not a thing.
 
-`get_tree()` and `put_tree()` still transfer sequentially inside themselves — a walk that
-runs ahead of its transfers needs bounded back-pressure, and a per-file progress callback
-means little when several files report at once. Both are follow-on work; fan out over `get`
-and `put` in the meantime.
+`get_tree()` and `put_tree()` take `concurrency=` as of 0.10, defaulting to `1`:
+
+```python
+result = await sftp.get_tree("/incoming", "downloads/", concurrency=8)
+```
+
+The walk feeds a **bounded** worker pool, not a task per file. That matters because a tree's
+size is the server's choice: `start_soon` inside the walk would let a peer answering with a
+million entries create a million pending tasks. The producer blocks while every worker is
+busy, so peak memory is the worker count and not the tree.
+
+Two things it will not do, both deliberate:
+
+- **`progress=` is refused above `concurrency=1`** rather than passed through. The callback is
+  `(transferred, total)` and carries no file identity, so several workers reporting at once is
+  several counters interleaved into one stream — a bar built on it jumps backwards. Use
+  `concurrency=1` to keep per-file progress, or read the counts off the returned `TreeResult`.
+- **It does not lift the 2 MiB ceiling.** One session is one channel is one window, so
+  concurrency *reaches* the ceiling on a tree of small files rather than exceeding it. Above
+  `1` the transfer order is not the walk's, so a failure part-way leaves an unpredictable
+  subset transferred.
+
+## Resuming a tree
+
+```python
+result = await sftp.get_tree("/incoming", "downloads/", resume=True)
+```
+
+The nine-gigabyte mirror interrupted at 95%. `resume=` forwards to `get` / `put` per file, so
+it inherits their guarantees exactly: an already-complete file costs one `STAT` and moves
+nothing, a partial one continues from where it stopped, and a local partial *longer* than the
+remote file is refused rather than truncated. It composes with `concurrency=`.
+
+**Uploading a tree with `resume=True` requires `publish=Publish(atomic=False)`**, and raises
+otherwise. Each file stages under a name generated fresh per call, so a previous run's partial
+cannot be found again — and a `staging_name` cannot be fixed for a whole tree. Deriving one per
+file from the target would make it predictable for every file at once, which is exactly what
+the generated name exists to prevent, so the combination is refused rather than quietly
+downgraded. Resuming an upload therefore means resuming the destination files themselves, and a
+consumer polling the directory can see a partial file while it happens.
 
 ## Listing
 

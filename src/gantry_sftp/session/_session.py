@@ -38,7 +38,7 @@ import os
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 from typing import override
@@ -118,6 +118,7 @@ from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
 from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._platform import NO_FOLLOW, require_local_io
+from gantry_sftp.session._pool import for_each_bounded
 from gantry_sftp.session._publish import (
     Durability,
     Publish,
@@ -1964,6 +1965,8 @@ class Session:
         max_depth: int | None = None,
         progress: ProgressCallback | None = None,
         preserve_times: bool = False,
+        resume: bool = False,
+        concurrency: int = 1,
     ) -> TreeResult:
         """Download a remote tree into ``local_path``, refusing to escape it.
 
@@ -1973,12 +1976,11 @@ class Session:
         :class:`~gantry_sftp.exceptions.UnsafePathError` and nothing is written -- this is the
         zip-slip class, and it is a real and exploited pattern in file-transfer clients.
 
-        Transfers are sequential **here**, which is no longer a property of the session. The
-        session multiplexes, so a caller who wants files to overlap can fan out over
-        :meth:`get` with a task group today. What this method does not yet have is a
-        ``concurrency`` parameter of its own, because a walk that runs ahead of its transfers
-        needs bounded back-pressure, and a progress callback reporting per file means little
-        when several files report at once. Registered rather than implied.
+        **Transfers are sequential by default and overlap on request** (``concurrency=``, new
+        in 0.10). The walk feeds a bounded pool rather than starting a task per file: a tree's
+        size is the server's choice, so a task per entry is unbounded allocation driven by the
+        peer. The producer blocks while every worker is busy, so peak memory is the worker
+        count and not the tree.
 
         Args:
             remote_path: Remote directory to copy.
@@ -1986,6 +1988,11 @@ class Session:
             max_depth: Levels below the root to descend, or ``None`` for no limit.
             progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
                 each one. A tree-wide total would need the whole walk up front.
+
+                **Refused with ``concurrency`` above 1**, rather than passed through: the
+                signature carries no file identity, so several workers reporting at once is one
+                stream of counters that reset unpredictably and a bar built on it jumps
+                backwards. Silently passing it would be a wrong answer with no symptom.
             preserve_times: Carry each file's remote timestamps onto its local copy, and each
                 created directory's onto the local directory. Off by default -- see
                 :meth:`put` for the argument. Costs no round trip either way: a file's times
@@ -1995,6 +2002,25 @@ class Session:
                 **The destination directory you named is not stamped**, only directories this
                 call creates inside it. Restamping a directory the caller already had would be
                 a side effect on something they did not ask to have modified.
+            resume: Continue an interrupted tree instead of re-transferring it. Forwarded to
+                :meth:`get` per file, so it inherits that method's guarantees exactly: an
+                already-complete file costs one ``STAT`` and moves nothing, a partial one
+                continues from its local length, and a local partial *longer* than the remote
+                file is refused rather than truncated. The nine-gigabyte mirror interrupted at
+                95% is the case this exists for.
+
+                Off by default for the same reason it is on :meth:`get`: adopting bytes
+                already on disk is a decision about whether those bytes came from this remote
+                file, and only the caller knows whether the destination is theirs.
+            concurrency: Files transferred at once. ``1`` -- the default -- keeps the exact
+                sequential path this method has always had. Above 1 the walk feeds a bounded
+                worker pool.
+
+                What it buys is round trips, not bandwidth: a session is one channel with one
+                2 MiB window (§5.1), so concurrency **reaches** the ceiling on a tree of small
+                files rather than lifting it. It cannot be combined with ``progress`` -- see
+                that argument -- and above 1 the order files are transferred in is not the
+                walk's, so a failure part-way leaves an unpredictable subset transferred.
 
         Returns:
             Counts, bytes, and every entry that was skipped with the reason it was.
@@ -2011,66 +2037,105 @@ class Session:
             TransferError: If a transfer fails partway.
         """
         require_local_io("get_tree()")
+        _check_tree_concurrency(concurrency, progress=progress, caller="get_tree")
         destination = _ensure_directory(Path(local_path), parents=True)
-        ledger = DestinationLedger()
-        files = directories = transferred = 0
-        skipped: list[Skipped] = []
-        collisions: list[PathCollision] = []
-        # Collected during the walk and applied after it -- see _stamp_local_directories.
-        # A directory's times come from its *parent's* listing, which READDIR already
-        # returned, so this costs no round trip.
-        directory_times: list[tuple[Path, Times]] = []
+        state = _DownloadState()
 
         with operation(
             session_logger, "get_tree", remote=_encode_path(remote_path), local=destination
         ) as record:
-            # aclosing, because the common exit from this loop is an exception -- a refused
-            # name, a failed transfer -- and a suspended async generator that is merely dropped
-            # is left to the garbage collector, which trio will not finalise for it.
-            async with aclosing(self.walk(remote_path, max_depth=max_depth)) as walker:
-                async for entry in walker:
-                    local_directory = _local_directory(destination, entry.relative)
-                    if entry.relative:
-                        _ = _ensure_directory(local_directory)
-                        directories += 1
-                        collisions.extend(_claim_directory(ledger, local_directory, entry))
-                    if preserve_times:
-                        directory_times.extend(
-                            (local_child(local_directory, child.filename), child.attrs.times)
-                            for child in entry.directories
-                            if child.attrs.times is not None
-                        )
-                    skipped.extend(entry.skipped)
-                    for child in entry.files:
-                        moved, collision = await self._get_child(
-                            destination=destination,
-                            local_directory=local_directory,
-                            entry=entry,
-                            child=child,
-                            ledger=ledger,
-                            progress=progress,
-                            preserve_times=preserve_times,
-                        )
-                        if collision is not None:
-                            collisions.append(collision)
-                            skipped.append(
-                                Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION)
-                            )
-                            continue
-                        transferred += moved
-                        files += 1
 
-            _stamp_local_directories(directory_times)
-            result = TreeResult(files, directories, transferred, tuple(skipped))
+            async def transfer(item: _TreeDownload) -> None:
+                # Appended rather than `state.transferred += ...`: augmented assignment loads
+                # the target before evaluating the right-hand side, so with `concurrency > 1`
+                # every worker finishing inside another's await adds to a value it read before
+                # the others finished. The lost update understates the byte count, and it is
+                # the same trap `download_many_concurrently` documents in `benchmarks/`.
+                state.moved.append(
+                    await self.get(
+                        item.remote,
+                        item.target,
+                        progress=progress,
+                        no_follow=True,
+                        resume=resume,
+                        preserve_times=preserve_times,
+                    )
+                )
+
+            await for_each_bounded(
+                self._walk_for_download(
+                    remote_path,
+                    destination=destination,
+                    max_depth=max_depth,
+                    preserve_times=preserve_times,
+                    state=state,
+                ),
+                transfer,
+                concurrency=concurrency,
+            )
+
+            _stamp_local_directories(state.directory_times)
+            result = TreeResult(
+                len(state.moved), state.directories, sum(state.moved), tuple(state.skipped)
+            )
             record["files"] = result.files
             record["directories"] = result.directories
             record["bytes"] = result.transferred
             record["skipped"] = len(result.skipped)
-            if collisions:
-                raise _collision_error(collisions, destination, result)
+            if state.collisions:
+                raise _collision_error(state.collisions, destination, result)
             return result
 
-    async def _get_child(
+    async def _walk_for_download(
+        self,
+        remote_path: bytes | str,
+        *,
+        destination: Path,
+        max_depth: int | None,
+        preserve_times: bool,
+        state: _DownloadState,
+    ) -> AsyncGenerator[_TreeDownload]:
+        """Walk the remote tree and hand out one settled file at a time.
+
+        **Everything that touches the ledger happens here**, in one task and in walk order,
+        before any transfer is queued -- which is what makes the collision check safe under
+        concurrency. See :meth:`_claim_download` for why that matters and what it used to be
+        resting on.
+
+        Extracted from :meth:`get_tree` rather than nested inside it because the two together
+        sit over the cognitive-complexity ceiling, and the split falls on a real seam: this
+        decides *what* to transfer, the caller decides *how many at once*.
+
+        ``aclosing`` on the walk, because the common exit is an exception -- a refused name, a
+        failed worker -- and a suspended async generator that is merely dropped is left to the
+        garbage collector, which trio will not finalise for it.
+        """
+        async with aclosing(self.walk(remote_path, max_depth=max_depth)) as walker:
+            async for entry in walker:
+                local_directory = _local_directory(destination, entry.relative)
+                _settle_directory(
+                    entry,
+                    local_directory=local_directory,
+                    preserve_times=preserve_times,
+                    state=state,
+                )
+                for child in entry.files:
+                    item, collision = self._claim_download(
+                        destination=destination,
+                        local_directory=local_directory,
+                        entry=entry,
+                        child=child,
+                        ledger=state.ledger,
+                    )
+                    if collision is not None:
+                        state.collisions.append(collision)
+                        state.skipped.append(
+                            Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION)
+                        )
+                    elif item is not None:
+                        yield item
+
+    def _claim_download(
         self,
         *,
         destination: Path,
@@ -2078,25 +2143,37 @@ class Session:
         entry: WalkEntry,
         child: DirEntry,
         ledger: DestinationLedger,
-        progress: ProgressCallback | None,
-        preserve_times: bool = False,
-    ) -> tuple[int, PathCollision | None]:
-        """Transfer one walked file, or report the collision that stopped it.
+    ) -> tuple[_TreeDownload | None, PathCollision | None]:
+        """Settle one walked file's destination, or report the collision that refuses it.
 
-        The ledger is consulted **before** the transfer and updated after it. Before, because
-        the point is to not open the earlier file with ``O_TRUNC``; after, because the
-        filesystem has no opinion about a file's identity until it exists.
+        Synchronous and called only from the producer, which is what makes the ledger safe
+        under concurrency: every check and every claim happens in one task, in walk order,
+        before any transfer is queued.
+
+        **The destination file is created here, empty, before the check** -- and that is what
+        makes the check mean anything. A collision is two remote names that the *filesystem*
+        resolves to one file, which it can only be asked about once an inode exists; until
+        0.10 the check ran before the transfer that created it, so it detected a collision
+        only because the *previous* file's transfer had already finished. With workers running
+        concurrently that stopped being true, and two colliding names would both have opened
+        the same file with ``O_TRUNC``, the second destroying the first while ``get_tree``
+        reported success. Creating it here restores the sequential guarantee exactly.
+
+        ``O_CREAT`` without ``O_TRUNC``: an existing file keeps its bytes, so a ``resume=True``
+        tree still finds the partial it left last run. ``O_NOFOLLOW`` because the containment
+        check above resolves symlinks and this must not undo it.
+
+        Returns:
+            ``(item, None)`` to transfer, or ``(None, collision)`` to refuse. Never both.
         """
         target = check_contained(destination, local_child(local_directory, child.filename))
         remote = join_remote(entry.path, child.filename)
+        _touch_destination(target)
         first = ledger.collides_with(target)
         if first is not None:
-            return 0, PathCollision(str(target), remote, first)
-        moved = await self.get(
-            remote, target, progress=progress, no_follow=True, preserve_times=preserve_times
-        )
+            return None, PathCollision(str(target), remote, first)
         ledger.claim(target, remote)
-        return moved, None
+        return _TreeDownload(remote, target), None
 
     async def put(
         self,
@@ -2881,6 +2958,8 @@ class Session:
         publish: Publish | None = None,
         preserve_times: bool = False,
         progress: ProgressCallback | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
         **legacy: bool | bytes | str | None,
     ) -> TreeResult:
         """Upload a local tree into ``remote_path``, creating directories as it goes.
@@ -2903,8 +2982,8 @@ class Session:
         when a level is actually absent, because v3 answers a failed ``MKDIR`` with the
         catch-all ``FAILURE`` and "it is already there" has to be distinguished by looking.
 
-        Transfers are sequential here, for the same reason :meth:`get_tree`'s are -- and with
-        the same escape, a task group over :meth:`put`.
+        Transfers are sequential by default and overlap on request (``concurrency=``), through
+        the same bounded pool :meth:`get_tree` uses and with the same back-pressure.
 
         Args:
             local_path: Local directory to copy. Followed if it is itself a symlink, because
@@ -2923,7 +3002,26 @@ class Session:
                 **The root you named is not stamped**, only directories this call creates
                 under it, matching :meth:`get_tree`.
             progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
-                each one. A tree-wide total would need the whole walk up front.
+                each one. A tree-wide total would need the whole walk up front. **Refused with
+                ``concurrency`` above 1** -- see :meth:`get_tree` for why.
+            resume: Continue an interrupted tree instead of re-uploading it. Forwarded to
+                :meth:`put` per file, so it inherits that method's gate: the adopted prefix is
+                checked against a verification rung wherever one is available, because a remote
+                partial of the right length from the wrong source is the failure resume exists
+                to avoid.
+
+                **Requires ``publish=Publish(atomic=False)``** and raises :exc:`ValueError`
+                otherwise. Each file stages under a name generated fresh per call, so last
+                run's partial cannot be found again -- and a ``staging_name`` cannot be fixed
+                for a whole tree. Deriving one per file from the target would make it
+                predictable for every file at once, which is what
+                :func:`~gantry_sftp.session.staging_token` exists to prevent, so the
+                combination is refused rather than silently downgraded. Resuming therefore
+                means resuming the destination files themselves, and a consumer polling the
+                directory can see a partial file while it happens.
+            concurrency: Files uploaded at once. ``1`` -- the default -- keeps the exact
+                sequential path this method has always had. See :meth:`get_tree` for what
+                concurrency buys, what it cannot lift, and what it costs in ordering.
             **legacy: The publish arguments under their pre-:class:`Publish` names, as
                 :meth:`put` accepts them and for the same reason.
 
@@ -2935,7 +3033,9 @@ class Session:
                 Windows. Raised before the walk starts; see :mod:`._platform`.
             UnsafePathError: If a local name could not be a remote path component.
             ValueError: If ``publish`` carries a ``staging_name``, which one tree's many files
-                cannot share.
+                cannot share; if ``resume`` is asked for with atomic publishing, which has
+                nothing findable to resume into; or if ``concurrency`` is below 1 or is above 1
+                with a ``progress`` callback.
             OSError: If a local directory or file cannot be read.
             CapabilityError: If a required guarantee is not available on this server, or if
                 ``remote_path`` is relative and this server's default directory is not rooted
@@ -2944,8 +3044,27 @@ class Session:
             TransferError: If a transfer fails partway.
         """
         require_local_io("put_tree()")
+        _check_tree_concurrency(concurrency, progress=progress, caller="put_tree")
         root = _encode_path(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put_tree")
+        if resume and policy.atomic:
+            # The decision D-54 had to make, and it is `put`'s rule reaching a tree rather
+            # than a new one. `put(resume=True, atomic=True)` needs an explicit staging_name,
+            # because the generated one carries fresh randomness per call and last run's
+            # partial cannot be found again -- and `put_tree` cannot take a staging_name at
+            # all, since one name cannot serve a tree's many files. Deriving one per file from
+            # the target was rejected rather than overlooked: a predictable staging name is
+            # exactly what `staging_token` exists to avoid, and here it would be predictable
+            # for every file in the tree at once, so two mirrors resuming into one destination
+            # would interleave file by file. So tree resume means resuming the destination
+            # itself, which is `atomic=False`, and the caller is told rather than downgraded.
+            raise ValueError(
+                "put_tree() cannot resume with atomic publishing: each file stages under a "
+                "name generated fresh per call, so a previous run's partial cannot be found, "
+                "and a staging_name cannot be fixed for a whole tree. Pass "
+                "publish=Publish(atomic=False) to resume the destination files themselves, "
+                "or drop resume=True to re-upload the tree atomically"
+            )
         if policy.staging_name is not None:
             # Caught here rather than at the first file, because the failure is in the request
             # and not in any one transfer: every file in the tree would stage under the same
@@ -2958,7 +3077,8 @@ class Session:
             )
         await self._require_rooted_paths(root, feature="uploading a tree")
         await self._mkdir_parents(root)
-        files = directories = transferred = 0
+        directories = 0
+        moved: list[int] = []
         skipped: list[Skipped] = []
 
         # Collected during the walk and applied after it -- see _set_directory_times. Local
@@ -2966,31 +3086,52 @@ class Session:
         directory_times: list[tuple[bytes, Times]] = []
 
         with operation(session_logger, "put_tree", local=local_path, remote=root) as record:
-            for entry in walk_local(Path(local_path), max_depth=max_depth):
-                remote_directory = _remote_directory(root, entry.relative)
-                if entry.relative:
-                    await self.mkdir(remote_directory, exist_ok=True)
-                    directories += 1
-                    if preserve_times:
-                        directory_times.append((remote_directory, _local_times(entry.path)))
-                skipped.extend(entry.skipped)
-                for name in entry.files:
-                    result = await self.put(
-                        entry.path / os.fsdecode(name),
-                        join_remote(remote_directory, remote_component(name)),
-                        publish=policy,
-                        preserve_times=preserve_times,
-                        progress=progress,
-                    )
-                    transferred += result.transferred
-                    files += 1
+
+            async def produce() -> AsyncGenerator[_TreeUpload]:
+                """Create each directory, then hand out its files one at a time.
+
+                The ``mkdir`` is awaited **here**, in the producer, before any of that
+                directory's files are queued -- so a worker never writes into a directory that
+                does not exist yet. `walk_local` is top-down, which is what makes that
+                sufficient rather than merely usual.
+                """
+                nonlocal directories
+                for entry in walk_local(Path(local_path), max_depth=max_depth):
+                    remote_directory = _remote_directory(root, entry.relative)
+                    if entry.relative:
+                        await self.mkdir(remote_directory, exist_ok=True)
+                        directories += 1
+                        if preserve_times:
+                            directory_times.append((remote_directory, _local_times(entry.path)))
+                    skipped.extend(entry.skipped)
+                    for name in entry.files:
+                        yield _TreeUpload(
+                            entry.path / os.fsdecode(name),
+                            join_remote(remote_directory, remote_component(name)),
+                        )
+
+            async def transfer(item: _TreeUpload) -> None:
+                result = await self.put(
+                    item.source,
+                    item.remote,
+                    publish=policy,
+                    preserve_times=preserve_times,
+                    progress=progress,
+                    resume=resume,
+                )
+                # Appended rather than `transferred += ...`: see `get_tree` for the lost
+                # update augmented assignment produces once several workers finish inside one
+                # another's awaits.
+                moved.append(result.transferred)
+
+            await for_each_bounded(produce(), transfer, concurrency=concurrency)
 
             await self._set_directory_times(directory_times)
-            record["files"] = files
+            record["files"] = len(moved)
             record["directories"] = directories
-            record["bytes"] = transferred
+            record["bytes"] = sum(moved)
             record["skipped"] = len(skipped)
-            return TreeResult(files, directories, transferred, tuple(skipped))
+            return TreeResult(len(moved), directories, sum(moved), tuple(skipped))
 
     async def _mkdir_parents(self, path: bytes) -> None:
         """Create ``path`` and any missing ancestors, cheaply in the common case.
@@ -3338,6 +3479,117 @@ def _strip_dot_prefix(path: bytes) -> bytes:
     if path == b".":
         return b""
     return path[2:] if path.startswith(b"./") else path
+
+
+@dataclass(slots=True)
+class _DownloadState:
+    """What a tree download accumulates while its producer walks and its workers transfer.
+
+    A mutable object rather than a pile of ``nonlocal`` bindings, so the producer can be a
+    method instead of a closure -- which is what keeps :meth:`Session.get_tree` under the
+    cognitive-complexity ceiling without an exemption.
+
+    Everything here except ``moved`` is written **only by the producer**, which runs in one
+    task; ``moved`` is appended to by the workers, and appending is the point -- see
+    :meth:`Session.get_tree`.
+    """
+
+    ledger: DestinationLedger = field(default_factory=DestinationLedger)
+    directories: int = 0
+    moved: list[int] = field(default_factory=list)
+    skipped: list[Skipped] = field(default_factory=list)
+    collisions: list[PathCollision] = field(default_factory=list)
+    # Collected during the walk and applied after it -- see _stamp_local_directories. A
+    # directory's times come from its *parent's* listing, which READDIR already returned, so
+    # this costs no round trip.
+    directory_times: list[tuple[Path, Times]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _TreeDownload:
+    """One file a tree download has settled a destination for, waiting to be transferred."""
+
+    remote: bytes
+    target: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _TreeUpload:
+    """One file a tree upload has settled a destination for, waiting to be transferred."""
+
+    source: Path
+    remote: bytes
+
+
+def _settle_directory(
+    entry: WalkEntry,
+    *,
+    local_directory: Path,
+    preserve_times: bool,
+    state: _DownloadState,
+) -> None:
+    """Create one walked directory locally and record what it contributes to the report.
+
+    The root is deliberately not counted or stamped: the caller named it, so creating it is
+    :meth:`Session.get_tree`'s own ``_ensure_directory`` and restamping it would be a side
+    effect on something they did not ask to have modified.
+    """
+    if entry.relative:
+        _ = _ensure_directory(local_directory)
+        state.directories += 1
+        state.collisions.extend(_claim_directory(state.ledger, local_directory, entry))
+    if preserve_times:
+        state.directory_times.extend(
+            (local_child(local_directory, child.filename), child.attrs.times)
+            for child in entry.directories
+            if child.attrs.times is not None
+        )
+    state.skipped.extend(entry.skipped)
+
+
+def _touch_destination(target: Path) -> None:
+    """Create ``target`` empty if it is not there, without truncating it if it is.
+
+    See :meth:`Session._claim_download` for why this runs before the collision check rather
+    than being left to the transfer's own ``open``.
+    """
+    os.close(os.open(target, os.O_CREAT | os.O_WRONLY | NO_FOLLOW, 0o600))
+
+
+def _check_tree_concurrency(
+    concurrency: int, *, progress: ProgressCallback | None, caller: str
+) -> None:
+    """Refuse a concurrency argument that cannot mean what the caller wants.
+
+    ``progress`` is the interesting half. :class:`~gantry_sftp.session.ProgressCallback` is
+    ``(transferred, total)`` and carries **no file identity** -- deliberately, so one reporter
+    works everywhere -- and a tree calls it per file, so ``total`` resets at each one. With a
+    single worker that is a sequence a reporter can follow. With several it is several files'
+    counters interleaved into one stream with nothing to tell them apart, and a progress bar
+    built on it would jump backwards at random. Passing it through anyway would be a silent
+    wrong answer, which this library refuses everywhere else, so it is refused here and the
+    message names both fixes.
+
+    Tree-wide progress, or a second callback shape carrying identity, is a real feature and a
+    real decision (D-55) -- it is not made here by accident.
+
+    Raises:
+        ValueError: If ``concurrency`` is below 1, or if it is above 1 with a ``progress``
+            callback that could not be interpreted.
+    """
+    if concurrency < 1:
+        raise ValueError(
+            f"{caller}() concurrency must be at least 1, got {concurrency}; "
+            f"1 transfers the tree one file at a time"
+        )
+    if concurrency > 1 and progress is not None:
+        raise ValueError(
+            f"{caller}() cannot take progress= with concurrency={concurrency}: the callback is "
+            f"(transferred, total) per file and carries no file identity, so several workers "
+            f"reporting at once produce one stream of counters that reset unpredictably. Use "
+            f"concurrency=1 to keep per-file progress, or drop progress= to keep the "
+            f"concurrency and read the counts from the returned TreeResult"
+        )
 
 
 def _unexpected(reply: Response, *, expected: str, path: bytes | None = None) -> SFTPError:
