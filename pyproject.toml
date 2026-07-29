@@ -147,6 +147,13 @@ ban-relative-imports = "parents"
 # Tests, examples, live-tests and benchmarks are exempt from docstring and
 # annotation gates, and from bandit's assert/subprocess rules. They are NOT
 # exempt from correctness lints.
+# `scripts/` is developer tooling rather than shipped code, and the lane runner inverts
+# T20: printing the table *is* what it does, so "no print" would be a rule against the
+# program. S603 goes with it -- it spawns the lane's tool by resolved absolute path with a
+# list argv and no shell, which is the checked-for property rather than the flagged one.
+# Docstrings and annotations are NOT exempt here, unlike tests/: scripts/ is small enough
+# that there is no reason for it to be the one unannotated corner.
+"scripts/**" = ["T20", "S603"]
 "tests/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
 "live-tests/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
 "benchmarks/**" = ["D", "ANN", "S101", "S603", "S607", "PLR2004", "T20"]
@@ -282,7 +289,13 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # `pyproject.toml` in it and no `LICENSE`, so the licence assertions fail against a
 # directory that was never meant to be a distribution. It also mutates nothing: it builds
 # a wheel from the real source tree and cannot kill a codec mutant.
+# `tests/test_lanes.py` is the third with the same root cause and the same shape: it loads
+# `scripts/lanes.py` by path from the repository root, and `mutants/` has no `scripts/`
+# because mutmut copies `source_paths` and nothing else. Collection dies on the missing
+# file. Same remedy, and the same reason not to reach for `also_copy`: the module imports
+# no `gantry_sftp`, so copying it in would add wall-clock and kill no mutant.
 pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
+    "--ignore=tests/test_lanes.py",
 ]

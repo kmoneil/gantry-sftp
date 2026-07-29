@@ -8,10 +8,12 @@ its server and its benchmark is an anecdote.
 
 ```bash
 uv sync --group bench                        # paramiko and asyncssh
-.venv/bin/pytest benchmarks/ -s              # about ten minutes
+python scripts/lanes.py benchmarks           # about ten minutes
 ```
 
-`-s` because the report is printed as well as written. The written copy lands in
+That lane is `pytest benchmarks/ -s`, and `scripts/lanes.py` is where it is spelled out — one
+place, so what CI runs and what you run cannot drift apart. `-s` because the report is printed
+as well as written. The written copy lands in
 `_reports/benchmarks.md`, which is gitignored: a generated table is evidence for a claim, not a
 source file.
 

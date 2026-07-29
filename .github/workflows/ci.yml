@@ -1,0 +1,179 @@
+# Continuous integration for gantry-sftp.
+#
+# THIS FILE HAS NEVER RUN. There is no git remote -- Repo Rules forbid one for now -- so
+# GitHub has never seen this repository and nothing here has ever been executed. It is
+# committed anyway for two reasons. Every lane DESIGN.md 10 calls load-bearing runs today
+# only when a human types the command, on one aarch64 Linux box; writing down which lane runs
+# where, on which platforms, and what it needs is most of the work, and it is work that does
+# not need a remote. And the Windows job is the entire stated closure condition of the card
+# about `ssh.exe` resolution, which cannot close while nothing creates the CI.
+#
+# Every lane below is invoked through `scripts/lanes.py`, never by spelling out a pytest
+# command here. Two spellings of "how this project runs its tests" is how the netem lane ends
+# up with one set of flags locally and another in CI, and `tests/test_lanes.py` asserts that
+# every lane the runner knows about is named in this file.
+#
+# Third-party actions are pinned to a commit SHA with the tag in a trailing comment. A
+# floating tag is a mutable reference to somebody else's code with a token in scope; this
+# project spawns `ssh` and handles credentials, so it does not get to be relaxed about that.
+# Re-pin deliberately, reading the diff, rather than by moving the tag.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, for the lanes that are too slow to run per-change. Nothing here fails on a
+    # schedule today, which was the defect this file exists to fix.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Static gates: ruff, mypy --strict, ty, complexipy, the uv.lock check, the exec bit.
+  #
+  # Linux only, and that is a property of `.pre-commit-config.yaml` rather than a shortcut:
+  # its local hooks invoke `.venv/bin/ruff` and friends by path, and Windows puts them in
+  # `.venv\Scripts`. Running them anywhere else would need a second spelling of the gate
+  # list, which is the thing this file is trying not to have. Nothing these tools check is
+  # platform-dependent -- `src` has no `sys.platform` branch that narrows a type.
+  # ---------------------------------------------------------------------------
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py gates
+
+  # ---------------------------------------------------------------------------
+  # The fast lane on all three platforms. This is the job that pays: `resolve_ssh_executable`
+  # implements a SysNative-before-System32 probe for Windows OpenSSH that has never executed
+  # on Windows, and `tests/test_argv.py` covers it only with injected inputs.
+  #
+  # Windows does not gate, and the reason is not caution. `os.pread` and `os.pwrite` are
+  # documented Unix-only, and the data path calls both -- `session/_download.py` places every
+  # payload with `os.pwrite` and `session/_upload.py` reads with `os.pread`. So the transfer
+  # rows cannot pass on Windows until that has a fallback, and a job that is known to fail
+  # for a known reason should report rather than block. It stays in the matrix because what
+  # we want from it is the list of what else breaks, which no amount of reading will produce.
+  # ---------------------------------------------------------------------------
+  fast:
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py fast
+
+  # ---------------------------------------------------------------------------
+  # A real sshd on localhost. Linux only for now: the harness probes for its binaries and
+  # validates its sshd config with `sshd -t` rather than assuming either, so it may well run
+  # on macOS -- but "may well" is not a lane, and adding a runner is cheap once there is a
+  # remote to run it on.
+  # ---------------------------------------------------------------------------
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py live
+
+  # ---------------------------------------------------------------------------
+  # The server matrix: the same client against OpenSSH, asyncssh and paramiko. It needs the
+  # `bench` group, which is deliberately not installed by default -- paramiko and asyncssh
+  # drag in `cryptography`, and a default install that pulled it in would make the
+  # no-cryptography claim harder to check than it should be. Hence its own job.
+  # ---------------------------------------------------------------------------
+  server-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server
+      - run: uv python install
+      - run: uv sync --frozen --group bench
+      - run: uv run --frozen python scripts/lanes.py matrix
+
+  # ---------------------------------------------------------------------------
+  # Measuring lanes. Not on pull requests: a shared runner's throughput varies with whoever
+  # else is on the host, and both of these compare ratios of measured throughput. They run on
+  # demand and weekly, and they report -- `scripts/lanes.py` records why each one does not
+  # gate, so the reason lives next to the lane rather than only here.
+  #
+  # netem shapes loopback with `tc`, which needs CAP_NET_ADMIN; hosted runners have
+  # passwordless sudo, and the lane probes by adding a real qdisc rather than by reading
+  # /proc/self/status, so it will say precisely what is missing if this is wrong.
+  # ---------------------------------------------------------------------------
+  netem:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server iproute2
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py netem
+
+  benchmarks:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server iproute2
+      - run: uv python install
+      - run: uv sync --frozen --group bench
+      - run: uv run --frozen python scripts/lanes.py benchmarks
+
+  # ---------------------------------------------------------------------------
+  # The mutation lane. Minutes rather than seconds, so it is weekly and on demand rather than
+  # per-change. It cannot gate yet: `mutmut run` exits 0 whether or not mutants survive, and
+  # the register of known-equivalent survivors is in the gitignored `_plans/` tree, so there
+  # is nothing committed for a machine to diff a run against. `mutmut results` is printed so
+  # a human can do the diff until there is.
+  # ---------------------------------------------------------------------------
+  mutation:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py mutation
+      - run: uv run --frozen mutmut results

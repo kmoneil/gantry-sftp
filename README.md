@@ -1163,8 +1163,8 @@ put the download range at 1.9–2.6×, then 1.6–2.3×, then 1.6–3.2×, becau
 is genuinely noisy — its spread column has reached 3.67 across those runs while ours stayed near
 1.1. A range that only one run reproduces is a number with an expiry date on it, and the widest
 ratio in that table is drawn from the least stable row. Absolute figures, the exact host and the
-full caveats are in the report the suite writes; re-run it with `pytest benchmarks/ -s` and it
-re-derives all of them.
+full caveats are in the report the suite writes; re-run it with
+`python scripts/lanes.py benchmarks` and it re-derives all of them.
 
 The **small-file upload row is newer and its range comes from two runs, not three** — it was
 added in 0.8 when the size check gave every `put` an extra `STAT` and it emerged that the matrix
@@ -1273,36 +1273,63 @@ uv sync
 .venv/bin/pre-commit install               # sets up pre-commit and pre-push
 ```
 
-The gates, all of which must pass before anything lands:
+Every proof this project has is a **lane**, and `scripts/lanes.py` is the one place they are
+named. Run it with no arguments for the table — what each lane proves, what it needs installed
+first, roughly how long it takes, and whether it gates:
 
 ```bash
-.venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
-.venv/bin/mypy                      # --strict, scoped to src
-.venv/bin/ty check                  # second type gate, same scope
-.venv/bin/complexipy src            # cognitive complexity, ceiling 15
-.venv/bin/python -m pytest          # unit + real-server lane
+python scripts/lanes.py                 # the table
+python scripts/lanes.py gates fast      # what has to pass before anything lands
+python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothing
 ```
+
+| lane | what it proves | needs, beyond `uv sync` |
+| --- | --- | --- |
+| `lanes.py gates` | ruff, mypy `--strict`, ty, complexipy, the `uv.lock` check, the exec bit | nothing; POSIX only |
+| `lanes.py fast` | unit tests, the real `sftp-server` rows, every example as a subprocess | `openssh-server` for some rows |
+| `lanes.py live` | a real `sshd` on localhost: transport, `ssh` environment, cancellation, handles | `openssh-server` |
+| `lanes.py matrix` | one client against three servers — OpenSSH, asyncssh, paramiko | `uv sync --group bench` |
+| `lanes.py netem` | every pipelining claim, on a `tc`-shaped link at 5/50/200 ms RTT | `CAP_NET_ADMIN` |
+| `lanes.py benchmarks` | wall clock and CPU against paramiko and asyncssh | both of the two above |
+| `lanes.py mutation` | whether an assertion would notice the line being wrong | nothing |
+
+The first four **gate**: a failure stops the change. The last three **report** — they measure,
+or they assert against a baseline that is not in this tree — and `scripts/lanes.py` carries the
+reason next to each one, so opting a lane out of gating is a written act rather than a habit.
 
 Type checking is deliberately two-tool: mypy is stricter and catches gaps ty misses. A
 finding gets fixed at the source, never silenced with an ignore.
 
-`tests/` and `examples/` need no network and are what the gates above run — every example is
-executed as a subprocess, because an example that has drifted out of sync with the library is
-a confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` on localhost;
+`tests/` and `examples/` need no network and are what `fast` runs — every example is executed
+as a subprocess, because an example that has drifted out of sync with the library is a
+confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` on localhost;
 `benchmarks/` needs that plus a shaped link and the comparison libraries. Both are excluded
-from the default run and skip with a reason rather than failing when their dependencies are
-absent:
-
-```bash
-.venv/bin/python -m pytest live-tests/       # needs openssh-server
-uv sync --group bench                        # paramiko and asyncssh
-.venv/bin/python -m pytest benchmarks/ -s    # needs the above plus tc netem
-```
+from the default `pytest` run, and every lane skips with a reason rather than failing when the
+thing it needs is absent.
 
 The comparison libraries are a separate dependency group and are deliberately not installed by
 default. They pull in `cryptography`, `pynacl` and `bcrypt` — Python cryptography is precisely
 what this project exists not to need, and a `uv sync` that installed it would make that claim
-harder to check than it should be.
+harder to check than it should be. No lane installs them on your behalf, for the same reason.
+
+### CI
+
+`.github/workflows/ci.yml` runs those lanes on Linux, macOS and Windows. It invokes them
+through `scripts/lanes.py` rather than spelling out a `pytest` command of its own, so CI and a
+developer cannot drift into running different things; `tests/test_lanes.py` asserts both that
+and that every lane the runner knows about is named in the workflow.
+
+**It has never run.** There is no git remote yet, so GitHub has never seen this repository.
+The file is committed anyway, because deciding which lane runs where and what it needs is most
+of the work and none of it needs a remote — and because a Windows job is the only thing that
+can settle whether `resolve_ssh_executable`'s `SysNative`-before-`System32` probe is right. It
+is unit-tested with injected inputs and has never executed on Windows.
+
+That Windows job **reports rather than gates**, and not out of caution. `os.pread` and
+`os.pwrite` are documented Unix-only and the data path calls both — `get` places every payload
+with `os.pwrite`, `put` reads with `os.pread` — so the transfer rows cannot pass there until
+that has a fallback. The job stays in the matrix because what is wanted from it is the list of
+*what else* breaks, and no amount of reading the code produces that list.
 
 ### The controlled `ssh` environment
 
@@ -1372,6 +1399,13 @@ reason for depending on anyio at all is that it costs nothing and buys trio supp
 codebase that has only ever run on asyncio is one accidental `asyncio.Queue` away from not
 having it.
 
+It **reports rather than gates**, and the reason is written next to the lane rather than only
+here: two of its rows compare ratios of measured throughput and have each failed once under load
+and passed on every re-run since. A lane that fails for reasons unrelated to the code is a lane
+whose failures get re-run instead of read, which is exactly how the regression it exists to
+catch would get waved through. Widening the thresholds without the measurement that justifies
+them would be the same mistake in the other direction, so it is open work rather than a fix.
+
 ### The benchmark lane
 
 `benchmarks/` is the source of truth for every performance number in this repository. It reuses
@@ -1406,9 +1440,9 @@ wrong. For frame parsing and offset arithmetic that distinction is the whole gam
 codec carries a `mutmut` run:
 
 ```bash
-.venv/bin/mutmut run          # ~4 minutes; scoped to codec/ by pyproject.toml
-.venv/bin/mutmut browse       # inspect survivors
-.venv/bin/mutmut results      # non-interactive list
+python scripts/lanes.py mutation   # ~4 minutes; scoped to codec/ by pyproject.toml
+.venv/bin/mutmut browse            # inspect survivors
+.venv/bin/mutmut results           # non-interactive list
 ```
 
 It is a lane, not a pre-commit gate — it takes minutes, not seconds. A surviving mutant in
@@ -1416,6 +1450,11 @@ It is a lane, not a pre-commit gate — it takes minutes, not seconds. A survivi
 *equivalent* (no test can distinguish them) are listed with their reasons in
 a register rather than suppressed, so a future run has a baseline to diff against
 instead of a triage to redo.
+
+It reports rather than gates, and the reason is mechanical: `mutmut run` exits 0 whether or
+not mutants survive, and the register of known-equivalent survivors is not in this repository,
+so there is nothing here for a machine to diff a run against. Comparing the two is a human
+step until that changes.
 
 `mutmut` mutates only functions the tests call, and it mutates the copy of the library it
 writes into `mutants/`. Test selection is `tests/` alone: `examples/` runs each example as a
