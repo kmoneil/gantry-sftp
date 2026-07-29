@@ -148,10 +148,17 @@ class _Downloader:
     """Drives one file's worth of pipelined reads.
 
     A single task, not a task group: SFTP is request/response over one stream, so there is
-    nothing *within* one file to run concurrently. Requests are tiny -- around thirty bytes
-    -- so filling the window cannot fill the pipe and deadlock against a server waiting for
-    us to read. That reasoning does *not* carry over to uploads, where the payload travels in
-    the request, and the upload path has its own answer.
+    nothing *within* one file to run concurrently. Requests are tiny -- around thirty bytes --
+    so *this* transfer's window cannot fill the pipe on its own. That reasoning does not carry
+    over to uploads, where the payload travels in the request, and the upload path has its own
+    answer.
+
+    **It also stopped being a safety argument once transfers began sharing a connection.** The
+    pipe is per session, not per transfer: an upload's 255 KiB ``WRITE`` fills it, and this
+    task's next thirty-byte ``READ`` then blocks behind it. Being a single task is what makes
+    that fatal -- there is no second task here waiting on the idle timeout, so the send is the
+    one place a download can stop with nobody watching. The bound is the dispatcher's send
+    deadline (D-40), not this docstring.
 
     Concurrency across files is a level up: several of these share one connection through the
     dispatcher, each with its own window and its own exchange.

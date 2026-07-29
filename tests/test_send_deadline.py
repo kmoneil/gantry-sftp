@@ -1,0 +1,452 @@
+"""The write half of a round trip, and what happens when the peer stops reading.
+
+Receives were bounded everywhere in this library and writes were not (D-40). The gap was
+reasoned about rather than measured, and the reasoning was about *reachability*: a request is
+around thirty bytes, a pipe holds 64 KiB, so a sender cannot fill it. That was true when a
+session ran one transfer at a time. Since the session multiplexes, one upload's 255 KiB ``WRITE``
+fills the pipe and every other task's write queues behind it — so a plain concurrent ``get``
+against a peer that has stopped draining hung forever, with nothing anywhere to stop it.
+
+Every test here uses a server that answers normally and then stops draining, which is what an
+appliance that stops reading its socket looks like from this side. Blocking inside ``send`` is
+the honest model: a full pipe does not fail a write, it simply never completes it, and everything
+the writer holds — the send lock included — stays held.
+
+The deadline is deliberately fatal to the connection rather than to the operation, and
+:meth:`Dispatcher._write` gives the argument: a cancelled write leaves part of a frame in the
+pipe, and the peer's next parse reads a length prefix out of the middle of our payload.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+from pathlib import Path
+
+import anyio
+import pytest
+
+from conftest import negotiate, running_dispatcher
+from gantry_sftp.codec import (
+    Attrs,
+    AttrsReply,
+    Close,
+    Codec,
+    Data,
+    Extended,
+    ExtendedReply,
+    FrameSplitter,
+    FSetStat,
+    FStat,
+    Handle,
+    Init,
+    LStat,
+    Open,
+    OpenFlag,
+    Packet,
+    Read,
+    RealPath,
+    Remove,
+    Rename,
+    Stat,
+    Status,
+    StatusCode,
+    Version,
+    Write,
+    decode,
+    encode,
+)
+from gantry_sftp.exceptions import TransferTimeoutError
+from gantry_sftp.session import Dispatcher, Publish, open_session
+from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+
+pytestmark = pytest.mark.anyio
+
+SEND_TIMEOUT = 0.5
+"""Short, because every test here waits it out. The shipped default is `request_timeout`."""
+
+WATCHDOG = 10.0
+"""A regression in this module is a hang, and a hang in a suite with no timeout plugin is a CI
+job that runs until somebody kills it. Every test that could hang carries this."""
+
+REMOTE_SIZE = 700_000
+"""Big enough that a download issues several READs, so a test can stall the second one and
+prove the scheduler was already in flight rather than stuck on its first move."""
+HANDLE = b"h"
+
+PIPE_FILLING_PAYLOAD = 200_000
+"""One write that cannot fit in a pipe buffer, and that a real `sftp-server` will still accept.
+
+Linux pipes hold 64 KiB. OpenSSH's server refuses a message over 256 KiB by calling `fatal()`
+and exiting, so "as big as possible" is the wrong choice -- it tests our framing against their
+ceiling instead of testing a blocked write."""
+
+
+class StallingServer:
+    """Answers every request, until it is asked to stop draining and never starts again.
+
+    ``stall_on`` picks the packet type that wedges it, so a test can get a transfer genuinely
+    under way before the pipe fills.
+    """
+
+    def __init__(self, *, stall_on: type[Packet] | None = None, stall_after: int = 1) -> None:
+        self.stall_on = stall_on
+        self.stall_after = stall_after
+        self.seen = 0
+        self.stalled = anyio.Event()
+        self.sent: list[Packet] = []
+        self._splitter = FrameSplitter()
+        self._outbox = bytearray()
+        self._has_output = anyio.Event()
+
+    async def send(self, data: bytes | memoryview) -> None:
+        for frame in self._splitter.feed(data):
+            packet = decode(frame)
+            self.sent.append(packet)
+            if self.stall_on is not None and isinstance(packet, self.stall_on):
+                self.seen += 1
+                if self.seen >= self.stall_after:
+                    self.stalled.set()
+                    await anyio.sleep_forever()
+            self._reply(packet)
+
+    def _reply(self, packet: Packet) -> None:
+        answer = _answer(packet)
+        if answer is None:  # pragma: no cover -- every packet these tests send has an answer
+            return
+        self._outbox += encode(answer)
+        self._has_output.set()
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        while not self._outbox:
+            self._has_output = anyio.Event()
+            await self._has_output.wait()
+        chunk = bytes(self._outbox[:max_bytes])
+        del self._outbox[:max_bytes]
+        return chunk
+
+    async def aclose(self) -> None:
+        return
+
+
+def _answer(packet: Packet) -> Packet | None:
+    """The smallest server that gets a transfer moving."""
+    answer: Packet | None = None
+    if isinstance(packet, Init):
+        answer = Version(3)
+    elif isinstance(packet, Stat | LStat | FStat):
+        answer = AttrsReply(packet.request_id, Attrs(size=REMOTE_SIZE, permissions=0o100644))
+    elif isinstance(packet, Open):
+        answer = Handle(packet.request_id, HANDLE)
+    elif isinstance(packet, Read):
+        answer = _read_answer(packet)
+    elif isinstance(packet, Write | Close | Remove | Rename | FSetStat):
+        answer = Status(packet.request_id, StatusCode.OK)
+    elif isinstance(packet, Extended):
+        answer = ExtendedReply(packet.request_id, b"")
+    return answer
+
+
+def _read_answer(packet: Read) -> Packet:
+    """DATA until the file runs out, then EOF -- the shape a real listing of reads gets."""
+    if packet.offset >= REMOTE_SIZE:
+        return Status(packet.request_id, StatusCode.EOF)
+    length = min(packet.length, REMOTE_SIZE - packet.offset)
+    return Data(packet.request_id, memoryview(bytes(length)))
+
+
+def session(server: StallingServer, **overrides: object):
+    """Open a session against ``server`` with the short deadlines these tests wait out."""
+    settings: dict[str, object] = {"request_timeout": SEND_TIMEOUT, "idle_timeout": 5.0}
+    settings.update(overrides)
+    return open_session(server, **settings)  # type: ignore[arg-type]
+
+
+# --- the two paths that hung ---------------------------------------------------------------
+
+
+async def test_a_handshake_whose_init_is_never_accepted_times_out():
+    """INIT used to be sent outside the deadline that covers VERSION.
+
+    Nine bytes cannot fill a pipe on a fresh connection, which is why this was reasoned to be
+    safe -- and "cannot happen" is a different claim from "is bounded", which is what a reader
+    of "timeouts on every wait" is being promised.
+
+    The message names *which half* stalled. One message for both would report a peer that never
+    read our INIT as a server that never answered, which sends the reader to look at the wrong
+    machine -- and the existing "server did not send VERSION" case is asserted, unchanged, in
+    `test_session.py`.
+    """
+    with anyio.fail_after(WATCHDOG), pytest.raises(TransferTimeoutError) as exc:
+        async with session(StallingServer(stall_on=Init)):
+            pytest.fail("the handshake completed against a server that never read it")
+
+    assert exc.value.args[0] == (f"the connection did not accept our INIT within {SEND_TIMEOUT}s")
+
+
+async def test_a_download_whose_read_is_never_accepted_times_out(tmp_path: Path):
+    """The one the card had reasoned away, and the one with no second task to save it.
+
+    The download scheduler is a single task: it fills the window, then waits for replies with
+    the idle timeout. A write that never completes happens *inside* the filling, where nothing
+    else is waiting to time out -- so before this deadline the transfer hung with no error, no
+    log line and no way out but a debugger.
+    """
+    server = StallingServer(stall_on=Read, stall_after=2)
+    with anyio.fail_after(WATCHDOG), pytest.raises(TransferTimeoutError) as exc:
+        async with session(server) as sftp:
+            _ = await sftp.get(b"/remote/file.bin", tmp_path / "out.bin")
+
+    # 26 bytes is a READ frame with a one-byte handle: 4 length, 1 type, 4 id, 5 handle,
+    # 8 offset, 4 length. Pinned rather than approximated, because the count is how a reader
+    # tells a stalled request from a stalled payload.
+    assert exc.value.args[0] == (
+        f"the connection did not accept 26 bytes of Read within {SEND_TIMEOUT}s; "
+        f"the peer has stopped reading and the stream can no longer be trusted"
+    )
+
+
+async def test_an_upload_whose_write_is_never_accepted_times_out(tmp_path: Path):
+    """The upload path had a bound already -- the drain task's idle timeout -- and now it has
+    the tighter, more accurate one. The error names the write rather than the silence."""
+    source = tmp_path / "upload.bin"
+    _ = source.write_bytes(os.urandom(100))
+
+    server = StallingServer(stall_on=Write)
+    with anyio.fail_after(WATCHDOG), pytest.raises(TransferTimeoutError) as exc:
+        async with session(server) as sftp:
+            _ = await sftp.put(source, b"/remote/upload.bin", publish=Publish(atomic=False))
+
+    # 126 bytes: the 22-byte WRITE header plus a 4-byte length and the 100-byte payload.
+    assert exc.value.args[0] == (
+        f"the connection did not accept 126 bytes of Write within {SEND_TIMEOUT}s; "
+        f"the peer has stopped reading and the stream can no longer be trusted"
+    )
+
+
+# --- what the deadline covers, and what it ends --------------------------------------------
+
+
+async def test_a_second_sender_behind_the_held_lock_reports_rather_than_queueing_forever(
+    tmp_path: Path,
+):
+    """A task parked on a lock held by a stalled sender is stalled by transitivity.
+
+    One pipe per session means one lock, so a deadline that started *after* the acquire would
+    bound the wrong wait. That is why :meth:`Dispatcher._write` puts the acquire inside the
+    scope, and this is the shape it is there for.
+
+    **What the assertion below records, because it surprised the recon:** the second operation
+    is stopped at its ``OPEN`` rather than at its ``WRITE``. Every transfer's first move is a
+    one-shot request, and those are bounded by ``Session.request`` whether or not a write has a
+    deadline of its own -- so the second uploader never gets far enough to queue on the lock as
+    a *sender*. The case where the acquire deadline is the only bound is a transfer that
+    already holds its handle: a download issuing its next ``READ`` while an upload holds the
+    lock. Defence in depth, and cheap, but not the thing this test proves.
+    """
+    source = tmp_path / "upload.bin"
+    _ = source.write_bytes(os.urandom(100))
+    server = StallingServer(stall_on=Write)
+    reported: list[str] = []
+
+    async def upload(sftp, remote: bytes) -> None:
+        with anyio.move_on_after(WATCHDOG):
+            try:
+                _ = await sftp.put(source, remote, publish=Publish(atomic=False))
+            except TransferTimeoutError as error:
+                reported.append(error.args[0])
+
+    with anyio.fail_after(WATCHDOG):
+        async with (
+            session(server, idle_timeout=WATCHDOG) as sftp,
+            anyio.create_task_group() as group,
+        ):
+            group.start_soon(upload, sftp, b"/remote/first.bin")
+            await server.stalled.wait()
+            group.start_soon(upload, sftp, b"/remote/second.bin")
+
+    assert sorted(reported) == [
+        f"Open was not answered within {SEND_TIMEOUT}s",
+        f"the connection did not accept 126 bytes of Write within {SEND_TIMEOUT}s; "
+        f"the peer has stopped reading and the stream can no longer be trusted",
+    ]
+    # The idle timeout is the watchdog itself here, so neither message can be the "server went
+    # quiet" one -- a queued sender that waited out the stall would have said that instead.
+
+
+async def test_a_timed_out_send_ends_the_connection_rather_than_the_operation(tmp_path: Path):
+    """The load-bearing decision, and the reason it is not "fail this transfer and carry on".
+
+    ``transport.send`` writes a whole frame and anyio's stream loops internally to do it, so a
+    cancelled write leaves *part of a frame* in the pipe. Whatever the peer parses next reads a
+    length prefix out of the middle of our payload. Letting other operations keep writing into
+    that stream would turn one reported timeout into silent corruption, so the failure is
+    recorded on the dispatcher and handed to everyone -- exactly as a dead transport is.
+    """
+    server = StallingServer(stall_on=Read, stall_after=2)
+    with anyio.fail_after(WATCHDOG):
+        async with session(server) as sftp:
+            with pytest.raises(TransferTimeoutError) as first:
+                _ = await sftp.get(b"/remote/file.bin", tmp_path / "out.bin")
+
+            with pytest.raises(TransferTimeoutError) as second:
+                _ = await sftp.realpath(b".")
+
+    # The same exception object, not a fresh one of the same class: every waiter on a dead
+    # connection is told the same thing, which is what stops two transfers reporting two
+    # guesses at one cause.
+    assert second.value is first.value
+
+
+async def test_no_send_timeout_means_no_bound_at_all(tmp_path: Path):
+    """``request_timeout=None`` is a legitimate thing to ask for and is never the default.
+
+    Spelled as "still blocked when we stopped waiting" rather than as a hang, because a test
+    that proves the absence of a timeout by hanging is a test that cannot fail.
+    """
+    server = StallingServer(stall_on=Read, stall_after=2)
+    with anyio.move_on_after(1.0) as scope:
+        async with session(server, request_timeout=None, idle_timeout=None) as sftp:
+            _ = await sftp.get(b"/remote/file.bin", tmp_path / "out.bin")
+
+    assert scope.cancelled_caught, "the transfer ended on its own with every deadline disabled"
+
+
+async def test_a_dispatcher_defaults_to_no_send_deadline():
+    """The bound arrives from `open_session`, which is the object that knows the timeouts.
+
+    A default deadline on the dispatcher itself would apply to callers who deliberately asked
+    for none, since `None` has to keep meaning `None` all the way down.
+    """
+    dispatcher = Dispatcher(StallingServer(), Codec())  # type: ignore[arg-type]
+    assert dispatcher._send_timeout is None  # noqa: SLF001 -- the field is the assertion
+
+
+# --- the paths that were already bounded, kept so they stay that way -------------------------
+
+
+async def test_a_one_shot_request_whose_send_stalls_still_reports():
+    """`Session.request` wraps the whole round trip, so this was bounded before D-40 too.
+
+    Kept because the send now has a deadline of its own inside that one: whichever fires first,
+    the caller must still get a `TransferTimeoutError` rather than an unwrapped `TimeoutError`
+    from a cancel scope.
+    """
+    with anyio.fail_after(WATCHDOG), pytest.raises(TransferTimeoutError):
+        async with session(StallingServer(stall_on=RealPath)) as sftp:
+            _ = await sftp.realpath(b".")
+
+
+async def test_cancelling_a_blocked_send_from_outside_still_unwinds(tmp_path: Path):
+    """The D-34 shape, checked rather than assumed: cleanup sends too.
+
+    A blocked write holds the send lock, and the shielded cleanup after a cancelled transfer --
+    the CLOSE for the handle, the REMOVE for a staging file -- queues behind it. Those are
+    bounded by `request_timeout` through `Session.request`, so the block unwinds on the
+    caller's schedule rather than waiting out the stall.
+    """
+    source = tmp_path / "upload.bin"
+    _ = source.write_bytes(os.urandom(100))
+    server = StallingServer(stall_on=Write)
+
+    started = anyio.current_time()
+    with anyio.fail_after(WATCHDOG):
+        with anyio.move_on_after(0.2):
+            async with session(server) as sftp:
+                _ = await sftp.put(source, b"/remote/upload.bin", publish=Publish(atomic=False))
+
+    assert anyio.current_time() - started < WATCHDOG / 2
+
+
+# --- a real pipe, genuinely full ------------------------------------------------------------
+
+
+async def test_a_stopped_server_fills_the_pipe_and_the_deadline_reports_it(tmp_path: Path):
+    """The fake above decides not to return. This one cannot return.
+
+    ``SIGSTOP`` the real ``sftp-server`` and it stops reading its stdin. Push more at it than a
+    pipe holds -- 64 KiB on Linux -- and the write blocks in the kernel, which is the condition
+    every test above models. A fake proves the deadline fires when a coroutine never completes;
+    only this proves that a peer which stops draining produces that condition at all.
+
+    ``round_trip`` has no timeout of its own, deliberately, so the send deadline is the only
+    thing that can end this. ``SIGCONT`` runs in a ``finally``: leaving a stopped child behind
+    would wedge the next test rather than fail this one.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    # Well past a 64 KiB pipe and well under OpenSSH's own 256 KiB message ceiling. Bigger
+    # than that is not a bigger test: `sftp-server` calls fatal() on an oversized frame and
+    # exits, which fails as a dead child rather than as a blocked write.
+    payload = os.urandom(PIPE_FILLING_PAYLOAD)
+    remote = str(tmp_path / "stalled.bin").encode()
+
+    async with open_local_server_transport(cwd=tmp_path) as transport:
+        codec = await negotiate(transport)
+        async with running_dispatcher(transport, codec, send_timeout=SEND_TIMEOUT) as dispatcher:
+            opened = await dispatcher.round_trip(
+                Open(
+                    codec.allocate_request_id(),
+                    remote,
+                    OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC,
+                )
+            )
+            assert isinstance(opened.response, Handle)
+            handle = opened.response.handle
+
+            os.kill(transport.pid, signal.SIGSTOP)
+            try:
+                with anyio.fail_after(WATCHDOG), pytest.raises(TransferTimeoutError) as exc:
+                    _ = await dispatcher.round_trip(
+                        Write(codec.allocate_request_id(), handle, 0, payload)
+                    )
+            finally:
+                os.kill(transport.pid, signal.SIGCONT)
+
+    # 25 bytes of frame plus the handle: 4 length, 1 type, 4 id, 4+n handle, 8 offset, 4 data
+    # length. Derived from the handle the server actually issued -- OpenSSH's are four bytes,
+    # and nothing promises another server's are.
+    assert exc.value.args[0] == (
+        f"the connection did not accept {25 + len(handle) + len(payload)} bytes of Write within "
+        f"{SEND_TIMEOUT}s; the peer has stopped reading and the stream can no longer be trusted"
+    )
+
+
+async def test_a_running_server_accepts_the_same_write(tmp_path: Path):
+    """The control, and it is not a formality.
+
+    Without it, the test above passes just as happily if 300 KB were too much for this
+    connection for some entirely different reason -- and it would then be asserting that our
+    own limits are wrong rather than that a stopped peer stalls.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    payload = os.urandom(PIPE_FILLING_PAYLOAD)
+    remote = str(tmp_path / "accepted.bin").encode()
+
+    async with open_local_server_transport(cwd=tmp_path) as transport:
+        codec = await negotiate(transport)
+        async with running_dispatcher(transport, codec, send_timeout=SEND_TIMEOUT) as dispatcher:
+            opened = await dispatcher.round_trip(
+                Open(
+                    codec.allocate_request_id(),
+                    remote,
+                    OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC,
+                )
+            )
+            assert isinstance(opened.response, Handle)
+            with anyio.fail_after(WATCHDOG):
+                written = await dispatcher.round_trip(
+                    Write(codec.allocate_request_id(), opened.response.handle, 0, payload)
+                )
+            assert isinstance(written.response, Status)
+            assert written.response.code is StatusCode.OK
+            _ = await dispatcher.round_trip(
+                Close(codec.allocate_request_id(), opened.response.handle)
+            )
+
+    # `os.stat` rather than `Path.stat`: this file's lint rules ban blocking pathlib calls from
+    # async code, and the point here is the byte count rather than the spelling.
+    assert os.stat(os.fsdecode(remote)).st_size == len(payload)  # noqa: PTH116

@@ -922,12 +922,27 @@ with anyio.move_on_after(30):
 Two timeouts ship, and they bound different things:
 
 - **`request_timeout=30.0`** covers one round trip — the handshake, a `STAT`, an `OPEN`, a
-  `CLOSE`. A server that accepts the connection and then says nothing trips it.
+  `CLOSE`. A server that accepts the connection and then says nothing trips it. It also bounds
+  every **write**, including the wait for the connection's send lock.
 - **`idle_timeout=60.0`** covers a bulk transfer's *silence*, not its duration. A nine-hour
   download over a slow link never trips it; sixty seconds with nothing arriving does.
 
 `None` for either means no bound at all. It is a legitimate thing to ask for, and it is never
 the default.
+
+**The write half was unbounded until 0.9, and "in practice it cannot block" is why** (D-40).
+A request is around thirty bytes and a pipe holds 64 KiB, so a sender could not fill it — while
+a session ran one transfer at a time. Once transfers share a connection, one upload's 255 KiB
+`WRITE` fills the pipe and every other task's write queues behind it, so an ordinary concurrent
+`get` against a peer that stopped draining hung forever with nothing to report it. Measured, not
+argued: `_plans/probes/` drove every sending path against a server that stops reading, and two of
+them never came back.
+
+**A write that times out ends the connection**, rather than just the transfer, and that is
+deliberate. A write puts a whole frame on the wire; abandoning one part-way leaves the peer
+parsing a length prefix out of the middle of your payload. So the failure reaches every operation
+on that session, and `with_reconnect()` treats it as retryable — a fresh connection rather than a
+poisoned one.
 
 Cancelling from outside — the `move_on_after` above, a task group whose sibling failed, Ctrl-C
 — stops the transfer, and then cleans up **before** the block finishes unwinding:

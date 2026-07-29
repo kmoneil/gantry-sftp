@@ -22,7 +22,9 @@ from gantry_sftp.transport import Transport
 
 
 @asynccontextmanager
-async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerator[Dispatcher]:
+async def running_dispatcher(
+    transport: Transport, codec: Codec, *, send_timeout: float | None = None
+) -> AsyncGenerator[Dispatcher]:
     """A dispatcher with its reader task running, stopped when the block ends.
 
     What `open_session` does, minus the handshake, for the tests that drive `download_handle`
@@ -34,8 +36,11 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
     `close()` is what stops the reader, and cancelling `reader.cancel_scope` would not: the
     reader is shielded (D-34). Mirroring production matters here beyond tidiness -- a helper
     that stopped the reader some other way would prove the fixture, not the library.
+
+    `send_timeout` defaults to none, matching `Dispatcher` itself: the bound arrives from
+    `open_session`, and a fixture that supplied one of its own would test the fixture.
     """
-    dispatcher = Dispatcher(transport, codec)
+    dispatcher = Dispatcher(transport, codec, send_timeout=send_timeout)
     try:
         async with anyio.create_task_group() as reader:
             reader.start_soon(dispatcher.run)

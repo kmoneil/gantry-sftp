@@ -49,7 +49,7 @@ import anyio
 
 from gantry_sftp._logging import frames_logger
 from gantry_sftp.codec import Close, Codec, Completed, Event, Handle, Request, describe
-from gantry_sftp.exceptions import ProtocolError, StateError
+from gantry_sftp.exceptions import ProtocolError, StateError, TransferTimeoutError
 from gantry_sftp.transport import Transport
 
 __all__ = ["Dispatcher", "Exchange"]
@@ -175,13 +175,24 @@ class Dispatcher:
         "_requests_sent",
         "_routes",
         "_send_lock",
+        "_send_timeout",
         "_transport",
         "_unclaimed",
     )
 
-    def __init__(self, transport: Transport, codec: Codec) -> None:
+    def __init__(
+        self, transport: Transport, codec: Codec, *, send_timeout: float | None = None
+    ) -> None:
         self._transport = transport
         self._codec = codec
+        self._send_timeout = send_timeout
+        """Seconds one write may take, including waiting for the send lock. ``None`` for no bound.
+
+        The write is the half of a round trip that had no deadline. Receives were bounded
+        everywhere and this was not, on the argument that a full pipe needs a peer that has
+        stopped reading -- which is precisely the failure an unattended transfer must survive
+        (D-40). Set from ``request_timeout`` by :func:`~gantry_sftp.session.open_session`, so the
+        two halves of a round trip are bounded by the same number."""
         self._routes: dict[int, Exchange] = {}
         self._exchanges: set[Exchange] = set()
         self._send_lock = anyio.Lock(fast_acquire=True)
@@ -508,6 +519,8 @@ class Dispatcher:
             StateError: If the session is closed, or the id is already in flight.
             ConnectError: If the connection has already failed, or fails on the write.
             ProtocolError: If the codec has already failed.
+            TransferTimeoutError: If the write does not complete within the send timeout. The
+                connection is finished at that point -- see :meth:`_write`.
         """
         if self._failure is not None:
             raise self._failure
@@ -522,8 +535,49 @@ class Dispatcher:
         self._bytes_sent += len(wire)
         if frames_logger.isEnabledFor(logging.DEBUG):
             frames_logger.debug("-> %s", describe(request))
-        async with self._send_lock:
-            await self._transport.send(wire)
+        await self._write(wire, request)
+
+    async def _write(self, wire: bytes, request: Request) -> None:
+        """Take the send lock and write one frame, within the send timeout.
+
+        **The deadline covers the lock as well as the write, and that is not tidiness.** A task
+        parked on a lock held by a stalled sender is stalled by transitivity, so a deadline that
+        started after the acquire would bound the wrong wait -- and with one pipe per session,
+        every sender is behind the same lock.
+
+        **A timed-out write ends the connection**, which is the decision this method exists to
+        make. ``transport.send`` writes a whole frame and anyio's stream loops internally to do
+        it, so cancelling it part-way leaves *part of a frame* in the pipe: the peer's next parse
+        reads a length prefix out of the middle of our payload. That is the desynchronised stream
+        :class:`~gantry_sftp.exceptions.ProtocolError` exists for, arriving silently. So the
+        failure is recorded here and handed to every live exchange, exactly as a dead transport
+        is -- one operation reporting a timeout while the others keep writing into a corrupted
+        stream would be the worse half of both outcomes.
+
+        The error is a :class:`~gantry_sftp.exceptions.TransferTimeoutError`, which
+        :func:`~gantry_sftp.session.is_retryable` already treats as retryable, so
+        :func:`~gantry_sftp.session.with_reconnect` answers a wedged peer with a fresh
+        connection rather than with a poisoned one.
+
+        Raises:
+            TransferTimeoutError: If the whole operation takes longer than the send timeout.
+        """
+        if self._send_timeout is None:
+            async with self._send_lock:
+                await self._transport.send(wire)
+            return
+        try:
+            with anyio.fail_after(self._send_timeout):
+                async with self._send_lock:
+                    await self._transport.send(wire)
+        except TimeoutError as exc:
+            stalled = TransferTimeoutError(
+                f"the connection did not accept {len(wire)} bytes of "
+                f"{type(request).__name__} within {self._send_timeout}s; the peer has stopped "
+                f"reading and the stream can no longer be trusted"
+            )
+            self._fail(stalled)
+            raise stalled from exc
 
     async def round_trip(self, request: Request) -> Completed:
         """Send one request and wait for its reply. The one-shot case, spelled once.

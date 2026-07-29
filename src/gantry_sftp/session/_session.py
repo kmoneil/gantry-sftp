@@ -431,7 +431,7 @@ class Session:
     Args:
         dispatcher: The connection's single reader, already running.
         limits: What the server said it would accept, or all-``None``.
-        request_timeout: Seconds for one one-shot request.
+        request_timeout: Seconds for one one-shot request, and for one write.
         idle_timeout: Seconds of silence during a bulk transfer.
         depth: Default requests in flight per transfer.
     """
@@ -2961,7 +2961,9 @@ async def open_session(
 
     Args:
         transport: A connected transport. Its lifetime is the caller's; this only drives it.
-        request_timeout: Seconds for the handshake and each one-shot request.
+        request_timeout: Seconds for the handshake, for each one-shot request, and for each
+            write -- including the wait for the connection's send lock. A write that runs out
+            of time ends the connection, because a half-written frame cannot be recovered from.
         idle_timeout: Seconds of total silence during a bulk transfer.
         depth: Default requests in flight per transfer.
 
@@ -2969,12 +2971,16 @@ async def open_session(
         A negotiated session, usable from several tasks at once.
 
     Raises:
-        TransferTimeoutError: If the server never sends VERSION.
+        TransferTimeoutError: If the handshake does not complete within ``request_timeout`` --
+            either half of it, since the message names which one stalled.
         ConnectError: If the transport fails, carrying the child's stderr.
     """
     codec = Codec()
-    await transport.send(codec.initiate())
-    await _await_version(transport, codec, request_timeout)
+    # Inside the handshake deadline rather than before it. INIT is nine bytes and cannot fill a
+    # pipe on a fresh connection, so this was reasoned to be safe -- but "cannot happen" and
+    # "is not bounded" are different claims, and the second one is what a caller reads as
+    # "timeouts on every wait". A transport whose write never returns hung here forever (D-40).
+    await _negotiate(transport, codec, request_timeout)
     limits = await _probe_limits(transport, codec, request_timeout)
     # The one handshake record. `gantry_sftp.frames` cannot cover INIT and VERSION: they are
     # exchanged before the dispatcher owns `receive`, and VERSION is not a reply to anything --
@@ -2988,7 +2994,10 @@ async def open_session(
             " ".join(render_field(name) for name in tuple(codec.extensions)[:_LOGGED_EXTENSIONS]),
         )
 
-    dispatcher = Dispatcher(transport, codec)
+    # The send deadline is `request_timeout`: a write is the first half of a round trip whose
+    # whole is already bounded by it, and a peer that cannot accept one frame in that time is
+    # not a peer this transfer finishes against. `None` stays unbounded, like everything else.
+    dispatcher = Dispatcher(transport, codec, send_timeout=request_timeout)
     try:
         async with anyio.create_task_group() as reader:
             _ = reader.start_soon(dispatcher.run)
@@ -3022,22 +3031,40 @@ async def _read_version(transport: Transport, codec: Codec) -> None:
         codec.receive(await transport.receive())
 
 
-async def _await_version(transport: Transport, codec: Codec, deadline: float | None) -> None:
-    """Wait for the server's VERSION, within a deadline covering the whole handshake.
+async def _negotiate(transport: Transport, codec: Codec, deadline: float | None) -> None:
+    """Do the handshake within a deadline covering both halves of it.
 
     Without this, a server that completes the connection and then says nothing hangs the
     caller forever -- which is exactly what an unattended job must not do, because nothing
     ever reports it.
+
+    **The send is inside the deadline too**, which it was not until D-40. A transport that
+    accepts the connection and never finishes a write hung here with nothing to stop it. Nine
+    bytes cannot fill a pipe, so the case needed a peer that was already wedged -- but a bound
+    that holds only while the failure is implausible is not a bound, and this library's own
+    README promises timeouts on every wait.
 
     The deadline spans the handshake rather than each chunk of it: per-chunk would let a
     server dribble one byte at a time indefinitely and never trip, which is a hang wearing a
     timeout's clothes.
     """
     if deadline is None:
+        await transport.send(codec.initiate())
         await _read_version(transport, codec)
         return
+
+    # Which half ran out of time is the whole diagnosis, and one message for both would give
+    # the wrong one half the time: "the server never answered" reads as a server problem, and a
+    # peer that never accepted our nine bytes is a different animal. The flag is set inside the
+    # scope and read outside it, which is the cheapest way to know how far we got.
+    sent = False
     try:
         with anyio.fail_after(deadline):
+            await transport.send(codec.initiate())
+            sent = True
             await _read_version(transport, codec)
     except TimeoutError as exc:
-        raise TransferTimeoutError(f"server did not send VERSION within {deadline}s") from exc
+        stalled = (
+            "server did not send VERSION" if sent else "the connection did not accept our INIT"
+        )
+        raise TransferTimeoutError(f"{stalled} within {deadline}s") from exc

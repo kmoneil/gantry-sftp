@@ -187,6 +187,17 @@ class SubprocessTransport:
         return self._stderr.text()
 
     @property
+    def pid(self) -> int:
+        """Process id of the child.
+
+        Public because it is already in this object's ``repr`` and in the transport log record,
+        and reading it out of either is worse than asking. What it is for: correlating a stalled
+        transfer with ``ps``, and signalling the child from a test that needs a genuinely
+        blocked pipe rather than a fake that declines to return.
+        """
+        return self._process.pid
+
+    @property
     def returncode(self) -> int | None:
         """Child exit status, or ``None`` while it is still running."""
         return self._process.returncode

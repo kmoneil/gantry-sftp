@@ -39,6 +39,13 @@ class Transport(Protocol):
     async def send(self, data: bytes | memoryview) -> None:
         """Write ``data``, in full.
 
+        **No deadline of its own, and blocking here is normal.** A peer that has stopped
+        reading fills the pipe and this write simply does not finish -- so an implementation
+        does not need a timeout, but a caller does. The session applies one in
+        :meth:`~gantry_sftp.session.Dispatcher._write`, and treats a write it had to abandon
+        as fatal to the connection: a half-written frame leaves the peer parsing a length
+        prefix out of the middle of the payload.
+
         Raises:
             ConnectError: If the peer is gone. For a subprocess transport the error carries
                 the child's stderr, which is usually the actual explanation.
