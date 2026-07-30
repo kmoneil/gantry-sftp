@@ -300,8 +300,15 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # because mutmut copies `source_paths` and nothing else. Collection dies on the missing
 # file. Same remedy, and the same reason not to reach for `also_copy`: the module imports
 # no `gantry_sftp`, so copying it in would add wall-clock and kill no mutant.
+# `tests/test_namespace_and_connect.py` is the fourth, found in 0.11 when a codec change
+# needed the lane and the lane would not start. It parses `examples/*.py` from the
+# repository root to check that no ordinary example imports the codec; under mutmut that
+# glob matches nothing, so the allowlist looks stale and the *inverse* test passes
+# vacuously. Worth naming rather than just ignoring: a test that resolves the repo root
+# does not merely fail here, it can also pass for the wrong reason.
 pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
     "--ignore=tests/test_lanes.py",
+    "--ignore=tests/test_namespace_and_connect.py",
 ]

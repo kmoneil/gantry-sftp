@@ -195,6 +195,10 @@ exists today:
   `readlink` / `symlink`, `supports()`, `listdir()` / streaming `scandir()`, and
   pipelined `get()` / `put()`, with typed errors, timeouts on every wait, and a progress
   callback
+- **byte ranges and a file object**: `open_file()` for a cursor — `read` / `readinto` / `write`
+  / `seek` / `truncate` — and `read_at` / `readinto_at` / `write_at` for explicit offsets, which
+  are safe to fan out over one handle. Every read is pipelined through the same scheduler `get`
+  uses rather than one request per call
 - **permissions that survive the transfer**: `mode=` and `Mode.PRESERVE` both directions, set
   on the file before anything can open it by its published name — without it every upload
   arrives `0666 & ~umask`, which is the server's default and used to be unchangeable
@@ -231,10 +235,11 @@ exists today:
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
 - a `benchmarks/` lane that runs this library, paramiko and asyncssh against the same server
-  over that shaped link, reporting wall clock **and** CPU — and, in the one scenario there that
-  asserts rather than reports, throughput swept against file size so that a cliff at a byte
-  count fails a run instead of waiting for a user to find it. `benchmarks/README.md` is the only
-  place in this project a performance figure lives, wins and losses in the same tables
+  over that shaped link, reporting wall clock **and** CPU — and, in the two scenarios there
+  that assert rather than report, throughput swept against file size so that a cliff at a byte
+  count fails a run, and the file object measured against our own `get` so that a read which
+  stopped pipelining does too. `benchmarks/README.md` is the only place in this project a
+  performance figure lives, wins and losses in the same tables
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
@@ -296,18 +301,18 @@ over a new connection.
 DESIGN.md's §8 sketch does not exist — concurrency is spelled with your own task group, or with
 `get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
 
-**The biggest thing missing is a file object, and it is worth being blunt about because it is not
-a convenience.** Every transfer here moves a *whole file between a remote path and a local path*.
-There is no way to read a byte range, no `read(n)` / `seek()` / `write()`, no append, and no way
-to send a transfer anywhere other than the filesystem — no `BytesIO` destination, no streaming a
-remote file into a parser or a hash without staging it on disk first. `Session.open()` returns a
-handle you can `fstat`, `fsync`, `truncate` and `close`, and not read. So if your file does not
-fit the whole-file shape, **this library cannot do your job yet and paramiko or asyncssh can** —
-both have a file-like object, and neither hides it. It is the next thing being built, and it is
-also what the fsspec adapter and `SFTPPath` are waiting on: an fsspec filesystem needs a
+**What is still missing, now that the file object is not.** As of 0.11 there is a byte-range
+surface — `open_file()` for a cursor, `read_at` / `readinto_at` / `write_at` for explicit
+offsets — so a header, a tail, an append and a stream into a parser no longer need the whole
+file staged on disk. See [Byte ranges, and a file object](#byte-ranges-and-a-file-object).
+
+What that unblocks has not been built yet: **the fsspec adapter and `SFTPPath` still do not
+exist**, though the primitive they were waiting on now does — an fsspec filesystem needs a
 byte-range fetch, and `Path.open` / `read_bytes` / `write_bytes` are most of what a path is for.
-The same slice is bringing `exists()`, `isdir()`, `isfile()`, `getsize()` and `makedirs()`, which
-also do not exist — today those are `stat()` in a `try` block.
+Neither do `exists()`, `isdir()`, `isfile()`, `getsize()` or `makedirs()`; today those are
+`stat()` in a `try` block. Against **asyncssh** specifically, this library is still behind on
+surface — no `statvfs`, no `hardlink`, no `copy-data` — and its transfers work on Windows where
+ours refuse.
 
 ## No event loop
 
@@ -343,9 +348,11 @@ Everything keeps its shape, including the parts that could not survive the bound
 | `await sftp.get(...)` | `sftp.get(...)` — returns the same `int` |
 | `async for entry in sftp.walk(...)` | `for entry in sftp.walk(...)` — an ordinary iterator |
 | `async with sftp.scandir(p) as entries` | `with sftp.scandir(p) as entries` — still a context manager, because it still holds a directory handle |
+| `async with sftp.open_file(p) as f` | `with sftp.open_file(p) as f` — the same, for the same reason: it holds a file handle |
 | `except NoSuchFileError` | `except NoSuchFileError` — arrives flat, not in an `ExceptionGroup` |
 
-Breaking out of a `walk`, a `glob` or a `scandir` closes the handle **on the server**, not
+Breaking out of a `walk`, a `glob`, a `scandir` or an `open_file` closes the handle **on the
+server**, not
 merely in Python: the suite asserts it by calling `close()` on the handle afterwards and
 requiring `NO_SUCH_FILE`, because "no complaint appeared" is the absence of evidence rather
 than evidence.
@@ -499,6 +506,82 @@ Two things it will not do, both deliberate:
   concurrency *reaches* the ceiling on a tree of small files rather than exceeding it. Above
   `1` the transfer order is not the walk's, so a failure part-way leaves an unpredictable
   subset transferred.
+
+## Byte ranges, and a file object
+
+`get` and `put` move a whole file between a remote path and a local path. When that is not the
+shape you need — a header, a range, a tail, an append, or a remote file streamed into a parser
+without staging it on disk — `open_file()` is the cursor form:
+
+```python
+import os
+
+async with sftp.open_file("/logs/today.jsonl") as remote:
+    header = await remote.read(512)
+    await remote.seek(-4096, os.SEEK_END)
+    tail = await remote.read()
+```
+
+It is a context manager because it holds a server-side handle, exactly like
+[`scandir`](#streaming-a-directory-you-did-not-size). `read` / `readinto` / `write` / `seek` /
+`tell` / `stat` / `truncate` / `fsync` are the surface; `os.SEEK_END` costs one `FSTAT` and the
+other two whences send nothing. Writing is a flag rather than a seek — `OpenFlag.APPEND` has the
+server place every write at its own idea of the end, so the cursor stops describing where the
+bytes landed, which is what the flag means.
+
+**A short read is only ever end of file.** A `DATA` shorter than its `READ` is legal mid-file and
+is re-requested underneath you, so `read(n)` returns `n` bytes unless the file ended — no caller
+has to loop. At or past the end you get `b""` rather than an exception, because end of file is a
+status the server sends and turning it into an exception would make every loop a `try`.
+
+### One file object is one task
+
+The cursor is mutable shared state. Two tasks reading the same object interleave their positions
+and each gets a subset of what it asked for — a correctness bug that reads as a scheduling one.
+That is not a limitation of the session, which multiplexes happily; it is what a cursor is.
+
+For concurrent access to one file, the offset is an argument instead:
+
+```python
+handle = await sftp.open("/data/big.parquet")
+try:
+    async with anyio.create_task_group() as tasks:
+        for index in range(4):
+            tasks.start_soon(fetch_chunk, handle, index)  # each calls read_at
+finally:
+    await sftp.close(handle)
+```
+
+`read_at(handle, offset, length)` returns `bytes`; `readinto_at(handle, buffer, offset)` fills a
+buffer you already own and is the zero-copy form; `write_at(handle, offset, data)` is the other
+direction. Reads at an explicit offset are idempotent and safe to fan out. Writes are not
+retried and never will be blindly — two tasks writing the same range is a race no client can
+arbitrate, exactly as with two processes and `pwrite`.
+
+### Read in big blocks
+
+**This is the one performance decision the surface hands you, and it is arithmetic rather than
+advice.** A `read(n)` fills the window, drains it, and only then issues the next block — where a
+`get` keeps the window full from its first request to its last. So a cursor read costs **one
+round trip per block**, `file_size / block_size` of them, and no block size removes it.
+
+The lever is making that count small: **read in blocks of at least 2 MiB** — the SSH channel
+window, the same ceiling [Tunables](#tunables-and-what-they-default-to) explains for `depth`. An
+8 KiB block is one round trip per 8 KiB, which on any link with latency is the whole transfer.
+What each block size costs on each link profile is measured in
+[`benchmarks/README.md`](benchmarks/README.md) rather than quoted here.
+
+**If you want `get`'s throughput without `get`'s destination, fan out `read_at`** — independent
+ranges in flight have no bubble to amortise. Closing the gap inside the cursor would take
+read-ahead, and that is deliberately not here: implicit prefetching is a policy the caller cannot
+see, and `paramiko#2454` is an open request for an API to switch theirs off.
+
+This is measured rather than asserted, and against the incumbent: `benchmarks/` carries a
+`read 16 MiB: file object vs whole file` row, and the run **fails** if our file object at a
+window-sized block drops below half our own `get`. That gate exists because the obvious
+implementation — one `READ` per call, awaited — is what makes `paramiko#2453`'s file object
+slower than its own `get` by more than an order of magnitude, and shipping it under a new name
+would have shipped the same complaint.
 
 ## Resuming a tree
 

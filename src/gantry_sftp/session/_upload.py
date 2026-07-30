@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import anyio
 from anyio.to_thread import run_sync
@@ -62,7 +63,62 @@ from gantry_sftp.session._download import (
     Span,
 )
 
-__all__ = ["upload_handle"]
+__all__ = ["BufferSource", "DescriptorSource", "Source", "upload_handle", "write_range_from"]
+
+
+class Source(Protocol):
+    """Where an uploaded payload comes from.
+
+    The mirror of a download's :class:`~gantry_sftp.session.Sink`, parameterised for the same
+    reason. A public ``write_at`` sends bytes the caller is holding, not bytes on local disk, and it
+    must not become a second sender: the window, the reply drain and the offset bookkeeping
+    below are the parts that are easy to get subtly wrong.
+
+    It is ``async`` because the descriptor implementation reads in a worker thread, and a
+    protocol that was not would force the disk read back onto the event loop.
+    """
+
+    async def read_at(self, offset: int, length: int) -> bytes | memoryview:
+        """Return up to ``length`` bytes at ``offset``. Empty means end of source."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DescriptorSource:
+    """Reads the payload from an open local file.
+
+    In a worker thread, which keeps a slow disk from stalling the receive side -- the half
+    that has to keep draining for either to move. ``run_sync`` is imported directly rather
+    than reached as ``anyio.to_thread...``: that attribute only resolves because anyio happens
+    to import the submodule eagerly today, which ty flags and which would break silently if it
+    stopped.
+    """
+
+    fd: int
+
+    async def read_at(self, offset: int, length: int) -> bytes | memoryview:
+        return await run_sync(os.pread, self.fd, length, offset)
+
+
+@dataclass(frozen=True, slots=True)
+class BufferSource:
+    """Reads the payload from a buffer the caller already has.
+
+    No thread and no copy: a ``memoryview`` slice is a view, so the payload handed to the
+    codec is a window onto the caller's bytes right up to the point the frame is built.
+
+    Attributes:
+        view: The bytes to send.
+        base: Absolute remote offset of ``view[0]``, so this answers the same absolute-offset
+            question a descriptor does.
+    """
+
+    view: memoryview
+    base: int
+
+    async def read_at(self, offset: int, length: int) -> bytes | memoryview:
+        start = offset - self.base
+        return self.view[start : start + length]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +135,7 @@ class _Uploader:
         codec: Codec,
         exchange: Exchange,
         handle: bytes,
-        fd: int,
+        source: Source,
         *,
         span: Span,
         write_length: int,
@@ -91,7 +147,7 @@ class _Uploader:
         self._codec = codec
         self._exchange = exchange
         self._handle = handle
-        self._fd = fd
+        self._source = source
         self._span = span
         """Where this run starts and where the local file ends. A non-zero start is a resume,
         and the bytes below it are assumed to be on the server already -- a claim the session
@@ -119,12 +175,7 @@ class _Uploader:
             length = self._write_length
             if self._span.end is not None:
                 length = min(length, self._span.end - offset)
-            # Reading the local file in a worker thread keeps a slow disk from stalling the
-            # receive side, which is the half that has to keep draining for either to move.
-            # `run_sync` is imported directly rather than reached as `anyio.to_thread...`:
-            # that attribute only resolves because anyio happens to import the submodule
-            # eagerly today, which ty flags and which would break silently if it stopped.
-            payload = await run_sync(os.pread, self._fd, length, offset)
+            payload = await self._source.read_at(offset, length)
             if not payload:
                 break
 
@@ -281,7 +332,7 @@ async def upload_handle(
                 dispatcher.codec,
                 exchange,
                 handle,
-                fd,
+                DescriptorSource(fd),
                 span=Span(start_offset, size),
                 write_length=write_length,
                 depth=depth,
@@ -292,3 +343,67 @@ async def upload_handle(
             return await uploader.run()
     finally:
         os.close(fd)
+
+
+async def write_range_from(
+    dispatcher: Dispatcher,
+    handle: bytes,
+    payload: memoryview,
+    *,
+    offset: int,
+    write_length: int,
+    depth: int = DEFAULT_PIPELINE_DEPTH,
+    idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
+    remote_path: bytes | None = None,
+) -> int:
+    """Write ``payload`` at ``offset``, pipelined, from memory rather than from a file.
+
+    The sending half of a byte-range surface, and the same reuse argument as
+    :func:`~gantry_sftp.session.read_range_into`: the window and the reply drain are the parts
+    that are hard, and a second implementation of them for in-memory writes would be a second
+    place for an offset to be wrong.
+
+    **No local file is involved, so this runs on every platform** -- ``os.pread`` is what
+    scopes ``put`` to POSIX, and it is not on this path.
+
+    Args:
+        dispatcher: The session's reader.
+        handle: An open remote file handle, writable.
+        payload: The bytes to send. Not copied.
+        offset: Absolute remote offset to write the first byte at.
+        write_length: Payload bytes per request.
+        depth: Requests in flight.
+        idle_timeout: Seconds without any response before giving up.
+        remote_path: Carried on errors for diagnosis.
+
+    Returns:
+        Bytes the server acknowledged, which is ``len(payload)`` on success.
+
+    Raises:
+        TransferError: If the server refuses a write.
+        TransferTimeoutError: If the server stops responding.
+        ValueError: If ``offset`` is negative, or ``depth``/``write_length`` make no progress.
+    """
+    if depth < 1:
+        raise ValueError(f"depth must be at least 1, got {depth}")
+    if write_length < 1:
+        raise ValueError(f"write_length must be at least 1, got {write_length}")
+    if offset < 0:
+        raise ValueError(f"offset must not be negative, got {offset}")
+    if not len(payload):
+        return 0
+
+    with dispatcher.exchange() as exchange:
+        uploader = _Uploader(
+            dispatcher.codec,
+            exchange,
+            handle,
+            BufferSource(payload, offset),
+            span=Span(offset, offset + len(payload)),
+            write_length=write_length,
+            depth=depth,
+            idle_timeout=idle_timeout,
+            progress=None,
+            remote_path=remote_path,
+        )
+        return await uploader.run()

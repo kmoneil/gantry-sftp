@@ -32,6 +32,7 @@ guarantee costs is a number rather than a footnote.
 from __future__ import annotations
 
 import getpass
+import hashlib
 import importlib
 import time
 from abc import ABC, abstractmethod
@@ -50,6 +51,16 @@ from gantry_sftp.transport import open_ssh_transport
 
 def _username() -> str:
     return getpass.getuser()
+
+
+def _digest_of(path: Path) -> str:
+    """Content digest of a local file, for a scenario whose destination is memory.
+
+    Every scenario verifies the bytes it moved. The ones that write a file compare the file;
+    a read into memory has nothing on disk to compare, so it compares a digest instead -- and
+    a client that returned fast and wrong still fails rather than winning.
+    """
+    return hashlib.blake2b(path.read_bytes()).hexdigest()
 
 
 def _file_size(path: Path) -> int:
@@ -300,6 +311,30 @@ class GantryClient(Client):
                 walls.append(time.perf_counter() - started)
         return walls
 
+    async def read_in_blocks(self, remote: Path, *, block_size: int) -> tuple[float, int]:
+        """Read a whole remote file through the **file object**, in fixed blocks, into memory.
+
+        The acceptance criterion D-91 attached to the file-object card (D-86), made
+        measurable. `paramiko#2453` reports `SFTPFile.read()` running 25x slower than the same
+        library's `SFTPClient.get()`, and the cause is the obvious implementation: one `READ`
+        per call, awaited. Shipping that under a new name would have shipped the complaint, so
+        the row exists to say which one we shipped.
+
+        Into memory, and nothing is kept: the destination is not the subject. Bytes are
+        verified by digest rather than by comparing a produced file, because there is no file.
+        """
+        digest = hashlib.blake2b()
+        moved = 0
+        async with self._transport() as transport, open_session(transport) as sftp:
+            started = time.perf_counter()
+            async with sftp.open_file(str(remote)) as handle:
+                while chunk := await handle.read(block_size):
+                    digest.update(chunk)
+                    moved += len(chunk)
+            elapsed = time.perf_counter() - started
+        assert digest.hexdigest() == _digest_of(remote), "the file object read the wrong bytes"
+        return elapsed, moved
+
     async def download_many_concurrently(
         self, remotes: Sequence[Path], into: Path, *, concurrency: int
     ) -> tuple[float, int]:
@@ -384,6 +419,38 @@ class ParamikoClient(Client):
         finally:
             client.close()
         return elapsed, _file_size(local)
+
+    def _read_in_blocks_positional(self, remote: Path, block_size: int) -> tuple[float, int]:
+        """`run_sync` passes positional arguments only, and every other hop here does the same."""
+        return self._read_in_blocks(remote, block_size=block_size)
+
+    def _read_in_blocks(self, remote: Path, *, block_size: int) -> tuple[float, int]:
+        """`SFTPFile.read()` in a loop -- the control for our own file-object row.
+
+        `paramiko#2453` is the reason this exists: their file object is reported at 25x their
+        own `get`, which is the pathology D-86 had to avoid rather than reproduce. Reported and
+        never asserted, like every other control here: an incumbent's defect must not be able
+        to fail our lane.
+        """
+        client = self._open()
+        digest = hashlib.blake2b()
+        moved = 0
+        try:
+            sftp = client.open_sftp()
+            started = time.perf_counter()
+            with sftp.open(str(remote), "rb") as handle:
+                while chunk := handle.read(block_size):
+                    digest.update(chunk)
+                    moved += len(chunk)
+            elapsed = time.perf_counter() - started
+            sftp.close()
+        finally:
+            client.close()
+        assert digest.hexdigest() == _digest_of(remote), "the file object read the wrong bytes"
+        return elapsed, moved
+
+    async def read_in_blocks(self, remote: Path, *, block_size: int) -> tuple[float, int]:
+        return await anyio.to_thread.run_sync(self._read_in_blocks_positional, remote, block_size)
 
     def _upload(self, local: Path, remote: Path) -> tuple[float, int]:
         client = self._open()

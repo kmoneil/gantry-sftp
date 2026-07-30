@@ -96,6 +96,7 @@ from gantry_sftp.session import (
     Mode,
     ProgressCallback,
     Publish,
+    RemoteFile,
     ServerLimits,
     ServerProfile,
     Session,
@@ -114,6 +115,7 @@ from gantry_sftp.transport import open_ssh_transport as _async_open_ssh_transpor
 __all__ = [
     "BoundPortal",
     "SyncDirectoryScan",
+    "SyncRemoteFile",
     "SyncSession",
     "SyncTransport",
     "connect",
@@ -243,6 +245,90 @@ class SyncDirectoryScan:
             return self._portal.call(self._scan.__anext__)
         except StopAsyncIteration:
             raise StopIteration from None
+
+
+class SyncRemoteFile:
+    """One open remote file with a cursor, from a thread with no event loop.
+
+    The blocking form of :class:`~gantry_sftp.session.RemoteFile`, and the same shape for the
+    same reason: it holds a server-side handle, so it is a context manager rather than a bare
+    object::
+
+        with sftp.open_file("/logs/today.jsonl") as remote:
+            header = remote.read(512)
+            remote.seek(-4096, os.SEEK_END)
+            tail = remote.read()
+
+    Every method is the async one through the portal, so the semantics -- what a short read
+    means, what ``APPEND`` does to the cursor, which calls are round trips -- are documented
+    there and are not restated here. **The single-task rule carries over unchanged**: the
+    cursor is shared mutable state, and two threads driving one of these interleave their
+    positions. Use :meth:`SyncSession.readinto_at` and :meth:`SyncSession.write_at` to work on
+    one file from several threads.
+
+    Args:
+        portal: The portal whose thread owns the loop.
+        remote: The async file object to drive.
+    """
+
+    def __init__(self, portal: BlockingPortal, remote: RemoteFile) -> None:
+        self._portal = portal
+        self._remote = remote
+
+    @override
+    def __repr__(self) -> str:
+        return f"<SyncRemoteFile over {self._remote!r}>"
+
+    @property
+    def path(self) -> bytes:
+        """The remote path, as bytes."""
+        return self._remote.path
+
+    def __enter__(self) -> Self:
+        """Open the file on the portal's thread."""
+        _ = self._portal.call(self._remote.__aenter__)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the handle, whichever way the block ended."""
+        _ = self._portal.call(self._remote.__aexit__, exc_type, exc, traceback)
+
+    def tell(self) -> int:
+        """The cursor. Pure, so it does not cross the thread boundary at all."""
+        return self._remote.tell()
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Move the cursor and return its new absolute position."""
+        return self._portal.call(partial(self._remote.seek, offset, whence))
+
+    def read(self, length: int | None = None) -> bytes:
+        """Read from the cursor and advance it."""
+        return self._portal.call(partial(self._remote.read, length))
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        """Read into a buffer you already own, and advance the cursor."""
+        return self._portal.call(partial(self._remote.readinto, buffer))
+
+    def write(self, data: bytes | memoryview) -> int:
+        """Write at the cursor and advance it."""
+        return self._portal.call(partial(self._remote.write, data))
+
+    def stat(self) -> Attrs:
+        """Attributes of the open file, from its handle rather than its name."""
+        return self._portal.call(self._remote.stat)
+
+    def truncate(self, size: int | None = None) -> None:
+        """Set the file's length, defaulting to the current cursor."""
+        return self._portal.call(partial(self._remote.truncate, size))
+
+    def fsync(self) -> None:
+        """Ask the server to flush this file to its disk, where it supports it."""
+        return self._portal.call(self._remote.fsync)
 
 
 class SyncSession:
@@ -446,6 +532,34 @@ class SyncSession:
     ) -> bytes:
         """Open a file and return its handle."""
         return self._run(partial(self._session.open, path, pflags, mode=mode))
+
+    def readinto_at(self, handle: bytes, buffer: bytearray | memoryview, offset: int) -> int:
+        """Read ``len(buffer)`` bytes from ``offset`` into ``buffer``. The zero-copy primitive."""
+        return self._run(partial(self._session.readinto_at, handle, buffer, offset))
+
+    def read_at(self, handle: bytes, offset: int, length: int) -> bytes:
+        """Read up to ``length`` bytes from ``offset``, pipelined."""
+        return self._run(partial(self._session.read_at, handle, offset, length))
+
+    def write_at(self, handle: bytes, offset: int, data: bytes | memoryview) -> int:
+        """Write ``data`` at ``offset``, pipelined."""
+        return self._run(partial(self._session.write_at, handle, offset, data))
+
+    def ftruncate(self, handle: bytes, size: int) -> None:
+        """Set the length of an open file, by handle rather than by path."""
+        return self._run(partial(self._session.ftruncate, handle, size))
+
+    def open_file(
+        self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None
+    ) -> SyncRemoteFile:
+        """Open a remote file as a cursor-bearing object, for ranges and streaming.
+
+        Not a blocking call: it returns the file, so it is ``with sftp.open_file(...)``. The
+        liveness check happens here rather than at ``__enter__``, for the same reason
+        :meth:`scandir`'s does -- a file asked for after the session's block has ended should
+        name the block rather than the portal.
+        """
+        return SyncRemoteFile(self._ready(), self._session.open_file(path, pflags, mode=mode))
 
     def opendir(self, path: bytes | str) -> bytes:
         """Open a directory and return its handle."""

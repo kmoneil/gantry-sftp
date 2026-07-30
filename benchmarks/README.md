@@ -42,6 +42,7 @@ unshaped profile needs no `tc` at all and runs in a plain checkout.
 | upload N × 8 KiB, sequential | the same case in the direction the matrix used to miss entirely. Both 16 MiB upload rows move one file, so a per-file round trip rounds to nothing in them; this is the only row a cost paid *per file* can appear in, and `put_tree` over a drop directory is the workload it stands for |
 | download N × 8 KiB, one connection | not a comparison. Our own sequential path against our own overlapped one, same files, same connection |
 | atomic publish 16 MiB | not a comparison. What *our own* default costs against our own in-place path |
+| read 16 MiB: file object vs whole file | not a comparison, and the one row besides the sweep that **gates**. Our own `open_file().read()` in fixed blocks against our own `get`, plus paramiko's file object as a control. `paramiko#2453` reports their `SFTPFile.read()` at 25x their own `get`; the obvious implementation of a byte-range read reproduces it, so this row is how we know which one we shipped (D-86) |
 | download / upload: throughput against size | the **shape**, on two profiles. Ten sizes bracketing every boundary the design has, so a cliff at a byte count is visible as a curve rather than inferred from two points. This is the only scenario that **gates** — see below |
 
 Across five link profiles: unshaped, 5 ms, 50 ms, 200 ms, and 50 ms rate-limited to 100 Mbit/s.
@@ -99,6 +100,53 @@ took that crossing 25 times and found the opposite — a **one-byte** step from 
 *raises* the median from 2.41 ms to 1.73 ms, because the second request pipelines behind the
 first while a single-request transfer has nothing to overlap a scheduler hiccup with. Its p90 is
 7.1 ms against a 1.7 ms floor. The fat tail is real; the fall was not.
+
+## The file-object row: having one was never the deliverable
+
+D-86 added a byte-range surface, and D-91's tracker gather attached an acceptance criterion to
+it that parity alone would have missed. The incumbent *has* a file object. It is also
+`paramiko#2453`: `SFTPFile.read()` reported at 25x slower than the same library's
+`SFTPClient.get()`, plus `paramiko#2454`, an open request for an API to turn its prefetching
+off. Shipping a file object that reads one `READ` per call and awaits it would have shipped
+that complaint under a new name -- and that is the *obvious* implementation, which is why the
+criterion is a benchmark row rather than a code review.
+
+So the row measures our file object against **our own `get`**, on the same file over the same
+link, and fails the run below half of it. Like the size sweep, it compares two rows of a single
+run rather than a figure against a baseline, so it needs no committed baseline and is not the
+regression gate D-63 is about.
+
+Block size is on the ladder because it is the one performance decision the surface hands a
+caller, and **the shaped profile is what turned that from a caveat into an arithmetic.** A
+`get` keeps its window full from the first request to the last. A `read(n)` fills the window,
+drains it, and only then issues the next block -- so a cursor read pays **one round trip per
+block**, `file_size / block_size` of them, and no block size removes it.
+
+Measured on the 100 Mbit/s 50 ms profile, 16 MiB, against our own `get` at 1.868 s:
+
+| block | wall | vs `get` |
+| ----- | ---- | -------- |
+| 261120 (one request) | 5.165 s | 0.36x |
+| 1 MiB | 2.570 s | 0.73x |
+| 2 MiB (the channel window) | 2.309 s | 0.81x |
+
+The 2 MiB row is the arithmetic showing its work: eight blocks, and 2.309 - 1.868 = 0.441 s
+against eight round trips of the measured 52.5 ms, which is 0.42 s. The gap is the bubbles and
+nothing else, which is why closing it needs read-ahead rather than tuning -- and read-ahead is
+deliberately not built (`paramiko#2454` is an open request for an API to switch theirs off).
+
+Unshaped the same ladder reads differently, and both are worth having: with no latency to hide,
+1 MiB blocks run at 1.19x `get` -- *faster*, because no local file is written -- and 8 KiB
+blocks at 0.10x. A gate written only against the unshaped profile would have concluded the file
+object was free.
+
+**Two things in this row are bounded by cost, and both are stated rather than left to a reader
+to notice.** The 8 KiB rung runs on the unshaped profile only -- 16 MiB in 8 KiB blocks is 2048
+round trips, which at 50 ms RTT is a hundred seconds *per sample* to re-learn what the unshaped
+rung already shows. And **paramiko is swept as a control on the unshaped profile only**, for the
+same arithmetic one layer over: its file object is round-trip-bound by construction, so a shaped
+profile turns each sample into minutes. What the control demonstrates it demonstrates unshaped,
+where it is already tens of times its own `get` with no latency to blame for it.
 
 ## Two columns, because wall clock alone cannot see the thesis
 

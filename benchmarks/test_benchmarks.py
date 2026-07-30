@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from _clients import BASELINE, Client, GantryClient, available, library_versions
+from _clients import BASELINE, Client, GantryClient, ParamikoClient, available, library_versions
 from _harness import (
     Environment,
     Measurement,
@@ -514,9 +514,6 @@ async def _scenario_atomic(
     return measurements
 
 
-DOWNLOAD_SWEEP = "download: throughput against size"
-UPLOAD_SWEEP = "upload: throughput against size"
-
 CHANNEL_WINDOW = 2 * 1024 * 1024
 """OpenSSH's `CHAN_SES_WINDOW_DEFAULT`, and paramiko's and asyncssh's, per DESIGN.md 5.1.
 
@@ -524,6 +521,122 @@ The line the two halves of :attr:`Profile.sweep_repeats` fall either side of, be
 where a rung stops being a fixed cost and starts being bytes: below it a transfer fits in one
 window and its wall clock is round trips, above it the window has to be refilled.
 """
+
+FILE_OBJECT_BLOCKS: tuple[int, ...] = (261120, 1024 * 1024, CHANNEL_WINDOW)
+"""Block sizes the file-object row reads with, and each one is a question.
+
+261120 is exactly one request -- OpenSSH's `max-read-length`. 1 MiB is four requests, which is
+half the channel window. `CHANNEL_WINDOW` is eight, which fills it. **The last entry is the one
+that gates, and which entry that is was decided by the 50 ms profile rather than chosen.**
+
+A `get` keeps its window full from the first request to the last. A `read(n)` fills the window,
+drains it, and only then issues the next block, so a cursor read pays **one round trip per
+block** -- `file_size / block_size` of them, and no block size removes it. Measured on a 50 ms
+link: 0.36x of `get` at one request per block, 0.73x at 1 MiB, 0.81x at the window, where the
+shortfall is eight blocks times one round trip and nothing else.
+
+So the rule a caller acts on is "read in blocks of at least the channel window", and the gate
+sits on that rung because it is the one where the remaining gap is structural rather than a
+choice. Closing it entirely needs read-ahead, which is deliberately not built.
+"""
+
+SMALL_BLOCK = 8 * 1024
+"""The block size a caller writes without thinking, measured on the **unshaped profile only**.
+
+A cursor read cannot pipeline past the range it was asked for, so a loop of 8 KiB reads is one
+round trip each -- and that is the cost worth publishing, because it is the difference between
+`read(8192)` and `read(1 << 20)` on a link with any latency at all.
+
+Unshaped only, and the reason is the finding itself: 16 MiB in 8 KiB blocks is 2048 round
+trips, which at 50 ms RTT is a hundred seconds *per sample* -- twenty minutes of lane time to
+re-measure something the unshaped row already shows at 0.1x. Bounding it is stated here rather
+than silently, because a scenario that quietly skips a profile reads as one that passed it.
+"""
+
+FILE_OBJECT_FLOOR = 0.5
+"""Fraction of our own `get` throughput the file object must reach at the largest block.
+
+The acceptance criterion from D-91, as a number. It **gates**, and for the same reason the size
+sweep does: it is a ratio between two rows of a *single run*, on one link, in one direction, so
+it needs no committed baseline and is not the regression gate D-63 is about. What it catches is
+the regression that matters -- a `read()` that stops pipelining is not 20% slower, it is one
+round trip per block, and on any shaped profile that is an order of magnitude.
+"""
+
+
+async def _scenario_file_object(
+    clients: Sequence[Client],
+    source: Path,
+    remote: Path,
+    blocks: Sequence[int],
+    *,
+    control: bool,
+) -> tuple[list[Measurement], list[str]]:
+    """What reading through the file object costs against reading the whole file (D-86).
+
+    Us against us for the row that gates, plus paramiko as a control. The control is the point
+    of the exercise rather than decoration: `paramiko#2453` reports their `SFTPFile.read()` at
+    25x their own `get`, and the obvious implementation of a byte-range read -- one `READ` per
+    call, awaited -- reproduces it exactly. Having a file object was never the deliverable.
+
+    Reported and never asserted for the control, asserted for ourselves, which is the same
+    split the size sweep uses and for the same reason.
+
+    **The control runs on the unshaped profile only, and the bound is a cost rather than a
+    judgement.** paramiko's file object is round-trip-bound by construction, so at 50 ms RTT one
+    16 MiB read is hundreds of round trips and four samples of it is minutes -- per block size,
+    per profile. What it demonstrates it demonstrates unshaped, where it is already tens of
+    times its own `get` with no latency to blame. Named here rather than left to a reader to
+    notice a missing row, because a scenario that quietly drops a client reads as one that
+    measured it.
+
+    Returns:
+        The measurements, and any failure lines. Failures are returned rather than raised so
+        that one bad row still writes its table -- a gate that destroys the evidence for its
+        own verdict is worse than no gate.
+    """
+    gantry = next((c for c in clients if isinstance(c, GantryClient)), None)
+    if gantry is None:  # pragma: no cover - gantry_sftp is always importable here
+        return [], []
+
+    scenario = "read 16 MiB: file object vs whole file"
+    baseline = await take_samples(
+        lambda: gantry.download(remote, source.parent / "file-object-baseline.bin"),
+        scenario=scenario,
+        client="gantry-sftp (get)",
+        repeats=REPEATS,
+    )
+    measurements = [baseline]
+    wanted = (GantryClient, ParamikoClient) if control else (GantryClient,)
+    for block in blocks:
+        for client in clients:
+            if not isinstance(client, wanted):
+                continue
+            measurements.append(
+                await take_samples(
+                    lambda c=client, b=block: c.read_in_blocks(remote, block_size=b),
+                    scenario=scenario,
+                    client=f"{client.name} (read {block // 1024} KiB blocks)",
+                    repeats=REPEATS,
+                )
+            )
+
+    largest = f"gantry-sftp (read {max(blocks) // 1024} KiB blocks)"
+    ours = next((m for m in measurements if m.client == largest), None)
+    failures = []
+    if ours is not None and baseline.throughput_mib_per_second:
+        fraction = ours.throughput_mib_per_second / baseline.throughput_mib_per_second
+        if fraction < FILE_OBJECT_FLOOR:
+            failures.append(
+                f"the file object reached {fraction:.2f}x `get`'s throughput at "
+                f"{max(blocks)}-byte blocks, below the {FILE_OBJECT_FLOOR}x floor: "
+                f"a read that stopped pipelining costs one round trip per block (D-86)"
+            )
+    return measurements, failures
+
+
+DOWNLOAD_SWEEP = "download: throughput against size"
+UPLOAD_SWEEP = "upload: throughput against size"
 
 
 def _repeats_for(size_bytes: int, repeats: tuple[int, int]) -> int:
@@ -724,6 +837,19 @@ async def test_benchmark_profile(
                 baseline_client="gantry-sftp (connection's first)",
             )
         )
+    shaped = profile.rtt_ms is not None
+    blocks = FILE_OBJECT_BLOCKS if shaped else (SMALL_BLOCK, *FILE_OBJECT_BLOCKS)
+    file_object, file_object_failures = await _scenario_file_object(
+        clients, tmp_path, large, blocks, control=not shaped
+    )
+    if file_object:
+        sections.append(
+            render_scenario(
+                "read 16 MiB: file object vs whole file",
+                file_object,
+                baseline_client="gantry-sftp (get)",
+            )
+        )
     if profile.small_files:
         sections.append(
             render_scenario(
@@ -775,6 +901,11 @@ async def test_benchmark_profile(
     # Asserted *after* the tables are in the report, not before. A cliff has to publish the
     # curve that proves it -- with the assertion first, the only evidence for a failure would
     # be its own message, and the section it belongs to would be missing from the report.
+    assert not file_object_failures, (
+        f"the file object did not keep up with `get` on {description} -- "
+        f"{'  |  '.join(file_object_failures)}. The table is in the report."
+    )
+
     ours = _route_falls(sweeps, report, profile=profile.name)
     assert not ours, (
         f"throughput fell as the file grew, on {description} -- "

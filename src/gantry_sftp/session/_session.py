@@ -117,6 +117,7 @@ from gantry_sftp.session._download import (
     DEFAULT_PIPELINE_DEPTH,
     ProgressCallback,
     download_handle,
+    read_range_into,
 )
 from gantry_sftp.session._glob import RECURSIVE, match_component, split_pattern
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
@@ -155,7 +156,7 @@ from gantry_sftp.session._recursive import (
     check_listed_name,
     join_remote,
 )
-from gantry_sftp.session._upload import upload_handle
+from gantry_sftp.session._upload import upload_handle, write_range_from
 from gantry_sftp.session._verify import (
     CHECK_FILE_BLOCK_SIZE,
     ContentCheck,
@@ -486,6 +487,255 @@ class DirectoryScan:
             raise StopAsyncIteration
         self._batch = batch
         self._index = 0
+
+
+class RemoteFile:
+    """One open remote file with a cursor: ranges, tails, appends and streaming.
+
+    Everything else in this library moves a *whole file between a remote path and a local
+    path*. That covers the common case and excludes a real one -- reading a header, tailing a
+    log, appending a record, or streaming a remote file into a parser or a hash without
+    staging it on disk first. This is that surface, and it is a context manager because it
+    holds a server-side handle::
+
+        async with sftp.open_file(b"/logs/today.jsonl") as remote:
+            first = await remote.read(512)
+
+    **Pipelined, which is the whole design constraint.** Every read here goes through the same
+    scheduler a ``get`` uses, so ``read(1 << 20)`` is several ``READ``s in flight rather than
+    one round trip per call. The obvious implementation -- one request per call, awaited --
+    is what makes the incumbent's file object 25x slower than its own whole-file download
+    (``paramiko#2453``), and it would have shipped that complaint under a new name.
+
+    **One file object is one task.** The cursor is mutable shared state: two tasks reading the
+    same object interleave their positions and each gets a subset of what it asked for. Use
+    :meth:`Session.readinto_at` and :meth:`Session.write_at` to fan out over one file -- they
+    take the offset as an argument, so there is no shared position to race on.
+
+    Attributes:
+        path: The remote path, as bytes.
+    """
+
+    def __init__(
+        self, session: Session, path: bytes, pflags: OpenFlag, *, mode: int | None = None
+    ) -> None:
+        self._session = session
+        self._path = path
+        self._pflags = pflags
+        self._mode = mode
+        self._handle: bytes | None = None
+        self._entered = False
+        self._position = 0
+
+    @property
+    def path(self) -> bytes:
+        """The remote path, encoded.
+
+        Bytes rather than ``str`` for the same reason every other server-facing name here is:
+        a remote filename need not be valid UTF-8.
+        """
+        return self._path
+
+    @override
+    def __repr__(self) -> str:
+        """Names the file, which half of the lifetime it is in, and where the cursor is.
+
+        The position is in it because the position is what a caller debugging this surface is
+        actually asking about -- a read that returned less than expected is usually a cursor
+        somewhere other than where its author believed.
+        """
+        state = "open" if self._handle is not None else ("closed" if self._entered else "unopened")
+        return f"<RemoteFile {self._path!r} {state} at {self._position}>"
+
+    def _open_handle(self) -> bytes:
+        """The handle, or the error explaining which half of the lifetime we are in.
+
+        Raises:
+            StateError: If the file is not currently open.
+        """
+        if self._handle is None:
+            if self._entered:
+                raise StateError("this open_file() is closed; its `async with` block has ended")
+            raise StateError("this open_file() is not open; use it in an `async with` block")
+        return self._handle
+
+    async def __aenter__(self) -> RemoteFile:
+        """Open the file.
+
+        Raises:
+            StateError: If this object has already been entered. One file object is one
+                handle; a second ``async with`` would silently reopen at position zero.
+            NoSuchFileError: If the path does not exist and was not to be created.
+            PermissionDeniedError: If the server will not open it.
+        """
+        if self._entered:
+            raise StateError("this open_file() has already been used; call open_file() again")
+        self._entered = True
+        self._handle = await self._session.open(self._path, self._pflags, mode=self._mode)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the handle, whichever way the block ended.
+
+        A ``CLOSE`` that fails on the way out of a clean block is reported; one that fails
+        while an exception is already propagating is not allowed to replace it, because the
+        first exception is the one that explains what happened.
+        """
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        if exc is None:
+            await self._session.close(handle)
+            return
+        await _close_quietly(self._session, handle)
+
+    def tell(self) -> int:
+        """The cursor, without asking the server.
+
+        Not a round trip, and never stale in the direction that matters: it is where the
+        *next* read or write will start.
+        """
+        return self._position
+
+    async def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Move the cursor and return its new absolute position.
+
+        ``SEEK_SET`` and ``SEEK_CUR`` are local arithmetic and send nothing. ``SEEK_END``
+        costs one ``FSTAT``, because only the server knows where the end is -- and the answer
+        is a snapshot: a file being appended to has moved by the time you read.
+
+        Seeking past the end is legal and does not extend the file. A read there returns
+        ``b""``; a write there leaves a hole that reads back as zeroes.
+
+        Args:
+            offset: Displacement, which may be negative for ``SEEK_CUR`` and ``SEEK_END``.
+            whence: One of ``os.SEEK_SET``, ``os.SEEK_CUR``, ``os.SEEK_END``.
+
+        Returns:
+            The new absolute position.
+
+        Raises:
+            ValueError: If ``whence`` is not one of the three, or the result is negative.
+            StateError: If the file is not open.
+        """
+        handle = self._open_handle()
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self._position + offset
+        elif whence == os.SEEK_END:
+            attrs = await self._session.fstat(handle)
+            if attrs.size is None:
+                raise ValueError(
+                    "the server did not report a size, so SEEK_END has nothing to seek from"
+                )
+            target = attrs.size + offset
+        else:
+            raise ValueError(f"whence must be os.SEEK_SET, SEEK_CUR or SEEK_END, got {whence}")
+        if target < 0:
+            raise ValueError(f"seek would put the position at {target}, before the start")
+        self._position = target
+        return target
+
+    async def read(self, length: int | None = None) -> bytes:
+        """Read from the cursor and advance it.
+
+        Args:
+            length: Bytes to read, or ``None`` for "the rest of the file", which costs one
+                extra ``FSTAT`` to find the end. The rest is a snapshot taken at that moment;
+                a file being written underneath you is not something a client can freeze.
+
+        Returns:
+            Exactly ``length`` bytes, unless end of file arrived first, and ``b""`` at the
+            end. A short return is **only** end of file -- a short ``DATA`` mid-file is legal
+            and is re-requested rather than handed back, so no caller has to loop.
+
+        Raises:
+            ValueError: If ``length`` is negative.
+            StateError: If the file is not open.
+        """
+        handle = self._open_handle()
+        if length is None:
+            attrs = await self._session.fstat(handle)
+            if attrs.size is None:
+                raise ValueError(
+                    "the server did not report a size, so read() cannot tell where the file "
+                    "ends; pass a length"
+                )
+            length = max(0, attrs.size - self._position)
+        data = await self._session.read_at(handle, self._position, length)
+        self._position += len(data)
+        return data
+
+    async def readinto(self, buffer: bytearray | memoryview) -> int:
+        """Read into a buffer you already own, with no copy, and advance the cursor.
+
+        Returns:
+            Bytes read, short of ``len(buffer)`` only at end of file.
+
+        Raises:
+            StateError: If the file is not open.
+        """
+        handle = self._open_handle()
+        filled = await self._session.readinto_at(handle, buffer, self._position)
+        self._position += filled
+        return filled
+
+    async def write(self, data: bytes | memoryview) -> int:
+        """Write at the cursor and advance it.
+
+        Note what ``APPEND`` does to this: a file opened with ``OpenFlag.APPEND`` has every
+        write placed at the *server's* idea of the end regardless of the offset sent, so the
+        cursor tracked here stops describing where the bytes landed. That is the flag's
+        meaning rather than a defect, and it is why appending is spelled with the flag rather
+        than with a seek.
+
+        Returns:
+            Bytes the server acknowledged, which is ``len(data)`` on success.
+
+        Raises:
+            StateError: If the file is not open.
+            TransferError: If the server refuses a write, carrying how far it got.
+        """
+        handle = self._open_handle()
+        written = await self._session.write_at(handle, self._position, data)
+        self._position += written
+        return written
+
+    async def stat(self) -> Attrs:
+        """Attributes of the open file, from its handle rather than its name.
+
+        Raises:
+            StateError: If the file is not open.
+        """
+        return await self._session.fstat(self._open_handle())
+
+    async def truncate(self, size: int | None = None) -> None:
+        """Set the file's length, defaulting to the current cursor.
+
+        Does not move the cursor, matching ``io``: truncating below the position leaves it
+        past the end, where a read returns ``b""``.
+
+        Raises:
+            ValueError: If ``size`` is negative.
+            StateError: If the file is not open.
+        """
+        handle = self._open_handle()
+        await self._session.ftruncate(handle, self._position if size is None else size)
+
+    async def fsync(self) -> None:
+        """Ask the server to flush this file to its disk, where it supports it.
+
+        Raises:
+            UnsupportedError: If the server does not advertise ``fsync@openssh.com``.
+            StateError: If the file is not open.
+        """
+        await self._session.fsync(self._open_handle())
 
 
 class Session:
@@ -1044,6 +1294,32 @@ class Session:
         encoded = _encode_path(path)
         await self._expect_status(SetStat(self._next(), encoded, Attrs(size=size)), path=encoded)
 
+    async def ftruncate(self, handle: bytes, size: int) -> None:
+        """Set the length of an **open file**, by handle rather than by path.
+
+        The handle-addressed :meth:`truncate`, and the difference is the same one :meth:`fstat`
+        exists for: a path can be replaced between the ``OPEN`` and the ``SETSTAT``, so a
+        writer that truncates by name can truncate a file it is not the one holding open. It
+        is also the only form available to a caller who has a handle and no usable path --
+        which is every caller of :meth:`open_file`.
+
+        ``FSETSTAT`` carrying only ``SIZE``. Growing a file this way makes a hole rather than
+        writing zeroes, so the space is not reserved and a later write can still fail with
+        ``ENOSPC``.
+
+        Args:
+            handle: An open file handle, opened for writing.
+            size: The new length in bytes.
+
+        Raises:
+            ValueError: If ``size`` is negative.
+            ServerError: If the server refuses. A read-only handle answers ``NO_SUCH_FILE``
+                here, the same misdirection a write on one gives.
+        """
+        if size < 0:
+            raise ValueError(f"size must not be negative, got {size}")
+        await self._expect_status(FSetStat(self._next(), handle, Attrs(size=size)))
+
     async def fstat(self, handle: bytes) -> Attrs:
         """Attributes of an open handle.
 
@@ -1249,6 +1525,172 @@ class Session:
         if isinstance(reply, Handle):
             return reply.handle
         raise _unexpected(reply, expected="HANDLE", path=encoded)
+
+    async def readinto_at(self, handle: bytes, buffer: bytearray | memoryview, offset: int) -> int:
+        """Read ``len(buffer)`` bytes from ``offset`` into ``buffer``. The zero-copy primitive.
+
+        Pipelined: a range longer than one request becomes several in flight, exactly as a
+        ``get`` does, because a byte-range read that issues one ``READ`` and awaits it costs a
+        round trip per call. That is not a hypothetical -- it is the documented behaviour of
+        the incumbent's file object, which runs 25x slower than its own whole-file download
+        (``paramiko#2453``).
+
+        **Safe to call from several tasks at once**, on the same handle or on different ones:
+        the offset is an argument rather than a cursor, so there is no shared position for two
+        tasks to interleave. :meth:`open_file` is the cursor-bearing form and is not.
+
+        Args:
+            handle: An open remote file handle, opened for reading.
+            buffer: Writable destination, filled from its first byte. Its length is the range.
+            offset: Absolute offset in the remote file.
+
+        Returns:
+            Bytes read. Short of ``len(buffer)`` **only at end of file** -- a short ``DATA`` is
+            legal mid-file and is re-requested rather than returned, so a caller never has to
+            loop to fill a range. ``0`` means the offset was at or past the end.
+
+            The unfilled tail of ``buffer`` is left as it was rather than zeroed.
+
+        Raises:
+            ValueError: If ``offset`` is negative.
+            TransferError: If the server refuses the read -- **not** the typed status error
+                :meth:`open` would raise, because this is the transfer scheduler and a refusal
+                here carries how far the range got. The status name is in the message.
+
+                Two of those messages mislead and it is the server's doing rather than ours: a
+                handle opened write-only answers ``NO_SUCH_FILE``, and so does a handle that
+                has already been closed. OpenSSH's handle lookup checks the direction, so "No
+                such file" is what a perfectly good path reports when the handle is the wrong
+                kind.
+            TransferTimeoutError: If the server stops responding.
+        """
+        view = memoryview(buffer) if isinstance(buffer, bytearray) else buffer
+        return await read_range_into(
+            self._dispatcher,
+            handle,
+            view,
+            offset=offset,
+            read_length=self.sizes_for(handle).read_length,
+            depth=self._depth,
+            idle_timeout=self._idle_timeout,
+        )
+
+    async def read_at(self, handle: bytes, offset: int, length: int) -> bytes:
+        """Read up to ``length`` bytes from ``offset``, pipelined.
+
+        The ergonomic form of :meth:`readinto_at`, and the one copy in it is the return type:
+        handing back immutable ``bytes`` means copying out of the buffer that was filled.
+        Reach for ``readinto_at`` when that matters.
+
+        **A zero-length read is answered here rather than on the wire.** OpenSSH replies to a
+        zero-length ``READ`` with an empty ``DATA``, which is also exactly how a server making
+        no progress looks -- the transfer scheduler tolerates one and fails on the second, and
+        it is right to. Rather than teach it an exception for a case whose answer is already
+        known, this returns ``b""`` without asking.
+
+        Args:
+            handle: An open remote file handle, opened for reading.
+            offset: Absolute offset in the remote file.
+            length: Bytes to read. May exceed the server's ``max-read-length``; the range is
+                split across requests, so there is no ceiling a caller has to know about.
+
+        Returns:
+            The bytes read: exactly ``length`` of them unless end of file arrived first, and
+            ``b""`` at or past the end.
+
+        Raises:
+            ValueError: If ``offset`` or ``length`` is negative.
+        """
+        if length < 0:
+            raise ValueError(f"length must not be negative, got {length}")
+        if offset < 0:
+            raise ValueError(f"offset must not be negative, got {offset}")
+        if length == 0:
+            return b""
+        buffer = bytearray(length)
+        filled = await self.readinto_at(handle, buffer, offset)
+        del buffer[filled:]
+        return bytes(buffer)
+
+    async def write_at(self, handle: bytes, offset: int, data: bytes | memoryview) -> int:
+        """Write ``data`` at ``offset``, pipelined.
+
+        Longer than one request becomes several in flight, and the payload is not copied on
+        the way to the wire.
+
+        **Safe to call from several tasks at once on different ranges**; two tasks writing the
+        same range is a race this cannot arbitrate, exactly as with two processes and
+        ``pwrite``. Unlike a read, a write is **not idempotent** -- nothing here retries one,
+        and a caller reissuing a failed write has to know what the server already stored.
+
+        Writing past the end of the file is legal and leaves a hole, which reads back as
+        zeroes. Verified against ``sftp-server`` rather than assumed.
+
+        Args:
+            handle: An open remote file handle, opened for writing.
+            offset: Absolute offset in the remote file.
+            data: The bytes to write. Empty writes no bytes and costs no round trip.
+
+        Returns:
+            Bytes the server acknowledged, which is ``len(data)`` on success.
+
+        Raises:
+            ValueError: If ``offset`` is negative.
+            TransferError: If the server refuses the write, carrying how far it got. A handle
+                opened read-only answers ``NO_SUCH_FILE`` inside that message, for the same
+                reason a read on a write-only handle does.
+        """
+        if offset < 0:
+            raise ValueError(f"offset must not be negative, got {offset}")
+        payload = memoryview(data) if isinstance(data, bytes) else data
+        if not len(payload):
+            return 0
+        return await write_range_from(
+            self._dispatcher,
+            handle,
+            payload,
+            offset=offset,
+            write_length=self.sizes_for(handle).write_length,
+            depth=self._depth,
+            idle_timeout=self._idle_timeout,
+        )
+
+    def open_file(
+        self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None
+    ) -> RemoteFile:
+        """Open a remote file as a cursor-bearing object, for ranges and streaming.
+
+        The shape a caller reaches for when the file does not fit the whole-file transfer
+        model: a header, a range, a tail, an append, or a stream into a parser::
+
+            async with sftp.open_file("/logs/today.jsonl") as remote:
+                header = await remote.read(512)
+                await remote.seek(-4096, io.SEEK_END)
+                tail = await remote.read()
+
+        A context manager rather than a bare object, for the same reason
+        :meth:`scandir` is one: it holds a server-side handle open, and an object that is
+        merely dropped is not finalised by trio -- the handle would sit on the server until
+        the garbage collector felt like it, if ever.
+
+        **One file object is one task.** The cursor is mutable shared state, so two tasks
+        reading the same object interleave their positions and each gets a subset of the bytes
+        it asked for -- a correctness bug that reads as a scheduling one. That is not a
+        limitation of the session, which multiplexes happily; it is what a cursor *is*. For
+        concurrent access to one file, use :meth:`readinto_at` and :meth:`write_at`, which take
+        the offset as an argument and are safe to fan out.
+
+        Args:
+            path: What to open.
+            pflags: Access and creation flags, exactly as :meth:`open`.
+            mode: Permission bits for a file this call creates. Omitting it means the file
+                arrives ``0666 & ~umask`` -- world-readable under the usual umask -- and no
+                later ``chmod`` closes the window between creation and the fix.
+
+        Returns:
+            An unopened :class:`RemoteFile`. Nothing is sent until it is entered.
+        """
+        return RemoteFile(self, _encode_path(path), pflags, mode=mode)
 
     async def opendir(self, path: bytes | str) -> bytes:
         """Open a remote directory and return its handle.

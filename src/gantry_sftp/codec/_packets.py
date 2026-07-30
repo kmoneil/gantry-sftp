@@ -292,7 +292,11 @@ class Write:
     request_id: int
     handle: bytes
     offset: int
-    data: bytes
+    data: bytes | memoryview
+    """``memoryview`` is accepted so a caller's buffer reaches the wire without being copied
+    into ``bytes`` first -- the same end-to-end rule the receive side already follows.
+    :meth:`decode_body` still materialises ``bytes``, because a decoded packet outlives the
+    frame it was read from and a view into a recycled buffer would not."""
 
     def encode_body(self, writer: WireWriter) -> None:
         """Append this packet's body, excluding the type byte."""

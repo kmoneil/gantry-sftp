@@ -22,6 +22,7 @@ makes that a usable leak probe rather than an inference from the absence of a co
 from __future__ import annotations
 
 import inspect
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -32,9 +33,11 @@ import pytest
 from anyio.from_thread import start_blocking_portal
 
 import gantry_sftp
+import gantry_sftp.session
 import gantry_sftp.sync as sync_module
 from gantry_sftp import (
     NoSuchFileError,
+    OpenFlag,
     Session,
     SessionOptions,
     StateError,
@@ -42,11 +45,12 @@ from gantry_sftp import (
 from gantry_sftp import (
     connect as async_connect,
 )
-from gantry_sftp.session import DirectoryScan
+from gantry_sftp.session import DirectoryScan, RemoteFile
 from gantry_sftp.session import open_session as async_open_session
 from gantry_sftp.sync import (
     BoundPortal,
     SyncDirectoryScan,
+    SyncRemoteFile,
     SyncSession,
     SyncTransport,
     connect,
@@ -91,16 +95,26 @@ RETURN_TRANSLATIONS = {
     "walk": ("AsyncGenerator[WalkEntry]", "Iterator[WalkEntry]"),
     "glob": ("AsyncGenerator[GlobMatch]", "Iterator[GlobMatch]"),
     "scandir": ("DirectoryScan", "SyncDirectoryScan"),
+    "open_file": ("RemoteFile", "SyncRemoteFile"),
 }
-"""The three members whose return type legitimately changes, and what it changes to.
+"""The four members whose return type legitimately changes, and what it changes to.
 
 Every other method returns exactly what the async one returns -- awaiting is what the portal
-does, so `get` is still `-> int`. These three are the shapes that could not survive the thread
-boundary unchanged: two async generators, which become ordinary Python iterators, and the
-directory scan, which becomes the blocking context manager of the same shape.
+does, so `get` is still `-> int`. These are the shapes that could not survive the thread
+boundary unchanged: two async generators, which become ordinary Python iterators, and two
+hand-written async context managers, which become blocking ones of the same shape.
+
+**`open_file` is the fourth entry and it was argued for rather than added to make the suite
+green** (D-86). The card that built it predicted this test would fail by name, and said that
+failing is the design working -- so the question it forces is whether a *fourth* kind of thing
+had appeared or the third kind had gained a member. It is the latter: `RemoteFile` holds a
+server-side handle across a block for exactly the reason `DirectoryScan` does, and a caller who
+`break`s out mid-read has to reach its `__aexit__` the same way. The derivation below is
+widened to say "a hand-written async context manager", which is what both of them are, rather
+than naming the second class -- a rule that lists instances stops being a rule at the third one.
 
 Named rather than skipped, and checked in both directions below, so the list cannot outlive
-its reason or quietly grow a fourth entry nobody argued for.
+its reason or quietly grow a fifth entry nobody argued for.
 """
 
 
@@ -175,6 +189,23 @@ def test_the_translation_table_has_no_stale_entries():
     assert stale == [], f"translated but no longer a Session method: {stale}"
 
 
+def returns_an_async_context_manager(member: Any) -> bool:
+    """Whether a method hands back an object a caller has to `async with`.
+
+    Resolved from the *returned class* rather than from its name (D-86). The first version of
+    this asked whether the annotation was the string `"DirectoryScan"`, which was accurate
+    while there was one such class and became a list of instances the moment there were two.
+    What actually cannot cross the thread boundary is an object holding a server-side handle
+    across a block, and what identifies one is that it defines `__aenter__` -- so that is the
+    question asked. A future method returning a third one is caught with no edit here.
+    """
+    annotation = inspect.signature(member).return_annotation
+    if not isinstance(annotation, str):
+        return False
+    returned = getattr(gantry_sftp.session, annotation, None)
+    return isinstance(returned, type) and hasattr(returned, "__aenter__")
+
+
 def test_only_the_streaming_shapes_are_translated():
     """The entries are exactly the members that cannot cross the boundary unchanged.
 
@@ -185,12 +216,28 @@ def test_only_the_streaming_shapes_are_translated():
         name
         for name, member in ASYNC_MEMBERS.items()
         if not isinstance(member, property)
-        and (
-            inspect.isasyncgenfunction(member)
-            or inspect.signature(member).return_annotation == "DirectoryScan"
-        )
+        and (inspect.isasyncgenfunction(member) or returns_an_async_context_manager(member))
     }
     assert set(RETURN_TRANSLATIONS) == must_translate
+
+
+def test_the_blocking_file_object_mirrors_the_async_one():
+    """`SyncRemoteFile` gets the same derivation `SyncSession` does, one level down.
+
+    `RemoteFile` is reached through `open_file` rather than through `Session`, so the parity
+    sweep above cannot see it: a method added to the file object and forgotten here would be
+    invisible to every other test in this module. `path` is a property on both, and `read` /
+    `seek` / `write` keep their signatures because the portal only removes the `await`.
+    """
+    theirs = public_members(RemoteFile)
+    ours = public_members(SyncRemoteFile)
+    assert sorted(set(theirs) - set(ours)) == [], "RemoteFile members with no blocking form"
+    assert sorted(set(ours) - set(theirs)) == [], "the blocking file object invented a member"
+    for name, member in theirs.items():
+        if isinstance(member, property):
+            assert isinstance(ours[name], property), f"{name} should stay a property"
+            continue
+        assert parameters(ours[name]) == parameters(member), f"{name} changed its arguments"
 
 
 # --- the entry points ----------------------------------------------------------------------
@@ -727,3 +774,63 @@ def test_the_transport_hands_back_the_async_object_it_carries(tmp_path: Path):
     with open_local_server_transport(cwd=tmp_path) as transport:
         assert hasattr(transport.transport, "send")
         assert hasattr(transport.transport, "receive")
+
+
+def test_the_blocking_file_object_reads_a_range_and_closes_its_handle(tmp_path: Path):
+    """The behavioural half of `open_file`, including the question the parity test cannot ask.
+
+    A blocking caller who leaves the `with` early -- an exception, a `return`, a decision made
+    on the first 512 bytes -- has to reach `RemoteFile.__aexit__` on the portal's thread. The
+    proof is the server's own bookkeeping rather than a reference count: `close()` of a handle
+    the server has already forgotten answers `NO_SUCH_FILE`, so asking a second time is how we
+    know the first one landed.
+    """
+    needs_real_server()
+    content = bytes(range(256)) * 4
+    (tmp_path / "data.bin").write_bytes(content)
+
+    with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        held: list[bytes] = []
+        with sftp.open_file(str(tmp_path / "data.bin").encode()) as remote:
+            assert remote.read(16) == content[:16]
+            assert remote.tell() == 16
+            assert remote.seek(-4, os.SEEK_END) == len(content) - 4
+            assert remote.read() == content[-4:]
+            held.append(remote._remote._open_handle())  # noqa: SLF001
+
+        with pytest.raises(NoSuchFileError) as error:
+            sftp.close(held[0])
+        assert error.value.code == 2
+
+
+def test_the_blocking_file_object_writes_from_several_threads_by_offset(tmp_path: Path):
+    """The fan-out shape, which is the reason `write_at` exists beside the cursor.
+
+    Four threads, one handle, four disjoint ranges. `SyncRemoteFile` is single-task for the
+    same reason `RemoteFile` is -- a cursor is shared mutable state -- so the offset form is
+    what a thread pool uses, and this is the test that says so in code.
+    """
+    needs_real_server()
+    target = tmp_path / "out.bin"
+
+    with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = sftp.open(str(target).encode(), OpenFlag.WRITE | OpenFlag.CREAT, mode=0o600)
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                written = list(
+                    pool.map(
+                        lambda index: sftp.write_at(handle, index * 4, bytes([index]) * 4),
+                        range(4),
+                    )
+                )
+        finally:
+            sftp.close(handle)
+
+    assert written == [4, 4, 4, 4]
+    assert target.read_bytes() == b"".join(bytes([index]) * 4 for index in range(4))

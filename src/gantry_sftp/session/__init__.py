@@ -16,6 +16,7 @@ from gantry_sftp.session._download import (
     DEFAULT_PIPELINE_DEPTH,
     ProgressCallback,
     download_handle,
+    read_range_into,
 )
 from gantry_sftp.session._limits import (
     DEFAULT_MAX_PACKET_LENGTH,
@@ -102,12 +103,13 @@ from gantry_sftp.session._session import (
     DEFAULT_SESSION_OPTIONS,
     LIMITS_EXTENSION,
     DirectoryScan,
+    RemoteFile,
     Session,
     SessionOptions,
     open_session,
     raise_for_status,
 )
-from gantry_sftp.session._upload import upload_handle
+from gantry_sftp.session._upload import upload_handle, write_range_from
 from gantry_sftp.session._verify import (
     CHECK_FILE_BLOCK_SIZE,
     ContentCheck,
@@ -152,6 +154,7 @@ __all__ = [
     "ProgressCallback",
     "Publish",
     "PublishMechanism",
+    "RemoteFile",
     "ResumeCheck",
     "ServerLimits",
     "ServerProfile",
@@ -185,6 +188,7 @@ __all__ = [
     "open_session",
     "parse_vendor_id",
     "raise_for_status",
+    "read_range_into",
     "read_request_overhead",
     "remote_component",
     "remote_component_reason",
@@ -196,5 +200,6 @@ __all__ = [
     "upload_handle",
     "walk_local",
     "with_reconnect",
+    "write_range_from",
     "write_request_overhead",
 ]

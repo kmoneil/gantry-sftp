@@ -163,10 +163,11 @@ LANES: tuple[Lane, ...] = (
         needs="uv sync --group bench, openssh-server, and CAP_NET_ADMIN as netem",
         reports_only=(
             "there is no committed baseline to compare a run's *figures* against, so it can "
-            "print a throughput regression but not fail on one (D-63). One thing in it does "
-            "assert, and needs no baseline to: the size sweep fails when our own throughput "
-            "falls as the file grows, which is a claim about a single run's shape rather than "
-            "about a number (D-92)"
+            "print a throughput regression but not fail on one (D-63). Two things in it do "
+            "assert, and neither needs a baseline: the size sweep fails when our own "
+            "throughput falls as the file grows (D-92), and the file-object row fails when "
+            "reading through `open_file` drops below half our own `get` (D-86). Both compare "
+            "two rows of a single run rather than a figure against a remembered one"
         ),
         takes="minutes",
     ),

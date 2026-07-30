@@ -62,9 +62,13 @@ from gantry_sftp.session._dispatch import Dispatcher, Exchange
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_PIPELINE_DEPTH",
+    "BufferSink",
+    "DescriptorSink",
     "ProgressCallback",
+    "Sink",
     "Span",
     "download_handle",
+    "read_range_into",
 ]
 
 DEFAULT_PIPELINE_DEPTH = 64
@@ -121,6 +125,70 @@ class ProgressCallback(Protocol):
     """
 
     def __call__(self, transferred: int, total: int | None) -> None: ...
+
+
+class Sink(Protocol):
+    """Where a downloaded payload goes.
+
+    The scheduler below is the only pipelining implementation in this library, and it existed
+    for one destination: a file descriptor written with ``os.pwrite``. A public byte-range read
+    needs the same scheduler with the bytes landing in memory instead, and the way to get that
+    is **not** a second scheduler -- one `READ` issued per call and awaited is precisely the
+    shape that makes the incumbent's file object 25x slower than its own `get`
+    (``paramiko#2453``).
+
+    So the destination is a parameter. It takes a ``memoryview`` and places it at an absolute
+    file offset; it never returns bytes to be concatenated, because a data path that
+    concatenates has copied.
+    """
+
+    def write_at(self, offset: int, payload: memoryview) -> None:
+        """Place ``payload`` at ``offset``, an absolute position in the remote file."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DescriptorSink:
+    """Writes into an open local file at explicit offsets.
+
+    ``pwrite`` needs no ordering and no seeking, which is what lets replies be handled in
+    whatever order they arrive -- and it is why this sink is POSIX-only while
+    :class:`BufferSink` is not. That split is the whole of the platform story for this layer.
+    """
+
+    fd: int
+
+    def write_at(self, offset: int, payload: memoryview) -> None:
+        """Write the whole payload, looping over short writes.
+
+        ``os.pwrite`` can write fewer bytes than asked, and a version of this that ignored
+        that would silently drop the tail of a payload.
+        """
+        written = 0
+        while written < len(payload):
+            written += os.pwrite(self.fd, payload[written:], offset + written)
+
+
+@dataclass(frozen=True, slots=True)
+class BufferSink:
+    """Writes into a caller's buffer, which is what makes a byte-range read possible.
+
+    ``base`` is the file offset the buffer's first byte corresponds to, so a range read of
+    ``[base, base + len(view))`` fills it exactly. Slice assignment into a ``memoryview`` is a
+    copy of the payload into the caller's memory and nothing more -- no intermediate ``bytes``,
+    no concatenation, and no per-payload allocation.
+
+    Attributes:
+        view: Writable view over the destination, exactly as long as the range being read.
+        base: Absolute file offset of ``view[0]``.
+    """
+
+    view: memoryview
+    base: int
+
+    def write_at(self, offset: int, payload: memoryview) -> None:
+        start = offset - self.base
+        self.view[start : start + len(payload)] = payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +249,7 @@ class _Downloader:
         codec: Codec,
         exchange: Exchange,
         handle: bytes,
-        fd: int,
+        sink: Sink,
         *,
         span: Span,
         read_length: int,
@@ -193,7 +261,7 @@ class _Downloader:
         self._codec = codec
         self._exchange = exchange
         self._handle = handle
-        self._fd = fd
+        self._sink = sink
         self._span = span
         self._read_length = read_length
         self._depth = depth
@@ -266,28 +334,41 @@ class _Downloader:
                 remote_path=self._remote_path,
             ) from exc
 
-    def _write_at(self, offset: int, payload: memoryview) -> int:
-        """Write ``payload`` at an explicit offset, looping over short writes.
-
-        ``pwrite`` needs no ordering and no seeking, which is what lets replies be handled
-        in whatever order they arrive. It can also write fewer bytes than asked, and a
-        version of this that ignored that would silently drop the tail of a payload.
-        """
-        written = 0
-        while written < len(payload):
-            written += os.pwrite(self._fd, payload[written:], offset + written)
-        return written
-
-    def _handle_data(self, issued: _Range, response: Data) -> None:
+    def _handle_data(self, issued: _Range, response: Data, request_id: int) -> None:
         payload = response.data
+        if len(payload) > issued.length:
+            self._refuse_an_overlong_data(issued, len(payload), request_id)
         if not payload:
             self._refuse_a_second_zero_length(issued)
-        self._write_at(issued.offset, payload)
+        self._sink.write_at(issued.offset, payload)
         self._written += len(payload)
 
         if len(payload) < issued.length:
             # Legal, and not EOF. Re-queue only what is missing.
             self._backlog.append(_Range(issued.offset + len(payload), issued.length - len(payload)))
+
+    def _refuse_an_overlong_data(self, issued: _Range, arrived: int, request_id: int) -> None:
+        """Refuse a DATA carrying **more** than the READ asked for.
+
+        Short is legal and handled above. Long is not: a server has no way to know what the
+        caller intended to do with the extra bytes, and every destination this can write into
+        is sized by the request. Writing them anyway meant a descriptor sink scribbling over
+        the range the *next* request owns -- silently, since nothing downstream re-checks a
+        length -- and a buffer sink raising ``ValueError`` from a slice assignment several
+        frames from the cause.
+
+        Named for what it is: server-supplied lengths are attacker-controlled input, and this
+        is the one place the transfer's own arithmetic can be steered from the far end.
+
+        Raises:
+            ProtocolError: Always. The frame is malformed with respect to its request rather
+                than the file being wrong, so this is not a ``TransferError``.
+        """
+        raise ProtocolError(
+            f"server answered a {issued.length}-byte READ at offset {issued.offset} with "
+            f"{arrived} bytes; a DATA may be short but never long",
+            request_id=request_id,
+        )
 
     def _refuse_a_second_zero_length(self, issued: _Range) -> None:
         """Let one zero-length DATA through, and no more.
@@ -345,7 +426,7 @@ class _Downloader:
         issued = self._outstanding.pop(request.request_id)
 
         if isinstance(event.response, Data):
-            self._handle_data(issued, event.response)
+            self._handle_data(issued, event.response, request.request_id)
         elif isinstance(event.response, Status):
             self._handle_status(issued, event.response)
         else:
@@ -442,12 +523,78 @@ async def download_handle(
             dispatcher.codec,
             exchange,
             handle,
-            fd,
+            DescriptorSink(fd),
             span=Span(start_offset, size),
             read_length=read_length,
             depth=depth,
             idle_timeout=idle_timeout,
             progress=progress,
+            remote_path=remote_path,
+        )
+        return await downloader.run()
+
+
+async def read_range_into(
+    dispatcher: Dispatcher,
+    handle: bytes,
+    buffer: memoryview,
+    *,
+    offset: int,
+    read_length: int,
+    depth: int = DEFAULT_PIPELINE_DEPTH,
+    idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
+    remote_path: bytes | None = None,
+) -> int:
+    """Read ``len(buffer)`` bytes from ``offset`` into ``buffer``, pipelined.
+
+    The same scheduler as :func:`download_handle` with the destination swapped, which is the
+    point: a byte-range read that issued one ``READ`` and awaited it would cost a round trip
+    per call, and that is the documented pathology of the file object this library exists to
+    improve on. A 1 MiB read here is four requests in flight against a server that will clamp
+    each one to ``max-read-length`` anyway.
+
+    **No local file is involved, so this runs on every platform** -- ``os.pwrite`` is what
+    scopes ``get`` to POSIX, and it is not on this path.
+
+    Args:
+        dispatcher: The session's reader.
+        handle: An open remote file handle.
+        buffer: Writable destination, filled from its first byte. Its length is the range.
+        offset: Absolute file offset to read from.
+        read_length: Payload bytes per request.
+        depth: Requests in flight.
+        idle_timeout: Seconds without any response before giving up.
+        remote_path: Carried on errors for diagnosis.
+
+    Returns:
+        Bytes actually read, which is short of ``len(buffer)`` only at end of file. The rest
+        of the buffer is left untouched rather than zeroed -- the caller owns it and a
+        library that scribbles on the part it did not fill is doing something the caller
+        cannot undo.
+
+    Raises:
+        ValueError: If ``offset`` is negative, or ``depth``/``read_length`` make no progress.
+    """
+    if depth < 1:
+        raise ValueError(f"depth must be at least 1, got {depth}")
+    if read_length < 1:
+        raise ValueError(f"read_length must be at least 1, got {read_length}")
+    if offset < 0:
+        raise ValueError(f"offset must not be negative, got {offset}")
+    if not len(buffer):
+        return 0
+
+    with dispatcher.exchange() as exchange:
+        downloader = _Downloader(
+            dispatcher.codec,
+            exchange,
+            handle,
+            BufferSink(buffer, offset),
+            span=Span(offset, offset + len(buffer)),
+            read_length=read_length,
+            depth=depth,
+            idle_timeout=idle_timeout,
+            progress=None,
             remote_path=remote_path,
         )
         return await downloader.run()
