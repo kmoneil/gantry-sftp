@@ -794,7 +794,20 @@ class Session:
 
         Probed lazily and never at connect time, because most sessions never need it: an
         operation given a ``/``-rooted path has its arithmetic defined by the draft and asks
-        nothing. See :meth:`_require_rooted_paths`."""
+        nothing. See :meth:`_require_rooted_paths`.
+
+        **Distinct from :attr:`_cwd`, and it stays that way even after a ``chdir``**: this is
+        where the *server* put us, and the probe that reads it deliberately bypasses the
+        client-side prefix. A field that meant "the server's root, unless somebody moved"
+        would make :attr:`server_root` a lie at exactly the moment it became interesting."""
+
+        self._cwd: bytes | None = None
+        """The prefix :meth:`chdir` prepends to relative paths, or ``None`` for none.
+
+        Always absolute when set: :meth:`chdir` canonicalises through ``REALPATH`` and refuses
+        on a namespace that is not ``/``-rooted, which is what makes prefixing idempotent.
+        Resolving an already-absolute path is a no-op, so a path this library built by joining
+        onto a resolved root cannot be prefixed twice however many layers it passes through."""
 
     @property
     def limits(self) -> ServerLimits:
@@ -887,10 +900,17 @@ class Session:
         answer whether anything is *moving*: two reprs a second apart with the same
         ``outstanding`` and different totals is a slow link, and with the same totals it is a
         stall.
+
+        ``cwd`` is present only when :meth:`chdir` has been called, because it is the one
+        piece of state here that changes what a *path* in the caller's own code means.
         """
+        # `cwd` appears only once set, and that is the point rather than brevity: it changes
+        # what every relative path in the program means, so its absence has to read as "no
+        # prefix" rather than as a field somebody skimmed past.
+        cwd = "" if self._cwd is None else f"cwd={self._cwd!r} "
         return (
             f"<Session server={self._profile.label} version={self._codec.server_version} "
-            f"extensions={len(self._codec.extensions)} depth={self._depth} "
+            f"extensions={len(self._codec.extensions)} {cwd}depth={self._depth} "
             f"outstanding={self._codec.outstanding} "
             f"requests={self._dispatcher.requests_sent}/{self._dispatcher.replies_received} "
             f"bytes={self._dispatcher.bytes_sent}/{self._dispatcher.bytes_received} "
@@ -1060,7 +1080,7 @@ class Session:
             NoSuchFileError: If the path does not exist.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         reply = await self.request(Stat(self._next(), encoded))
         if isinstance(reply, AttrsReply):
             return reply.attrs
@@ -1078,11 +1098,119 @@ class Session:
             NoSuchFileError: If the path does not exist.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         reply = await self.request(LStat(self._next(), encoded))
         if isinstance(reply, AttrsReply):
             return reply.attrs
         raise _unexpected(reply, expected="ATTRS", path=encoded)
+
+    # --- the working directory, which this protocol does not have ---------------------------
+
+    def _resolve(self, path: bytes | str) -> bytes:
+        """Encode a caller's path and apply the working directory, if there is one.
+
+        **Every public path argument goes through here**, which is what makes ``chdir`` mean
+        the same thing to ``stat`` and to ``glob`` without either of them knowing it exists.
+        The alternative -- each method prepending for itself -- is a per-method decision
+        nobody re-reads, and the one that got forgotten would silently operate on a different
+        file from the one the caller named.
+
+        **Idempotent by construction, which is the property the recursive operations need.**
+        Only a *relative* path is prefixed, and :attr:`_cwd` is always absolute, so a resolved
+        path resolves to itself. ``walk`` resolves its root once and then joins child names
+        onto that absolute root; every child therefore passes through here again -- from the
+        walk, and again from whatever the caller does with it -- and is unchanged both times.
+        A prefix applied to whatever it was handed would double on exactly those paths, and
+        the resulting name would still be legal, so nothing would have failed.
+        """
+        encoded = _encode_path(path)
+        if self._cwd is None or encoded.startswith(b"/"):
+            return encoded
+        return join_remote(self._cwd, encoded)
+
+    async def chdir(self, path: bytes | str) -> None:
+        """Set the directory relative paths resolve against, for this session.
+
+        **SFTP v3 has no working directory**, so there is nothing on the wire to set: this is a
+        prefix *this library* prepends, and every relative path given to this session
+        afterwards is joined onto it. The server still has a default directory of its own --
+        :attr:`server_root` -- and that is what relative paths resolve against until this is
+        called.
+
+        Two round trips, and both are the reason to use it rather than string arithmetic:
+
+        - **``REALPATH`` first**, so what is stored is canonical. A prefix holding ``..`` is a
+          prefix a symlink can make point somewhere else between the ``chdir`` and the
+          operation, which is the same class of hazard as the containment checks on the
+          download side. It also makes :meth:`getcwd` truthful rather than an echo.
+        - **Then one ``STAT``**, because ``REALPATH`` checks nothing: canonicalising a path
+          that does not exist *succeeds* on OpenSSH, measured against 10.0p2. Without it a
+          ``chdir`` to a typo would be accepted and every later operation would fail somewhere
+          else, naming a path the caller never typed. A ``STAT`` rather than
+          :meth:`isdir` so that the three answers stay distinct in one round trip: absent
+          raises ``NoSuchFileError``, present-but-not-a-directory raises with what it is, and
+          a server that sends no permission bits refuses rather than being guessed at.
+
+        Relative arguments compose, as a shell's do: two ``chdir("a")`` calls land in
+        ``a/a``. Passing an absolute path replaces the prefix outright.
+
+        **It does not survive a reconnect**, and that is consistent rather than an oversight:
+        :func:`~gantry_sftp.session.with_reconnect` builds a new session per attempt and
+        nothing survives one -- not the handles, not the request ids, not the negotiated
+        limits. An operation that needs a working directory sets it *inside* the operation,
+        which is the same shape that function already requires for everything else.
+
+        Args:
+            path: Directory to work from. Relative paths resolve against the current one.
+
+        Raises:
+            CapabilityError: If this server's namespace is not rooted at ``/``. A prefix is
+                ``/`` arithmetic, so there is nothing correct to prepend -- the same refusal,
+                for the same reason, as the recursive operations (D-77).
+            CapabilityError: Also if the server sent no permission bits, leaving "is it a
+                directory" unanswerable -- the same refusal :meth:`isdir` makes.
+            NoSuchFileError: If the path is not there.
+            ServerError: If it is not a directory, or the server refuses to canonicalise it.
+        """
+        requested = self._resolve(path)
+        await self._require_rooted_paths(requested, feature="chdir()")
+        canonical = await self._realpath_raw(requested)
+        kind = self._classify(await self.stat(canonical), path=canonical, caller="chdir")
+        if kind is not EntryKind.DIRECTORY:
+            raise ServerError(
+                f"chdir() needs a directory and {canonical!r} is a {kind.value}",
+                code=int(StatusCode.FAILURE),
+                path=canonical,
+            )
+        # Assigned last, so a refusal at any step above leaves the session where it was.
+        self._cwd = canonical
+
+    async def getcwd(self) -> bytes:
+        """The directory relative paths resolve against right now.
+
+        Whatever :meth:`chdir` last set, or -- before any ``chdir`` -- **the server's own
+        default directory**, which is a ``REALPATH`` of ``.`` probed once and cached for the
+        session. That probe is not new: it is what :meth:`_require_rooted_paths` has always
+        done to decide whether path arithmetic is safe here, and :attr:`server_root` is the
+        same value read without asking for it.
+
+        Bytes, like everything else a server chose the spelling of.
+
+        Returns:
+            An absolute path, on any server whose namespace is rooted at ``/``. On one whose
+            is not, whatever that server calls its default directory -- which is why this
+            does *not* refuse where :meth:`chdir` does: reporting where you are asks no
+            arithmetic, and prepending to it does.
+
+        Raises:
+            ServerError: If the server will not canonicalise ``.``, which is the only way the
+                question can fail to have an answer.
+        """
+        if self._cwd is not None:
+            return self._cwd
+        if self._root is None:
+            self._root = await self._realpath_raw(b".")
+        return self._root
 
     # --- predicates ------------------------------------------------------------------------
 
@@ -1152,25 +1280,35 @@ class Session:
             PermissionDeniedError: If the path could not be reached.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         attributes = await self._attrs_or_absent(encoded, follow_symlinks=follow_symlinks)
         if attributes is None:
             return False
+        return self._classify(attributes, path=encoded, caller=predicate) is expected
+
+    def _classify(self, attributes: Attrs, *, path: bytes, caller: str) -> EntryKind:
+        """What an entry is, refusing to guess where the server sent no permission bits.
+
+        Shared by the predicates and by :meth:`chdir`, which need the same refusal for the
+        same reason and differ only in what they do with a *missing* path -- a predicate
+        answers ``False`` and ``chdir`` raises. Splitting the classification out is what lets
+        each of them spend one round trip rather than two.
+        """
         found = entry_kind(attributes)
-        if found is EntryKind.UNKNOWN:
-            unclassifiable = CapabilityError(
-                f"{predicate}() cannot be answered for {encoded!r}: the server returned "
-                f"attributes with no permission bits, and filexfer v3 carries the file type "
-                f"in those bits, so there is nothing here to classify. Returning False would "
-                f"report a definite 'no' for a question the server did not answer. Call "
-                f"stat() or lstat() and decide from Attrs.permissions, or use walk(), which "
-                f"reports an entry it cannot settle as skipped rather than guessing",
-                feature=f"{predicate}() against a server that sends no permission bits",
-                path=encoded,
-            )
-            unclassifiable.add_note(self._server_note())
-            raise unclassifiable
-        return found is expected
+        if found is not EntryKind.UNKNOWN:
+            return found
+        unclassifiable = CapabilityError(
+            f"{caller}() cannot be answered for {path!r}: the server returned "
+            f"attributes with no permission bits, and filexfer v3 carries the file type "
+            f"in those bits, so there is nothing here to classify. Returning False would "
+            f"report a definite 'no' for a question the server did not answer. Call "
+            f"stat() or lstat() and decide from Attrs.permissions, or use walk(), which "
+            f"reports an entry it cannot settle as skipped rather than guessing",
+            feature=f"{caller}() against a server that sends no permission bits",
+            path=path,
+        )
+        unclassifiable.add_note(self._server_note())
+        raise unclassifiable
 
     async def exists(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
         """Whether anything is at ``path``.
@@ -1199,7 +1337,7 @@ class Session:
                 for a name that is merely too long.
         """
         return (
-            await self._attrs_or_absent(_encode_path(path), follow_symlinks=follow_symlinks)
+            await self._attrs_or_absent(self._resolve(path), follow_symlinks=follow_symlinks)
             is not None
         )
 
@@ -1442,7 +1580,7 @@ class Session:
             PermissionDeniedError: If the server will not change it.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         await self._set_one_attribute(
             encoded,
             Attrs(permissions=mode & PERMISSION_BITS),
@@ -1481,7 +1619,7 @@ class Session:
                 Unix server.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         await self._set_one_attribute(
             encoded,
             Attrs(owner=Owner(uid=uid, gid=gid)),
@@ -1516,7 +1654,7 @@ class Session:
             ServerError: For any other refusal.
             ValueError: If either value does not fit filexfer v3's ``uint32`` seconds.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         await self._set_one_attribute(
             encoded,
             Attrs(times=Times(atime=atime, mtime=mtime)),
@@ -1547,7 +1685,7 @@ class Session:
             PermissionDeniedError: If the server will not change it.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         await self._expect_status(SetStat(self._next(), encoded, Attrs(size=size)), path=encoded)
 
     async def ftruncate(self, handle: bytes, size: int) -> None:
@@ -1622,7 +1760,7 @@ class Session:
             ServerError: If the path is not a symlink (``BAD_MESSAGE``), or for any other
                 refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         reply = await self.request(ReadLink(self._next(), encoded))
         if not isinstance(reply, Name):
             raise _unexpected(reply, expected="NAME", path=encoded)
@@ -1648,6 +1786,16 @@ class Session:
         ``target`` is not resolved, checked, or required to exist. A dangling symlink is a
         legal thing to create and some deployments create one deliberately.
 
+        **That includes not resolving it against :meth:`chdir`'s working directory**, which is
+        the one place this library's prefix must not reach: ``target`` is a *string stored
+        inside the link*, interpreted by the server relative to the link's own directory, not
+        a path this client is about to operate on. Prefixing it would silently turn
+        ``symlink(b"data.csv", b"alias.csv")`` -- a relative link, which is what a shell makes
+        and what survives the directory being moved -- into an absolute one pointing at
+        wherever the session happened to be standing. Caught by the sweep that routed every
+        other path through the resolver: this docstring already said the rule, and the sweep
+        made it false.
+
         Args:
             target: What the link should point at.
             link_path: The name to create.
@@ -1656,7 +1804,7 @@ class Session:
             PermissionDeniedError: If the server will not create it.
             ServerError: For any other refusal, including a name that is already taken.
         """
-        encoded = _encode_path(link_path)
+        encoded = self._resolve(link_path)
         await self._expect_status(
             SymLink(self._next(), targetpath=_encode_path(target), linkpath=encoded),
             path=encoded,
@@ -1677,13 +1825,27 @@ class Session:
         first of several would be picking one of the server's answers and calling it the
         canonical path, which is the silently-wrong failure this layer exists to prevent.
 
+        **A relative argument resolves against :meth:`getcwd`**, like every other path this
+        session takes, so ``realpath(b".")`` after a :meth:`chdir` canonicalises the directory
+        you moved to rather than the one the server started you in. :attr:`server_root` is the
+        other question and keeps its own answer.
+
         Raises:
             ProtocolError: If the server answers with something other than a NAME, or with a
                 NAME carrying any number of names other than one.
             NoSuchFileError: If the server refuses because the path does not exist.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        return await self._realpath_raw(self._resolve(path))
+
+    async def _realpath_raw(self, encoded: bytes) -> bytes:
+        """``REALPATH`` of an already-resolved path, with no working directory applied.
+
+        The split exists for one caller and it is load-bearing: the rootedness probe below
+        asks *the server* where its default directory is, and running that through the
+        client-side prefix would answer with wherever :meth:`chdir` last went. It would then
+        cache that as :attr:`server_root`, which is a different question with a public name.
+        """
         reply = await self.request(RealPath(self._next(), encoded))
         if not isinstance(reply, Name):
             raise _unexpected(reply, expected="NAME", path=encoded)
@@ -1727,7 +1889,7 @@ class Session:
         if path.startswith(b"/"):
             return
         if self._root is None:
-            self._root = await self.realpath(b".")
+            self._root = await self._realpath_raw(b".")
         if self._root.startswith(b"/"):
             return
         refusal = CapabilityError(
@@ -1775,7 +1937,7 @@ class Session:
             PermissionDeniedError: If the server will not open it.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         attrs = EMPTY_ATTRS if mode is None else Attrs(permissions=mode)
         reply = await self.request(Open(self._next(), encoded, pflags, attrs))
         if isinstance(reply, Handle):
@@ -1946,7 +2108,7 @@ class Session:
         Returns:
             An unopened :class:`RemoteFile`. Nothing is sent until it is entered.
         """
-        return RemoteFile(self, _encode_path(path), pflags, mode=mode)
+        return RemoteFile(self, self._resolve(path), pflags, mode=mode)
 
     async def opendir(self, path: bytes | str) -> bytes:
         """Open a remote directory and return its handle.
@@ -1955,7 +2117,7 @@ class Session:
             NoSuchFileError: If the path does not exist.
             ServerError: If it is not a directory, or the server refuses.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         reply = await self.request(OpenDir(self._next(), encoded))
         if isinstance(reply, Handle):
             return reply.handle
@@ -2041,7 +2203,7 @@ class Session:
             come in the order the server sent them, which is not guaranteed to be sorted, and
             ``.`` and ``..`` are excluded exactly as in :meth:`listdir`.
         """
-        return DirectoryScan(self, _encode_path(path))
+        return DirectoryScan(self, self._resolve(path))
 
     async def listdir(self, path: bytes | str) -> list[DirEntry]:
         """List a directory, following the batches to the end.
@@ -2091,7 +2253,7 @@ class Session:
         Raises:
             ServerError: If the server refuses, and ``exist_ok`` does not excuse it.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         try:
             await self._expect_status(MkDir(self._next(), encoded, EMPTY_ATTRS), path=encoded)
         except ServerError:
@@ -2131,7 +2293,7 @@ class Session:
                 when ``exist_ok`` is false, and something that is not a directory being in
                 the way.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         try:
             await self._mkdir_parents(encoded, exist_ok=exist_ok)
         except ServerError as refusal:
@@ -2194,7 +2356,7 @@ class Session:
             NoSuchFileError: If the path is not there.
             ServerError: For any other refusal, including the path being a directory.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         await self._expect_status(Remove(self._next(), encoded), path=encoded)
 
     async def rmdir(self, path: bytes | str) -> None:
@@ -2208,7 +2370,7 @@ class Session:
             NoSuchFileError: If the path is not there.
             ServerError: For any other refusal, including the directory not being empty.
         """
-        encoded = _encode_path(path)
+        encoded = self._resolve(path)
         await self._expect_status(RmDir(self._next(), encoded), path=encoded)
 
     async def rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
@@ -2223,9 +2385,9 @@ class Session:
         Raises:
             ServerError: If the server refuses, which includes the target already existing.
         """
-        encoded = _encode_path(new_path)
+        encoded = self._resolve(new_path)
         await self._expect_status(
-            Rename(self._next(), _encode_path(old_path), encoded), path=encoded
+            Rename(self._next(), self._resolve(old_path), encoded), path=encoded
         )
 
     async def posix_rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
@@ -2241,8 +2403,8 @@ class Session:
             UnsupportedError: If the server does not implement the extension.
             ServerError: For any other refusal.
         """
-        encoded = _encode_path(new_path)
-        request = PosixRename(self._next(), _encode_path(old_path), encoded)
+        encoded = self._resolve(new_path)
+        request = PosixRename(self._next(), self._resolve(old_path), encoded)
         await self._expect_status(request.to_extended(), path=encoded)
 
     async def fsync(self, handle: bytes) -> None:
@@ -2643,7 +2805,7 @@ class Session:
         """
         require_local_io("get()")
         _check_local_path(local_path, method="get()")
-        encoded = _encode_path(remote_path)
+        encoded = self._resolve(remote_path)
         requested_mode = resolve_mode(mode, caller="get()")
         with operation(session_logger, "get", remote=encoded, local=local_path) as record:
             attributes = await self.stat(encoded)
@@ -2815,7 +2977,7 @@ class Session:
                 not rooted at ``/``, so descending would build paths it does not mean.
             ServerError: If the server refuses a listing.
         """
-        root = _encode_path(path)
+        root = self._resolve(path)
         await self._require_rooted_paths(root, feature="walking a tree")
         pending: list[tuple[bytes, tuple[bytes, ...]]] = [(root, ())]
         while pending:
@@ -2970,7 +3132,7 @@ class Session:
                 the shape of partial success this library refuses everywhere else, so an
                 unreadable directory in the pattern's path is raised rather than swallowed.
         """
-        encoded = _encode_path(pattern)
+        encoded = self._resolve(pattern)
         await self._require_rooted_paths(encoded, feature="globbing")
         base, components, directories_only = split_pattern(encoded, case_sensitive=case_sensitive)
         if not components:
@@ -3270,7 +3432,7 @@ class Session:
         state = _DownloadState()
 
         with operation(
-            session_logger, "get_tree", remote=_encode_path(remote_path), local=destination
+            session_logger, "get_tree", remote=self._resolve(remote_path), local=destination
         ) as record:
 
             async def transfer(item: _TreeDownload) -> None:
@@ -3573,7 +3735,7 @@ class Session:
         """
         require_local_io("put()")
         _check_local_path(local_path, method="put()")
-        target = _encode_path(remote_path)
+        target = self._resolve(remote_path)
         # Before the OPEN and before anything is sent, so a bad `mode=` costs no round trip and
         # no staging file. `PRESERVE` resolves here because this is where the local file is
         # named; every helper below takes a number or nothing.
@@ -4403,7 +4565,7 @@ class Session:
         require_local_io("put_tree()")
         _check_local_path(local_path, method="put_tree()")
         _check_tree_concurrency(concurrency, progress=progress, caller="put_tree")
-        root = _encode_path(remote_path)
+        root = self._resolve(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put_tree")
         if resume and policy.atomic:
             # The decision D-54 had to make, and it is `put`'s rule reaching a tree rather
@@ -4561,7 +4723,7 @@ class Session:
             ServerError: If the server refuses a removal -- including refusing to unlink an
                 entry that turned out to be a directory, which names that exact path.
         """
-        root = _encode_path(path)
+        root = self._resolve(path)
         with operation(session_logger, "rmtree", remote=root) as record:
             entries: list[WalkEntry] = []
             async with aclosing(self.walk(root)) as walker:

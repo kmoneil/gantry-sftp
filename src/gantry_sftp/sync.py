@@ -484,6 +484,14 @@ class SyncSession:
         """Attributes of a path, following symlinks."""
         return self._run(partial(self._session.stat, path))
 
+    def chdir(self, path: bytes | str) -> None:
+        """Set the directory relative paths resolve against, for this session."""
+        return self._run(partial(self._session.chdir, path))
+
+    def getcwd(self) -> bytes:
+        """Where relative paths resolve from: the prefix, or the server's own default."""
+        return self._run(self._session.getcwd)
+
     def exists(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
         """Whether anything is at a path -- ``False`` only for ``NO_SUCH_FILE``."""
         return self._run(partial(self._session.exists, path, follow_symlinks=follow_symlinks))

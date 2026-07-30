@@ -157,7 +157,11 @@ async def with_reconnect[T](
 
     **``operation`` is re-run from the beginning, against a session that did not exist
     before.** Nothing survives a reconnect: not the remote handles, not the request ids, not
-    the negotiated limits. So the operation has to be one of two things.
+    the negotiated limits, and **not a working directory set with**
+    :meth:`~gantry_sftp.session.Session.chdir` -- which is worth naming because it is the one
+    of those a caller can set from outside and might expect to persist. An operation that
+    needs one calls ``chdir`` *inside* itself, exactly as it re-establishes everything else.
+    So the operation has to be one of two things.
 
     *Resumable*, which is the case this is built for::
 

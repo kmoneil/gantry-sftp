@@ -211,7 +211,7 @@ exists today:
 - **one call to connect**: `connect(host, ...)` opens the `ssh` connection and a session over
   it, and `from gantry_sftp import ...` reaches every entry point and value type — so no
   program needs an import from `gantry_sftp.codec`, the layer the design calls internal
-- a session with `stat`, `lstat`, `fstat`, `realpath`, `open`/`close`, `mkdir`, `rmdir`,
+- a session with `stat`, `lstat`, `fstat`, `realpath`, `chdir` / `getcwd`, `open`/`close`, `mkdir`, `rmdir`,
   `remove`, `rename`, `posix_rename`, `fsync`, `chmod` / `chown` / `utime` / `truncate`,
   `readlink` / `symlink`, `supports()`, `listdir()` / streaming `scandir()`, and
   pipelined `get()` / `put()`, with typed errors, timeouts on every wait, and a progress
@@ -629,6 +629,44 @@ the generated name exists to prevent, so the combination is refused rather than 
 downgraded. Resuming an upload therefore means resuming the destination files themselves, and a
 consumer polling the directory can see a partial file while it happens.
 
+## A working directory, which this protocol does not have
+
+```python
+await sftp.chdir("/incoming/2026")
+await sftp.get("data.csv", "data.csv")     # /incoming/2026/data.csv
+await sftp.getcwd()                        # b'/incoming/2026'
+```
+
+**SFTP v3 has no working directory.** There is nothing on the wire to set and nothing to ask, so
+`chdir` is a prefix *this library* prepends to relative paths. Every method takes it — `stat`,
+`glob`, `walk`, `get_tree`, `open_file`, all of them — because they share one resolver rather
+than each remembering to apply it.
+
+Before any `chdir`, relative paths are left alone and the **server** resolves them against its
+own default directory. `getcwd()` reports that until you move; `session.server_root` is the same
+value and never moves.
+
+Four things worth knowing:
+
+- **`chdir` costs two round trips and checks two things.** A `REALPATH`, so what is stored is
+  canonical — a prefix holding `..` is one a symlink can redirect between the `chdir` and the
+  operation. Then a `STAT`, because `REALPATH` checks nothing: canonicalising a path that does
+  not exist *succeeds* on OpenSSH, so without it a `chdir` to a typo would be accepted and every
+  later call would fail somewhere else, naming a path you never typed.
+- **Absolute paths are never prefixed**, so mixing the two is safe and a path this library hands
+  you back — from `walk`, `glob`, `realpath` — can be passed straight back in.
+- **`symlink()`'s target is not prefixed.** It is a string stored *inside* the link and
+  interpreted by the server relative to the link's own directory, so
+  `symlink("data.csv", "alias.csv")` stays the relative link a shell would make.
+- **It does not survive a reconnect.** `with_reconnect` builds a new session per attempt and
+  nothing survives one — not the handles, not the request ids, not the limits. Call `chdir`
+  *inside* the operation, the same way you re-establish everything else.
+
+On a server whose namespace is not rooted at `/`, `chdir` refuses with `CapabilityError`: a
+prefix is `/` arithmetic, and the draft defines no other filename syntax. `getcwd` still answers,
+because reporting where you are asks no arithmetic. See
+[Servers whose namespace is not rooted at `/`](#servers-whose-namespace-is-not-rooted-at-).
+
 ## Two kinds of path
 
 One transfer takes one of each, and the rule is different on each side:
@@ -971,6 +1009,17 @@ for everything behind that IP. And **`FAILURE` is terminal**, even though it is 
 transient: v3's catch-all is what a permission problem, a full disk, a name collision and a
 momentary appliance hiccup all arrive as, so retrying it would turn every fast clear failure
 into three slow ones. That changes when the quirks layer can match a server's message text.
+
+**And against OpenSSH it cannot change, at any layer.** That is worth stating plainly rather
+than reading as a to-do: a transient `FAILURE` mid-transfer kills the transfer, and no amount
+of work here fixes it for the reference server. OpenSSH's `STATUS` message is a constant
+function of the status code — five distinct conditions, from a full disk to a name collision,
+all send the single word `Failure`, measured — so there is nothing in the reply to classify on.
+Retrying an individual request inside a live connection therefore needs a server whose message
+text carries information (asyncssh's does; OpenSSH's does not), and until one is in the test
+matrix this stays unbuilt rather than half-built. What you get today is `with_reconnect`, which
+re-runs the whole operation when the *link* drops. An eight-hour transfer to an appliance that
+hiccups once still starts again from the top — with `resume=True`, from where it got to.
 
 **`BAD_MESSAGE` is terminal too, and it does not mean what its name says.** It reads as "the
 frame you sent was malformed", which would make it a bug in this library rather than an answer

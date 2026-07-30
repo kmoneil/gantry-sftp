@@ -11,6 +11,7 @@ python examples/download.py                       # pipelined get(), with progre
 python examples/file_object.py                    # byte ranges, a tail, an append, no staging
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
 python examples/listing.py                        # listdir() and scandir(), and what a listing can't know
+python examples/working_directory.py              # chdir() as a prefix, and what a reconnect does to it
 python examples/predicates.py                     # exists()/isdir()/..., and the answer that is neither yes nor no
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/destination_collision.py          # two remote names, one local file, and the refusal
@@ -34,6 +35,7 @@ python examples/download.py user@host /remote/data.parquet
 python examples/file_object.py user@host /remote/dir
 python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
+python examples/working_directory.py user@host /remote/dir
 python examples/predicates.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
@@ -65,6 +67,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `file_object.py`          | `open_file()`: a header, a tail, a range and an append without staging the file -- plus `read_at` / `readinto_at` fanned out over one handle, which is what the cursor form cannot do, and why block size is the one performance decision this surface hands you |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
+| `working_directory.py`    | `chdir()` / `getcwd()`: a prefix this library prepends because v3 has no working directory, why absolute paths are never touched, why `symlink`'s target is not either, and the reconnect that silently starts you somewhere else |
 | `predicates.py`           | `exists()` / `isdir()` / `isfile()` / `islink()` / `getsize()` / `getmtime()` / `makedirs()`, the third state a predicate has — a refusal is not `False` — and the two questions a broken symlink separates |
 | `doctor.py`               | `python -m gantry_sftp doctor` as data: `local_diagnosis()` for a container health check with no network, `server_diagnosis()` for the handshake a transfer would make, and the exit codes that let a Dockerfile tell "no ssh" from "host unreachable" |
 | `glob_patterns.py`        | `glob()`: the `glob(3)` dialect and where it differs from `fnmatch`, the dotfile rule, `**`, a trailing `/`, and a match whose path goes straight to `get()` |
