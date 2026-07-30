@@ -231,6 +231,54 @@ def test_no_shipped_document_states_a_throughput_figure(document: Path):
     )
 
 
+def test_the_benchmark_lane_still_names_the_costs_it_measured():
+    """The honesty property, which outlived the form it was written in (D-88, then D-94).
+
+    D-88 relocated the ratio tables into `benchmarks/README.md` on the argument that deleting
+    them would take the two rows that do not flatter us -- the connect cost and the CPU column
+    -- down with the wins, and that a selectively positive record is worse than the
+    front-loading it replaced. D-94 then moved the *figures* out of the committed tree
+    entirely, into the report the suite generates, which is gitignored.
+
+    That is a deliberate change and not a quiet reversal of the first one, because the property
+    D-88 was protecting is not "the tables exist" -- it is that **a reader who never runs the
+    lane still learns where this architecture costs something**. So the losses are still named,
+    in prose instead of in a column, and they are pinned here: a future edit can rewrite the
+    sentence and cannot silently drop the admission.
+    """
+    lane = (ROOT / "benchmarks" / "README.md").read_text(encoding="utf-8")
+    admissions = (
+        "slower to connect",
+        "wins nothing on CPU",
+    )
+    missing = [phrase for phrase in admissions if phrase not in lane]
+    assert not missing, f"benchmarks/README.md stopped naming what this costs: {missing}"
+
+
+def test_the_committed_tree_holds_no_benchmark_figures():
+    """The other half of D-94: the numbers went to a generated report, not to a nicer table.
+
+    `benchmarks/README.md` is excluded from the prose sweep above because it is the lane's
+    method document and quotes the banned shape inside the rule that bans it. That exclusion
+    would be a hole if nothing checked the file itself, so this is the check: the results
+    tables are gone, and what a reader is pointed at is the generated report.
+    """
+    lane = without_typography((ROOT / "benchmarks" / "README.md").read_text(encoding="utf-8"))
+    for shape in THROUGHPUT_CLAIM_SHAPES:
+        for match in re.finditer(shape, lane, re.IGNORECASE):
+            if match.group(0).endswith("Mbit/s"):
+                # A `tc` rate limit, which names a profile rather than reporting a result. A
+                # number the harness *sets* is not a number it *found*, and nothing this
+                # library does is measured in bits per second -- the report uses MiB/s.
+                continue
+            number = lane[: match.start()].count("\n")
+            window = "\n".join(lane.splitlines()[max(0, number - 1) : number + 2])
+            assert CITATION.search(window) or "unattributed" in window, (
+                f"benchmarks/README.md:{number + 1} carries a figure again: {match.group(0)!r}"
+            )
+    assert "_reports/benchmarks.md" in lane, "the lane must say where its figures actually go"
+
+
 def without_typography(text: str) -> str:
     """An `x` and a `-` for the glyphs, so this module's own source carries neither.
 
@@ -238,28 +286,6 @@ def without_typography(text: str) -> str:
     the claim, not its punctuation, and an en dash relaxing into a hyphen should not fail it.
     """
     return text.replace("\u00d7", "x").replace("\u2013", "-")
-
-
-def test_the_benchmark_report_keeps_the_rows_that_do_not_flatter_us():
-    """Relocated, not deleted -- and this is the half that decays quietly.
-
-    Moving the numbers out of the README could have been done by deleting them, and the result
-    would read better: what leaves with them is the connect cost, the CPU column, the small-file
-    upload loss and the clause forbidding an unattributed "10x faster than paramiko". A record
-    with only the wins in it is worse than the front-loading D-88 set out to fix, because the
-    honesty artifact and the wins are the same artifact. So the losses are pinned by content.
-    """
-    report = without_typography((ROOT / "benchmarks" / "README.md").read_text(encoding="utf-8"))
-    losses = (
-        "| connect and close | **1.2-1.4x slower** | **1.2-2.1x slower** |",
-        "**1.7-1.8x slower unshaped**",
-        "| CPU per MiB, download | about the same | **1.2-1.6x worse** |",
-        "**Connecting is our weak spot, and it is structural.**",
-        '"No cryptography in Python" does not become a CPU win.',
-        'Nothing here is an unattributed "10x faster than paramiko"',
-    )
-    missing = [row for row in losses if row not in report]
-    assert not missing, f"benchmarks/README.md dropped the rows that do not flatter us: {missing}"
 
 
 def test_the_readme_sends_a_reader_who_wants_numbers_somewhere_real():
@@ -271,3 +297,61 @@ def test_the_readme_sends_a_reader_who_wants_numbers_somewhere_real():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "benchmarks/README.md" in readme
     assert (ROOT / "benchmarks" / "README.md").is_file()
+
+
+# --- What the distribution carries, decided rather than defaulted (D-94) --------------------
+
+SHIPPED = ("src", "tests", "examples", "live-tests", "scripts", "README.md", "LICENSE")
+"""Top-level entries an sdist must carry.
+
+`tests/` and `examples/` are in for a reason worth stating, because "why ship tests?" gets asked
+every few years: Debian, Fedora and conda-forge rebuild from the sdist and run the suite to
+validate their build, and `examples/` is tested documentation with a README of its own.
+"""
+
+WITHHELD = ("benchmarks", ".github", ".pre-commit-config.yaml", ".complexipy_cache")
+"""Top-level entries an sdist must **not** carry, and each one is a decision.
+
+`benchmarks/` needs paramiko and asyncssh -- the Python cryptography this library exists not to
+need -- plus `openssh-server` and `CAP_NET_ADMIN`, and it is not self-contained anyway, since it
+imports `sshd` from `live-tests/`. A shipped directory that cannot run is worse than an absent
+one. It stays in the repository, in CI and gating; it is simply not part of what a user receives.
+
+`.complexipy_cache` is in this list because it **was shipping**, unnoticed, until the tarball was
+opened and looked at -- the same class of silent packaging defect as the missing licence text
+this module was written for. A lint cache in a distribution is not a style question.
+
+`.gitignore` is deliberately absent from both lists: hatchling force-includes it whatever the
+excludes say, measured on a real build, so asserting either way would be asserting about
+hatchling rather than about a decision of ours.
+"""
+
+
+@pytest.mark.slow
+def test_the_sdist_carries_what_was_decided_and_nothing_else(distribution: tuple[Path, Path]):
+    """Hatchling's default is "the whole working tree", which is not a decision.
+
+    A packaging exclusion is invisible from the source tree by construction: every test passes,
+    the build succeeds, and the only way to see what a user receives is to open the artifact.
+    That is why this asserts both directions -- a `WITHHELD` entry creeping back in would look
+    exactly like nothing having happened.
+    """
+    _, sdist = distribution
+    with tarfile.open(sdist) as archive:
+        top = {name.split("/")[1] for name in archive.getnames() if "/" in name}
+
+    missing = sorted(entry for entry in SHIPPED if entry not in top)
+    assert missing == [], f"the sdist stopped carrying: {missing}"
+    leaked = sorted(entry for entry in WITHHELD if entry in top)
+    assert leaked == [], f"the sdist is carrying what it was told not to: {leaked}"
+
+
+@pytest.mark.slow
+def test_the_wheel_carries_only_the_package(distribution: tuple[Path, Path]):
+    """The wheel is what `pip install` unpacks into site-packages, so anything beyond the
+    package itself lands in a user's environment under a name they did not choose."""
+    wheel, _ = distribution
+    with zipfile.ZipFile(wheel) as archive:
+        top = {name.split("/")[0] for name in archive.namelist()}
+    unexpected = sorted(name for name in top if not name.startswith("gantry_sftp"))
+    assert unexpected == [], f"the wheel carries more than the package: {unexpected}"

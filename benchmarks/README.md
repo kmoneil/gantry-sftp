@@ -1,12 +1,16 @@
 # benchmarks
 
-The source of truth for every performance claim this project makes, and since 0.10 the only
-place one lives. Nothing shipped outside this directory states a throughput figure — not the
-README, not an example, not a docstring — because the ranking rule this project is built on puts
-a correctness gap above a throughput feature, and a document that says so and then leads with
-ratios is arguing against itself (D-88). The older half of that rule still governs here: an
-unattributed "10× faster than paramiko" is marketing, and a number without its link profile, its
-server and its benchmark is an anecdote.
+Where every performance number this project has comes from, and **none of them is committed**.
+A run writes `_reports/benchmarks.md`, which git ignores; this directory keeps the method, the
+fairness rules and the two scenarios that gate. It is also excluded from the built distribution,
+because no packager runs a benchmark and it needs paramiko and asyncssh — the Python
+cryptography this library exists not to need — to do anything at all (D-88, D-94).
+
+The reason is the ranking rule the project is built on: a correctness gap outranks a throughput
+feature, and a repository that says so and then carries a table of ratios against its
+competitors is arguing against itself. The older half of the rule still governs whatever a run
+prints: an unattributed "10× faster than paramiko" is marketing, and a number without its link
+profile, its server and its benchmark is an anecdote.
 
 ```bash
 uv sync --group bench                        # paramiko and asyncssh
@@ -122,23 +126,17 @@ caller, and **the shaped profile is what turned that from a caveat into an arith
 drains it, and only then issues the next block -- so a cursor read pays **one round trip per
 block**, `file_size / block_size` of them, and no block size removes it.
 
-Measured on the 100 Mbit/s 50 ms profile, 16 MiB, against our own `get` at 1.868 s:
+So the ladder climbs towards `get` as the block grows, and the gate sits on the window-sized
+rung because that is where the remaining gap stops being a choice: at the window, the shortfall
+against `get` is the per-block bubbles and nothing else -- checked on a shaped run by subtracting
+the block count times the measured RTT from the difference, which accounts for it. Closing it
+needs read-ahead rather than tuning, and read-ahead is deliberately not built (`paramiko#2454`
+is an open request for an API to switch theirs off).
 
-| block | wall | vs `get` |
-| ----- | ---- | -------- |
-| 261120 (one request) | 5.165 s | 0.36x |
-| 1 MiB | 2.570 s | 0.73x |
-| 2 MiB (the channel window) | 2.309 s | 0.81x |
-
-The 2 MiB row is the arithmetic showing its work: eight blocks, and 2.309 - 1.868 = 0.441 s
-against eight round trips of the measured 52.5 ms, which is 0.42 s. The gap is the bubbles and
-nothing else, which is why closing it needs read-ahead rather than tuning -- and read-ahead is
-deliberately not built (`paramiko#2454` is an open request for an API to switch theirs off).
-
-Unshaped the same ladder reads differently, and both are worth having: with no latency to hide,
-1 MiB blocks run at 1.19x `get` -- *faster*, because no local file is written -- and 8 KiB
-blocks at 0.10x. A gate written only against the unshaped profile would have concluded the file
-object was free.
+**Run both profiles before believing either.** Unshaped, with no latency to hide, the file
+object is *faster* than `get` at large blocks -- there is no local file to write -- so a gate
+written only against that profile would have concluded the feature was free. The shaped profile
+is where the per-block cost exists at all. The figures for each are in the generated report.
 
 **Two things in this row are bounded by cost, and both are stated rather than left to a reader
 to notice.** The 8 KiB rung runs on the unshaped profile only -- 16 MiB in 8 KiB blocks is 2048
@@ -220,161 +218,42 @@ and you should distrust a 1.3× difference in it — which is the usual state of
 profile, where a 16 MiB transfer takes tens of milliseconds and the run-to-run variation is
 larger than anything being compared.
 
-## What the lane has found
+## Where the figures are
 
-Everything below moved here from the README in 0.10, unchanged (D-88). It is kept in one place
-rather than summarised in two, and it is kept *whole* — including the rows that go the wrong way,
-which are not separable from the ones that go the right way. A version of this section with only
-the wins in it would be marketing, and it would be a worse document than the front-loading it
-replaced.
+**Not here, and not anywhere committed.** The suite writes its full report to
+`_reports/benchmarks.md`, which is gitignored, and that is the only place an absolute number or
+a cross-library ratio lives. Re-derive them with `python scripts/lanes.py benchmarks`; the run
+takes about ten minutes and prints the same tables it writes.
 
-Re-derive all of it with `python scripts/lanes.py benchmarks`.
+The reason is the ranking rule this project is built on: a correctness gap outranks a throughput
+feature, and a repository that says so and then carries a table of ratios against its
+competitors is arguing against itself (D-88). The tables lived in this file for exactly one day,
+which was long enough to make the point that they had to leave the README and not long enough to
+pretend they belonged here instead (D-94).
 
-### Bytes in flight, and the ceiling that is not ours
+What survives in the committed tree is this document -- the method, the fairness rules and the
+two gates -- because those are decisions and they are worth reviewing. A figure is an
+observation of one machine on one afternoon, and it ages whether or not anybody re-reads it.
 
-Sustained SFTP throughput is bounded by bytes in flight, not by cryptography:
+**The line to apply when adding one**, because "no numbers" is not quite the rule and pretending
+it is invites the next person to delete something load-bearing: a figure that is *evidence for a
+decision in this file* stays -- three samples reading a tail as a cliff is why the unshaped
+profile takes twenty-five, and paramiko's stall floor is why the unshaped profile stays in the
+sweep at all. A figure that *reports how fast this library is* goes to the report. If a number
+would still be true of a rewritten scheduler, it is probably a decision's evidence; if it moves
+when the scheduler does, it is a result.
 
-```
-throughput ~= (outstanding_requests * request_size) / RTT
-```
+**What is stated here is the half that is a disclosure rather than a claim.** This library is
+*slower to connect* than either alternative -- spawning `ssh` costs a fork, an exec and
+OpenSSH's own configuration parsing before a packet moves, and for connection-heavy work
+`ControlMaster` is the fix rather than an optimisation. And it **wins nothing on CPU**, because
+`cryptography` is OpenSSL and the expensive part was never interpreted in either design; what
+moves out of Python is per-packet framing, and a pipe copy is paid for it.
 
-OpenSSH's own `sftp(1)` defaults to 64 outstanding requests of 32768 bytes — exactly 2 MiB in
-flight, which caps a 100 ms transatlantic link at roughly 21 MB/s regardless of how fast the
-machine is. That is a scheduling bug, not a crypto bug, and it is invisible on localhost, which
-is why it went unnoticed for two decades.
-
-That formula is measured rather than argued. On a `tc netem`-shaped loopback link against
-OpenSSH 10.0p2, raising pipeline depth from 1 to 64 at a fixed 32768-byte request size transfers
-the same file **50.7× faster at 5 ms RTT, 36.8× at 50 ms and 24.8× at 200 ms** (2026-07-29) —
-and on an unshaped link the same comparison is noise. At depth 1 the elapsed time *is* one round
-trip per request, within 3%. That lane is `live-tests/test_netem_pipelining.py` rather than this
-directory, and it re-measures on every run.
-
-**Those figures are for a connection that has already moved something**, and the difference is
-worth knowing because it is not ours. The same three comparisons on a connection's *first*
-transfer come out at 13.0×, 7.6× and 5.0×: a deep pipeline puts about a megabyte in flight
-immediately, which is more than an initial TCP congestion window, so its opening round trips are
-spent waiting for that window to open rather than for the server. Measured at six round trips
-for a 768 KiB transfer as a connection's first, and **one** as its fourth (D-81).
-
-**Throughput follows the product, not either factor.** Three different (depth × size) pairs
-multiplying to the same bytes-in-flight figure perform within 4% of each other, and improvement
-stops at **2 MiB**: going from 0.5 MiB to 2 MiB in flight roughly doubles throughput, going from
-2 MiB to 8 MiB changes it by about 1%, whether the 8 MiB is reached with deep small requests or
-shallow large ones. 2 MiB is the channel window in the table above — enforced by the SSH
-transport, one layer below anything this library does, so no amount of pipelining lifts it. Two
-consequences worth having before tuning anything:
-
-- **`sftp(1)`'s defaults are not timid.** `-R 64 -B 32768` is exactly the channel window. What
-  this library fixes is clients that never *reach* 2 MiB, not `sftp(1)`'s inability to exceed it.
-- **Past 2 MiB the lever is more channels, not more depth.** One `ssh` child is one channel is
-  one window, so concurrent transfers help by reaching the window rather than by exceeding it,
-  and a second connection is what gets a second window. Raising depth past the window buys
-  memory consumption and nothing else. Neither paramiko nor asyncssh is past 2 MiB today either —
-  but both implement SSH and *could* raise their own window, and we cannot raise OpenSSH's,
-  because not implementing SSH is the whole point. That is a real cost of this architecture and
-  it is written here rather than left for someone to find with a tuned paramiko.
-
-### The same download, cold and warm
-
-`download 16 MiB, one connection` is not a comparison: it is the same file over the same
-connection, timed as that connection's first transfer and as its second (D-23).
-
-| RTT | first transfer | second transfer | |
-| --- | -------------- | --------------- | --- |
-| 50 ms | 18.4 MiB/s | 24.8 MiB/s | **1.35× faster** |
-| 200 ms | 4.7 MiB/s | 6.3 MiB/s | **1.35× faster** |
-
-(`tc netem`-shaped loopback against OpenSSH 10.0p2, 2026-07-29.) The warm figure is about 82% of
-what the 2 MiB channel window implies, once the three round trips `get` spends on `STAT`, `OPEN`
-and `CLOSE` are subtracted — so **the ceiling is reachable, and reaching it is a property of
-reusing the connection** rather than of tuning anything. Every cross-library row below is a first
-transfer, for all three libraries, because connections are not reused between samples.
-
-### Measured against paramiko and asyncssh
-
-Against **paramiko 5.0.0** and **asyncssh 2.24.0** on OpenSSH 10.0p2 over `tc netem`-shaped
-loopback:
-
-| scenario | vs paramiko | vs asyncssh |
-| -------- | ----------- | ----------- |
-| download 16 MiB | **1.6–3.2× faster** | 1.1–1.4× faster |
-| upload 16 MiB | 1.2–1.5× faster | up to 1.5×, level on the rate-limited profile |
-| N × 8 KiB download, sequential | ~1.5× faster | **a tie** |
-| N × 8 KiB upload, sequential | level shaped (≤1.05×); **1.7–1.8× slower unshaped** | level shaped (≤1.07×); 1.1–1.2× slower unshaped |
-| connect and close | **1.2–1.4× slower** | **1.2–2.1× slower** |
-| CPU per MiB, download | about the same | **1.2–1.6× worse** |
-| CPU per MiB, upload | 1.1–1.6× better | mixed, 0.7–1.4× |
-
-Ratios across 5, 50 and 200 ms RTT plus a 100 Mbit/s rate-limited profile, taken as the **union
-of three full runs** rather than the best one. That widening is not padding: the runs put the
-download range at 1.9–2.6×, then 1.6–2.3×, then 1.6–3.2×, because paramiko's 200 ms row is
-genuinely noisy — its spread column has reached 3.67 across those runs while ours stayed near
-1.1. A range that only one run reproduces is a number with an expiry date on it, and the widest
-ratio in that table is drawn from the least stable row. Absolute figures, the exact host and the
-full caveats are in the report the suite writes.
-
-The **small-file upload row is newer and its range comes from two runs, not three** — it was
-added in 0.8 when the size check gave every `put` an extra `STAT` and it emerged that the matrix
-could not see a per-file cost at all: every small-file row was a download, and both 16 MiB upload
-rows move one file. Those two 16 MiB rows were re-measured in the same pair of runs and did not
-move outside the ranges above; at 200 ms RTT the added round trip shows up as roughly +0.15 s on
-a 3.3 s transfer, which is the one `STAT` and nothing else.
-
-**Concurrency, measured against ourselves.** The same small-file corpus over one connection,
-eight transfers at a time against one at a time: **3.1× on unshaped loopback, 9.1× at 5 ms RTT
-and 8.0× at 50 ms**, with CPU per MiB *lower* rather than higher. Us against us, deliberately —
-paramiko and asyncssh can be driven concurrently too, so racing our task group against their
-`for` loop would measure a feature gap while looking like a speed gap, which is the fairness rule
-above. The gain is round trips, which is why it grows with latency and why the unshaped number is
-the smallest one here.
-
-### The rows a pitch would not choose, which are the interesting ones
-
-**We lose small-file upload on a fast link, and we win small-file download on the same one.**
-Unshaped, 200 × 8 KiB: 3.0–3.2× *faster* than paramiko downloading, 1.7–1.8× *slower* uploading,
-same files, same count, same connection. With the round trips nearly free the difference is
-per-operation work in Python, and the CPU column says so. It disappears the moment the link has
-any latency, where all three tie, so it costs nothing on the networks this library is for and
-everything on loopback. It is not the size check — paramiko performs the same one.
-
-**Measured 2026-07-28, and the swing between those two rows is mostly not ours.** Ranging each
-library against *itself* on the same corpus and connection: our upload is **1.25×** our own
-download, while paramiko's upload is **0.23×** theirs — paramiko's small-file `get` is over four
-times its own `put`, and disabling its prefetch does not change that. So the cross-library rows
-above are two facts, not one. Our own direction asymmetry is modest and its largest single
-component is that `put` reads the local file in a worker thread while `get` calls `os.pwrite`
-inline — worth 75–130 µs per file, about a third of the gap. The anyio primitives in that path
-are innocent: a task group, a semaphore acquire and an event wait total ~17 µs per file, measured
-directly.
-
-**Read the download row with that in mind.** It is an honest measurement of both libraries'
-default APIs, which is the fairness rule above — but a good part of the 3× is paramiko's `get`,
-not our scheduler. The row that demonstrates what the scheduling actually buys is the
-`one connection` one, which is this library against itself.
-
-The upload gap is **measured, understood and deliberately not fixed** (D-72). Restoring the
-symmetry means reading small payloads inline, which trades away the property that a slow local
-disk cannot stall the receive side — to win back tens of milliseconds on a link with no latency,
-which is the one case nobody ships.
-
-**"No cryptography in Python" does not become a CPU win.** `cryptography` is OpenSSL and OpenSSL
-uses the CPU's AES instructions, so the expensive part was never interpreted in either design.
-What moves out of Python is per-packet framing work, and we pay a pipe copy for it. The thesis
-was always that this is a *scheduling* win rather than a crypto one — the wall clock column says
-that is right, and the CPU column is what stops the softer claim being written down.
-
-**Connecting is our weak spot, and it is structural.** Spawning `ssh` costs a fork, an exec and
-OpenSSH's own configuration parsing before a packet moves — 0.5–0.9 s extra per connection at
-200 ms RTT, and 1.5–3.9× the CPU of an in-process handshake. The gap is widest where latency is
-lowest (2.1× against asyncssh at 5 ms, 1.2× at 200 ms), which is the signature of a fixed
-process-startup cost rather than an extra round trip. For connection-heavy workloads
-`ControlMaster` is not an optimisation, it is the fix — and it is the first thing to reach for,
-because it is also what pays the cold-transfer cost above once per control socket rather than
-once per session.
-
-Nothing here is an unattributed "10× faster than paramiko": every figure names its link, its
-server, its versions and the benchmark that produced it, and that benchmark re-runs.
+Where it is *faster* is in the generated report and not in this sentence, and the asymmetry is
+the point rather than modesty: a cost is worth knowing whether or not you trust the person
+reporting it, and a win is worth exactly as much as the evidence attached to it. The evidence
+does not live in the committed tree.
 
 ## What these numbers do not say
 

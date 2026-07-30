@@ -238,17 +238,18 @@ exists today:
   over that shaped link, reporting wall clock **and** CPU — and, in the two scenarios there
   that assert rather than report, throughput swept against file size so that a cliff at a byte
   count fails a run, and the file object measured against our own `get` so that a read which
-  stopped pipelining does too. `benchmarks/README.md` is the only place in this project a
-  performance figure lives, wins and losses in the same tables
+  stopped pipelining does too. It is a lane rather than a published result: the figures it
+  produces are written to a report that is not committed, because a number in a repository ages
+  and a lane re-runs
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
 host-key verification and authentication — by key or by password — all done by OpenSSH, and no
 cryptography in this package. It is also measured against both alternatives, in both directions,
 on five link profiles — including the scenarios where we lose, which are connecting and CPU. The
-figures are in [`benchmarks/README.md`](benchmarks/README.md) rather than here, for the reason in
-[Why](#why): a document that ranks correctness above throughput and then leads with ratios is
-arguing against itself. It moves files:
+figures are not in this repository at all, for the reason in [Why](#why): a document that ranks
+correctness above throughput and then leads with ratios is arguing against itself. The lane is
+[`benchmarks/`](benchmarks/README.md) and it writes its report when you run it. It moves files:
 
 ```python
 import anyio
@@ -568,8 +569,9 @@ round trip per block**, `file_size / block_size` of them, and no block size remo
 The lever is making that count small: **read in blocks of at least 2 MiB** — the SSH channel
 window, the same ceiling [Tunables](#tunables-and-what-they-default-to) explains for `depth`. An
 8 KiB block is one round trip per 8 KiB, which on any link with latency is the whole transfer.
-What each block size costs on each link profile is measured in
-[`benchmarks/README.md`](benchmarks/README.md) rather than quoted here.
+What each block size costs on each link profile is what the
+[benchmark lane](benchmarks/README.md) measures; run it rather than trusting a number quoted
+here, which is why none is.
 
 **If you want `get`'s throughput without `get`'s destination, fan out `read_at`** — independent
 ranges in flight have no bubble to amortise. Closing the gap inside the cursor would take
@@ -1073,7 +1075,7 @@ There is no matching flag on `put()`: we control the source there, so a length d
 wrong every time, and `SizeCheck` has no `skipped` value as a result. The cost is one `STAT`
 per upload, and it was benchmarked rather than assumed — on every shaped profile the small-file
 upload row ties with paramiko and asyncssh, because one round trip is invisible beside the ones a
-transfer already spends. The figures are in `benchmarks/README.md`. paramiko's `put` has done the same
+transfer already spends. paramiko's `put` has done the same
 `STAT`-and-compare by default since 1.7.7 — its `confirm` parameter — so the benchmark's paramiko
 column pays it too and still ties. An earlier draft promised an opt-out flag here; the measurement
 withdrew it.
@@ -1702,12 +1704,16 @@ output readable by every user on the machine.
 
 ## Speed, and where its numbers are
 
-Not here, deliberately. Every throughput figure this project has lives in
-[`benchmarks/README.md`](benchmarks/README.md) — the cross-library ratios in both directions, the
-size sweep, the cold-versus-warm connection, and the three scenarios where we lose. It is a lane
-that re-runs (`python scripts/lanes.py benchmarks`) rather than a result quoted in prose, and it
-is the only place in this repository allowed to state one, because a number in a README ages
-without anybody noticing and a number in a suite fails.
+Not here, and not anywhere in this repository. [`benchmarks/`](benchmarks/README.md) measures
+this library against paramiko and asyncssh across five link profiles, in both directions, and
+writes its tables to a report that is **not committed** — run `python scripts/lanes.py
+benchmarks` and it re-derives them in about ten minutes.
+
+That is a decision rather than an omission. A figure in a document is an observation of one
+machine on one afternoon and it ages without anybody noticing; a lane fails. What the committed
+tree does say is where this architecture *costs* something — it is slower to connect than either
+alternative, and it wins nothing on CPU — because a cost is worth knowing whether or not you
+trust the person reporting it.
 
 Two things about speed are mechanism rather than measurement, so they are worth stating where you
 are reading:
@@ -1748,7 +1754,7 @@ stderr, and the connection dies mid-write. So the size is derived, not defaulted
 
 **Why raising `depth` past 64 does nothing.** 64 × 255 KiB is what the client *issues*; what
 the connection can hold is the SSH channel window, which is 2 MiB — OpenSSH's
-`CHAN_SES_WINDOW_DEFAULT`, and measured to be the plateau in `benchmarks/README.md`.
+`CHAN_SES_WINDOW_DEFAULT`, and measured to be the plateau by the benchmark lane.
 Issuing past the ceiling is deliberate, so that a server which clamps the request size still
 reaches it, but the bytes in flight are the window's business. More depth buys memory
 pressure. The thing that would buy throughput is a second connection.
@@ -1918,7 +1924,10 @@ them would be the same mistake in the other direction, so it is open work rather
 
 ### The benchmark lane
 
-`benchmarks/` is the source of truth for every performance number in this repository. It reuses
+`benchmarks/` is where every performance number this project has comes from, and none of them is
+committed — the suite writes `_reports/benchmarks.md`, which is gitignored, and the directory is
+excluded from the built distribution because no packager runs a benchmark and it needs paramiko
+and asyncssh to do anything. It reuses
 the netem shaping and the `sshd` harness from `live-tests/` rather than copying them — two
 spellings of "how this suite connects" is how the scrubbed `ssh` environment ends up applied in
 one of them and not the other, and a benchmark that quietly read your `ssh_config` would report

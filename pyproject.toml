@@ -48,6 +48,38 @@ path = "src/gantry_sftp/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/gantry_sftp"]
 
+# What the source distribution carries, decided rather than defaulted. Hatchling's default is
+# "everything git does not ignore", which measured out as the whole working tree -- including a
+# `.complexipy_cache/` that had been shipping unnoticed, which is the same class of silent
+# packaging defect as the missing licence text `tests/test_packaging.py` exists for.
+#
+# `tests/` and `examples/` stay in, and the reason is downstream packagers: Debian, Fedora and
+# conda-forge rebuild from the sdist and run the suite to validate the build. `examples/` is
+# tested documentation and carries its own README.
+#
+# `benchmarks/` is excluded, and the case is not aesthetic. No packager runs benchmarks; it
+# needs `paramiko` and `asyncssh` to do anything, which is the Python cryptography this library
+# exists not to need; it needs `openssh-server` and `CAP_NET_ADMIN` besides; and it is not even
+# self-contained, since `_clients.py` imports `sshd` from `live-tests/`. A shipped directory
+# that cannot run is worse than an absent one. It stays in the repository, in CI, and gating --
+# what changes is only that it is not part of what a user receives.
+#
+# The repository furniture goes for the same reason: a CI workflow and a pre-commit config
+# describe how this project is developed, not what was installed. `.gitignore` is *not* in the
+# list because hatchling force-includes it whatever the excludes say -- tried both spellings and
+# measured the tarball -- and a line that does nothing is worse than an absent one.
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "benchmarks",
+  ".github",
+  ".pre-commit-config.yaml",
+  ".complexipy_cache",
+  ".hypothesis",
+  ".pytest_cache",
+  ".ruff_cache",
+  "mutants",
+]
+
 # The shipped dependency is anyio and nothing else. The codec layer has no runtime
 # dependencies at all and that is load-bearing, not an accident -- see DESIGN.md 4.1.
 #

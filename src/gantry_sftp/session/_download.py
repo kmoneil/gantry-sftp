@@ -89,8 +89,9 @@ are spent waiting for that window to open rather than for the server. The same d
 measurably faster as a connection's second transfer than as its first, and the warm figure
 reaches most of what the 2 MiB channel window implies once the three metadata round trips
 ``get`` makes -- ``STAT``, ``OPEN``, ``CLOSE`` -- are subtracted. Both figures, with their link
-profile and their date, are in ``benchmarks/README.md``; they are not repeated here, because a
-number in a docstring ages without anybody noticing (D-23, D-88).
+profile and their date, come out of ``benchmarks/`` when it is run; they are not repeated here
+and are not committed anywhere, because a number in a docstring ages without anybody noticing
+(D-23, D-88, D-94).
 
 That cost belongs to the transport rather than to this scheduler, and it is paid once per
 connection: a session that moves several files amortises it, which is an argument for

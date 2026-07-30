@@ -1,6 +1,7 @@
 """Measuring a transfer honestly: what is timed, what is counted, and what neither can say.
 
-This module is the source of truth for every performance claim this repository makes. Until
+This module is where every performance number this project has comes from -- none of which is
+committed, since 0.11: a run writes the gitignored `_reports/benchmarks.md` (D-94). Until
 it existed, no throughput number was allowed to appear in any document, and the rule it is
 built to satisfy is the Docs Rule: *a number names the link profile, the server, and the
 benchmark that produced it, or it is not stated.*
