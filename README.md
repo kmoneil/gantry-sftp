@@ -445,15 +445,55 @@ Runnable: `examples/blocking.py`.
 ```python
 from contextlib import aclosing
 
+from gantry_sftp import local_child
+
 async with aclosing(sftp.glob("/incoming/*.csv")) as matches:
     async for match in matches:
-        await sftp.get(match.path, local_dir / os.fsdecode(match.name))
+        await sftp.get(match.path, local_child(local_dir, match.name))
 ```
 
 `match.path` is a path **this library** built, by joining a name that was checked for
 separators and dot entries onto the prefix you typed. That is the reason to use `glob` rather
 than a `listdir` and an `fnmatch`: written by hand, that join is at your call site, and a
 server answering with `../../etc/x` is a path traversal you wrote yourself.
+
+### When the filter is not a pattern
+
+A regular expression, a modification-time watermark, a size threshold, a lookup in a
+manifest — none of those can come through `glob`, and none of them means writing the join
+unsafely. The two functions `glob` itself calls are public, and the whole answer is two lines:
+
+```python
+from gantry_sftp import check_listed_name, join_remote, local_child
+
+drop = b"/incoming"
+for entry in await sftp.listdir(drop):
+    if entry.is_file and pattern.match(entry.name):
+        remote = join_remote(drop, check_listed_name(entry.filename, directory=drop))
+        await sftp.get(remote, local_child(local_dir, entry.filename))
+```
+
+- **`check_listed_name(name, directory=...)`** returns the name unchanged, so it reads as a
+  pass-through, and raises `UnsafePathError` for a name that is not one path component —
+  empty, `.` or `..`, or carrying a `/` or a NUL. On an honest server it never fires: a POSIX
+  filename cannot contain a `/`.
+- **`join_remote(parent, name)`** joins with `/` always, never `os.path.join`, which on a
+  Windows *client* would produce a path no server understands. Both arguments are bytes,
+  because `entry.filename` is bytes — `entry.name` is the same name decoded for display, and
+  decoding is not reversible for every server that will ever answer you.
+- **`local_child(directory, name)`** is the destination side, and it is the one that is easy
+  to forget: `local_dir / os.fsdecode(entry.filename)` is the zip-slip. It validates against
+  the **local** rules and then decodes with `os.fsdecode`, so a filename that is not valid
+  UTF-8 lands on disk as the bytes it arrived as. The local rules are a strict superset of the
+  remote ones — a name that cleared `check_listed_name` can still be `..\evil` or `C:evil` or
+  `CON`, none of which contains a `/` and all of which mean something on Windows — so passing
+  the remote check is not a reason to skip this one.
+
+The same three are what `glob`, `walk`, `get_tree` and `put_tree` use internally, so a
+hand-written loop and a library one refuse the same names for the same reasons. `entry` here
+is a `DirEntry`, which deliberately does **not** carry a `.path`: it is also what the upload
+walk reports, where a remote directory does not exist, and a property that worked in one
+direction and raised in the other would be worse than the two lines above.
 
 **The dialect is `glob(3)`'s, because that is what `sftp(1)` uses.** It globs client-side
 through POSIX `glob(3)`, so this is the pattern language you already have. Three consequences

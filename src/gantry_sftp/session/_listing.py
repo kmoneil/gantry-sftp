@@ -164,6 +164,19 @@ class DirEntry:
     client that returns names alone forces a STAT per entry, which is a round trip per file
     and the reason listing a large directory is slow in every paramiko-based tool.
 
+    **It deliberately does not carry the directory it came from, so there is no ``.path``**
+    (D-97, costed and declined). Two facts decide it. This type is *shared with the upload
+    direction* -- :func:`~gantry_sftp.session.local_dir_entry` builds one from a local
+    ``stat`` so a :class:`~gantry_sftp.session.Skipped` reads the same whichever direction
+    produced it -- and there is no remote directory to put in that field; putting the local
+    parent there would be the local-path-on-the-wire confusion the walk types are separate to
+    avoid. Making it optional is worse rather than cheaper: ``.path`` would then be a property
+    that reads as total and raises on entries from one of the two directions, which is the
+    third state DoD 2 exists to stop being discovered rather than decided. The directory a
+    listing came from is the one the caller passed to :meth:`Session.listdir` or
+    :meth:`Session.scandir`, and joining onto it is :func:`check_listed_name` plus
+    :func:`join_remote` -- two lines, documented in the README beside ``glob``.
+
     Attributes:
         filename: The name, exactly as the server sent it. Bytes, because it is not
             guaranteed to be text and is attacker-controlled either way.

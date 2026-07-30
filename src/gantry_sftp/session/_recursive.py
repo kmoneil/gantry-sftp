@@ -168,10 +168,17 @@ class GlobMatch:
     """One entry a pattern matched.
 
     Carries the **path** rather than only the name, and that is the security half of
-    :meth:`Session.glob` rather than a convenience: the whole reason a caller reaches for a
-    glob instead of a hand-rolled ``listdir`` plus match is so that the join from a
-    server-supplied name to a path they will feed to ``get`` happens here, once, against a
-    validated component -- not at every call site.
+    :meth:`Session.glob` rather than a convenience: the join from a server-supplied name to a
+    path the caller will feed to ``get`` happens here, once, against a component that has
+    already been checked, so a hand-rolled ``listdir`` plus match does not have to get it
+    right.
+
+    **This is not the only safe place to join, and saying otherwise sent readers back to the
+    hazard** (D-97). A predicate that is not a pattern -- a regular expression, a watermark
+    comparison, a size test, a manifest lookup -- cannot come through ``glob`` at all, and
+    that caller is not stuck: :func:`check_listed_name` and :func:`join_remote` are public and
+    are exactly what this class calls. Two lines at the call site build the same path this
+    one carries.
 
     Attributes:
         path: Full remote path, built by joining validated components onto the pattern's own

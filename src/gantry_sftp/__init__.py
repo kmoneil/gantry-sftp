@@ -28,6 +28,14 @@ connection. :mod:`gantry_sftp.codec` is the sans-I/O protocol layer
 underneath, public because a frame dumper and a fuzz harness need it. Typed errors are
 re-exported here; every one carries state rather than a string.
 
+**Names a server sent are attacker-controlled, and building a path out of one is not the
+caller's problem to solve from scratch.** ``glob`` and the recursive operations do it
+internally; a caller whose filter is a regular expression or a watermark rather than a
+pattern gets the same primitives -- :func:`~gantry_sftp.session.check_listed_name` and
+:func:`~gantry_sftp.session.join_remote` for the remote path,
+:func:`~gantry_sftp.session.local_child` for the local one -- from here rather than from a
+submodule (D-97).
+
 This module used to point at ``_plans/DESIGN.md`` and ``_plans/progress.md``. Neither is in
 any distribution -- they are gitignored working documents -- so ``help(gantry_sftp)`` was
 sending readers to files they could not obtain (D-47). The README is what ships.
@@ -60,6 +68,7 @@ from gantry_sftp.exceptions import (
 from gantry_sftp.session import (
     DirEntry,
     EntryKind,
+    GlobMatch,
     Mode,
     Publish,
     RemoteFile,
@@ -71,7 +80,10 @@ from gantry_sftp.session import (
     UploadResult,
     Verify,
     WalkEntry,
+    check_listed_name,
     is_retryable,
+    join_remote,
+    local_child,
     open_session,
     with_reconnect,
 )
@@ -85,6 +97,7 @@ __all__ = [
     "DestinationCollisionError",
     "DirEntry",
     "EntryKind",
+    "GlobMatch",
     "HostKeyError",
     "InsecureOptionWarning",
     "Mode",
@@ -114,8 +127,11 @@ __all__ = [
     "Verify",
     "WalkEntry",
     "__version__",
+    "check_listed_name",
     "connect",
     "is_retryable",
+    "join_remote",
+    "local_child",
     "open_session",
     "open_ssh_transport",
     "with_reconnect",

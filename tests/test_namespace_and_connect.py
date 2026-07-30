@@ -100,6 +100,7 @@ def test_a_program_needs_no_import_from_the_codec():
         "Times",  # Attrs.times
         "DirEntry",  # what listdir/scandir yield
         "EntryKind",  # DirEntry.kind
+        "GlobMatch",  # what glob yields
         "WalkEntry",  # what walk yields
         "Skipped",  # TreeResult.skipped
         "SkipReason",  # Skipped.reason
@@ -118,6 +119,52 @@ def test_a_program_needs_no_import_from_the_codec():
 def test_the_entry_points_are_all_reachable_from_the_top():
     for name in ("connect", "open_session", "open_ssh_transport", "with_reconnect", "is_retryable"):
         assert hasattr(gantry_sftp, name), name
+
+
+def test_the_safe_join_a_caller_has_to_write_is_reachable_from_the_top():
+    """D-97, and it is the same property as D-58's rather than a second rule.
+
+    A filter that is not a pattern -- a regex, a watermark, a manifest lookup -- cannot come
+    through ``glob``, so that caller performs the join themselves. The functions ``glob``
+    calls internally are what they should call, and a security primitive reachable only from
+    a subpackage is one only its author finds: the README teaches this loop, so the README's
+    own import has to work from the top level.
+    """
+    for name in ("check_listed_name", "join_remote", "local_child"):
+        assert hasattr(gantry_sftp, name), name
+        assert name in gantry_sftp.__all__, name
+
+
+def test_the_predicates_under_them_stay_in_the_session_namespace():
+    """The other half of the same decision, written down so it is not read as an omission.
+
+    ``remote_component_reason`` and ``unsafe_reason`` answer *why* a name is unusable instead
+    of refusing it, which is the shape of a caller who wants to skip one entry and carry on.
+    This library does not do that -- a hostile name fails the whole operation, in ``walk``,
+    ``glob`` and both tree transfers -- so promoting the skip primitive to the top level would
+    advertise a policy the library declines to take. They stay public, one import away, for a
+    caller who has decided otherwise on purpose.
+    """
+    for name in ("remote_component_reason", "unsafe_reason", "check_component", "check_contained"):
+        assert hasattr(gantry_sftp.session, name), name
+        assert name not in gantry_sftp.__all__, name
+
+
+def test_a_listing_entry_carries_no_path_and_that_is_the_decision():
+    """D-97 costed ``DirEntry.path`` and declined it; this is the decline, enforced.
+
+    :class:`~gantry_sftp.DirEntry` is also what the *upload* walk reports, via
+    ``local_dir_entry``, where there is no remote directory to carry. A field that one
+    direction fills and the other cannot makes ``.path`` a property that reads as total and
+    raises on half its instances -- a third state discovered at a call site rather than
+    decided here. The directory is the one the caller passed to ``listdir``/``scandir``.
+    """
+    assert not hasattr(gantry_sftp.DirEntry, "path")
+    assert not hasattr(gantry_sftp.DirEntry, "directory")
+    # And the reason it cannot be filled: this is the same type, built from a local stat.
+    local = gantry_sftp.session.local_dir_entry(b"report.csv", (ROOT / "README.md").stat())
+    assert isinstance(local, gantry_sftp.DirEntry)
+    assert local.filename == b"report.csv"
 
 
 DEMONSTRATES_THE_CODEC = {

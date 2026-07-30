@@ -13,6 +13,12 @@ inside the library, against a component that has been checked for separators and
 Written by hand, that join is at your call site, and a server answering with `../../etc/x` is
 a path traversal you wrote yourself.
 
+**And when your filter is not a pattern, you are not sent back to that hazard.** A regular
+expression, a watermark, a size test or a manifest lookup cannot come through `glob()` at
+all, so the last section of this example does the same job with `listdir()` and a regex --
+using `check_listed_name` and `join_remote`, which are what `glob()` itself calls, and
+`local_child` for the destination. Two lines, the same refusals.
+
 Three things in the output are worth knowing before you tune anything:
 
 **The dialect is `glob(3)`'s, not `fnmatch`'s.** `sftp(1)` globs client-side through POSIX
@@ -32,6 +38,7 @@ two distinct names match one pattern. The example directory contains such a name
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from collections.abc import AsyncIterator
@@ -40,6 +47,7 @@ from pathlib import Path
 
 import anyio
 
+from gantry_sftp import check_listed_name, join_remote, local_child
 from gantry_sftp.session import Session, open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport
 
@@ -95,6 +103,30 @@ async def show(sftp: Session, pattern: str, note: str) -> list[bytes]:
     return matched
 
 
+async def by_predicate(sftp: Session, directory: str, into: Path) -> list[bytes]:
+    """The same job with a filter `glob()` cannot express -- here, a regular expression.
+
+    Nothing about this loop is less safe than the glob above it, and that is the point. The
+    two calls that build the remote path are the two `glob()` makes internally, in the same
+    order: refuse the name, then join it.
+
+    `drop` is **bytes**, because `entry.filename` is bytes and a remote name need not be
+    valid UTF-8. `entry.name` is the same name decoded for display -- fine to match a pattern
+    against, and not what you build a path out of.
+    """
+    drop = os.fsencode(directory)
+    taken: list[bytes] = []
+    for entry in await sftp.listdir(drop):
+        # A watermark, a size threshold or a manifest lookup goes exactly here.
+        if not entry.is_file or not re.fullmatch(r"[a-z]+\.csv", entry.name):
+            continue
+        remote = join_remote(drop, check_listed_name(entry.filename, directory=drop))
+        written = await sftp.get(remote, local_child(into, entry.filename))
+        taken.append(remote)
+        print(f"    {os.fsdecode(entry.filename)}  ({written} bytes)")
+    return taken
+
+
 async def main() -> None:
     destination = sys.argv[1] if len(sys.argv) > 1 else None
     remote_dir = sys.argv[2] if len(sys.argv) > 2 else None
@@ -123,11 +155,22 @@ async def main() -> None:
 
             # The point of the whole thing: a match carries a path this library built, so it
             # goes straight to `get` with no joining at the call site.
+            #
+            # The *local* side is the half that still has a join in it, and `local_child` is
+            # what performs it. `into / os.fsdecode(match.name)` -- which this example used to
+            # do -- is safe here only by accident of platform: the name cleared the remote
+            # check, so it holds no `/`, and on Windows the local rules are a strict superset
+            # that `..\evil`, `C:evil` and `CON` all fail while holding no `/` at all.
             print("\nfetching every match of **/*.csv:")
             async with aclosing(sftp.glob(f"{target}/**/*.csv")) as found:
                 async for match in found:
-                    written = await sftp.get(match.path, into / os.fsdecode(match.name))
+                    written = await sftp.get(match.path, local_child(into, match.name))
                     print(f"    {os.fsdecode(match.name)}  ({written} bytes)")
+
+            print("\nthe same job with a regex, which no pattern can express:")
+            picked = workdir / "picked"
+            picked.mkdir()
+            matched_by_regex = await by_predicate(sftp, target, picked)
 
     # `*.csv` matched neither the .txt nor the dotfile, and did not descend.
     assert all(path.endswith(b".csv") for path in top)
@@ -138,6 +181,9 @@ async def main() -> None:
     assert any(b"/2026/" in path for path in everything)
     # And the trailing slash matched the directory rather than anything in it.
     assert all(path.endswith(b"2026") for path in directories)
+    # The regex is anchored and ASCII-only, so it takes a subset of what `*.csv` took -- and
+    # every path it produced is one this library's own join built.
+    assert set(matched_by_regex) <= set(top)
 
     print(f"\n{len(top)} at the top level, {len(everything)} at every level")
 

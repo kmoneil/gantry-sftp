@@ -53,8 +53,11 @@ from gantry_sftp.session import (
     Publish,
     SkipReason,
     TreeResult,
+    check_listed_name,
     join_remote,
+    local_child,
     open_session,
+    remote_component_reason,
 )
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
@@ -549,6 +552,59 @@ async def test_a_traversing_directory_name_is_refused_before_it_is_created(tmp_p
     assert exc.value.name == b"../escape"
     assert not (tmp_path / "escape").exists()
     assert not (tmp_path / "loot.csv").exists()
+
+
+async def test_the_hand_written_loop_the_readme_documents_refuses_a_decoy(tmp_path: Path):
+    """D-97: the two-call spelling, driven the way a caller writes it.
+
+    The primitives shipped public and documented and nothing outside the library said so, so
+    the README now teaches this loop for a filter no pattern can express. A test that called
+    the two functions with a literal would only prove the functions work; this one puts the
+    hostile name where a server puts it -- second in a listing, after an honest sibling -- so
+    it proves the *spelling* works, including that the honest entry before it produced the
+    path this library's own join would have produced.
+    """
+    drop = b"/incoming"
+    tree = {
+        drop: (named(b"report.csv", REGULAR, 3), named(b"../secrets/key", REGULAR, 3)),
+    }
+    built: list[bytes] = []
+
+    async with open_session(TreeServer(tree=tree)) as sftp:  # type: ignore[arg-type]
+
+        async def take_matching() -> None:
+            """The README's loop, verbatim apart from the filter."""
+            for entry in await sftp.listdir(drop):
+                name = check_listed_name(entry.filename, directory=drop)
+                built.append(join_remote(drop, name))
+
+        with pytest.raises(UnsafePathError) as exc:
+            await take_matching()
+
+    assert built == [b"/incoming/report.csv"], "the honest entry did not join as documented"
+    assert exc.value.name == b"../secrets/key"
+    assert exc.value.args[0] == (
+        "refusing the server-supplied name b'../secrets/key' in the listing of b'/incoming': "
+        "it contains a path separator, so it is not one path component and this server is not "
+        "describing its own directory truthfully"
+    )
+    # And the destination half of the same loop, which is a separate refusal with its own
+    # rules: this name is caught by the separator on every platform, `..\\evil` only on
+    # Windows, and neither is caught by the remote check alone.
+    with pytest.raises(UnsafePathError) as local_exc:
+        _ = local_child(tmp_path, b"../secrets/key")
+    assert local_exc.value.args[0] == (
+        "refusing to use the server-supplied name b'../secrets/key': it contains a path separator"
+    )
+    with pytest.raises(UnsafePathError) as windows_exc:
+        _ = local_child(tmp_path, b"..\\evil", windows=True)
+    assert windows_exc.value.args[0] == (
+        "refusing to use the server-supplied name b'..\\\\evil': it contains a character "
+        "Windows does not allow in a filename"
+    )
+    assert remote_component_reason(b"..\\evil") is None, (
+        "the remote check cannot catch this one, which is why local_child is a second call"
+    )
 
 
 @pytest.mark.parametrize("dotted", [b"..", b"."])
