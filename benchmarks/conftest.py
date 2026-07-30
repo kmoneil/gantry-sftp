@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,50 @@ under two seconds, which is what keeps the whole matrix inside a few minutes.
 
 SMALL_FILE_BYTES = 8 * 1024
 """Small enough that the cost is round trips rather than bytes -- the small-file case."""
+
+SWEEP_LADDER: tuple[tuple[int, str], ...] = (
+    (4 * 1024, "one request, one round trip"),
+    (32 * 1024, "SSH max packet; above paramiko#2438's 32675-byte write cliff"),
+    (64 * 1024, "two SSH packets -- one per request is no longer enough"),
+    (128 * 1024, "half a request"),
+    (261120, "exactly one request -- OpenSSH's `max-read-length`"),
+    (262144, "1 KiB more: two requests, and the round number DESIGN.md 4.2 forbids"),
+    (1024 * 1024, "four requests, inside the 2 MiB channel window"),
+    (2 * 1024 * 1024, "the 2 MiB channel window itself"),
+    (8 * 1024 * 1024, "32 requests -- window-bound, depth not yet binding"),
+    (16 * 1024 * 1024, "past depth x request size (64 x 261120); the matrix's own size"),
+)
+"""Sizes the throughput-against-size sweep visits, and what each one brackets (D-92).
+
+A geometric ladder rather than round numbers, because **the point of the sweep is the
+boundaries**: what people report against the incumbent is a cliff at a byte count -- writing
+more than 32675 bytes costing 99% of the throughput (`paramiko#2438`), one API running 25x
+another (`paramiko#2453`) -- and a cliff is only visible if a size sits either side of the
+boundary it would hide on. Every design boundary this library has is bracketed here: the
+single-request case, the SSH packet size, the derived `max-read-length` (255 KiB, *not* 256 --
+DESIGN.md 4.2), the crossing from one request to two, the 2 MiB channel window, and the
+pipeline depth x request size product past which depth rather than file size is the limit.
+
+The whole ladder is 27.8 MiB on disk, written once per session.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class SweepFile:
+    """One rung of :data:`SWEEP_LADDER`, on disk.
+
+    Attributes:
+        size_bytes: Its size, which is what the sweep plots against.
+        note: What boundary it brackets, carried into the report so a reader does not have to
+            recognise the number to know why the row exists.
+        path: Where it is. The same file is the download source and the upload source -- the
+            server serves this filesystem over loopback, so a second copy would buy nothing
+            but a second thing to keep in step.
+    """
+
+    size_bytes: int
+    note: str
+    path: Path
 
 
 @pytest.fixture(scope="session")
@@ -105,6 +150,25 @@ def corpus(ssh_server: SSHServer) -> dict[str, object]:
         "upload_source": upload_source,
         "upload_dir": destinations,
     }
+
+
+@pytest.fixture(scope="session")
+def sweep_corpus(ssh_server: SSHServer) -> tuple[SweepFile, ...]:
+    """One file per rung of :data:`SWEEP_LADDER`, ascending.
+
+    Session-scoped and requested lazily by the profiles that sweep, so a ``-k`` selection that
+    runs no sweep writes no 27.8 MiB.
+    """
+    root = ssh_server.root / "sweep"
+    root.mkdir(exist_ok=True)
+    files = []
+    for size, note in SWEEP_LADDER:
+        path = root / f"size-{size}.bin"
+        # Seeded by size, so two rungs never hold each other's bytes -- a verification that
+        # compares the wrong pair of files would pass by accident on identical content.
+        _fill(path, size, seed=size % 251)
+        files.append(SweepFile(size_bytes=size, note=note, path=path))
+    return tuple(files)
 
 
 ShapeLink = Callable[..., ShapedLink]

@@ -1,9 +1,14 @@
-"""The benchmark matrix: three libraries, six scenarios, five link profiles.
+"""The benchmark matrix: three libraries, one server, five link profiles.
+
+The scenario list is deliberately not counted here -- ``benchmarks/README.md`` has the table and
+it grows; a number in this sentence would be a second place to update and the one nobody does.
 
 This is a pytest module rather than a script on purpose. A benchmark that is not also a test
 drifts until it measures something other than what it claims, and there is no assertion to
 notice -- so every scenario here **verifies the bytes it moved** before its number is allowed
-into the report. A client that returns fast and wrong must fail, not win.
+into the report. A client that returns fast and wrong must fail, not win. One scenario goes
+further and asserts on its *result*: the size sweep fails a run whose throughput falls as the
+file grows (D-92).
 
 Run it explicitly; it is out of the default test run for the same reason ``live-tests/`` is::
 
@@ -26,8 +31,20 @@ from pathlib import Path
 
 import pytest
 from _clients import BASELINE, Client, GantryClient, available, library_versions
-from _harness import Environment, Measurement, render_report, render_scenario, take_samples
+from _harness import (
+    Environment,
+    Measurement,
+    SizePoint,
+    SizeSweep,
+    render_report,
+    render_scenario,
+    render_size_sweep,
+    size_label,
+    take_samples,
+)
 from sshd import SFTP_SERVER_CANDIDATES, SSHServer, first_existing
+
+from conftest import SweepFile
 
 pytestmark = pytest.mark.anyio
 
@@ -52,6 +69,27 @@ because the report names a link profile and a report that names a link it did no
 worse than no report.
 """
 
+SWEEP_WARMUPS = 1
+"""Transfers discarded before timing begins, per size, on that size's own connection.
+
+One, and *of the same size as the rungs being timed*, which is the part that matters: D-81
+found every published row was timing a connection's first transfer, and the small end of a
+size ladder is where a fixed startup cost does the most damage. Warming with the same size
+warms the congestion window in proportion to what the rung actually needs.
+"""
+
+CLIFF_TOLERANCE = 0.5
+"""Fraction of the best throughput measured at any smaller size that a rung may fall to.
+
+A halving, and it **gates** -- see the sweep scenario's docstring for why that does not
+duplicate D-63. Set where a pathology lives rather than where noise does: the complaints this
+sweep answers are a 99% collapse (`paramiko#2438`) and a 25x gap (`paramiko#2453`), while the
+run-to-run spread on this lane sits near 1.1 and reaches 1.9 on the unshaped profile. The
+tolerance is not what keeps noise out of the gate, though -- :func:`_harness._fell_below`
+compares the rung's *fastest* run against the reference's *slowest*, so a fall the samples
+cannot separate is printed and not failed.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class Profile:
@@ -69,11 +107,41 @@ class Profile:
     concurrency row, so the three stay comparable to each other on any given profile.
     """
 
+    sweep_repeats: tuple[int, int] | None = None
+    """Samples per sweep rung ``(below the 2 MiB channel window, at or above it)``, or ``None``
+    not to sweep this profile at all (D-92).
+
+    **Two profiles sweep, not five.** The sweep is ten sizes x two directions x every available
+    client, so it costs about what the rest of a profile costs, and its answer is a *shape*
+    which does not need five links to be visible. ``unshaped`` is in because it needs no ``tc``
+    and is therefore what a plain checkout gets, and because a framing or per-packet cliff
+    shows up with no latency at all. ``50ms`` is in because a *pipelining* cliff needs a link
+    where a round trip costs something, and 50 ms is where this suite's other latency findings
+    have been legible. 200 ms would triple the wall clock for the same curve.
+
+    **Both halves are per profile because a rung costs two orders of magnitude more on one
+    profile than another** -- roughly 2 ms unshaped against 220 ms at 50 ms RTT -- so one
+    sample count cannot serve both. The unshaped profile needs the larger one and can afford
+    it: three samples there reported 262144 bytes downloading at 0.47x the throughput of
+    261120, which read as a cost for crossing from one request to two.
+    ``_plans/probes/size_boundary_probe.py`` took that crossing 25 times and found the
+    opposite -- a **one-byte** step from 261120 to 261121 *raises* the median from 2.41 ms to
+    1.73 ms, because the second request pipelines behind the first and there is nothing for a
+    single-request transfer to overlap a scheduler hiccup with. Its p90 is 7.1 ms against a
+    1.7 ms floor: the fat tail is real, the fall was not, and a three-sample median lands
+    anywhere in between. Nine samples still put it on the wrong rung; twenty-five settle it and
+    cost under a second.
+    """
+
+    @property
+    def sweeps(self) -> bool:
+        return self.sweep_repeats is not None
+
 
 PROFILES = (
-    Profile(name="unshaped", small_files=200),
+    Profile(name="unshaped", small_files=200, sweep_repeats=(25, 9)),
     Profile(name="5ms", rtt_ms=5.0, small_files=100),
-    Profile(name="50ms", rtt_ms=50.0, small_files=24),
+    Profile(name="50ms", rtt_ms=50.0, small_files=24, sweep_repeats=(9, 3)),
     Profile(name="200ms", rtt_ms=200.0),
     Profile(name="50ms-100mbit", rtt_ms=50.0, rate_mbit=100.0),
 )
@@ -112,6 +180,17 @@ CAVEATS = (
     "claim about the other two libraries.",
     "Our upload row is `atomic=False, fsync=False`, which is the work the other two do. What "
     "our default costs is the separate `atomic publish` scenario.",
+    "**The `throughput against size` sweeps are the one place a connection is reused, and "
+    "their numbers are therefore not comparable with any table above them.** Each rung runs "
+    "on its own connection with a same-size warmup discarded first, because a fresh "
+    "connection per size would time TCP slow start at the small end and publish congestion "
+    "control as a cliff (D-81). They carry no CPU column for the same reason: one connection "
+    "is one reaped child, so per-sample CPU does not exist. The other two libraries are swept "
+    "as **controls** -- reported, never asserted; an incumbent's pathology must not be able to "
+    "fail this lane. Our own curve does gate, on shape rather than on any figure: a rung that "
+    "falls below half the best throughput measured at a smaller size, by a margin its own "
+    "samples separate, fails the run. Whether a *number* moving between runs should fail CI "
+    "is still D-63's open question and this does not answer it.",
     "**Comparing the two small-file rows against each other measures two libraries' direction "
     "asymmetries at once, not one.** Each client has its own ratio between its `get` and its "
     "`put`, and a cross-library row cannot separate them -- D-72 was filed reading the "
@@ -130,6 +209,13 @@ class ReportSink:
     sections: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     profiles: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    """Findings a run produced that no table states in words -- a control's size cliff.
+
+    They land in the report's caveats rather than in a table because they are claims about
+    another library, and a claim about another library is only honest with its versions beside
+    it, which is what the environment header carries.
+    """
 
     @property
     def complete(self) -> bool:
@@ -167,7 +253,7 @@ def _write_report(report: ReportSink) -> Iterator[None]:
         environment=environment,
         profile=coverage,
         sections=report.sections,
-        caveats=(*CAVEATS, *(f"Client skipped: {s}" for s in report.skipped)),
+        caveats=(*CAVEATS, *report.notes, *(f"Client skipped: {s}" for s in report.skipped)),
     )
     destination = Path(__file__).resolve().parent.parent / "_reports"
     destination.mkdir(exist_ok=True)
@@ -428,6 +514,148 @@ async def _scenario_atomic(
     return measurements
 
 
+DOWNLOAD_SWEEP = "download: throughput against size"
+UPLOAD_SWEEP = "upload: throughput against size"
+
+CHANNEL_WINDOW = 2 * 1024 * 1024
+"""OpenSSH's `CHAN_SES_WINDOW_DEFAULT`, and paramiko's and asyncssh's, per DESIGN.md 5.1.
+
+The line the two halves of :attr:`Profile.sweep_repeats` fall either side of, because it is
+where a rung stops being a fixed cost and starts being bytes: below it a transfer fits in one
+window and its wall clock is round trips, above it the window has to be refilled.
+"""
+
+
+def _repeats_for(size_bytes: int, repeats: tuple[int, int]) -> int:
+    """Samples to keep for one rung -- see :attr:`Profile.sweep_repeats`."""
+    below, at_or_above = repeats
+    return below if size_bytes < CHANNEL_WINDOW else at_or_above
+
+
+async def _download_sweep(
+    client: Client, ladder: Sequence[SweepFile], workdir: Path, repeats: tuple[int, int]
+) -> SizeSweep:
+    into = workdir / f"sweep-{client.name}"
+    into.mkdir(exist_ok=True)
+    points = []
+    for rung in ladder:
+        destination = into / rung.path.name
+        walls = await client.download_repeatedly(
+            rung.path,
+            destination,
+            repeats=_repeats_for(rung.size_bytes, repeats),
+            warmups=SWEEP_WARMUPS,
+        )
+        assert _identical(destination, rung.path), (
+            f"{client.name} downloaded {size_label(rung.size_bytes)} wrongly"
+        )
+        points.append(
+            SizePoint(size_bytes=rung.size_bytes, note=rung.note, wall_seconds=tuple(walls))
+        )
+    return SizeSweep(scenario=DOWNLOAD_SWEEP, client=client.name, points=tuple(points))
+
+
+async def _upload_sweep(
+    client: Client, ladder: Sequence[SweepFile], upload_dir: Path, repeats: tuple[int, int]
+) -> SizeSweep:
+    into = upload_dir / f"sweep-{client.name}"
+    into.mkdir(exist_ok=True)
+    points = []
+    for rung in ladder:
+        destination = into / rung.path.name
+        walls = await client.upload_repeatedly(
+            rung.path,
+            destination,
+            repeats=_repeats_for(rung.size_bytes, repeats),
+            warmups=SWEEP_WARMUPS,
+        )
+        assert _identical(destination, rung.path), (
+            f"{client.name} uploaded {size_label(rung.size_bytes)} wrongly"
+        )
+        points.append(
+            SizePoint(size_bytes=rung.size_bytes, note=rung.note, wall_seconds=tuple(walls))
+        )
+    # Same check the small-file upload row makes: `atomic=False` must stage nothing, and a
+    # staging file left behind would inflate the next rung's time as well as litter.
+    leftovers = _hidden_names(into)
+    assert leftovers == [], f"{client.name} left staging files behind: {leftovers}"
+    return SizeSweep(scenario=UPLOAD_SWEEP, client=client.name, points=tuple(points))
+
+
+async def _scenario_size_sweep(
+    clients: Sequence[Client],
+    ladder: Sequence[SweepFile],
+    workdir: Path,
+    upload_dir: Path,
+    repeats: tuple[int, int],
+) -> list[SizeSweep]:
+    """Throughput against size, both directions, every available client (D-92).
+
+    Three decisions, each one the card's and each one written down here because a later reader
+    will otherwise read this as an ordinary parametrisation of the rows above.
+
+    **It runs on one connection per rung, unlike every comparison row here.** That suspends
+    this suite's no-connection-reuse rule deliberately and identically for all three clients:
+    a fresh connection per size times TCP slow start at the small end (D-81), and a sweep
+    looking for a cliff would have found congestion control and named it one. The consequence
+    is that these numbers are **not** comparable with the fixed-size comparison tables above,
+    which are all cold on purpose.
+
+    **The other two libraries are swept as controls.** `paramiko#2438` reports a 99% collapse
+    above 32675 bytes and `paramiko#2453` a 25x gap between two of its own APIs; the strongest
+    form of "we have no cliff" is the same ladder showing their curve beside ours. It is
+    reported and never asserted -- an incumbent's pathology must not be able to fail this
+    lane. Both reproduce as of paramiko 5.0.0, `#2438` included and it is closed upstream: a
+    ~40 ms stall floor at 32-64 KiB writes and at 128 KiB-1 MiB reads, intermittent rather than
+    uniform, which is why the control's falls are read off :meth:`SizeSweep.dips`.
+
+    **Our own curve gates, and that is not D-63's gate.** D-63 owns the missing *regression*
+    gate, which needs a committed baseline to compare a run against and is blocked on not
+    having one. This assertion needs no baseline and quotes no figure: it is internal to a
+    single run, comparing rungs of one curve against each other, and it fails only when our
+    throughput falls as the file grows by a margin the run's own samples can separate. Whether
+    a *number* moving between runs should fail CI is still D-63's question.
+    """
+    sweeps = [await _download_sweep(client, ladder, workdir, repeats) for client in clients]
+    return sweeps + [await _upload_sweep(client, ladder, upload_dir, repeats) for client in clients]
+
+
+def _route_falls(sweeps: Sequence[SizeSweep], report: ReportSink, *, profile: str) -> list[str]:
+    """Send each curve's falling rungs where they belong, and hand back the ones that fail.
+
+    Two destinations, because the two kinds of curve carry different authority. A control's
+    fall is a *finding* about another library: it goes into the report's caveats, is read off
+    :meth:`SizeSweep.dips` because an incumbent's stall is bimodal and its fast mode would
+    defeat the separability test, and it can never fail this lane. Ours is read off
+    :meth:`SizeSweep.cliffs`, which is separable by construction, and it does.
+
+    Args:
+        sweeps: Every curve measured on this profile.
+        report: Where a control's finding is recorded.
+        profile: The profile's name, which goes into the note. Two profiles sweep, and a stall
+            at 40 ms of fixed cost is a different claim at 0.2 ms per round trip than at 50 --
+            an unattributed finding in a report covering both says neither.
+
+    Returns:
+        One entry per curve of *ours* that fell. Empty is the result the sweep exists to keep
+        true.
+    """
+    ours = []
+    for sweep in sweeps:
+        if sweep.client != BASELINE:
+            dips = [dip.describe() for dip in sweep.dips(tolerance=CLIFF_TOLERANCE)]
+            if dips:
+                report.notes.append(
+                    f"Control finding on `{profile}` -- {sweep.client}, {sweep.scenario}: "
+                    f"{'; '.join(dips)}"
+                )
+            continue
+        cliffs = [cliff.describe() for cliff in sweep.cliffs(tolerance=CLIFF_TOLERANCE)]
+        if cliffs:
+            ours.append(f"{sweep.scenario}: {'; '.join(cliffs)}")
+    return ours
+
+
 @pytest.mark.parametrize("profile", PROFILES, ids=lambda p: p.name)
 async def test_benchmark_profile(
     profile: Profile,
@@ -531,6 +759,26 @@ async def test_benchmark_profile(
                 baseline_client="gantry-sftp (in place)",
             )
         )
+    sweeps: list[SizeSweep] = []
+    if profile.sweep_repeats is not None:
+        # Requested lazily like `shape_link`, so a selection that runs no sweep writes no
+        # 27.8 MiB of ladder.
+        ladder: Sequence[SweepFile] = request.getfixturevalue("sweep_corpus")
+        sweeps = await _scenario_size_sweep(
+            clients, ladder, tmp_path, upload_dir, profile.sweep_repeats
+        )
+        sections.extend(render_size_sweep(sweep, tolerance=CLIFF_TOLERANCE) for sweep in sweeps)
 
     report.sections.append(f"### Link: {description}\n\n" + "\n".join(sections))
     report.profiles.append(profile.name)
+
+    # Asserted *after* the tables are in the report, not before. A cliff has to publish the
+    # curve that proves it -- with the assertion first, the only evidence for a failure would
+    # be its own message, and the section it belongs to would be missing from the report.
+    ours = _route_falls(sweeps, report, profile=profile.name)
+    assert not ours, (
+        f"throughput fell as the file grew, on {description} -- "
+        f"{'  |  '.join(ours)}. The curve is in the report; a rung that falls below "
+        f"{CLIFF_TOLERANCE:.0%} of the best throughput measured at any smaller size, by a "
+        f"margin its own samples separate, is the size cliff this sweep exists to refuse."
+    )

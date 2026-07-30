@@ -135,7 +135,9 @@ exists today:
   `tc netem`-shaped link where the pipelining claims are actually measured
 - a `benchmarks/` lane that runs this library, paramiko and asyncssh against the same server
   over that shaped link, reporting wall clock **and** CPU — the source of truth for every
-  performance number here, including the two that do not flatter us
+  performance number here, including the two that do not flatter us — and, in the one scenario
+  there that asserts rather than reports, throughput swept against file size so that a cliff at
+  a byte count fails a run instead of waiting for a user to find it
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
@@ -1904,6 +1906,19 @@ The fairness rules — best default API per library, host keys verified by all t
 `ssh_config` for any of them, our own atomic publish switched off in the comparison row and
 measured separately — are in `benchmarks/README.md`, one written line per decision that could
 have gone the other way.
+
+One scenario in it is not a comparison and is the only thing in the lane that **fails a run**:
+throughput swept against file size, ten sizes from 4 KiB to 16 MiB, both directions. Nobody
+reports a library's speed as a ratio — they report a *pathology*, a cliff at a byte count, and
+those are what the incumbent's tracker is full of. So the claim worth being able to make is that
+throughput rises and then plateaus and **never falls as the file grows**, and it is worth
+nothing unless something sweeps the axis a cliff would hide on. Every rung is a boundary rather
+than a round number, including the crossing from one 261120-byte request to two, and each one
+reuses a connection with a warm-up discarded so that TCP slow start is not mistaken for a cliff
+at the small end. paramiko and asyncssh are swept beside us as controls — reported, never
+asserted, because an incumbent's pathology must not be able to fail our lane. This says nothing
+about a *regression* between runs; comparing figures against a committed baseline is separate,
+unbuilt work.
 
 ### The mutation lane
 

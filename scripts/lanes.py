@@ -10,7 +10,11 @@ and **whether it gates**. That last field is the one worth writing down. ``netem
 ``benchmarks`` and ``mutation`` measure rather than assert, or assert against a baseline that
 is not in this tree, so they report and do not fail -- and a lane list that called them gates
 would make every other lane's word worth less. Each non-gating lane therefore has to say why,
-in the field next to it; there is no way to add a quiet one.
+in the field next to it; there is no way to add a quiet one. ``benchmarks`` is the one whose
+reason now has an exception inside it, and the exception is what the field has to carry: a
+*figure* there has nothing to be compared against, but the size sweep's *shape* is internal to
+one run, so it asserts. Measurement and assertion are not the same axis as absolute and
+relative, and the field says which is which rather than implying a lane is all one thing.
 
 Nothing here installs anything, and that is deliberate rather than lazy. A lane that ran
 ``uv sync --group bench`` on your behalf would make "the comparison libraries are deliberately
@@ -158,8 +162,11 @@ LANES: tuple[Lane, ...] = (
         args=("-m", "pytest", "benchmarks/", "-s"),
         needs="uv sync --group bench, openssh-server, and CAP_NET_ADMIN as netem",
         reports_only=(
-            "there is no committed baseline to compare a run against, so it can print a "
-            "regression but not fail on one (D-63)"
+            "there is no committed baseline to compare a run's *figures* against, so it can "
+            "print a throughput regression but not fail on one (D-63). One thing in it does "
+            "assert, and needs no baseline to: the size sweep fails when our own throughput "
+            "falls as the file grows, which is a claim about a single run's shape rather than "
+            "about a number (D-92)"
         ),
         takes="minutes",
     ),

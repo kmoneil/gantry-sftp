@@ -22,6 +22,8 @@ from pathlib import Path
 
 import anyio
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 _ROOT = Path(__file__).resolve().parent.parent
 _BENCHMARKS = _ROOT / "benchmarks"
@@ -43,10 +45,14 @@ from _harness import (  # noqa: E402
     Environment,
     Measurement,
     Sample,
+    SizePoint,
+    SizeSweep,
     _command_output,
     cpu_seconds,
     render_report,
     render_scenario,
+    render_size_sweep,
+    size_label,
     take_samples,
 )
 
@@ -253,6 +259,66 @@ async def test_the_warm_download_row_times_a_later_transfer_and_not_the_first(mo
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("direction", ["download", "upload"])
+async def test_a_sweep_rung_runs_on_one_connection_and_times_neither_warmup(monkeypatch, direction):
+    """D-92's rungs must reuse the connection, and nothing downstream could notice if they did not.
+
+    A rung that opened a connection per repeat would still produce a curve, still pass every
+    verification, and still be published -- it would just be timing TCP slow start at the small
+    end and calling the result a size cliff. That is the exact mistake D-81 found in the rows
+    above, so the departure from this suite's no-reuse rule is asserted rather than trusted.
+    """
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    import _clients  # noqa: PLC0415
+
+    opened = 0
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def _transfer(self):
+            self.calls += 1
+            # Warmups slow, timed transfers instant -- the reverse of reality, so a clock that
+            # spanned a warmup could not come out below the warmup's duration.
+            await anyio.sleep(0.05 if self.calls <= 2 else 0.0)
+
+        async def get(self, remote: str, local: Path) -> int:
+            await self._transfer()
+            return 1
+
+        async def put(self, local: Path, remote: str, *, publish):
+            assert publish.atomic is False, "the sweep must match the other two clients"
+            assert publish.fsync is False
+            await self._transfer()
+
+    session = FakeSession()
+
+    @asynccontextmanager
+    async def fake_transport():
+        yield object()
+
+    @asynccontextmanager
+    async def fake_open_session(_transport):
+        nonlocal opened
+        opened += 1
+        yield session
+
+    monkeypatch.setattr(_clients.GantryClient, "_transport", lambda self: fake_transport())
+    monkeypatch.setattr(_clients, "open_session", fake_open_session)
+
+    client = _clients.GantryClient(server=None)  # type: ignore[arg-type]
+    method = getattr(client, f"{direction}_repeatedly")
+    walls = await method(Path("/a"), Path("/b"), repeats=3, warmups=2)
+
+    assert opened == 1, "the ladder's whole point is that one connection carries the rung"
+    assert session.calls == 5, "two warmups and three timed transfers"
+    assert len(walls) == 3, "the warmups must not appear as samples"
+    assert max(walls) < 0.05, f"a warmup landed inside a timed window: {walls}"
+
+
+@pytest.mark.anyio
 async def test_cpu_is_measured_per_sample_rather_than_cumulatively():
     async def run_once() -> tuple[float, int]:
         await anyio.to_thread.run_sync(burn_in_a_child)
@@ -312,3 +378,261 @@ def test_a_version_command_that_does_not_exist_is_reported_rather_than_raised():
     # header is metadata, and a missing binary is a fact about the host worth printing.
     reported = _command_output(["definitely-not-a-real-binary-xyzzy", "-V"])
     assert reported.startswith("unavailable (")
+
+
+# --- the size sweep (D-92) -------------------------------------------------------------------
+#
+# This half of the harness decides whether a *shape* is published as sound, and unlike the
+# ratio columns above it also **gates the benchmark lane**. So the arithmetic gets the same
+# treatment the ratio arithmetic got: a detector that never fires would leave the size cliff
+# the sweep exists to refuse undetected, and one that fires on noise would make the lane
+# unrunnable and get switched off.
+
+
+def point(size: int, walls: list[float], note: str = "n") -> SizePoint:
+    return SizePoint(size_bytes=size, note=note, wall_seconds=tuple(walls))
+
+
+def rising_sweep() -> SizeSweep:
+    """Throughput rising and then flattening -- the shape the library promises."""
+    return SizeSweep(
+        scenario="download",
+        client="gantry-sftp",
+        points=(
+            point(4096, [0.010, 0.011, 0.012]),  # 0.4 MiB/s
+            point(262144, [0.010, 0.011, 0.012]),  # 25 MiB/s
+            point(2097152, [0.020, 0.021, 0.022]),  # 100 MiB/s
+            point(16777216, [0.150, 0.155, 0.160]),  # 106 MiB/s -- the plateau
+        ),
+    )
+
+
+def test_size_label_names_only_the_units_that_divide_exactly():
+    # 261120 is the size the whole ladder is built around, and rendering it as "256 KiB" --
+    # which is the number DESIGN.md 4.2 forbids as a request size -- would put the wrong
+    # boundary in the report.
+    assert size_label(261120) == "255 KiB"
+    assert size_label(262144) == "256 KiB"
+    assert size_label(16777216) == "16 MiB"
+    assert size_label(4096) == "4 KiB"
+    assert size_label(1000) == "1000 B"
+    assert size_label(1048577) == "1048577 B"
+
+
+def test_a_size_point_refuses_the_states_that_would_divide_by_zero():
+    with pytest.raises(ValueError) as no_bytes:
+        point(0, [0.1])
+    assert no_bytes.value.args[0] == "a size point must move bytes, got 0"
+
+    with pytest.raises(ValueError) as no_samples:
+        point(4096, [])
+    assert no_samples.value.args[0] == "4 KiB has no samples"
+
+    with pytest.raises(ValueError) as instant:
+        point(4096, [0.1, 0.0])
+    assert instant.value.args[0] == "4 KiB has a non-positive wall time"
+
+
+def test_throughput_uses_the_median_and_the_extremes_are_recoverable():
+    one = point(1048576, [0.5, 1.0, 2.0])
+    assert one.throughput_mib_per_second == 1.0
+    assert one.best_throughput_mib_per_second == 2.0
+    assert one.worst_throughput_mib_per_second == 0.5
+    assert one.spread == 4.0
+
+
+def test_a_sweep_of_one_point_has_no_shape_and_is_refused():
+    with pytest.raises(ValueError) as exc:
+        SizeSweep(scenario="download", client="c", points=(point(4096, [0.1]),))
+    assert exc.value.args[0] == "c/download has no shape: 1 point"
+
+
+def test_a_sweep_refuses_sizes_that_are_not_strictly_ascending():
+    """The cliff detector reads "smaller" off the list order, so the order is an invariant.
+
+    Handed a descending or duplicated ladder it would compare each rung against the wrong
+    reference and report a rising curve as falling, or the reverse. That is a wrong *result*
+    rather than a crash, which is why it is refused at construction.
+    """
+    with pytest.raises(ValueError) as descending:
+        SizeSweep(
+            scenario="download",
+            client="c",
+            points=(point(262144, [0.1]), point(4096, [0.1])),
+        )
+    assert descending.value.args[0] == "c/download sizes are not strictly ascending"
+
+    with pytest.raises(ValueError) as duplicated:
+        SizeSweep(
+            scenario="download",
+            client="c",
+            points=(point(4096, [0.1]), point(4096, [0.1])),
+        )
+    assert duplicated.value.args[0] == "c/download sizes are not strictly ascending"
+
+
+def test_a_rising_then_flat_curve_has_no_cliffs_and_no_dips():
+    sweep = rising_sweep()
+    assert sweep.cliffs(tolerance=0.5) == ()
+    assert sweep.dips(tolerance=0.5) == ()
+
+
+def test_a_collapse_is_a_cliff_and_names_where_it_fell_from():
+    """paramiko#2438's shape: throughput dies at a byte count and the reference is upstream."""
+    sweep = SizeSweep(
+        scenario="upload",
+        client="paramiko",
+        points=(
+            point(4096, [0.0008, 0.0008, 0.0009]),
+            point(32768, [0.0420, 0.0421, 0.0422]),  # ~0.74 MiB/s against ~4.6
+            point(131072, [0.0010, 0.0010, 0.0011]),
+        ),
+    )
+    (cliff,) = sweep.cliffs(tolerance=0.5)
+    assert cliff.point.size_bytes == 32768
+    assert cliff.reference.size_bytes == 4096
+    assert cliff.ratio < 0.2
+    assert cliff.describe() == ("32 KiB runs at 0.74 MiB/s, 0.15x the 4.88 MiB/s measured at 4 KiB")
+
+
+def test_a_bimodal_stall_is_a_dip_but_never_a_cliff():
+    """The case that decided there are two detectors rather than one.
+
+    An incumbent's stall is intermittent -- paramiko's 32 KiB upload came out of the first real
+    run with a fastest-to-slowest range of 47x -- so its fast mode keeps the sample ranges
+    overlapping. Failing a run on that would be failing on noise; not reporting it at all would
+    throw away the control's whole reason for existing. So: reported, not asserted.
+    """
+    sweep = SizeSweep(
+        scenario="upload",
+        client="paramiko",
+        points=(
+            point(4096, [0.0010, 0.0010, 0.0010]),  # 3.9 MiB/s
+            point(32768, [0.0010, 0.0400, 0.0470]),  # median 0.5 MiB/s, but one fast run
+        ),
+    )
+    assert sweep.cliffs(tolerance=0.5) == ()
+    (dip,) = sweep.dips(tolerance=0.5)
+    assert dip.point.size_bytes == 32768
+
+
+def test_the_reference_is_the_best_smaller_size_not_the_one_before_it():
+    """A slide has no single step big enough to notice, and is still a collapse.
+
+    Comparing each rung with its immediate predecessor would let throughput walk down 30% a
+    rung forever without ever tripping the gate. The reference is the best rung *anywhere*
+    below, which is what makes "never falls as the file grows" the actual assertion.
+    """
+    sweep = SizeSweep(
+        scenario="download",
+        client="gantry-sftp",
+        points=(
+            point(262144, [0.0025, 0.0025, 0.0025]),  # 100 MiB/s -- the peak
+            point(1048576, [0.0140, 0.0140, 0.0140]),  # 71 MiB/s
+            point(2097152, [0.0400, 0.0400, 0.0400]),  # 50 MiB/s
+            point(8388608, [0.2400, 0.2400, 0.2400]),  # 33 MiB/s -- 0.33x the peak
+        ),
+    )
+    falls = sweep.cliffs(tolerance=0.5)
+    assert [c.point.size_bytes for c in falls] == [8388608]
+    assert falls[0].reference.size_bytes == 262144
+
+
+def test_a_tolerance_outside_the_unit_interval_is_refused():
+    sweep = rising_sweep()
+    for bad in (0.0, -0.5, 1.5):
+        with pytest.raises(ValueError) as exc:
+            sweep.cliffs(tolerance=bad)
+        assert exc.value.args[0] == f"tolerance must be in (0, 1], got {bad}"
+        with pytest.raises(ValueError) as also:
+            sweep.dips(tolerance=bad)
+        assert also.value.args[0] == f"tolerance must be in (0, 1], got {bad}"
+
+
+def test_the_table_marks_a_cliff_on_exactly_the_rungs_the_gate_fails_on():
+    """The report and the gate must be the same computation, not two spellings of one idea.
+
+    A table reading `rising` beside a failing run -- or `CLIFF` beside a passing one -- would
+    be worse than no table, because the table is the evidence the failure message points at.
+    """
+    sweep = SizeSweep(
+        scenario="download",
+        client="gantry-sftp",
+        points=(
+            point(4096, [0.0100, 0.0100, 0.0100]),
+            point(262144, [0.0025, 0.0025, 0.0025]),  # 100 MiB/s
+            point(1048576, [0.0500, 0.0500, 0.0500]),  # 20 MiB/s -- 0.2x, separable
+        ),
+    )
+    rendered = render_size_sweep(sweep, tolerance=0.5)
+    rows = [line for line in rendered.splitlines() if line.startswith("| ") and " KiB" in line]
+    marked = [line for line in rendered.splitlines() if "CLIFF" in line]
+    assert len(marked) == 1
+    assert marked[0].startswith("| 1 MiB |")
+    assert [c.point.size_bytes for c in sweep.cliffs(tolerance=0.5)] == [1048576]
+    # The first rung has nothing below it, so its verdict is a dash rather than "rising" --
+    # calling it rising would be a comparison against nothing.
+    assert rows[0].startswith("| 4 KiB |")
+    assert rows[0].endswith("| -- |")
+    assert "255 KiB" not in rendered, "the ladder's own labels must survive into the table"
+    assert "| rising |" in rendered
+    # No CPU column, deliberately: one connection carries the whole ladder, so there is one
+    # reaped child and per-sample CPU does not exist. See the module docstring.
+    assert "CPU" not in rendered
+
+
+@st.composite
+def any_sweep(draw: st.DrawFn) -> SizeSweep:
+    """An arbitrary curve: ascending sizes, arbitrary positive timings, any number of samples."""
+    sizes = sorted(draw(st.sets(st.integers(min_value=1, max_value=10**8), min_size=2, max_size=6)))
+    walls = st.lists(st.floats(min_value=1e-5, max_value=10.0), min_size=1, max_size=4)
+    return SizeSweep(
+        scenario="download", client="c", points=tuple(point(size, draw(walls)) for size in sizes)
+    )
+
+
+@given(any_sweep())
+def test_every_cliff_is_also_a_dip(sweep: SizeSweep):
+    """Containment, on any curve at all: the gate can only fire where the report already says so.
+
+    The two detectors are separate code paths -- one compares medians, the other compares the
+    unflattering extremes -- and the whole design rests on the strict one being a subset of the
+    loose one. If it ever were not, a run could fail on a rung the table describes as fine.
+    """
+    cliffs = {c.point.size_bytes for c in sweep.cliffs(tolerance=0.5)}
+    dips = {d.point.size_bytes for d in sweep.dips(tolerance=0.5)}
+    assert cliffs <= dips
+
+
+@given(
+    sizes=st.sets(st.integers(min_value=1, max_value=10**8), min_size=2, max_size=8),
+    walls=st.lists(st.floats(min_value=1e-5, max_value=10.0), min_size=1, max_size=5),
+)
+def test_a_curve_whose_throughput_only_rises_never_reports_a_fall(
+    sizes: set[int], walls: list[float]
+):
+    """Equal timings at ascending sizes is throughput rising by construction -- the promise.
+
+    Free of any assumption about the *sample* distribution: however noisy the timings are, if
+    every rung is noisy the same way then throughput rises with size and nothing may be
+    reported. A detector that fired here would fail the lane on a healthy library.
+    """
+    sweep = SizeSweep(
+        scenario="download", client="c", points=tuple(point(s, walls) for s in sorted(sizes))
+    )
+    assert sweep.cliffs(tolerance=0.5) == ()
+    assert sweep.dips(tolerance=0.5) == ()
+
+
+def test_a_dip_the_samples_cannot_separate_is_marked_overlapping_in_the_table():
+    sweep = SizeSweep(
+        scenario="download",
+        client="gantry-sftp",
+        points=(
+            point(262144, [0.0025, 0.0030, 0.0060]),
+            point(1048576, [0.0100, 0.0180, 0.0400]),
+        ),
+    )
+    rendered = render_size_sweep(sweep, tolerance=0.5)
+    assert "(overlapping)" in rendered
+    assert "CLIFF" not in rendered

@@ -35,7 +35,7 @@ import getpass
 import importlib
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from importlib.util import find_spec
 from pathlib import Path
@@ -119,6 +119,35 @@ class Client(ABC):
         driven concurrently too, so racing our task group against their ``for`` loop would
         measure a feature gap while looking like a speed gap. This measures round trips per
         file, which is the thing the gap is actually about.
+        """
+
+    @abstractmethod
+    async def download_repeatedly(
+        self, remote: Path, local: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        """Fetch one file several times on **one** connection, timing each fetch separately.
+
+        The size sweep's primitive (D-92), and the one place the class docstring's
+        no-connection-reuse rule is deliberately suspended -- identically for all three
+        clients, which is what keeps their curves comparable with each other. The reason is
+        D-81: a fresh connection per size would spend the small end of the ladder in TCP slow
+        start, and a sweep looking for a cliff would find congestion control and name it one.
+
+        Returns:
+            Wall seconds for each timed transfer, warmups excluded. No byte count and no CPU:
+            the size is the caller's own ladder entry, the bytes are verified by comparing the
+            produced file, and one connection means one reaped child so per-sample CPU does
+            not exist. See :mod:`_harness`.
+        """
+
+    @abstractmethod
+    async def upload_repeatedly(
+        self, local: Path, remote: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        """Send one file several times on one connection. Mirror of ``download_repeatedly``.
+
+        Both directions, because a cliff need not be symmetric: `paramiko#2438` is a *write*
+        pathology and reads are what most of the tuning attention goes to.
         """
 
     @abstractmethod
@@ -240,6 +269,36 @@ class GantryClient(Client):
                 moved += result.transferred
             elapsed = time.perf_counter() - started
         return elapsed, moved
+
+    async def download_repeatedly(
+        self, remote: Path, local: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        async with self._transport() as transport, open_session(transport) as sftp:
+            for _ in range(warmups):
+                await sftp.get(str(remote), local)
+            walls = []
+            for _ in range(repeats):
+                started = time.perf_counter()
+                await sftp.get(str(remote), local)
+                walls.append(time.perf_counter() - started)
+        return walls
+
+    async def upload_repeatedly(
+        self, local: Path, remote: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        # `atomic=False, fsync=False` to match the other two clients, exactly as `upload` does.
+        # The sweep's question is where throughput falls with size; measuring our publish
+        # guarantee against their absence of one would put a constant in every rung.
+        publish = Publish(atomic=False, fsync=False)
+        async with self._transport() as transport, open_session(transport) as sftp:
+            for _ in range(warmups):
+                await sftp.put(local, str(remote), publish=publish)
+            walls = []
+            for _ in range(repeats):
+                started = time.perf_counter()
+                await sftp.put(local, str(remote), publish=publish)
+                walls.append(time.perf_counter() - started)
+        return walls
 
     async def download_many_concurrently(
         self, remotes: Sequence[Path], into: Path, *, concurrency: int
@@ -364,6 +423,51 @@ class ParamikoClient(Client):
             client.close()
         return elapsed, sum(_file_size(into / s.name) for s in sources)
 
+    def _repeatedly(
+        self, transfer: Callable[[], object], repeats: int, warmups: int
+    ) -> list[float]:
+        """Time ``transfer`` ``repeats`` times after discarding ``warmups`` of them.
+
+        The connection is the caller's, already open: the sweep's whole point is that one
+        connection carries the ladder, so this helper must not create one.
+        """
+        for _ in range(warmups):
+            transfer()
+        walls = []
+        for _ in range(repeats):
+            started = time.perf_counter()
+            transfer()
+            walls.append(time.perf_counter() - started)
+        return walls
+
+    def _download_repeatedly(
+        self, remote: Path, local: Path, repeats: int, warmups: int
+    ) -> list[float]:
+        client = self._open()
+        try:
+            sftp = client.open_sftp()
+            walls = self._repeatedly(
+                lambda: sftp.get(str(remote), str(local)), repeats=repeats, warmups=warmups
+            )
+            sftp.close()
+        finally:
+            client.close()
+        return walls
+
+    def _upload_repeatedly(
+        self, local: Path, remote: Path, repeats: int, warmups: int
+    ) -> list[float]:
+        client = self._open()
+        try:
+            sftp = client.open_sftp()
+            walls = self._repeatedly(
+                lambda: sftp.put(str(local), str(remote)), repeats=repeats, warmups=warmups
+            )
+            sftp.close()
+        finally:
+            client.close()
+        return walls
+
     async def connect_and_close(self) -> tuple[float, int]:
         return await anyio.to_thread.run_sync(self._connect_and_close)
 
@@ -378,6 +482,20 @@ class ParamikoClient(Client):
 
     async def upload_many(self, sources: Sequence[Path], into: Path) -> tuple[float, int]:
         return await anyio.to_thread.run_sync(self._upload_many, sources, into)
+
+    async def download_repeatedly(
+        self, remote: Path, local: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        return await anyio.to_thread.run_sync(
+            self._download_repeatedly, remote, local, repeats, warmups
+        )
+
+    async def upload_repeatedly(
+        self, local: Path, remote: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        return await anyio.to_thread.run_sync(
+            self._upload_repeatedly, local, remote, repeats, warmups
+        )
 
 
 class AsyncsshClient(Client):
@@ -441,6 +559,32 @@ class AsyncsshClient(Client):
                 await sftp.put(str(source), str(into / source.name))
             elapsed = time.perf_counter() - started
         return elapsed, sum(_file_size(into / s.name) for s in sources)
+
+    async def download_repeatedly(
+        self, remote: Path, local: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        async with self._connect() as conn, conn.start_sftp_client() as sftp:
+            for _ in range(warmups):
+                await sftp.get(str(remote), str(local))
+            walls = []
+            for _ in range(repeats):
+                started = time.perf_counter()
+                await sftp.get(str(remote), str(local))
+                walls.append(time.perf_counter() - started)
+        return walls
+
+    async def upload_repeatedly(
+        self, local: Path, remote: Path, *, repeats: int, warmups: int
+    ) -> list[float]:
+        async with self._connect() as conn, conn.start_sftp_client() as sftp:
+            for _ in range(warmups):
+                await sftp.put(str(local), str(remote))
+            walls = []
+            for _ in range(repeats):
+                started = time.perf_counter()
+                await sftp.put(str(local), str(remote))
+                walls.append(time.perf_counter() - started)
+        return walls
 
 
 ALL_CLIENTS: tuple[type[Client], ...] = (GantryClient, ParamikoClient, AsyncsshClient)

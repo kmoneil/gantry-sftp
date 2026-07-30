@@ -28,6 +28,15 @@ makes the comparison fair even though the window is wider than the operation.
 profile is slow -- so a median difference between two clients can easily be noise wearing a
 result's clothes. :class:`Comparison` carries ``separable``, and the renderer marks a ratio it
 cannot stand behind rather than printing it with the same confidence as one it can.
+
+**A size sweep is a different measurement and it drops the CPU column rather than faking
+one.** :class:`SizeSweep` answers "does throughput ever *fall* as the file grows", which is
+the shape people actually report against the incumbent -- a cliff at a byte count, not a
+ratio (D-92). Two consequences follow. The whole ladder for one client and one direction runs
+on **one connection**, because a fresh connection per size would time TCP slow start at the
+small end and publish congestion control as a cliff (D-81); and one connection means one
+reaped child, so per-sample CPU is not recoverable and is therefore not reported. Wall clock
+is what the question is about.
 """
 
 from __future__ import annotations
@@ -161,6 +170,234 @@ class Comparison:
             self.subject.slowest_wall_seconds < self.baseline.fastest_wall_seconds
             or self.baseline.slowest_wall_seconds < self.subject.fastest_wall_seconds
         )
+
+
+def size_label(size_bytes: int) -> str:
+    """A byte count rendered the way the boundary it brackets is written.
+
+    Exact division only, so ``261120`` reads as ``255 KiB`` and a size that is not a whole
+    number of units keeps its byte count rather than being rounded into a lie.
+    """
+    for unit, name in ((MIB, "MiB"), (1024, "KiB")):
+        if size_bytes >= unit and size_bytes % unit == 0:
+            return f"{size_bytes // unit} {name}"
+    return f"{size_bytes} B"
+
+
+@dataclass(frozen=True, slots=True)
+class SizePoint:
+    """One file size, timed repeatedly on one already-warm connection.
+
+    Attributes:
+        size_bytes: Bytes moved by each timed transfer.
+        note: What boundary this size brackets, printed beside the row so the table explains
+            why the point exists rather than leaving a reader to recognise the number.
+        wall_seconds: One entry per timed transfer. Kept rather than summarised, because the
+            spread is what decides whether a fall in throughput is a cliff or noise.
+    """
+
+    size_bytes: int
+    note: str
+    wall_seconds: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if self.size_bytes <= 0:
+            raise ValueError(f"a size point must move bytes, got {self.size_bytes}")
+        if not self.wall_seconds:
+            raise ValueError(f"{size_label(self.size_bytes)} has no samples")
+        if min(self.wall_seconds) <= 0.0:
+            raise ValueError(f"{size_label(self.size_bytes)} has a non-positive wall time")
+
+    @property
+    def wall(self) -> float:
+        """Median wall time. Median rather than mean: one stalled run must not define it."""
+        return statistics.median(self.wall_seconds)
+
+    @property
+    def throughput_mib_per_second(self) -> float:
+        return (self.size_bytes / MIB) / self.wall
+
+    @property
+    def best_throughput_mib_per_second(self) -> float:
+        """Throughput of this size's *fastest* run -- its most flattering sample."""
+        return (self.size_bytes / MIB) / min(self.wall_seconds)
+
+    @property
+    def worst_throughput_mib_per_second(self) -> float:
+        """Throughput of this size's *slowest* run -- its least flattering sample."""
+        return (self.size_bytes / MIB) / max(self.wall_seconds)
+
+    @property
+    def spread(self) -> float:
+        return max(self.wall_seconds) / min(self.wall_seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class Cliff:
+    """A size whose throughput collapsed against a smaller one, beyond what noise explains.
+
+    The two throughputs compared are deliberately the *unflattering* pair: this point's
+    fastest run against the reference's slowest. A fall that survives that comparison cannot
+    be the run-to-run variation, which is why :meth:`SizeSweep.cliffs` may be asserted on
+    while the printed ratio beside a row may not.
+    """
+
+    point: SizePoint
+    reference: SizePoint
+
+    @property
+    def ratio(self) -> float:
+        """Median throughput here over median throughput at the reference size."""
+        return self.point.throughput_mib_per_second / self.reference.throughput_mib_per_second
+
+    def describe(self) -> str:
+        return (
+            f"{size_label(self.point.size_bytes)} runs at "
+            f"{self.point.throughput_mib_per_second:.2f} MiB/s, {self.ratio:.2f}x the "
+            f"{self.reference.throughput_mib_per_second:.2f} MiB/s measured at "
+            f"{size_label(self.reference.size_bytes)}"
+        )
+
+
+def _fastest_below(points: Sequence[SizePoint], index: int) -> SizePoint | None:
+    """The smaller size with the highest median throughput, or ``None`` for the first point."""
+    smaller = points[:index]
+    if not smaller:
+        return None
+    return max(smaller, key=lambda p: p.throughput_mib_per_second)
+
+
+def _fell_below(point: SizePoint, reference: SizePoint, fraction: float) -> bool:
+    """Whether this point's *fastest* run still came in under ``fraction`` of the reference's
+    *slowest* -- that is, whether even its luckiest sample fell that far short.
+
+    One predicate serves two questions. At ``fraction = 1.0`` it is separability -- the same
+    non-overlapping-ranges test :attr:`Comparison.separable` applies to a cross-library ratio.
+    Below 1.0 it is the cliff test, which is separability with a margin.
+    """
+    return (
+        point.best_throughput_mib_per_second < fraction * reference.worst_throughput_mib_per_second
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SizeSweep:
+    """Throughput as a function of file size, for one client in one direction.
+
+    The interesting output is not a number, it is the shape: throughput should rise as the
+    per-transfer fixed cost is amortised and then plateau at whatever the link and the channel
+    window allow. It must never fall.
+    """
+
+    scenario: str
+    client: str
+    points: tuple[SizePoint, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.points) < 2:
+            raise ValueError(
+                f"{self.client}/{self.scenario} has no shape: {len(self.points)} point"
+            )
+        sizes = [p.size_bytes for p in self.points]
+        if sizes != sorted(set(sizes)):
+            raise ValueError(f"{self.client}/{self.scenario} sizes are not strictly ascending")
+
+    def _falls(self, *, tolerance: float, separable: bool) -> tuple[Cliff, ...]:
+        if not 0.0 < tolerance <= 1.0:
+            raise ValueError(f"tolerance must be in (0, 1], got {tolerance}")
+        found = []
+        for index, point in enumerate(self.points):
+            reference = _fastest_below(self.points, index)
+            if reference is None:
+                continue
+            fell = (
+                _fell_below(point, reference, tolerance)
+                if separable
+                else point.throughput_mib_per_second
+                < tolerance * reference.throughput_mib_per_second
+            )
+            if fell:
+                found.append(Cliff(point=point, reference=reference))
+        return tuple(found)
+
+    def cliffs(self, *, tolerance: float) -> tuple[Cliff, ...]:
+        """Every size whose throughput fell below ``tolerance`` x the best measured below it,
+        by a margin the run's own samples separate.
+
+        The strict half of the pair, and the only one worth asserting on: it compares this
+        size's *fastest* run against the reference's *slowest*, so a fall it reports cannot be
+        the run-to-run variation. It is a subset of :meth:`dips` by construction.
+
+        Args:
+            tolerance: Fraction of the best smaller throughput a point may fall to before it
+                counts as a cliff. ``0.5`` means a halving.
+
+        Returns:
+            One :class:`Cliff` per offending size, in ascending size order. Empty is the
+            result this suite exists to keep true.
+        """
+        return self._falls(tolerance=tolerance, separable=True)
+
+    def dips(self, *, tolerance: float) -> tuple[Cliff, ...]:
+        """The same fall measured on medians alone, without the separability requirement.
+
+        The loose half, for the curves that are **reported rather than asserted** -- the
+        control libraries. A bimodal stall is exactly what an incumbent's size cliff looks like
+        in a small sample (paramiko's 32 KiB upload came out with a spread of 44 on the first
+        run of this sweep), and a stall whose fast mode is still fast will never satisfy
+        :meth:`cliffs`. Refusing to *fail* on that is right; refusing to *mention* it would be
+        throwing away the control's whole reason for existing.
+        """
+        return self._falls(tolerance=tolerance, separable=False)
+
+
+def _shape(sweep: SizeSweep, index: int, *, tolerance: float) -> str:
+    """The ``shape`` cell for one row: rising, dipping, or a cliff.
+
+    Derived from the same two predicates :meth:`SizeSweep.cliffs` uses, so the word in the
+    table and the assertion that fires can never disagree -- a report saying `rising` beside a
+    failing run would be worse than no report.
+    """
+    point = sweep.points[index]
+    reference = _fastest_below(sweep.points, index)
+    if reference is None:
+        return "--"
+    ratio = point.throughput_mib_per_second / reference.throughput_mib_per_second
+    if ratio >= 1.0:
+        return "rising"
+    if _fell_below(point, reference, tolerance):
+        return f"**CLIFF** -- {ratio:.2f}x best below"
+    # A fall the samples cannot separate is printed with the same marker a cross-library ratio
+    # gets, and for the same reason: three repeats cannot tell a small dip from a busy machine.
+    overlapping = "" if _fell_below(point, reference, 1.0) else " (overlapping)"
+    return f"{ratio:.2f}x best below{overlapping}"
+
+
+SWEEP_HEADER = (
+    "| size | boundary | wall s | MiB/s | spread | shape |\n"
+    "| ---- | -------- | ------ | ----- | ------ | ----- |"
+)
+
+
+def render_size_sweep(sweep: SizeSweep, *, tolerance: float) -> str:
+    """One markdown table for one client's throughput-against-size curve.
+
+    Args:
+        sweep: The measured curve, ascending by size.
+        tolerance: Passed through to the shape verdict, so the printed word and the gate's
+            threshold are the same number.
+
+    Returns:
+        A markdown fragment: heading, table, and nothing else. No CPU column -- see the module
+        docstring; a sweep runs on one connection and its child is reaped once.
+    """
+    rows = "\n".join(
+        f"| {size_label(p.size_bytes)} | {p.note} | {p.wall:.4f} "
+        f"| {p.throughput_mib_per_second:.2f} | {p.spread:.2f} "
+        f"| {_shape(sweep, index, tolerance=tolerance)} |"
+        for index, p in enumerate(sweep.points)
+    )
+    return f"#### {sweep.scenario} -- {sweep.client}\n\n{SWEEP_HEADER}\n{rows}\n"
 
 
 def _command_output(argv: list[str]) -> str:
