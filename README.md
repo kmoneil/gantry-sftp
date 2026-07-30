@@ -144,7 +144,9 @@ deprecation schedule forever, and every turn of that schedule reaches every user
 break.
 
 **There is no cryptography in this package and no cryptographic dependency**, so it cannot produce
-any of that: `pip install gantry-sftp` pulls `anyio` and nothing else. Algorithm currency is the
+any of that: `pip install gantry-sftp` pulls `anyio` and nothing else. There is one optional
+extra, `[fsspec]`, and it does not change that sentence — fsspec has no required dependencies
+of its own, and it is fsspec's *own* `sftp` extra that installs paramiko. Algorithm currency is the
 same fact from the other side: this library cannot lag on a key type, cannot mis-parse
 `known_hosts` and cannot diverge from the `ssh_config` you already tested with `ssh`, because it
 implements none of them. The episode where OpenSSH 8.8 disabled SHA-1 `ssh-rsa` signatures and a
@@ -323,21 +325,20 @@ async with connect("host", user="bob", session=SessionOptions(depth=16)) as sftp
 over a new connection.
 
 **There is a blocking surface, and it is a facade rather than a generated twin**; see
-[No event loop](#no-event-loop). Not yet: the fsspec adapter or `SFTPPath`. `put_many()` from
-DESIGN.md's §8 sketch does not exist. Concurrency is spelled with your own task group, or with
-`get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
+[No event loop](#no-event-loop). There is an **fsspec filesystem**; see
+[pandas, dask and anything else that speaks fsspec](#pandas-dask-and-anything-else-that-speaks-fsspec).
+Not yet: `SFTPPath`. `put_many()` from DESIGN.md's §8 sketch does not exist. Concurrency is
+spelled with your own task group, or with `get_tree(concurrency=)`, rather than a
+`concurrency=` argument on a `*_many` call.
 
-**What is still missing, now that the file object is not.** As of 0.11 there is a byte-range
-surface, `open_file()` for a cursor and `read_at` / `readinto_at` / `write_at` for explicit
-offsets, so a header, a tail, an append and a stream into a parser no longer need the whole
-file staged on disk. See [Byte ranges, and a file object](#byte-ranges-and-a-file-object).
+**What is still missing.** `SFTPPath` does not exist — `Path.open` / `read_bytes` /
+`write_bytes` are most of what a path is for, and the byte-range surface they needed landed in
+0.11 ([Byte ranges, and a file object](#byte-ranges-and-a-file-object)), so what remains is the
+path algebra rather than a missing primitive. The other things it was waiting on have all
+landed: the predicates ([Is it there?](#is-it-there)), relative paths with `chdir` / `getcwd`
+([A working directory](#a-working-directory-which-this-protocol-does-not-have)), and the
+blocking surface.
 
-What that unblocks has not been built yet: **the fsspec adapter and `SFTPPath` still do not
-exist**, though the primitive they were waiting on now does. An fsspec filesystem needs a
-byte-range fetch, and `Path.open` / `read_bytes` / `write_bytes` are most of what a path is for.
-The other two things they were waiting on have since landed: the path predicates
-([Is it there?](#is-it-there)) and relative paths with `chdir` / `getcwd`
-([A working directory](#a-working-directory-which-this-protocol-does-not-have)).
 Against **asyncssh** specifically, this library is still behind on surface, with no `statvfs`,
 no `hardlink` and no `copy-data`, and its transfers work on Windows where ours refuse.
 
@@ -439,6 +440,97 @@ Four things to know about the thread boundary:
   to half-build. The async form is unaffected.
 
 Runnable: `examples/blocking.py`.
+
+## pandas, dask and anything else that speaks fsspec
+
+```python
+from gantry_sftp.fsspec import register
+
+register()  # once, at startup -- never on import, and the reason is below
+
+import pandas as pd
+frame = pd.read_parquet("gantry-sftp://bob@example.com/incoming/events.parquet")
+```
+
+Install it with the extra: `pip install gantry-sftp[fsspec]`. Nothing else in the library
+needs fsspec, and importing `gantry_sftp` does not import it.
+
+**Registration is explicit, and that is a security decision.** `sftp://` and `ssh://` are
+*already* registered inside fsspec itself, to an implementation that wraps paramiko —
+and fsspec's `register_implementation(..., clobber=False)` **succeeds silently** when nothing
+has resolved `sftp://` yet, raising only once something has. Which of the two you get is
+decided by import order. So this library claims nothing on import; you say which name you
+want:
+
+```python
+register()                       # `gantry-sftp://`, a name nothing else claims
+register("sftp", override=True)  # take `sftp://`, deliberately and in writing
+```
+
+`register("sftp")` without `override=True` raises and names the incumbent. A library that
+changed what `pd.read_parquet("sftp://…")` does merely because it was installed would be
+doing the thing this README's [bug class](#the-bug-class-this-library-cannot-have) section is
+about.
+
+**What taking `sftp://` buys you.** The incumbent calls
+`set_missing_host_key_policy(paramiko.AutoAddPolicy())` unconditionally, so every `sftp://`
+URL in the pandas and dask ecosystem today accepts whatever host key it is offered. Ours
+spawns `ssh`, which reads your real `known_hosts` and refuses. Three more differences, each
+a defect on the other side rather than a preference:
+
+- **`ls` and `info` agree about a symlink.** The incumbent's `ls` reads the listing's
+  attributes, so a symlink is `"link"`; its `info` calls `stat`, which follows, so the same
+  path is `"file"` — while fsspec's own docstring says `info` returns "exactly the same
+  information as `ls`". Here both follow, so `isfile` on a symlinked parquet is `True` and
+  something will actually open it. `islink` is a separate key, as it is in fsspec's own
+  `LocalFileSystem`.
+- **A file object that does not cost a round trip per read.** `_fetch_range` goes through the
+  same scheduler a whole-file `get` uses, over one handle held for the object's lifetime.
+- **A server that omits attributes does not crash the listing.** `S_ISDIR(None)` is a
+  `TypeError` on the other side; here an entry the server did not describe is `"other"`, and
+  a broken symlink is reported rather than dropped or raised.
+
+### The URL form
+
+```
+gantry-sftp://[user[:password]@]host[:port]/absolute/path[?parameters]
+```
+
+The path is always absolute — fsspec has no way to express a relative one — so `cwd=` is how
+you name a relative root. fsspec parses the authority and hands the **query string back
+unparsed**, so these parameters are this library's own, and they are the arguments
+[`connect()`](#connect) already takes:
+
+| | |
+| --- | --- |
+| `user`, `identity_file`, `config_file`, `ssh_executable` | as on `connect()` |
+| `port` | as on `connect()`, and also expressible as `host:port` |
+| `cwd` | a remote working directory relative paths resolve against |
+| `depth`, `request_timeout`, `idle_timeout` | the [tunables](#tunables-and-what-they-default-to). `request_timeout=none` means "wait forever" |
+
+An unknown parameter **raises** rather than being ignored: a misspelled `identiy_file` that
+silently does nothing is a connection that fails for a reason the message will not name.
+
+### Two things about fsspec's own design to know before you deploy this
+
+Neither is a defect of this adapter, and both will surprise you if nobody says them.
+
+- **One connection per thread, not per host.** fsspec caches filesystem instances by a token
+  that includes the thread id, and the cache holds a strong reference on purpose, so
+  `__del__` never fires and there is no `close()` in fsspec's contract. A thread pool calling
+  `pd.read_parquet` therefore opens one `ssh` child per thread. The connection is opened
+  lazily — resolving a URL costs nothing — and `close()` plus a context manager are provided
+  for when you want to decide; `skip_instance_cache=True` is the spelling for "a connection I
+  control".
+- **A password in a URL is a password in `storage_options`** for every other fsspec
+  filesystem, which is what `__reduce__` pickles — so a dask scheduler ships it to every
+  worker — and what `to_json()` serialises, with `include_password` defaulting to `True`.
+  **Not here**: the password reaches the constructor and is never stored on the instance, so
+  none of those carry it. The cost is stated rather than hidden — the password is not part of
+  the cache token either, so two filesystems differing only in password come back as one
+  instance holding the first. `skip_instance_cache=True` when that is not what you want.
+
+Runnable: `examples/fsspec_urls.py`.
 
 ## Matching names: `glob`
 

@@ -34,6 +34,21 @@ dependencies = [
     "anyio>=4.14.2",
 ]
 
+# The adapter in `gantry_sftp.fsspec`, and the only optional dependency this project has.
+#
+# **The floor is the version it was verified against, not the oldest that works**, and that is
+# a deliberate difference from an ordinary lower bound. The adapter reads fsspec *internals*
+# rather than API -- `known_implementations`, the `_Cached` metaclass's tokenizing,
+# `_strip_tokenize_options`, `to_json`'s `include_password` default -- because that is what
+# displacing a registered protocol and keeping a credential out of a pickle require. Every one
+# of those was re-probed against 2026.7.0 in the same change (`_plans/probes/`), and a claim
+# about an untested older version would be exactly the "recalled from memory" defect this repo
+# refuses elsewhere. Raise the floor when the probes are re-run against something newer.
+[project.optional-dependencies]
+fsspec = [
+    "fsspec>=2026.7.0",
+]
+
 # No `[project.urls]`. There is no remote repository yet, and METADATA advertising a Homepage
 # that 404s is the same defect as a docstring pointing at a gitignored file: a reader is told
 # where to go and cannot get there. It comes back with the repository.
@@ -98,7 +113,15 @@ bench = [
     "asyncssh>=2.19",
     "paramiko>=3.5",
 ]
+# fsspec is in `dev` rather than in a group of its own, which is the opposite call from
+# `bench` and for the reason `bench` states: fsspec is pure Python with **no required
+# dependencies at all** (measured -- every entry in its METADATA is behind an extra), so
+# installing it does not drag in the cryptography this project exists not to need. It is
+# `paramiko` that fsspec's own `sftp` extra pulls, and we install neither. The consequence
+# that matters is that the adapter's tests run in the default lane instead of skipping, which
+# is what DoD 1 asks for a shipped surface.
 dev = [
+  "fsspec>=2026.7.0",
   "pytest>=8.3",
   "hypothesis>=6.112",
   "ruff>=0.14",
@@ -204,9 +227,17 @@ ban-relative-imports = "parents"
 # credential literal in any other test is still something to look at twice.
 "tests/test_askpass.py" = ["S105", "S106"]
 "tests/test_diagnosis.py" = ["S105"]
+# Same reason one layer up: the fsspec adapter's whole credential argument is that a password
+# reaches `__init__` and never `storage_options`, so the tests that prove it search `to_json()`
+# and `__reduce__` for the literal they passed in.
+"tests/test_fsspec.py" = ["S105", "S106"]
 "tests/test_transport.py" = ["S105", "S106"]
 "live-tests/test_password_auth.py" = ["S105", "S106"]
 "examples/password_auth.py" = ["S105", "S106"]
+# Same shape again: the example's point is that this literal reaches the constructor and then
+# appears in none of the four surfaces fsspec would otherwise serialise it into, so it has to
+# be in the file to be searched for.
+"examples/fsspec_urls.py" = ["S105", "S106"]
 
 # ---------------------------------------------------------------------------
 # mypy -- stricter of the two type gates, scoped to shipped code
@@ -225,6 +256,21 @@ enable_error_code = [
   "unused-awaitable",
   "explicit-override",
 ]
+
+# fsspec ships no `py.typed` and has no stubs on PyPI, so `import fsspec` is an error under
+# strict and its classes arrive as `Any`. **This one cannot be fixed at the source**, which is
+# the bar CLAUDE.md sets before an ignore is allowed: the fix is upstream, in a package we do
+# not control, and hand-writing stubs for `AbstractFileSystem` would be a layout recalled from
+# memory -- the defect this repository refuses for wire formats, applied to an API.
+#
+# Scoped as narrowly as it can be. Only the missing-stub error is waived; the two classes that
+# subclass an `Any` base carry an inline `# type: ignore[misc]` naming this same reason, so the
+# debt is visible at the two places it is actually taken rather than only here.
+#
+# Remove both when fsspec ships `py.typed`.
+[[tool.mypy.overrides]]
+module = ["fsspec", "fsspec.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # ty -- second type gate, same scope

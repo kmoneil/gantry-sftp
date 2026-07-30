@@ -431,10 +431,24 @@ wheels = [
 ]
 
 [[package]]
+name = "fsspec"
+version = "2026.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/00/78/f34251dadb8f3921264a1d9b8946f5e542014ee2614b285261b4e40e6775/fsspec-2026.7.0.tar.gz", hash = "sha256:c803c40f4cf860b49dea58ee3e1c33cb9c790520e233537e1340049f89b82a88", size = 317040, upload-time = "2026-07-28T16:34:51.052Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/3c/6a2bf344106328fd04963664a60b9bb6496fc25df8e962fcdc1367285fb9/fsspec-2026.7.0-py3-none-any.whl", hash = "sha256:b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279", size = 206583, upload-time = "2026-07-28T16:34:49.538Z" },
+]
+
+[[package]]
 name = "gantry-sftp"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
+]
+
+[package.optional-dependencies]
+fsspec = [
+    { name = "fsspec" },
 ]
 
 [package.dev-dependencies]
@@ -444,6 +458,7 @@ bench = [
 ]
 dev = [
     { name = "complexipy" },
+    { name = "fsspec" },
     { name = "hypothesis" },
     { name = "mutmut" },
     { name = "mypy" },
@@ -455,7 +470,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "anyio", specifier = ">=4.14.2" }]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.14.2" },
+    { name = "fsspec", marker = "extra == 'fsspec'", specifier = ">=2026.7.0" },
+]
+provides-extras = ["fsspec"]
 
 [package.metadata.requires-dev]
 bench = [
@@ -464,6 +483,7 @@ bench = [
 ]
 dev = [
     { name = "complexipy", specifier = ">=3.0" },
+    { name = "fsspec", specifier = ">=2026.7.0" },
     { name = "hypothesis", specifier = ">=6.112" },
     { name = "mutmut", specifier = ">=3.2" },
     { name = "mypy", specifier = ">=1.13" },
