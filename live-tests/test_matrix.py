@@ -881,6 +881,86 @@ async def test_a_failure_tail_is_present_on_every_server_including_the_wrapped_o
     assert exc.value.message, "STATUS arrived with no tail at all"
 
 
+# --- D-87: a predicate's answers, across three implementations ---------------------------------
+
+
+async def test_the_predicates_agree_across_every_implementation(server: MatrixServer):
+    """`exists`/`isdir`/`isfile` rest on two things a server chooses, so ask all three.
+
+    The first is the status code for a path that is not there, which the matrix already pins
+    to `NO_SUCH_FILE` everywhere -- and `False` here means that code and nothing else, so a
+    server answering `FAILURE` instead would turn every absent path into a raised error.
+
+    The second is whether a `STAT` reply carries permission bits at all. v3 keeps the file
+    type inside them, so a server that omits them makes `isdir` unanswerable -- which this
+    library reports as a `CapabilityError` rather than a `False`. That case is unreachable
+    against OpenSSH and is proven against a fake in `tests/test_predicates.py`; what this
+    test establishes is that the fake is describing a hypothetical rather than any of the
+    three implementations here.
+    """
+    (server.root / "folder").mkdir()
+    (server.root / "data.bin").write_bytes(b"payload")
+
+    async with connected(server) as sftp:
+        assert await sftp.exists(str(server.root / "data.bin")) is True
+        assert await sftp.exists(str(server.root / "folder")) is True
+        assert await sftp.exists(str(server.root / "not-here")) is False
+
+        assert await sftp.isdir(str(server.root / "folder")) is True
+        assert await sftp.isfile(str(server.root / "data.bin")) is True
+        assert await sftp.isdir(str(server.root / "data.bin")) is False
+
+        assert await sftp.getsize(str(server.root / "data.bin")) == len(b"payload")
+        assert await sftp.getmtime(str(server.root / "data.bin")) is not None
+
+
+async def test_makedirs_walks_up_on_every_implementation(server: MatrixServer):
+    """The walk-up is driven by a *refusal*, and v3 does not say which refusal it will be.
+
+    `_mkdir_parents` retries after any `ServerError` rather than after `NO_SUCH_FILE`
+    specifically, because the status for "the parent is missing" is exactly the kind of thing
+    §7 says implementations disagree about. This is that generosity being load-bearing rather
+    than defensive: three servers, three error-mapping layers, one chain of directories that
+    has to appear.
+    """
+    destination = server.root / "a" / "b" / "c"
+
+    async with connected(server) as sftp:
+        await sftp.makedirs(str(destination))
+        assert await sftp.isdir(str(destination)) is True
+
+        # And the second call is the one that has to be refused rather than quietly excused.
+        with pytest.raises(ServerError):
+            await sftp.makedirs(str(destination))
+        await sftp.makedirs(str(destination), exist_ok=True)
+
+    assert destination.is_dir()
+
+
+async def test_a_path_that_cannot_be_reached_is_not_reported_as_absent(server: MatrixServer):
+    """The third state, against three error-mapping layers rather than one.
+
+    `EACCES` has to arrive as something other than `NO_SUCH_FILE` or `exists()` answers
+    `False` for a path the caller merely cannot see -- and the next line in most programs that
+    ask creates something there. The assertion is deliberately on the *class* rather than on
+    `PermissionDeniedError`: what matters is that it is not silently a `False`, and a server
+    that mapped `EACCES` to the `FAILURE` catch-all would still be safe.
+    """
+    closed = server.root / "closed"
+    closed.mkdir()
+    (closed / "secret.bin").write_bytes(b"payload")
+    closed.chmod(0o000)
+    try:
+        async with connected(server) as sftp:
+            with pytest.raises(ServerError) as refused:
+                await sftp.exists(str(closed / "secret.bin"))
+        assert not isinstance(refused.value, NoSuchFileError), (
+            "an unreadable path arrived as NO_SUCH_FILE, which a predicate reports as False"
+        )
+    finally:
+        closed.chmod(0o755)
+
+
 # --- D-15: does a server whose replies nobody reads stop reading us? --------------------------
 
 CHANNEL_WINDOW = 2 * 1024 * 1024

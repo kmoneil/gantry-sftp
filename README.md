@@ -195,6 +195,10 @@ exists today:
   `readlink` / `symlink`, `supports()`, `listdir()` / streaming `scandir()`, and
   pipelined `get()` / `put()`, with typed errors, timeouts on every wait, and a progress
   callback
+- **path predicates that have three states**: `exists` / `isdir` / `isfile` / `islink` /
+  `getsize` / `getmtime` / `makedirs`, where `False` means the server said `NO_SUCH_FILE` and
+  every other refusal is raised — a `PERMISSION_DENIED` reported as "not there" is how a
+  publisher overwrites a file it was never allowed to see
 - **byte ranges and a file object**: `open_file()` for a cursor — `read` / `readinto` / `write`
   / `seek` / `truncate` — and `read_at` / `readinto_at` / `write_at` for explicit offsets, which
   are safe to fan out over one handle. Every read is pipelined through the same scheduler `get`
@@ -658,6 +662,86 @@ a session multiplexes and a scan holds no lock.
 contains. `walk()` uses it too, which means the raw listing and the classified one are never
 both in memory; one directory still is, and that bound is structural — a top-down walk cannot
 know where to descend until it has seen every name.
+
+## Is it there?
+
+```python
+if not await sftp.exists("/incoming/2026"):
+    await sftp.makedirs("/incoming/2026/q3")
+```
+
+`exists`, `isdir`, `isfile`, `islink`, `getsize`, `getmtime`, `makedirs` — and each of them
+takes bytes or `str`, like everything else on the session.
+
+**`False` means the server said `NO_SUCH_FILE`, and only that.** Every other refusal is
+raised. This is the one decision in this section worth reading, because the obvious
+implementation gets it wrong:
+
+| The server answers | Because | `exists()` |
+| ------------------ | ------- | ---------- |
+| `NO_SUCH_FILE` | it is not there — and also `ENOTDIR`, a path under a file, and `ELOOP`, a symlink loop | `False` |
+| `PERMISSION_DENIED` | a directory on the way may not be traversed | **raises** |
+| `BAD_MESSAGE` | the name is longer than the far end's `NAME_MAX`. The code reads as *your frame was malformed*; it is `ENAMETOOLONG` | **raises** |
+| `FAILURE` | v3's catch-all — a full disk, a read-only mount, whatever the server felt like | **raises** |
+
+A predicate that collapsed those into `False` would report a path as free when something you
+cannot see is sitting on it, and the next line in almost every program that calls `exists()`
+creates something there. So `if not await sftp.exists(p)` needs no `try` around it: the
+answer is either an answer or an exception that names the path and the refusal.
+
+`isdir`, `isfile` and `islink` add one more state. v3 carries the file type inside the
+permission bits, and a server is not obliged to send any — the same `EntryKind.UNKNOWN` a
+listing can report. They raise `CapabilityError` there rather than answering `False`, because
+"not a directory" is a definite answer to a question the server did not answer.
+
+### Following the link, or not
+
+`exists`, `isdir`, `isfile`, `getsize` and `getmtime` take `follow_symlinks=` and default to
+`True`, matching `os.path`. `islink` does not take it: resolving the link first is what makes
+its question unanswerable.
+
+A **broken** symlink is where the two spellings separate, and the difference is the one
+publishing cares about:
+
+```python
+await sftp.exists("/incoming/yesterday.csv")                        # False -- no file there
+await sftp.exists("/incoming/yesterday.csv", follow_symlinks=False) # True  -- name is taken
+await sftp.islink("/incoming/yesterday.csv")                        # True
+```
+
+### One attribute, and the answer that is missing
+
+```python
+size = await sftp.getsize("/incoming/data.parquet")   # int | None
+when = await sftp.getmtime("/incoming/data.parquet")  # datetime | None, aware, UTC
+```
+
+`None` means the server sent an ATTRS with no such field — legal in v3, and not the same as
+zero or as 1970. A file that is not there **raises** instead, so the `None` means exactly one
+thing. `getmtime` returns an aware UTC `datetime` rather than `os.path.getmtime`'s float, for
+the reason `modified_at` exists: `datetime.fromtimestamp(seconds)` with no timezone gives the
+*client's* local wall clock and then disagrees with everything rendered server-side. It is
+second-granular, because v3 has no sub-second field.
+
+### `makedirs`
+
+`os.makedirs` semantics, including the asymmetry: an existing **ancestor** is never an error,
+and `exist_ok` governs the last component only. It costs one round trip when the parent is
+already there, and walks up a level at a time only where one is genuinely absent.
+
+Where something is in the way, the error says what — v3 answers a failed `MKDIR` with the
+contentless `FAILURE`, and OpenSSH sends the single word `Failure` for an occupied name, a
+full disk and a read-only mount alike, so the note is the diagnosis:
+
+```
+ServerError: server returned FAILURE: Failure path=b'/incoming/2026'
+  b'/incoming/2026' already exists and is a file, not a directory, so nothing can be
+  created at that name until it is moved or removed
+```
+
+The path named is the deepest level that actually failed, which is not always the one you
+asked for: `makedirs("/locked/a/b")` against a directory you may not write reports
+`/locked/a`, because that is the one to fix.
 
 ## Walking and recursive download
 

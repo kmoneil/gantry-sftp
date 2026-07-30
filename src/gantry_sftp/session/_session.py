@@ -39,6 +39,7 @@ import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import override
@@ -121,7 +122,13 @@ from gantry_sftp.session._download import (
 )
 from gantry_sftp.session._glob import RECURSIVE, match_component, split_pattern
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
-from gantry_sftp.session._listing import DOT_ENTRIES, DirEntry, EntryKind, entry_kind
+from gantry_sftp.session._listing import (
+    DOT_ENTRIES,
+    DirEntry,
+    EntryKind,
+    entry_kind,
+    modified_at,
+)
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
 from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._mode import (
@@ -1077,6 +1084,255 @@ class Session:
             return reply.attrs
         raise _unexpected(reply, expected="ATTRS", path=encoded)
 
+    # --- predicates ------------------------------------------------------------------------
+
+    async def _attrs_or_absent(self, path: bytes, *, follow_symlinks: bool) -> Attrs | None:
+        """Attributes for a predicate: ``None`` where the path is not there, nothing swallowed.
+
+        **The whole of the three-state rule is here**, so that no predicate below gets to
+        decide it separately. ``NO_SUCH_FILE`` is the server *answering* "no" and becomes
+        ``None``; every other status is the server declining to answer and is raised. A
+        predicate that collapses a refusal into ``False`` tells its caller a path is free when
+        it may be occupied by something they are not allowed to see, and the caller then
+        creates over it.
+
+        Which conditions land in which state is a property of the far end rather than a
+        deduction, so it was measured against OpenSSH 10.0p2
+        (``_plans/probes/predicate_third_state_probe.py``):
+
+        - A path *under* a file component answers ``NO_SUCH_FILE``. OpenSSH folds ``ENOTDIR``
+          in there, so ``exists(b"/etc/passwd/nope")`` is an ordinary ``False``.
+        - A symlink loop answers ``NO_SUCH_FILE`` as well (``ELOOP``), which matches what
+          :func:`os.path.exists` reports for one locally.
+        - A path inside a directory the caller may not traverse answers
+          ``PERMISSION_DENIED``. **This is the third state**, it is reachable in one line of
+          setup, and it is the case the rule exists for.
+        - A name longer than the far end's ``NAME_MAX`` answers ``BAD_MESSAGE``, which reads
+          as "your frame was malformed" and is nothing of the kind -- it is ``ENAMETOOLONG``
+          arriving under a code that describes the wrong layer. It is a plain
+          :class:`~gantry_sftp.exceptions.ServerError`, so catching anything broader than
+          ``NoSuchFileError`` here would answer "not there" for a path that was merely long.
+
+        Args:
+            path: Encoded remote path.
+            follow_symlinks: ``STAT`` when true, ``LSTAT`` when false.
+
+        Returns:
+            The attributes, or ``None`` if the server said ``NO_SUCH_FILE``.
+        """
+        try:
+            return await (self.stat(path) if follow_symlinks else self.lstat(path))
+        except NoSuchFileError:
+            return None
+
+    async def _kind_is(
+        self, path: bytes | str, expected: EntryKind, *, follow_symlinks: bool, predicate: str
+    ) -> bool:
+        """Whether the server positively classifies ``path`` as ``expected``.
+
+        ``False`` for absent and for a kind that is not the one asked about;
+        :class:`~gantry_sftp.exceptions.CapabilityError` for a server that answered without
+        permission bits, because v3 carries the file type *in* those bits and there is then
+        nothing to classify from. Returning ``False`` there would report "not a directory"
+        for an entry the server declined to describe -- the guess
+        :attr:`~gantry_sftp.session.EntryKind.UNKNOWN` exists to prevent, and the reason
+        recursive downloads silently skip directories on some servers.
+
+        Args:
+            path: Remote path.
+            expected: The kind being asked about.
+            follow_symlinks: Whether to resolve a symlink before classifying.
+            predicate: Name of the calling method, for the error message.
+
+        Returns:
+            Whether the path is of that kind.
+
+        Raises:
+            CapabilityError: If the server reported no permission bits.
+            PermissionDeniedError: If the path could not be reached.
+            ServerError: For any other refusal.
+        """
+        encoded = _encode_path(path)
+        attributes = await self._attrs_or_absent(encoded, follow_symlinks=follow_symlinks)
+        if attributes is None:
+            return False
+        found = entry_kind(attributes)
+        if found is EntryKind.UNKNOWN:
+            unclassifiable = CapabilityError(
+                f"{predicate}() cannot be answered for {encoded!r}: the server returned "
+                f"attributes with no permission bits, and filexfer v3 carries the file type "
+                f"in those bits, so there is nothing here to classify. Returning False would "
+                f"report a definite 'no' for a question the server did not answer. Call "
+                f"stat() or lstat() and decide from Attrs.permissions, or use walk(), which "
+                f"reports an entry it cannot settle as skipped rather than guessing",
+                feature=f"{predicate}() against a server that sends no permission bits",
+                path=encoded,
+            )
+            unclassifiable.add_note(self._server_note())
+            raise unclassifiable
+        return found is expected
+
+    async def exists(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
+        """Whether anything is at ``path``.
+
+        ``False`` means the server said ``NO_SUCH_FILE`` and nothing else. A refusal it will
+        not explain -- ``PERMISSION_DENIED`` on a directory you may not traverse, the v3
+        ``FAILURE`` catch-all, a read-only mount -- is **raised**, because "I may not look" is
+        not "there is nothing there", and a caller who treats it as one goes on to create
+        something on top of whatever is already in the way.
+
+        **Follows symlinks by default**, like :func:`os.path.exists`, so a link whose target is
+        gone is ``False``. ``follow_symlinks=False`` asks the other question -- *is this name
+        taken* -- which is the one publishing needs, and answers ``True`` for that broken link.
+
+        Args:
+            path: Remote path.
+            follow_symlinks: Resolve a final symlink before answering. ``False`` reports on the
+                link itself.
+
+        Returns:
+            Whether the path exists.
+
+        Raises:
+            PermissionDeniedError: If the path could not be reached to find out.
+            ServerError: For any other refusal, including the ``BAD_MESSAGE`` OpenSSH answers
+                for a name that is merely too long.
+        """
+        return (
+            await self._attrs_or_absent(_encode_path(path), follow_symlinks=follow_symlinks)
+            is not None
+        )
+
+    async def isdir(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
+        """Whether ``path`` is a directory.
+
+        ``False`` for a path that is not there and for one that is something else; a refusal is
+        raised, as in :meth:`exists`. Follows symlinks by default, so a link pointing at a
+        directory is one -- :func:`os.path.isdir`'s answer. ``follow_symlinks=False`` reports on
+        the link itself, which is then a symlink and not a directory.
+
+        Args:
+            path: Remote path.
+            follow_symlinks: Resolve a final symlink before classifying.
+
+        Returns:
+            Whether it is a directory.
+
+        Raises:
+            CapabilityError: If the server sent no permission bits, leaving the kind unknowable.
+            PermissionDeniedError: If the path could not be reached.
+            ServerError: For any other refusal.
+        """
+        return await self._kind_is(
+            path, EntryKind.DIRECTORY, follow_symlinks=follow_symlinks, predicate="isdir"
+        )
+
+    async def isfile(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
+        """Whether ``path`` is a regular file.
+
+        Regular specifically: a fifo, a socket or a device node is ``False`` rather than
+        "not a directory, therefore a file". Follows symlinks by default, matching
+        :func:`os.path.isfile`.
+
+        Args:
+            path: Remote path.
+            follow_symlinks: Resolve a final symlink before classifying.
+
+        Returns:
+            Whether it is a regular file.
+
+        Raises:
+            CapabilityError: If the server sent no permission bits, leaving the kind unknowable.
+            PermissionDeniedError: If the path could not be reached.
+            ServerError: For any other refusal.
+        """
+        return await self._kind_is(
+            path, EntryKind.FILE, follow_symlinks=follow_symlinks, predicate="isfile"
+        )
+
+    async def islink(self, path: bytes | str) -> bool:
+        """Whether ``path`` is a symlink.
+
+        **No** ``follow_symlinks`` argument, unlike its neighbours: following the link first is
+        what makes the question unanswerable, since what is at the end of one is never the link.
+        This is ``LSTAT`` always, which is also why a *broken* link is ``True`` here and
+        ``False`` from ``exists()`` -- between them those two separate "this name is taken" from
+        "there is a file at the end of it".
+
+        Args:
+            path: Remote path.
+
+        Returns:
+            Whether the name is a symlink.
+
+        Raises:
+            CapabilityError: If the server sent no permission bits, leaving the kind unknowable.
+            PermissionDeniedError: If the path could not be reached.
+            ServerError: For any other refusal.
+        """
+        return await self._kind_is(
+            path, EntryKind.SYMLINK, follow_symlinks=False, predicate="islink"
+        )
+
+    async def getsize(self, path: bytes | str, *, follow_symlinks: bool = True) -> int | None:
+        """Size of ``path`` in bytes, or ``None`` where the server did not report one.
+
+        **Not a predicate, and the two absences are different.** A path that is not there
+        raises ``NoSuchFileError`` -- as :func:`os.path.getsize` raises rather than returning
+        anything -- while ``None`` means the file is there and the server sent an ``ATTRS``
+        with no ``SIZE`` bit in it. Every field of a v3 ``ATTRS`` is optional, so that is legal
+        and it happens; returning ``0`` for it would report an empty file, which reads as a
+        successful answer and is the silent-wrong-answer class :meth:`get` was fixed for.
+
+        With ``follow_symlinks=False`` on a symlink this is the length of the *target string*,
+        which is what ``lstat`` reports and what :func:`os.lstat` gives for one locally.
+
+        Args:
+            path: Remote path.
+            follow_symlinks: Resolve a final symlink before measuring.
+
+        Returns:
+            The size, or ``None`` if the server reported no size at all.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            ServerError: For any other refusal.
+        """
+        attributes = await (self.stat(path) if follow_symlinks else self.lstat(path))
+        return attributes.size
+
+    async def getmtime(self, path: bytes | str, *, follow_symlinks: bool = True) -> datetime | None:
+        """When ``path`` was last modified, or ``None`` where the server did not say.
+
+        **An aware UTC :class:`~datetime.datetime`, not a float**, and deliberately not
+        :func:`os.path.getmtime`'s return type: this library reports timestamps through
+        :func:`~gantry_sftp.session.modified_at`, whose whole reason for existing is that
+        ``datetime.fromtimestamp(seconds)`` with no timezone yields the *client's* local wall
+        clock and then silently disagrees with everything rendered server-side. A method
+        handing back a bare number would put that trap back at the call site.
+
+        ``None`` is "the server sent no ``ACMODTIME``", which is legal in v3 and is not
+        1970 -- the coercion that makes every file look ancient to an ``if remote > local``
+        and turns a sync into either a full re-transfer or a no-op, depending on which way the
+        comparison runs. A path that is not there raises, as in :meth:`getsize`.
+
+        Second-granular, since v3 has no sub-second field, so this is not a change detector on
+        its own. See :func:`~gantry_sftp.session.modified_at` for the ``uint32`` range limit.
+
+        Args:
+            path: Remote path.
+            follow_symlinks: Resolve a final symlink before reading its time.
+
+        Returns:
+            The modification time as an aware UTC datetime, or ``None`` if unstated.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            ServerError: For any other refusal.
+        """
+        attributes = await (self.stat(path) if follow_symlinks else self.lstat(path))
+        return modified_at(attributes)
+
     async def _set_one_attribute(
         self, path: bytes, attrs: Attrs, *, follow_symlinks: bool, operation: str
     ) -> None:
@@ -1842,6 +2098,73 @@ class Session:
             if not exist_ok or not await self._is_directory(encoded):
                 raise
 
+    async def makedirs(self, path: bytes | str, *, exist_ok: bool = False) -> None:
+        """Create a directory and any missing ancestors of it.
+
+        :func:`os.makedirs` semantics, including the part that is easy to miss: **an existing
+        ancestor is always fine, and ``exist_ok`` governs the last component only.** So
+        ``makedirs`` on a directory that is already there raises by default, and the argument
+        is how a caller says they meant "make sure it exists".
+
+        Cheap in the common case and only in it. One ``MKDIR`` when the parent is already
+        there, and a walk up the path -- one round trip per level -- only when a level is
+        genuinely absent. The alternative, creating every ancestor unconditionally, charges
+        every caller the depth of their destination to help the one whose destination was
+        three levels missing.
+
+        **A refusal names the deepest component that could not be created**, which is not
+        always the one you asked for: ``makedirs(b"/locked/a/b")`` against a directory you may
+        not write reports ``/locked/a``, because that is the one to fix. v3 answers a failed
+        ``MKDIR`` with the contentless ``FAILURE`` -- OpenSSH 10.0p2 sends the single word
+        ``Failure`` whether the path is occupied by a file, occupied by a directory, or on a
+        full disk -- so where something *is* in the way this looks, and says which of those it
+        was, in a note on the error.
+
+        Args:
+            path: Remote directory to create, with its ancestors.
+            exist_ok: Do not raise if the last component is already a directory. An existing
+                ancestor never raises regardless.
+
+        Raises:
+            PermissionDeniedError: If a level could not be created.
+            ServerError: For any other refusal, including the destination already existing
+                when ``exist_ok`` is false, and something that is not a directory being in
+                the way.
+        """
+        encoded = _encode_path(path)
+        try:
+            await self._mkdir_parents(encoded, exist_ok=exist_ok)
+        except ServerError as refusal:
+            await self._note_what_is_in_the_way(refusal)
+            raise
+
+    async def _note_what_is_in_the_way(self, refusal: ServerError) -> None:
+        """Turn a bare ``FAILURE`` from a ``MKDIR`` into something that names the obstacle.
+
+        One ``LSTAT``, on an already-failing path, because the status code carries nothing:
+        five distinct conditions render as ``Failure`` on OpenSSH and none of them says
+        whether a file is sitting where the directory should go. A server that will not answer
+        the ``LSTAT`` either leaves the error exactly as it was -- a note is worth having and
+        never worth inventing.
+        """
+        if refusal.path is None:
+            return
+        try:
+            attributes = await self.lstat(refusal.path)
+        except ServerError:
+            return
+        kind = entry_kind(attributes)
+        if kind is EntryKind.DIRECTORY:
+            refusal.add_note(
+                f"{refusal.path!r} is already a directory; pass exist_ok=True to accept that "
+                f"rather than treating it as a failure"
+            )
+            return
+        refusal.add_note(
+            f"{refusal.path!r} already exists and is a {kind.value}, not a directory, so "
+            f"nothing can be created at that name until it is moved or removed"
+        )
+
     async def _is_directory(self, path: bytes) -> bool:
         """Whether the server positively reports ``path`` as a directory.
 
@@ -1849,6 +2172,10 @@ class Session:
         including a server that sends no permissions at all -- answers ``False``. Used to
         decide whether a refusal can be excused, and "the server would not say" is not an
         excuse.
+
+        Distinct from :meth:`isdir`, which is the public question and raises where this
+        returns ``False``: here the caller is deciding whether to *excuse* a refusal it
+        already has, and an unexplained answer must not excuse anything.
         """
         try:
             attributes = await self.lstat(path)
@@ -4104,7 +4431,7 @@ class Session:
             )
         requested_mode = resolve_mode(mode, caller="put_tree()")
         await self._require_rooted_paths(root, feature="uploading a tree")
-        await self._mkdir_parents(root)
+        await self._mkdir_parents(root, exist_ok=True)
         directories = 0
         moved: list[int] = []
         skipped: list[Skipped] = []
@@ -4169,23 +4496,29 @@ class Session:
             record["skipped"] = len(skipped)
             return TreeResult(len(moved), directories, sum(moved), tuple(skipped))
 
-    async def _mkdir_parents(self, path: bytes) -> None:
+    async def _mkdir_parents(self, path: bytes, *, exist_ok: bool) -> None:
         """Create ``path`` and any missing ancestors, cheaply in the common case.
 
         One ``MKDIR`` when the directory is already there or its parent is, and a walk up the
         path only when a level is genuinely absent. The alternative -- creating every ancestor
         unconditionally -- is a round trip per level of the destination on every call, paid by
         every caller to help the one whose destination was three levels missing.
+
+        ``exist_ok`` applies to ``path`` and **not** to what it recurses into: an ancestor that
+        already exists is never an error, whatever the caller asked about the destination. That
+        asymmetry is :func:`os.makedirs`'s and it is the reason this takes the argument at all
+        rather than tolerating everything, which is what it did while :meth:`put_tree` was its
+        only caller.
         """
         try:
-            await self.mkdir(path, exist_ok=True)
+            await self.mkdir(path, exist_ok=exist_ok)
         except ServerError:
             parent, _ = split_parent(path)
             stripped = parent.rstrip(b"/")
             if not stripped or stripped == path:
                 raise
-            await self._mkdir_parents(stripped)
-            await self.mkdir(path, exist_ok=True)
+            await self._mkdir_parents(stripped, exist_ok=True)
+            await self.mkdir(path, exist_ok=exist_ok)
 
     async def rmtree(self, path: bytes | str) -> TreeResult:
         """Remove a remote tree, including ``path`` itself.

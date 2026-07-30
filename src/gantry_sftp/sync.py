@@ -75,6 +75,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, contextmanager
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import TracebackType
@@ -483,6 +484,30 @@ class SyncSession:
         """Attributes of a path, following symlinks."""
         return self._run(partial(self._session.stat, path))
 
+    def exists(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
+        """Whether anything is at a path -- ``False`` only for ``NO_SUCH_FILE``."""
+        return self._run(partial(self._session.exists, path, follow_symlinks=follow_symlinks))
+
+    def isdir(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
+        """Whether a path is a directory."""
+        return self._run(partial(self._session.isdir, path, follow_symlinks=follow_symlinks))
+
+    def isfile(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
+        """Whether a path is a regular file."""
+        return self._run(partial(self._session.isfile, path, follow_symlinks=follow_symlinks))
+
+    def islink(self, path: bytes | str) -> bool:
+        """Whether a path is a symlink. Never follows, so a broken link is still one."""
+        return self._run(partial(self._session.islink, path))
+
+    def getsize(self, path: bytes | str, *, follow_symlinks: bool = True) -> int | None:
+        """Size in bytes, or ``None`` where the server reported no size."""
+        return self._run(partial(self._session.getsize, path, follow_symlinks=follow_symlinks))
+
+    def getmtime(self, path: bytes | str, *, follow_symlinks: bool = True) -> datetime | None:
+        """Modification time as an aware UTC datetime, or ``None`` where unstated."""
+        return self._run(partial(self._session.getmtime, path, follow_symlinks=follow_symlinks))
+
     def lstat(self, path: bytes | str) -> Attrs:
         """Attributes of a path without following a final symlink."""
         return self._run(partial(self._session.lstat, path))
@@ -616,6 +641,10 @@ class SyncSession:
     def mkdir(self, path: bytes | str, *, exist_ok: bool = False) -> None:
         """Create a directory."""
         return self._run(partial(self._session.mkdir, path, exist_ok=exist_ok))
+
+    def makedirs(self, path: bytes | str, *, exist_ok: bool = False) -> None:
+        """Create a directory and any missing ancestors of it."""
+        return self._run(partial(self._session.makedirs, path, exist_ok=exist_ok))
 
     def rmdir(self, path: bytes | str) -> None:
         """Remove an empty directory."""

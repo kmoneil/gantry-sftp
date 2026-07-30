@@ -11,6 +11,7 @@ python examples/download.py                       # pipelined get(), with progre
 python examples/file_object.py                    # byte ranges, a tail, an append, no staging
 python examples/atomic_publish.py                 # put(), and what "atomic" actually resolved to
 python examples/listing.py                        # listdir() and scandir(), and what a listing can't know
+python examples/predicates.py                     # exists()/isdir()/..., and the answer that is neither yes nor no
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/destination_collision.py          # two remote names, one local file, and the refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
@@ -32,6 +33,7 @@ python examples/download.py user@host /remote/data.parquet
 python examples/file_object.py user@host /remote/dir
 python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
+python examples/predicates.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
 python examples/resume.py user@host /remote/dir
@@ -61,6 +63,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `file_object.py`          | `open_file()`: a header, a tail, a range and an append without staging the file -- plus `read_at` / `readinto_at` fanned out over one handle, which is what the cursor form cannot do, and why block size is the one performance decision this surface hands you |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
+| `predicates.py`           | `exists()` / `isdir()` / `isfile()` / `islink()` / `getsize()` / `getmtime()` / `makedirs()`, the third state a predicate has — a refusal is not `False` — and the two questions a broken symlink separates |
 | `glob_patterns.py`        | `glob()`: the `glob(3)` dialect and where it differs from `fnmatch`, the dotfile rule, `**`, a trailing `/`, and a match whose path goes straight to `get()` |
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, the names a hostile server gets refused, and `server_root` — why an absolute path costs no probe |
 | `destination_collision.py` | `DestinationCollisionError`: two legal remote names that a case-folding destination makes one file, and why the check asks the filesystem rather than the name |
