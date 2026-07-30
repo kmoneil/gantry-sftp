@@ -20,6 +20,7 @@ python examples/retry.py                          # a link that drops, reconnect
 python examples/concurrent_transfers.py           # many transfers over one session
 python examples/cancellation.py                   # stop a transfer, and what it leaves behind
 python examples/connect_errors.py                 # why the connection failed, as a class
+python examples/doctor.py                         # what this machine can do, as a report and as data
 python examples/password_auth.py                  # password= , and where the secret does not go
 python examples/observability.py                  # the logs, a frame dump, and the counters
 python examples/server_capabilities.py            # who is at the other end, and what they refuse
@@ -41,6 +42,7 @@ python examples/retry.py user@host /remote/dir
 python examples/concurrent_transfers.py user@host /remote/dir
 python examples/cancellation.py user@host /remote/dir
 python examples/connect_errors.py user@host
+python examples/doctor.py user@host
 GANTRY_SFTP_PASSWORD=... python examples/password_auth.py user@host
 python examples/observability.py user@host /remote/dir
 python examples/server_capabilities.py user@host
@@ -64,6 +66,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
 | `predicates.py`           | `exists()` / `isdir()` / `isfile()` / `islink()` / `getsize()` / `getmtime()` / `makedirs()`, the third state a predicate has — a refusal is not `False` — and the two questions a broken symlink separates |
+| `doctor.py`               | `python -m gantry_sftp doctor` as data: `local_diagnosis()` for a container health check with no network, `server_diagnosis()` for the handshake a transfer would make, and the exit codes that let a Dockerfile tell "no ssh" from "host unreachable" |
 | `glob_patterns.py`        | `glob()`: the `glob(3)` dialect and where it differs from `fnmatch`, the dotfile rule, `**`, a trailing `/`, and a match whose path goes straight to `get()` |
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, the names a hostile server gets refused, and `server_root` — why an absolute path costs no probe |
 | `destination_collision.py` | `DestinationCollisionError`: two legal remote names that a case-folding destination makes one file, and why the check asks the filesystem rather than the name |

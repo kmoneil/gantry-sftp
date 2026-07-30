@@ -45,6 +45,7 @@ from gantry_sftp.exceptions import ProtocolError
 __all__ = [
     "CHECK_FILE_NAME",
     "FSYNC_NAME",
+    "IMPLEMENTED_EXTENSIONS",
     "LIMITS_NAME",
     "LSETSTAT_NAME",
     "POSIX_RENAME_NAME",
@@ -74,6 +75,26 @@ Derived from the same string constant the advertisement table uses rather than t
 as a bytes literal. Two spellings of one wire string is how ``copy-data@openssh.com``
 happened: a name that never matches degrades to the fallback forever and passes every test
 written against the same wrong constant.
+"""
+
+IMPLEMENTED_EXTENSIONS: tuple[str, ...] = (
+    EXTENSION_POSIX_RENAME,
+    EXTENSION_FSYNC,
+    EXTENSION_LSETSTAT,
+    EXTENSION_LIMITS,
+    EXTENSION_CHECK_FILE,
+)
+"""The extensions this library can actually *send*, as distinct from the ones it can name.
+
+There is an ``EXTENSION_*`` constant for every name OpenSSH is known to advertise, including
+the ones nothing here implements -- so ``supports()`` can answer about a server's whole
+advertisement without anybody typing a wire string by hand. That makes the constants a list
+of what exists, and leaves "what do we do with it" unanswered, which is the question an
+operator staring at an advertisement actually has.
+
+This is that answer, and it lives beside the bodies rather than in the diagnostic that prints
+it: an extension is implemented when it has a body in this module, so the set is derived from
+the same place the code is. :mod:`tests.test_extensions` asserts the two cannot drift.
 """
 
 

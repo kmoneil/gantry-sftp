@@ -68,6 +68,7 @@ from gantry_sftp.codec._describe import MAX_FIELD_BYTES, describe, render_field
 from gantry_sftp.codec._extensions import (
     CHECK_FILE_NAME,
     FSYNC_NAME,
+    IMPLEMENTED_EXTENSIONS,
     LIMITS_NAME,
     LSETSTAT_NAME,
     POSIX_RENAME_NAME,
@@ -132,6 +133,7 @@ __all__ = [
     "EXTENSION_STATVFS",
     "EXTENSION_USERS_GROUPS_BY_ID",
     "FSYNC_NAME",
+    "IMPLEMENTED_EXTENSIONS",
     "LIMITS_NAME",
     "LSETSTAT_NAME",
     "MAX_FIELD_BYTES",

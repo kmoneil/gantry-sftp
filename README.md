@@ -47,11 +47,31 @@ same sentence as the reason to use it, so it is here rather than at the bottom.
 
 **Your machine already satisfies this and your container probably does not**, which is the
 failure worth pre-empting: it passes locally, then fails on first deploy. Check the image you
-actually deploy rather than trusting a table:
+actually deploy rather than trusting a table — the library will check itself, and needs no
+server to do it:
 
 ```console
-$ ssh -V          # any version; we do not require a recent one
-OpenSSH_10.0p2 ...
+$ python -m gantry_sftp doctor
+gantry-sftp doctor
+
+local
+  library                 0.0.0 (filexfer v3)
+  ssh executable          ssh -- a bare name, so PATH decides at spawn time
+  ssh version             OpenSSH_10.0p2 Debian-7+deb13u4, OpenSSL 3.5.6 7 Apr 2026
+  transfers               supported
+  ssh config              /home/bob/.ssh/config
+  environment             none of the steering variables are set
+  defaults                depth=64 request_timeout=30.0 idle_timeout=60.0
+
+exit 0 (OK)
+```
+
+Put it in the build and the image that cannot work fails its own build instead of a
+customer's first transfer. The exit codes are distinct so a `RUN` can tell the cases apart:
+**0** usable · **3** no `ssh` binary · **4** platform cannot transfer · **5** host unreachable.
+
+```dockerfile
+RUN python -m gantry_sftp doctor
 ```
 
 Add it in a Dockerfile with whichever your base image uses:
@@ -1812,6 +1832,47 @@ reporter that calls `str()` rather than `repr()` on a local, a core dump, and
 output readable by every user on the machine.
 
 `examples/logging.py` runs all of this with no arguments.
+
+### `doctor`, the diagnostic no other Python SFTP library can ship
+
+```console
+$ python -m gantry_sftp doctor sftp.example.com
+```
+
+paramiko and asyncssh **are** the SSH environment — no external binary, no `ssh_config` somebody
+else wrote, no agent socket resolved by a program they do not own — so they have nothing to
+introspect. This library spawns OpenSSH, and the price of that dependency is also the only
+reason a report like this can exist.
+
+Without a host it reaches no network and answers what a container image needs to know: which
+`ssh` would be spawned and how that was resolved, its version, whether this platform supports
+transfers, which config file `ssh` will read, which steering variables are set, and the
+tunables this build ships. That is the [Dockerfile check](#what-it-needs--read-this-before-you-install-it).
+
+With a host it connects once and reports **the same negotiation a transfer performs**: the
+protocol version, the identified implementation, every advertised extension split into the ones
+this library uses and the ones it ignores, the `limits@openssh.com` answers, the request size
+derived from them, the pipeline depth, and where the session starts. That is a better answer to
+*why did `posix_rename` not happen* or *why is this slow* than any log line, because it is not a
+description of the handshake — it is the handshake.
+
+| flag | |
+| --- | --- |
+| `--json` | the same report as JSON, so CI asserts on fields rather than scraping text |
+| `--user`, `--port`, `-i`, `--config-file` | as `ssh` takes them |
+| `-o KEY=VALUE` | repeatable, so the connection you diagnose is the one that is failing |
+
+It is safe to paste into a bug report, which is the point of it: only the variables that steer
+`ssh` are read at all, and their values go through the same masking chokepoint as everything
+above. There is no `--password` — a secret does not belong on a command line — and no flag to
+replace the environment, because the environment is part of what is being diagnosed.
+
+Exit codes are distinct rather than 0/1: **0** usable · **2** usage · **3** no `ssh` binary ·
+**4** platform cannot transfer · **5** host unreachable.
+
+The report is data before it is text. `gantry_sftp.doctor.local_diagnosis()` and
+`server_diagnosis()` return dataclasses, so a health check reads fields instead of parsing —
+`examples/doctor.py` does exactly that.
 
 ## Speed, and where its numbers are
 

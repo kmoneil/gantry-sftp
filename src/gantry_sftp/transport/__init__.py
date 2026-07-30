@@ -38,6 +38,7 @@ from gantry_sftp.transport._diagnosis import (
     password_auth_hint,
 )
 from gantry_sftp.transport._subprocess import (
+    LOGGED_ENVIRONMENT_VARIABLES,
     SFTP_SERVER_CANDIDATES,
     StderrBuffer,
     SubprocessTransport,
@@ -55,6 +56,7 @@ __all__ = [
     "DEFAULT_SUBSYSTEM",
     "HOST_KEY_MARKERS",
     "INTERACTIVE_AUTH_METHODS",
+    "LOGGED_ENVIRONMENT_VARIABLES",
     "PASSWORD_AUTH_OPTIONS",
     "SFTP_SERVER_CANDIDATES",
     "StderrBuffer",

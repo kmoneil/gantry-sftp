@@ -181,3 +181,63 @@ def test_codec_imports_only_itself_and_the_exception_module() -> None:
     assert not offenders, "codec may only import from codec/ and exceptions: " + "; ".join(
         offenders
     )
+
+
+# --- the top of the stack, which is a layer too (D-90) ------------------------------------------
+
+ERGONOMICS = ("gantry_sftp.doctor", "gantry_sftp.__main__")
+"""Modules that sit *above* session and transport, and are imported by nothing below them.
+
+The command line and the diagnostic are the top of the dependency order — they may reach down
+through the whole library, and nothing in the library may reach up to them. Stated as a list
+because there are two of them; the assertion below is what keeps the list from becoming a
+description of what happened rather than a rule.
+"""
+
+
+def test_nothing_below_the_ergonomics_layer_imports_it() -> None:
+    """One import of ``doctor`` from ``session`` would invert the dependency order.
+
+    It would also, quietly, make a ``python -m`` entry point part of the library's import
+    graph: ``__main__`` runs an ``argparse`` at import time in some shapes, and every consumer
+    would pay for a command they never invoke. The direction is one-way and this is the
+    assertion, in the same file and for the same reason the codec's purity is asserted rather
+    than documented.
+    """
+    below = [
+        module
+        for module in package_modules()
+        if f"gantry_sftp.{module.stem}" not in ERGONOMICS and module.stem != "__main__"
+    ]
+    offenders = [
+        f"{module.name}:{line} imports {name}"
+        for module in below
+        for line, name in imported_paths(module)
+        if name in ERGONOMICS
+    ]
+
+    assert not offenders, "the ergonomics layer is imported from below it: " + "; ".join(offenders)
+
+
+def test_the_ergonomics_layer_is_not_empty() -> None:
+    """Guards the guard: a renamed module would make the test above vacuous rather than red."""
+    present = {f"gantry_sftp.{module.stem}" for module in package_modules()}
+    missing = [name for name in ERGONOMICS if name not in present]
+    assert missing == [], f"named in ERGONOMICS but no longer a module: {missing}"
+
+
+def imported_paths(module: Path) -> list[tuple[int, str]]:
+    """Every fully-qualified module name imported by ``module``, with its line number.
+
+    Distinct from :func:`imported_roots`, which truncates to the top-level package: this rule
+    is about a *submodule* of ``gantry_sftp``, and the root of every one of those is
+    ``gantry_sftp``.
+    """
+    tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend((node.lineno, alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            found.append((node.lineno, node.module))
+    return found
