@@ -81,11 +81,12 @@ and the ceiling is reached with room to spare rather than exactly.
 
 **The window is reachable, but not on a connection's first transfer.** A depth this deep puts
 more than an initial TCP congestion window in flight immediately, so the opening round trips
-are spent waiting for that window to open rather than for the server. The same 16 MiB download
-runs **1.35x faster as a connection's second transfer than as its first**, at both 50 ms and
-200 ms RTT, reaching about **82% of what the 2 MiB channel window implies** once the three
-metadata round trips ``get`` makes -- ``STAT``, ``OPEN``, ``CLOSE`` -- are subtracted
-(``benchmarks/``, ``tc netem``-shaped loopback against OpenSSH 10.0p2, 2026-07-29; D-23).
+are spent waiting for that window to open rather than for the server. The same download is
+measurably faster as a connection's second transfer than as its first, and the warm figure
+reaches most of what the 2 MiB channel window implies once the three metadata round trips
+``get`` makes -- ``STAT``, ``OPEN``, ``CLOSE`` -- are subtracted. Both figures, with their link
+profile and their date, are in ``benchmarks/README.md``; they are not repeated here, because a
+number in a docstring ages without anybody noticing (D-23, D-88).
 
 That cost belongs to the transport rather than to this scheduler, and it is paid once per
 connection: a session that moves several files amortises it, which is an argument for

@@ -76,6 +76,103 @@ hedged, because finding it out after adopting a library is worse than finding it
 If `ssh` is missing, you get a `ConnectError` whose `hint` says all of the above — see
 [When the connection fails](#when-the-connection-fails).
 
+## The failures this prevents
+
+The reason to switch is not a ratio. It is this list, and every row names the mechanism *and* the
+test that proves it, because a prevention claim without a test is a rumour.
+
+| The failure | What stops it | What proves it |
+| --- | --- | --- |
+| A consumer picks up a file that is real, plausible and a quarter written | `put()` stages under a temporary name, flushes, then renames — and the result says which mechanism it actually got | `tests/test_publish.py`, `examples/atomic_publish.py` |
+| A truncated transfer reported as success | a size check on every transfer, and on the way up it runs *before* the rename, so a short upload never becomes the destination | `tests/test_verification.py` |
+| An upload that arrives world-readable | `mode=` is set in the `OPEN` that creates the file, before anything can open it by its published name. Omitting it means `0666 & ~umask`, and a `chmod` afterwards leaves a window | `tests/test_modes.py` |
+| Timestamps replaced by the time of the transfer | `preserve_times=` in both directions, stamping a descriptor rather than a path | `tests/test_timestamps.py` |
+| A hostile filename escaping the destination directory | every server-supplied name is checked before it reaches the filesystem — absolute paths, `..`, and a parent directory that is a symlink pointing out of the tree | `tests/test_localpath.py`, `tests/test_recursive.py` |
+| Two legal remote names silently becoming one local file | the collision check asks the filesystem for identity rather than folding the name, so Unicode normalisation and Windows trailing dots come free | `tests/test_localpath.py` |
+| A resume that adopts the wrong bytes | a partial that cannot be a prefix is refused, and `resume_check` reports what was actually proven rather than that something was | `tests/test_resume.py`, `tests/test_content_verification.py` |
+| A `UnicodeDecodeError` on somebody else's filename | bytes end to end: `DirEntry.filename` is bytes, every `Session` method takes `bytes` or `str`, `realpath` returns bytes, and the decode question is decided once on the download side | `tests/test_listing.py` |
+| A transfer that hangs with nothing to escape it | a deadline on every wait, including the send and including the wait for the send lock | `tests/test_send_deadline.py`, `tests/test_cancellation.py` |
+
+**Two of those are the incumbent's open bugs rather than hypotheticals** (counts read from the
+trackers on 2026-07-29). `paramiko#546`, *Crashes on filenames that are not UTF-8*, has been open
+since 2015 with 47 comments; `#707` is the same crash on a single filename byte, and seven issues
+carry that shape in their title. Hanging with no timeout to
+escape is `paramiko#520` (54 comments, open since 2015), `#926` (*Downloading Large Files Hangs /
+Stalls*, 27 comments), `#515` and `#331`.
+
+**And this is where the performance claim belongs, because nobody complains in ratios.** What
+people report against an SFTP client is a *pathology*: it hangs, it stalls, it cliffs at a byte
+count (`paramiko#2438` — writing more than 32675 bytes costs 99% of the throughput), or one of its
+own APIs runs 25× slower than another (`paramiko#2453`). Those are failure modes, not benchmark
+rows. So the claim worth having is that **throughput rises with file size and then plateaus, and
+never falls** — which is asserted rather than reported: ten sizes bracketing every boundary the
+design has, both directions, and a fall fails the run. Its limits, stated because they matter: it
+covers `get` and `put` on two of the five link profiles, and the read path a file object would use
+is not swept, because there is no file object yet.
+
+## The bug class this library cannot have
+
+**The loudest thing in paramiko's tracker is not a bug, it is a treadmill.** Four issues, 252
+reactions between them, and they are the same issue four times over eight years: Blowfish
+deprecated in `cryptography` 37 (`#2038`, 99 reactions), `CryptographyDeprecationWarning`s on
+`cryptography` 2.5 (`#1369`, 86), TripleDES (`#2419`, 46), and one more of the same (`#1386`, 21).
+Beside them, a `bcrypt` dependency that produced `GLIBC_2.28 not found` at runtime (`#2108`) and a
+`DSSKey` removal that broke `pysftp` downstream for people who never used those keys (`#2537`).
+None of it is anybody's mistake. An SSH implementation in Python must track a crypto library's
+deprecation schedule forever, and every turn of that schedule reaches every user as a warning or a
+break.
+
+**There is no cryptography in this package and no cryptographic dependency**, so it cannot produce
+any of that — `pip install gantry-sftp` pulls `anyio` and nothing else. Algorithm currency is the
+same fact from the other side: this library cannot lag on a key type, cannot mis-parse
+`known_hosts` and cannot diverge from the `ssh_config` you already tested with `ssh`, because it
+implements none of them. The episode where OpenSSH 8.8 disabled SHA-1 `ssh-rsa` signatures and a
+Python client had to grow `rsa-sha2-*` (`paramiko#1643`, 61 comments — then `#2017`, where the fix
+broke compatibility in the other direction) is a shape there is no way to reproduce from here.
+
+**`Error reading SSH protocol banner` appears in 55 issues in that repository.** What you get here
+instead is OpenSSH's own stderr, verbatim, on a typed exception, with a `hint` when there is
+something to do about it — see [When the connection fails](#when-the-connection-fails).
+
+**asyncssh deserves a different sentence, so it gets one.** The argument above is not an argument
+against it: its loudest issue has 7 reactions to paramiko's 99, most of its tracker is questions
+that were answered, and against asyncssh this library is *behind* on surface — no file object, no
+`statvfs`, no `hardlink` — and on Windows, where its transfers work and ours refuse. Three things
+stand against it and they are the honest three: no cryptography in Python, the table above, and
+trio.
+
+## What is free because OpenSSH does it
+
+Every item here is an open feature request in the incumbent's tracker with no path forward inside a
+Python SSH implementation, and none of it is implemented here — which is why none of it can rot
+here:
+
+- **`ssh_config`, in full** — `Match`, `Include`, `ProxyJump`, `ProxyCommand`, `IdentityFile`.
+  (`fsspec#516` is the same wish one layer up.)
+- **`ControlMaster` / `ControlPath` multiplexing** (`paramiko#852`, open since 2016). If your
+  `ssh_config` sets it, you have it, and for connection-heavy work it is the fix rather than an
+  optimisation — connecting is this library's weak spot.
+- **Host keys signed by a CA** (`paramiko#771`), and the agent with more than one key in it
+  (`paramiko#1390`).
+- **Reaching a host through a proxy or a bastion** — `ProxyJump`, and `ProxyCommand` for SOCKS
+  (`paramiko#955`, 24 reactions). Port *forwardings* are a different feature and this library
+  switches them off on purpose: an SFTP client has no business opening one.
+- **FIDO `sk-*` keys, GSSAPI, post-quantum key exchange**, and every CVE fix — which arrives with
+  your OS package rather than with a release from us.
+
+See [Authenticating](#authenticating), which is a short section for exactly this reason.
+
+## asyncio, trio, or no event loop at all
+
+The core is async and it is written against `anyio`, so it runs on **asyncio and on trio**, and
+every async test in the suite runs on both backends — which is what makes that a property rather
+than a dependency choice. asyncssh's implementation depends on asyncio primitives directly, so
+trio is not available there; it was asked for in 2019 (`asyncssh#208`) and still is not. paramiko
+is threads.
+
+If you have no event loop at all, `gantry_sftp.sync` is a blocking facade over the same code — not
+a second implementation of it — see [No event loop](#no-event-loop).
+
 ## Status
 
 **Pre-alpha, and honest about it.** Nothing is published and the API will change. What
@@ -134,18 +231,19 @@ exists today:
   no network, no containers — and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
 - a `benchmarks/` lane that runs this library, paramiko and asyncssh against the same server
-  over that shaped link, reporting wall clock **and** CPU — the source of truth for every
-  performance number here, including the two that do not flatter us — and, in the one scenario
-  there that asserts rather than reports, throughput swept against file size so that a cliff at
-  a byte count fails a run instead of waiting for a user to find it
+  over that shaped link, reporting wall clock **and** CPU — and, in the one scenario there that
+  asserts rather than reports, throughput swept against file size so that a cliff at a byte
+  count fails a run instead of waiting for a user to find it. `benchmarks/README.md` is the only
+  place in this project a performance figure lives, wins and losses in the same tables
 - runnable `examples/`, each of which works with no arguments and is executed by the suite
 
 The thesis is proven end to end: SFTP runs over a real SSH connection, with key exchange,
 host-key verification and authentication — by key or by password — all done by OpenSSH, and no
-cryptography in this package. It is also now measured against the alternatives — on a shaped link it downloads
-1.6–3.2× faster than paramiko and 1.1–1.4× faster than asyncssh, it is *slower* to connect, and
-it wins nothing on CPU. All three of those are below, including the two that do not flatter it.
-It moves files:
+cryptography in this package. It is also measured against both alternatives, in both directions,
+on five link profiles — including the scenarios where we lose, which are connecting and CPU. The
+figures are in [`benchmarks/README.md`](benchmarks/README.md) rather than here, for the reason in
+[Why](#why): a document that ranks correctness above throughput and then leads with ratios is
+arguing against itself. It moves files:
 
 ```python
 import anyio
@@ -873,7 +971,7 @@ Rung 3 is not free of decisions, so here is what it actually does:
 | --- | --- | --- |
 | what it compares | bytes that arrived vs. the size the `STAT` reported | the local file's length vs. what the server says it holds |
 | when | after the transfer | **before the rename**, against the staging file, so a short upload never becomes the destination — in place, necessarily after |
-| cost | nothing; `get` already makes that `STAT` | one extra `STAT` — measured, and level with paramiko and asyncssh on every shaped profile |
+| cost | nothing; `get` already makes that `STAT` | one extra `STAT` — measured rather than assumed, and it ties on every shaped profile (`benchmarks/`) |
 | on mismatch | `TransferError` carrying both paths and the offset | `TransferError`; the staging file is removed and the destination is left alone |
 | server won't report a size | check skipped, download still succeeds | `result.size_check` is `unavailable` |
 | turning it off | `get(..., verify_size=False)` | no flag — see below |
@@ -891,8 +989,8 @@ changing size underneath you, and makes the result a snapshot of unknown complet
 There is no matching flag on `put()`: we control the source there, so a length disagreement is
 wrong every time, and `SizeCheck` has no `skipped` value as a result. The cost is one `STAT`
 per upload, and it was benchmarked rather than assumed — on every shaped profile the small-file
-upload row ties with paramiko and asyncssh to within 5%, because one round trip is invisible
-beside the ones a transfer already spends. paramiko's `put` has done the same
+upload row ties with paramiko and asyncssh, because one round trip is invisible beside the ones a
+transfer already spends. The figures are in `benchmarks/README.md`. paramiko's `put` has done the same
 `STAT`-and-compare by default since 1.7.7 — its `confirm` parameter — so the benchmark's paramiko
 column pays it too and still ties. An earlier draft promised an opt-out flag here; the measurement
 withdrew it.
@@ -1519,172 +1617,26 @@ output readable by every user on the machine.
 
 `examples/logging.py` runs all of this with no arguments.
 
-## Why it is faster, and where it is not
+## Speed, and where its numbers are
 
-Speed is not the objective — see above — but it is measurable, and a claim about it should
-either be evidenced or dropped. This section is the evidence, including the parts that go the
-wrong way.
+Not here, deliberately. Every throughput figure this project has lives in
+[`benchmarks/README.md`](benchmarks/README.md) — the cross-library ratios in both directions, the
+size sweep, the cold-versus-warm connection, and the three scenarios where we lose. It is a lane
+that re-runs (`python scripts/lanes.py benchmarks`) rather than a result quoted in prose, and it
+is the only place in this repository allowed to state one, because a number in a README ages
+without anybody noticing and a number in a suite fails.
 
-Sustained SFTP throughput is bounded by bytes in flight, not by cryptography:
+Two things about speed are mechanism rather than measurement, so they are worth stating where you
+are reading:
 
-```
-throughput ~= (outstanding_requests * request_size) / RTT
-```
-
-OpenSSH's own `sftp(1)` defaults to 64 outstanding requests of 32768 bytes — exactly 2 MiB
-in flight, which caps a 100 ms transatlantic link at roughly 21 MB/s regardless of how fast
-the machine is. That is a scheduling bug, not a crypto bug, and it is invisible on
-localhost, which is why it went unnoticed for two decades.
-
-That formula is now measured rather than argued. On a `tc netem`-shaped loopback link
-against OpenSSH 10.0p2, raising pipeline depth from 1 to 64 at a fixed 32768-byte request
-size transfers the same file **50.7× faster at 5 ms RTT, 36.8× at 50 ms and 24.8× at 200 ms**
-(2026-07-29) — and on an unshaped link the same comparison is noise. At depth 1 the elapsed
-time *is* one round trip per request, within 3%. The lane is
-`live-tests/test_netem_pipelining.py` and it re-measures on every run.
-
-**Those figures are for a connection that has already moved something**, and the difference
-is worth knowing because it is not ours. The same three comparisons on a connection's *first*
-transfer come out at 13.0×, 7.6× and 5.0×: a deep pipeline puts about a megabyte in flight
-immediately, which is more than an initial TCP congestion window, so its opening round trips
-are spent waiting for that window to open rather than for the server. Measured at six round
-trips for a 768 KiB transfer as a connection's first, and **one** as its fourth. The practical
-form of this: a session that transfers several files pays it once, and `ControlMaster` — which
-this README recommends for the connect cost — pays it once for every session that shares the
-control socket.
-
-The benchmark's own headline scenario says the same thing in throughput. A 16 MiB download,
-same file and same connection, timed as that connection's first transfer and as its second:
-
-| RTT | first transfer | second transfer | |
-| --- | -------------- | --------------- | --- |
-| 50 ms | 18.4 MiB/s | 24.8 MiB/s | **1.35× faster** |
-| 200 ms | 4.7 MiB/s | 6.3 MiB/s | **1.35× faster** |
-
-(`benchmarks/`, `tc netem`-shaped loopback against OpenSSH 10.0p2, 2026-07-29.) The warm figure
-is about 82% of what the 2 MiB channel window implies, once the three round trips `get` spends
-on `STAT`, `OPEN` and `CLOSE` are subtracted — so **the ceiling is reachable, and reaching it is
-a property of reusing the connection** rather than of tuning anything. Every cross-library row
-below is a first transfer, for all three libraries, because the benchmark opens a fresh
-connection per sample so that the cost of connecting is not hidden.
-
-### The ceiling, which is not ours
-
-The same lane found where the formula stops. Throughput follows **bytes in flight** rather
-than depth or request size individually — three different (depth × size) pairs multiplying to
-the same product perform within 4% of each other — and it stops improving at **2 MiB**.
-Going from 0.5 MiB to 2 MiB in flight roughly doubles throughput; going from 2 MiB to 8 MiB
-changes it by about 1%, whether the 8 MiB is reached with deep small requests or shallow
-large ones.
-
-2 MiB is OpenSSH's per-channel flow-control window. It is enforced by the SSH transport, one
-layer below anything this library does, so no amount of pipelining lifts it. Three things
-follow, and they are worth knowing before you tune anything:
-
-- **`sftp(1)`'s defaults are not timid.** `-R 64 -B 32768` is exactly the channel window.
-  What this library fixes is clients that never reach 2 MiB, not `sftp(1)`'s inability to
-  exceed it.
-- **Past 2 MiB the lever is more channels, not more depth.** Raising depth beyond the window
-  buys memory consumption and nothing else. Concurrent transfers over one session now work,
-  and they help by *reaching* the window rather than exceeding it — one `ssh` child is one
-  channel is one window. A second connection is what gets a second window, and this library
-  does not manage a pool of them yet.
-- **It is not OpenSSH's idiosyncrasy — it is the ecosystem's default.** Read off the sources
-  while building the benchmark: `paramiko.transport.DEFAULT_WINDOW_SIZE` is 2097152 with a
-  32768 max packet, and `asyncssh.connection._DEFAULT_WINDOW` is `2*1024*1024` with the same
-  packet size. The same two constants three times. Nobody is past 2 MiB today — but paramiko
-  and asyncssh implement SSH and could raise their own window, and we cannot raise OpenSSH's,
-  because not implementing SSH is the whole point. That is a real cost of this architecture and
-  it is written down here rather than left for someone to discover with a tuned paramiko.
-
-### Measured against paramiko and asyncssh
-
-`benchmarks/` now exists, so the comparison is a measurement rather than a promise. Three
-libraries, one uniform interface, the same `sshd`, five link profiles, every scenario verifying
-the bytes it moved. Against **paramiko 5.0.0** and **asyncssh 2.24.0** on OpenSSH 10.0p2 over
-`tc netem`-shaped loopback:
-
-| scenario | vs paramiko | vs asyncssh |
-| -------- | ----------- | ----------- |
-| download 16 MiB | **1.6–3.2× faster** | 1.1–1.4× faster |
-| upload 16 MiB | 1.2–1.5× faster | up to 1.5×, level on the rate-limited profile |
-| N × 8 KiB download, sequential | ~1.5× faster | **a tie** |
-| N × 8 KiB upload, sequential | level shaped (≤1.05×); **1.7–1.8× slower unshaped** | level shaped (≤1.07×); 1.1–1.2× slower unshaped |
-| connect and close | **1.2–1.4× slower** | **1.2–2.1× slower** |
-| CPU per MiB, download | about the same | **1.2–1.6× worse** |
-| CPU per MiB, upload | 1.1–1.6× better | mixed, 0.7–1.4× |
-
-Ratios across 5, 50 and 200 ms RTT plus a 100 Mbit/s rate-limited profile, taken as the
-**union of three full runs** rather than the best one. That widening is not padding: the runs
-put the download range at 1.9–2.6×, then 1.6–2.3×, then 1.6–3.2×, because paramiko's 200 ms row
-is genuinely noisy — its spread column has reached 3.67 across those runs while ours stayed near
-1.1. A range that only one run reproduces is a number with an expiry date on it, and the widest
-ratio in that table is drawn from the least stable row. Absolute figures, the exact host and the
-full caveats are in the report the suite writes; re-run it with
-`python scripts/lanes.py benchmarks` and it re-derives all of them.
-
-The **small-file upload row is newer and its range comes from two runs, not three** — it was
-added in 0.8 when the size check gave every `put` an extra `STAT` and it emerged that the matrix
-could not see a per-file cost at all: every small-file row was a download, and both 16 MiB
-upload rows move one file. Those two 16 MiB rows were re-measured in the same pair of runs and
-did not move outside the ranges above; at 200 ms RTT the added round trip shows up as roughly
-+0.15 s on a 3.3 s transfer, which is the one `STAT` and nothing else.
-
-**Concurrency, measured against ourselves.** The same small-file corpus over one connection,
-eight transfers at a time against one at a time: **3.1× on unshaped loopback, 9.1× at 5 ms RTT
-and 8.0× at 50 ms**, with CPU per MiB *lower* rather than higher. Us against us, deliberately —
-paramiko and asyncssh can be driven concurrently too, so racing our task group against their
-`for` loop would measure a feature gap while looking like a speed gap, and the cross-library row
-above stays sequential for all three. The gain is round trips, which is why it grows with
-latency and why the unshaped number is the smallest one here.
-
-Three of those rows are not the ones a pitch would choose, and they are the interesting ones.
-
-**We lose small-file upload on a fast link, and we win small-file download on the same one.**
-Unshaped, 200 × 8 KiB: 3.0–3.2× *faster* than paramiko downloading, 1.7–1.8× *slower* uploading,
-same files, same count, same connection. With the round trips nearly free the difference is
-per-operation work in Python, and the CPU column says so. It disappears the moment the link has
-any latency, where all three tie, so it costs nothing on the networks this library is for and
-everything on loopback. It is not the size check — paramiko performs the same one.
-
-**Measured 2026-07-28, and the swing between those two rows is mostly not ours.** Ranging each
-library against *itself* on the same corpus and connection: our upload is **1.25×** our own
-download, while paramiko's upload is **0.23×** theirs — paramiko's small-file `get` is over four
-times its own `put`, and disabling its prefetch does not change that. So the cross-library rows
-above are two facts, not one. Our own direction asymmetry is modest and its largest single
-component is that `put` reads the local file in a worker thread while `get` calls `os.pwrite`
-inline — worth 75–130 µs per file, about a third of the gap. The anyio primitives in that path
-are innocent: a task group, a semaphore acquire and an event wait total ~17 µs per file, measured
-directly.
-
-**Read the download row with that in mind.** It is an honest measurement of both libraries'
-default APIs, which is the benchmark's fairness rule — but a good part of the 3× is paramiko's
-`get`, not our scheduler. The row that demonstrates what the scheduling actually buys is the
-`one connection` one below, which is this library against itself.
-
-The upload gap is **measured, understood and deliberately not fixed** (D-72). Restoring the
-symmetry means reading small payloads inline, which trades away the property that a slow local
-disk cannot stall the receive side — to win back tens of milliseconds on a link with no latency,
-which is the one case nobody ships.
-
-**"No cryptography in Python" does not become a CPU win.** `cryptography` is OpenSSL and
-OpenSSL uses the CPU's AES instructions, so the expensive part was never interpreted in either
-design. What moves out of Python is per-packet framing work, and we pay a pipe copy for it. The
-thesis in §5 was always that this is a *scheduling* win rather than a crypto one — the wall
-clock column says that is right, and the CPU column is what stops the softer claim being
-written down.
-
-**Connecting is our weak spot, and it is structural.** Spawning `ssh` costs a fork, an exec and
-OpenSSH's own configuration parsing before a packet moves — 0.5–0.9 s extra per connection at
-200 ms RTT, and 1.5–3.9× the CPU of an in-process handshake. The gap is widest where latency is
-lowest (2.1× against asyncssh at 5 ms, 1.2× at 200 ms), which is the signature of a fixed
-process-startup cost rather than an extra round trip. For connection-heavy workloads
-`ControlMaster` is not an optimisation, it is the fix.
-
-The ratios in the section above are this library measured against *itself*, which is a weaker
-kind of claim and is labelled as one. Nothing here is an unattributed "10× faster than
-paramiko": every figure names its link, its server, its versions and the benchmark that
-produced it, and that benchmark re-runs.
+- **Sustained SFTP throughput is bounded by bytes in flight, not by cryptography.** Outstanding
+  requests times request size, divided by the round-trip time. That is why this library pipelines
+  by default and why `sftp(1)`'s 64 requests of 32 KiB is the number the whole design argues with.
+- **The ceiling is OpenSSH's per-channel flow-control window, 2 MiB, and it is not ours to lift.**
+  It is enforced by the SSH transport one layer below anything here, so no amount of pipelining
+  exceeds it — see [Tunables](#tunables-and-what-they-default-to) for what that means for `depth`.
+  paramiko and asyncssh default to the same 2 MiB and *could* raise it; we cannot, and that is a
+  real cost of not implementing SSH rather than a detail.
 
 ## Tunables, and what they default to
 
@@ -1712,7 +1664,8 @@ packet limit is not refused — measured, `sftp-server` exits with no `STATUS` a
 stderr, and the connection dies mid-write. So the size is derived, not defaulted.
 
 **Why raising `depth` past 64 does nothing.** 64 × 255 KiB is what the client *issues*; what
-the connection can hold is the SSH channel window, which is 2 MiB (measured — see below).
+the connection can hold is the SSH channel window, which is 2 MiB — OpenSSH's
+`CHAN_SES_WINDOW_DEFAULT`, and measured to be the plateau in `benchmarks/README.md`.
 Issuing past the ceiling is deliberate, so that a server which clamps the request size still
 reaches it, but the bytes in flight are the window's business. More depth buys memory
 pressure. The thing that would buy throughput is a second connection.

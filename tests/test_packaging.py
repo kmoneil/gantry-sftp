@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -160,3 +161,113 @@ def test_the_readme_quotes_the_missing_ssh_hint_exactly_as_the_code_produces_it(
     produced = " ".join(missing_executable_hint("ssh", errno_value=errno.ENOENT).split())
     quoted = " ".join(readme.split())
     assert f"hint: {produced}" in quoted
+
+
+# --- No shipped document states a throughput figure (D-88) ----------------------------------
+
+# The multiplication sign is written as an escape rather than pasted: ruff's RUF001 is right
+# that the glyph is ambiguous with an `x` in source, and `re` reads the escape itself.
+THROUGHPUT_CLAIM_SHAPES = (
+    # "1.35x faster", "1.6-3.2 times slower", "1.2-1.6x worse"
+    r"\d+(?:\.\d+)?\s*(?:[\u00d7x]|times)\s*(?:faster|slower|better|worse)",
+    # an unquantified cross-library speed claim, which is the same marketing minus the number
+    r"(?:faster|slower)\s+than\s+(?:paramiko|asyncssh|scp|rsync|`?sftp\(1\)`?)",
+    # an absolute rate: "24.8 MiB/s", "100 Mbit/s"
+    r"\d+(?:\.\d+)?\s*(?:[MKG]i?B|[MKG]bit)\s*/\s*s",
+    # "3.2x paramiko"
+    r"\d+(?:\.\d+)?\s*[\u00d7x]\s*(?:paramiko|asyncssh)",
+)
+
+# A figure describing a *defect in someone else's* throughput, carrying the tracker item it was
+# read from, is evidence about a failure mode rather than a claim about our rate -- and it is the
+# form D-91's inventory asked for, since nobody complains in ratios: they report a cliff, a stall
+# or a hang. So a match is excused by a citation next to it, and by nothing else.
+CITATION = re.compile(r"(?:paramiko|asyncssh|fsspec)#\d+")
+
+
+def shipped_prose() -> list[Path]:
+    """Every document a user reads to learn what this library is. Three deliberate absences.
+
+    `benchmarks/` is the sanctioned home, so it is not scanned. Neither is `live-tests/`, for the
+    same reason one layer down: it is the lane that *produces* the pipelining figures, and a proof
+    may state what it measured -- both are excluded as measurement lanes rather than as documents.
+    CLAUDE.md is out because it is addressed to whoever changes the library rather than to whoever
+    uses it, and it quotes the banned shape on purpose, inside the rule that bans it.
+    """
+    return [
+        ROOT / "README.md",
+        *sorted((ROOT / "examples").rglob("*.md")),
+        *sorted((ROOT / "examples").rglob("*.py")),
+        *sorted((ROOT / "src").rglob("*.py")),
+    ]
+
+
+@pytest.mark.parametrize("document", shipped_prose(), ids=lambda path: path.name)
+def test_no_shipped_document_states_a_throughput_figure(document: Path):
+    """The rule this project could not follow while it was only about sourcing (D-88).
+
+    The old Docs Rule -- "performance claims are dated and sourced or they are not made" -- was
+    satisfied by every sentence that broke it: the README's longest section was throughput, and
+    the front screen led with ratios against both competitors, all of it correctly dated and
+    sourced. DESIGN 2.1 ranks a correctness gap above a throughput feature, so a shipped document
+    that leads with ratios argues against the thesis it opens with.
+
+    Relocation is the fix rather than deletion, and the other half of it is
+    `test_the_benchmark_report_keeps_the_rows_that_do_not_flatter_us`: a rule that only removed
+    figures would take the two that go the wrong way with them.
+    """
+    text = document.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    offences = []
+    for shape in THROUGHPUT_CLAIM_SHAPES:
+        for match in re.finditer(shape, text, re.IGNORECASE):
+            number = text[: match.start()].count("\n")
+            window = "\n".join(lines[max(0, number - 1) : number + 2])
+            if not CITATION.search(window):
+                offences.append(f"{document.name}:{number + 1}: {match.group(0)!r}")
+    assert not offences, (
+        "throughput figures belong in benchmarks/README.md and nowhere else (D-88): "
+        + "; ".join(offences)
+    )
+
+
+def without_typography(text: str) -> str:
+    """An `x` and a `-` for the glyphs, so this module's own source carries neither.
+
+    Normalising both sides is also the right strictness: the subject of the assertion below is
+    the claim, not its punctuation, and an en dash relaxing into a hyphen should not fail it.
+    """
+    return text.replace("\u00d7", "x").replace("\u2013", "-")
+
+
+def test_the_benchmark_report_keeps_the_rows_that_do_not_flatter_us():
+    """Relocated, not deleted -- and this is the half that decays quietly.
+
+    Moving the numbers out of the README could have been done by deleting them, and the result
+    would read better: what leaves with them is the connect cost, the CPU column, the small-file
+    upload loss and the clause forbidding an unattributed "10x faster than paramiko". A record
+    with only the wins in it is worse than the front-loading D-88 set out to fix, because the
+    honesty artifact and the wins are the same artifact. So the losses are pinned by content.
+    """
+    report = without_typography((ROOT / "benchmarks" / "README.md").read_text(encoding="utf-8"))
+    losses = (
+        "| connect and close | **1.2-1.4x slower** | **1.2-2.1x slower** |",
+        "**1.7-1.8x slower unshaped**",
+        "| CPU per MiB, download | about the same | **1.2-1.6x worse** |",
+        "**Connecting is our weak spot, and it is structural.**",
+        '"No cryptography in Python" does not become a CPU win.',
+        'Nothing here is an unattributed "10x faster than paramiko"',
+    )
+    missing = [row for row in losses if row not in report]
+    assert not missing, f"benchmarks/README.md dropped the rows that do not flatter us: {missing}"
+
+
+def test_the_readme_sends_a_reader_who_wants_numbers_somewhere_real():
+    """The pointer is the other half of the relocation, and a dangling one is worse than a ratio.
+
+    A reader who wants to know how fast this is has to be told where the figures went, by name,
+    or the effect of D-88 is that the question stopped being answered.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "benchmarks/README.md" in readme
+    assert (ROOT / "benchmarks" / "README.md").is_file()
