@@ -40,7 +40,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequen
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import TracebackType
 from typing import override
 
@@ -2642,6 +2642,7 @@ class Session:
                 said there were.
         """
         require_local_io("get()")
+        _check_local_path(local_path, method="get()")
         encoded = _encode_path(remote_path)
         requested_mode = resolve_mode(mode, caller="get()")
         with operation(session_logger, "get", remote=encoded, local=local_path) as record:
@@ -3262,6 +3263,7 @@ class Session:
             TransferError: If a transfer fails partway.
         """
         require_local_io("get_tree()")
+        _check_local_path(local_path, method="get_tree()")
         _check_tree_concurrency(concurrency, progress=progress, caller="get_tree")
         requested_mode = resolve_mode(mode, caller="get_tree()")
         destination = _ensure_directory(Path(local_path), parents=True)
@@ -3570,6 +3572,7 @@ class Session:
                 disagrees with the local file's.
         """
         require_local_io("put()")
+        _check_local_path(local_path, method="put()")
         target = _encode_path(remote_path)
         # Before the OPEN and before anything is sent, so a bad `mode=` costs no round trip and
         # no staging file. `PRESERVE` resolves here because this is where the local file is
@@ -4398,6 +4401,7 @@ class Session:
             TransferError: If a transfer fails partway.
         """
         require_local_io("put_tree()")
+        _check_local_path(local_path, method="put_tree()")
         _check_tree_concurrency(concurrency, progress=progress, caller="put_tree")
         root = _encode_path(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put_tree")
@@ -4883,6 +4887,36 @@ def _download_resume_offset(local_path: Path | str, size: int | None, remote_pat
     return have
 
 
+def _check_local_path(local_path: object, *, method: str) -> None:
+    """Refuse a local path that is not a ``Path`` or a ``str``, naming the argument (D-96).
+
+    **The mirror of the remote-path rule, and the two disagreed before this existed.** A
+    transfer takes one path of each kind, and passing ``bytes`` for the local one used to
+    reach four different endings: ``get`` accepted it and wrote the file, because POSIX
+    ``open`` takes bytes; ``put``, ``get_tree`` and ``put_tree`` raised ``pathlib``'s own
+    ``TypeError``, which names neither the method nor the argument. Accepted-here and
+    refused-there is the per-site decision nobody re-reads, so it is decided once: the
+    declared type is the accepted type.
+
+    ``bytes`` is called out specifically, since it is not a typo -- it is the *remote* rule
+    applied one argument over, and the fix is to say which side is which rather than which
+    type is wrong.
+
+    Raises:
+        TypeError: If ``local_path`` is neither ``Path`` nor ``str``.
+    """
+    if isinstance(local_path, Path | str):
+        return
+    kind = type(local_path).__name__
+    detail = (
+        "bytes is the rule for the *remote* path, which goes on the wire; a local path is "
+        "opened by this process"
+        if isinstance(local_path, bytes)
+        else "it is opened by this process, so it has to be something pathlib accepts"
+    )
+    raise TypeError(f"{method} needs a Path or str for its local path, not {kind}: {detail}")
+
+
 def _optional_path(path: bytes | str | None) -> bytes | None:
     """Encode a path that may be absent, keeping ``None`` distinct from an empty name."""
     return None if path is None else _encode_path(path)
@@ -4895,8 +4929,47 @@ def _encode_path(path: bytes | str) -> bytes:
     invalid UTF-8, was decoded leniently, and is now being sent again survives the round
     trip unchanged. Server-supplied names are frequently not valid UTF-8, and a client that
     cannot re-send what it was just given cannot operate on those files at all.
+
+    Anything else is refused here rather than by whatever it fails inside (D-96).
+
+    Raises:
+        TypeError: If ``path`` is neither ``bytes`` nor ``str``.
     """
-    return path if isinstance(path, bytes) else path.encode("utf-8", "surrogateescape")
+    if isinstance(path, bytes | str):
+        return path if isinstance(path, bytes) else path.encode("utf-8", "surrogateescape")
+    raise TypeError(_wrong_path_type(path))
+
+
+def _wrong_path_type(path: object) -> str:
+    r"""Explain a remote path that is not ``bytes`` or ``str``, and say why not a ``Path``.
+
+    **A ``Path`` gets its own sentence because it is the type callers actually pass**, and
+    because "unsupported" would be the wrong reason. ``pathlib`` is a type whose job is to
+    normalise, and a remote name has to survive byte for byte: ``PurePosixPath`` drops a
+    trailing slash on construction, and on Windows ``str(Path("/incoming/x"))`` is
+    ``'\\incoming\\x'`` -- which the server does not refuse, because a backslash is a legal
+    character in a POSIX filename. It would create a file *named* ``\\incoming\\x``. So a
+    silent ``os.fsencode`` here would be a data-placement bug wearing a convenience's clothes.
+
+    The asymmetry is named too. ``get``/``put`` take a ``Path`` for their **local** side, so a
+    caller who has just written one is not confused about ``pathlib`` -- they are one argument
+    out on a rule nothing had ever stated.
+    """
+    kind = type(path).__name__
+    if isinstance(path, PurePath):
+        return (
+            f"a remote path must be bytes or str, not {kind}: pathlib normalises and a remote "
+            f"name has to survive byte for byte -- a trailing slash goes on construction, and "
+            f"str(Path(...)) on Windows renders separators as backslashes, which a server takes "
+            f"as part of the filename rather than as separators. Pass str(path) if it really is "
+            f"posix-shaped, or the bytes the server gave you. The local side of get()/put() is "
+            f"the argument that takes a Path"
+        )
+    return (
+        f"a remote path must be bytes or str, not {kind}: it goes on the wire as bytes, and "
+        f"str is encoded with surrogateescape so a name the server sent can be sent back "
+        f"unchanged"
+    )
 
 
 def _strip_dot_prefix(path: bytes) -> bytes:

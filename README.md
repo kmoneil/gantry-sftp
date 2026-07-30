@@ -91,6 +91,7 @@ test that proves it, because a prevention claim without a test is a rumour.
 | Two legal remote names silently becoming one local file | the collision check asks the filesystem for identity rather than folding the name, so Unicode normalisation and Windows trailing dots come free | `tests/test_localpath.py` |
 | A resume that adopts the wrong bytes | a partial that cannot be a prefix is refused, and `resume_check` reports what was actually proven rather than that something was | `tests/test_resume.py`, `tests/test_content_verification.py` |
 | A `UnicodeDecodeError` on somebody else's filename | bytes end to end: `DirEntry.filename` is bytes, every `Session` method takes `bytes` or `str`, `realpath` returns bytes, and the decode question is decided once on the download side | `tests/test_listing.py` |
+| A `Path` silently becoming `\incoming\data.csv` on the server | a remote path is `bytes` or `str` and a `Path` is refused by name — `pathlib` drops a trailing slash and renders separators as backslashes on Windows, and a backslash is a legal character in a POSIX filename, so the server would create it rather than refuse it | `tests/test_path_types.py` |
 | A transfer that hangs with nothing to escape it | a deadline on every wait, including the send and including the wait for the send lock | `tests/test_send_deadline.py`, `tests/test_cancellation.py` |
 
 **Two of those are the incumbent's open bugs rather than hypotheticals** (counts read from the
@@ -607,6 +608,32 @@ file from the target would make it predictable for every file at once, which is 
 the generated name exists to prevent, so the combination is refused rather than quietly
 downgraded. Resuming an upload therefore means resuming the destination files themselves, and a
 consumer polling the directory can see a partial file while it happens.
+
+## Two kinds of path
+
+One transfer takes one of each, and the rule is different on each side:
+
+```python
+await sftp.get("/incoming/data.csv", Path("downloads/data.csv"))
+#              ^ remote: bytes or str              ^ local: Path or str
+```
+
+A **remote** path is `bytes` or `str`. It goes on the wire as bytes, and a `str` is encoded with
+`surrogateescape` so a name the server sent — which is frequently not valid UTF-8 — can be sent
+straight back. A **local** path is a `Path` or a `str`, because it is opened by this process.
+
+**A `Path` for the remote side is refused, and that is deliberate rather than unimplemented.**
+`pathlib` normalises, and a remote name has to survive byte for byte:
+
+- `PurePosixPath("/incoming/")` is `PurePosixPath('/incoming')` — the trailing slash is gone
+  before the library ever sees it;
+- `str(Path("/incoming/data.csv"))` on **Windows** is `'\incoming\data.csv'`, and a backslash is
+  a perfectly legal character in a POSIX filename. The server would not refuse it. You would get
+  a file *named* `\incoming\data.csv`, in whatever directory the session started in.
+
+So the refusal is a `TypeError` naming the rule, not an `os.fsencode` that looks like a
+convenience. Pass `str(path)` when the path really is posix-shaped, or the bytes the server gave
+you.
 
 ## Listing
 
