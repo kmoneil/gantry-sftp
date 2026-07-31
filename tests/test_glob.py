@@ -21,7 +21,13 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from gantry_sftp.exceptions import CapabilityError, UnsafePathError
+from gantry_sftp.exceptions import (
+    CapabilityError,
+    NoSuchFileError,
+    PermissionDeniedError,
+    ServerError,
+    UnsafePathError,
+)
 from gantry_sftp.session import open_session
 from gantry_sftp.session._glob import (
     RECURSIVE,
@@ -507,3 +513,89 @@ async def test_nothing_matching_is_an_empty_result_rather_than_an_error():
         assert await matches(sftp, b"/root/*.parquet") == []
         # A directory in the middle of the pattern that does not exist matches nothing too.
         assert await matches(sftp, b"/root/absent/*.csv") == []
+
+
+# --- the third state, for the half of the feature that has no wildcard in it -------------------
+#
+# D-102. `_glob_literal` caught `(NoSuchFileError, ServerError)` -- and `NoSuchFileError` *is* a
+# `ServerError`, so the second element swallowed every other status. Both tests below passed
+# vacuously before the fix, returning `[]`, and both fail against the code as it stood.
+#
+# The asymmetry that made it invisible: the wildcard branch (`_glob_listing`) has always been
+# correct and documents refusing exactly this, so `glob("/closed/*.txt")` raised while
+# `glob("/closed/secret.txt")` answered "no matches". Whether the caller's pattern happened to
+# contain a `*` decided which answer they got, which is why both spellings are asserted here.
+
+
+async def test_a_literal_pattern_does_not_report_permission_denied_as_no_match(tmp_path: Path):
+    """A refusal to answer must not arrive as an answer of "there is nothing there".
+
+    The consequence is the one `test_permission_denied_is_not_false` names for the predicates:
+    a caller that reads an empty glob as absence creates over a file it could not see. For a
+    mirror or a sync built on `glob`, it is a silently incomplete copy reported as a complete
+    one -- the shape this library refuses everywhere else.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    closed = tmp_path / "closed"
+    closed.mkdir()
+    (closed / "secret.txt").write_bytes(b"payload")
+    closed.chmod(0o000)
+    try:
+        async with (
+            open_local_server_transport(cwd=tmp_path) as transport,
+            open_session(transport) as sftp,
+        ):
+            inside = os.fsencode(str(closed / "secret.txt"))
+
+            with pytest.raises(PermissionDeniedError) as denied:
+                _ = await matches(sftp, inside)
+            assert denied.value.args[0] == "server returned PERMISSION_DENIED: Permission denied"
+            assert denied.value.path == inside
+
+            # The wildcard branch has always been right. Asserted beside it so the two halves
+            # of one feature cannot drift apart again without a test noticing.
+            with pytest.raises(PermissionDeniedError):
+                _ = await matches(sftp, os.fsencode(str(closed)) + b"/*.txt")
+    finally:
+        closed.chmod(0o755)
+
+
+async def test_a_literal_pattern_does_not_report_an_overlong_name_as_no_match(tmp_path: Path):
+    """`ENAMETOOLONG` arrives as `BAD_MESSAGE`, which is a bare `ServerError`.
+
+    The second status the old catch swallowed, and the one that shows the width of it: a
+    `ServerError` that is *not* about existence at all reads as "matches nothing". `glob` has
+    no `Skipped` channel, so nothing anywhere recorded that the question went unanswered.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    too_long = os.fsencode(str(tmp_path / ("n" * 4096)))
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(ServerError) as refused:
+            _ = await matches(sftp, too_long)
+        assert refused.value.args[0] == "server returned BAD_MESSAGE: Bad message"
+        assert not isinstance(refused.value, NoSuchFileError)
+
+
+async def test_a_literal_pattern_that_is_merely_absent_still_matches_nothing(tmp_path: Path):
+    """The state the catch was right about, kept from being fixed away.
+
+    `NO_SUCH_FILE` stays an empty result: a pattern matching nothing is the ordinary case, and
+    a literal pattern is still a pattern. Narrowing the `except` must not turn that into an
+    error -- which is the regression a fix for the two tests above would most plausibly cause.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        assert await matches(sftp, os.fsencode(str(tmp_path / "absent.csv"))) == []

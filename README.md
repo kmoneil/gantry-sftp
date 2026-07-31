@@ -634,10 +634,12 @@ applies it to `ls` and not to `get`, so there is no consistent behaviour to copy
 Matching runs on **bytes**, because a remote name need not be valid UTF-8 and a lossy decode
 makes two distinct names match one pattern. Symlinks match but are never descended into, the
 same as in `walk`. Nothing is accumulated, since matches are yielded as they are found, so it is an
-async generator and you close it, exactly as with `walk`. A directory in the pattern's path that
-does not exist matches nothing; one that exists and **cannot be read** raises, which is a
-deliberate divergence from `glob(3)`: answering "no matches" when the truth is "I was not
-allowed to look" is a partial success wearing a complete one's clothes.
+async generator and you close it, exactly as with `walk`. A path in the pattern that does not
+exist matches nothing; one that exists and **cannot be read** raises, which is a deliberate
+divergence from `glob(3)`: answering "no matches" when the truth is "I was not allowed to look"
+is a partial success wearing a complete one's clothes. That holds for a directory the pattern
+descends through *and* for a pattern with no wildcard in it at all — only `NO_SUCH_FILE` is an
+empty result, and a refusal to answer never is.
 
 Runnable: `examples/glob_patterns.py`.
 

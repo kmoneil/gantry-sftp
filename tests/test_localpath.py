@@ -13,12 +13,14 @@ matters is not the one CI runs on -- the same arrangement ``resolve_ssh_executab
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from gantry_sftp.codec import Times
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session import (
     WINDOWS_RESERVED_NAMES,
@@ -29,6 +31,7 @@ from gantry_sftp.session import (
     local_child,
     unsafe_reason,
 )
+from gantry_sftp.session._session import _chmod_local_directories, _stamp_local_directories
 
 # --- names that must never become a filename ----------------------------------------------
 
@@ -284,3 +287,68 @@ def test_the_ledger_says_how_much_it_is_holding(tmp_path: Path):
     assert repr(ledger) == "<DestinationLedger 0 claimed>"
     ledger.claim(written, b"/root/a.csv")
     assert repr(ledger) == "<DestinationLedger 1 claimed>"
+
+
+# --- the metadata pass, which runs long after the containment check ----------------------------
+#
+# D-102. `get_tree` collects each walked directory's times and mode from its *parent's* listing
+# and applies them after the whole walk, because writing a file into a directory dirties its
+# mtime and a directory created `0o500` cannot be written into at all. So the containment check
+# that cleared the path is minutes old by the time the stamp lands, and a local attacker has had
+# the entire transfer to swap the directory for a symlink -- the same race `_chmod_local` has
+# always re-applied `O_NOFOLLOW` against for *files*. The directory pass was reaching for
+# `os.utime(path, ...)` and `Path.chmod`, which both follow one.
+#
+# `check_contained` cannot catch this and is not meant to: it resolved a path that was innocent
+# when it was asked. These two are the descriptor-level defence behind it.
+
+
+def test_stamping_a_directory_that_became_a_symlink_does_not_follow_it(tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.utime(outside, (1_000_000_000, 1_000_000_000))
+    before = outside.stat().st_mtime_ns
+
+    destination = tmp_path / "dest"
+    destination.mkdir()
+    swapped = destination / "reports"
+    swapped.symlink_to(outside, target_is_directory=True)
+
+    # Swallowed per directory, exactly as an unwritable destination is: the files are the
+    # payload and they have all arrived, so a timestamp that could not be set is not a reason
+    # to fail a completed download. The point is that it is not *redirected*.
+    _stamp_local_directories([(swapped, Times(atime=1_600_000_007, mtime=1_600_000_000))])
+
+    assert outside.stat().st_mtime_ns == before, "utime followed the link out of the destination"
+
+
+def test_chmodding_a_directory_that_became_a_symlink_does_not_follow_it(tmp_path: Path):
+    """The more dangerous half: a followed link puts the remote tree's bits on another file."""
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    outside.chmod(0o755)
+
+    destination = tmp_path / "dest"
+    destination.mkdir()
+    swapped = destination / "reports"
+    swapped.symlink_to(outside, target_is_directory=True)
+
+    _chmod_local_directories([(swapped, 0o700)])
+
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755, (
+        "chmod followed the link out of the destination"
+    )
+
+
+def test_an_ordinary_directory_is_still_stamped_and_chmodded(tmp_path: Path):
+    """The behaviour the two above must not have cost, or the fix broke `preserve_times`."""
+    ordinary = tmp_path / "sub"
+    ordinary.mkdir()
+
+    _stamp_local_directories([(ordinary, Times(atime=1_600_000_007, mtime=1_600_000_000))])
+    _chmod_local_directories([(ordinary, 0o750)])
+
+    status = ordinary.stat()
+    assert int(status.st_mtime) == 1_600_000_000
+    assert int(status.st_atime) == 1_600_000_007
+    assert stat.S_IMODE(status.st_mode) == 0o750

@@ -3095,7 +3095,10 @@ class Session:
 
         Args:
             pattern: The pattern, absolute or relative. A pattern with no magic in it is a
-                path, and yields one match if it exists and nothing if it does not.
+                path, and yields one match if it exists and nothing if it does not -- with
+                "does not exist" meaning ``NO_SUCH_FILE`` specifically, not any refusal to
+                answer. A server that will not stat it raises, the same as for a directory
+                the pattern reached; see ``Raises``.
             max_depth: How far ``**`` may descend below the point it appears, or ``None`` for
                 no limit. Ignored by a pattern that does not use ``**``, since every other
                 component consumes exactly one level. The bound exists because an infinite tree
@@ -3127,14 +3130,20 @@ class Session:
             UnsafePathError: If the server sends a name that cannot be one path component.
             CapabilityError: If ``pattern`` is relative and this server's default directory is
                 not rooted at ``/``, so joining would build paths it does not mean.
-            ServerError: If the server refuses a listing of a directory the pattern reached.
-                A directory that does not exist is **not** an error -- it matches nothing, the
-                same as a name that does not match. **This is a deliberate divergence from**
-                ``glob(3)``, which passes no error function and therefore skips a directory it
-                cannot read: silently, and indistinguishably from that directory being empty.
-                A glob that answers "no matches" when it means "I was not allowed to look" is
-                the shape of partial success this library refuses everywhere else, so an
-                unreadable directory in the pattern's path is raised rather than swallowed.
+            ServerError: If the server refuses a listing of a directory the pattern reached,
+                **or refuses to stat a wholly literal pattern**. Only ``NO_SUCH_FILE`` is
+                swallowed, and only into an empty result: a path that does not exist matches
+                nothing, the same as a name that does not match. **This is a deliberate
+                divergence from** ``glob(3)``, which passes no error function and therefore
+                skips what it cannot read: silently, and indistinguishably from it being
+                empty. A glob that answers "no matches" when it means "I was not allowed to
+                look" is the shape of partial success this library refuses everywhere else.
+
+                Both halves of the pattern space, and that is D-102 rather than a restatement:
+                until 0.11 the literal half caught every ``ServerError`` and answered "no
+                matches" to ``PERMISSION_DENIED`` and to the ``BAD_MESSAGE`` an over-long name
+                arrives as. Whether the caller's pattern happened to contain a ``*`` decided
+                which of two opposite answers they got.
         """
         encoded = self._resolve(pattern)
         await self._require_rooted_paths(encoded, feature="globbing")
@@ -3163,10 +3172,19 @@ class Session:
         what the matching path does for every other component; and a missing path is ``None``
         rather than an error, because a pattern matching nothing is the ordinary case and a
         literal pattern is still a pattern.
+
+        **Through :meth:`_attrs_or_absent` rather than round its own ``except``**, which is the
+        whole of the fix for D-102. This used to catch ``(NoSuchFileError, ServerError)`` -- and
+        ``NoSuchFileError`` *is* a ``ServerError``, so the second element swallowed every other
+        status too. A file the caller was not allowed to stat came back as "matches nothing",
+        and so did a name that was merely too long. That is the divergence from ``glob(3)``
+        that :meth:`_glob_listing` documents refusing, three methods below, for the wildcard
+        half of the same feature: a glob answering "no matches" when it means "I was not
+        allowed to look" is a partial success wearing a complete one's clothes. Whether the
+        caller's pattern happened to contain a ``*`` decided which answer they got.
         """
-        try:
-            attributes = await self.lstat(path)
-        except (NoSuchFileError, ServerError):
+        attributes = await self._attrs_or_absent(path, follow_symlinks=False)
+        if attributes is None:
             return None
         entry = DirEntry(filename=path.rpartition(b"/")[2], longname=b"", attrs=attributes)
         if directories_only and entry_kind(attributes) is not EntryKind.DIRECTORY:
@@ -4986,6 +5004,28 @@ def _chmod_local(path: Path | str, mode: int, *, no_follow: bool) -> None:
         os.close(fd)
 
 
+def _stamp_local(path: Path | str, times: Times) -> None:
+    """Apply times to a local directory that is already complete, without following a link.
+
+    The mirror of :func:`_chmod_local`, and it exists for the same reason: this pass runs
+    *after* the walk that containment-checked the path, so the check is old by the time the
+    stamp lands and a local attacker has had the whole transfer to swap the directory for a
+    symlink. ``os.utime`` on a path follows one; on a descriptor opened ``O_NOFOLLOW`` there
+    is nothing left to follow.
+
+    The descriptor form rather than ``follow_symlinks=False`` because that is what
+    :func:`~gantry_sftp.session.require_local_io` already guarantees -- it probes
+    ``os.utime in os.supports_fd`` -- and it is the shape ``session/_platform.py`` describes
+    for stamping metadata generally. ``os.supports_follow_symlinks`` is a separate probe this
+    library does not make, so relying on it would be a third capability to degrade.
+    """
+    fd = os.open(path, os.O_RDONLY | NO_FOLLOW)
+    try:
+        os.utime(fd, (times.atime, times.mtime))
+    finally:
+        os.close(fd)
+
+
 def _stamp_local_directories(entries: Sequence[tuple[Path, Times]]) -> None:
     """Apply remote directory times locally, once everything inside them has been written.
 
@@ -4997,10 +5037,14 @@ def _stamp_local_directories(entries: Sequence[tuple[Path, Times]]) -> None:
     A failure is swallowed per directory. The files are the payload and they have all arrived;
     a directory whose timestamp could not be set -- because the destination is read-only to us,
     or on a filesystem that will not take one -- is not a reason to fail a completed download.
+    **A directory that is now a symlink lands in that same swallow** (``O_NOFOLLOW`` answers
+    ``ELOOP``, an ``OSError``), which is the right end for it: the timestamp is metadata on a
+    tree whose files have all arrived, so refusing to stamp costs nothing, while following the
+    link would put the transfer's mtime on a file outside the destination.
     """
     for path, times in entries:
         with suppress(OSError):
-            os.utime(path, (times.atime, times.mtime))
+            _stamp_local(path, times)
 
 
 def _chmod_local_directories(entries: Sequence[tuple[Path, int]]) -> None:
@@ -5015,10 +5059,17 @@ def _chmod_local_directories(entries: Sequence[tuple[Path, int]]) -> None:
     the files are the payload and they have all arrived. That is the opposite of what a *file*'s
     mode does, which fails the transfer, and the difference is that a file's mode is what the
     caller asked to control while a directory's is carried along with it.
+
+    Through :func:`_chmod_local` rather than ``Path.chmod``, which follows a symlink -- the same
+    correction :func:`_stamp_local` carries and for the same reason, and the more dangerous half
+    of the pair: a followed link puts the remote tree's permission bits on a file outside the
+    destination, where ``0o777`` on the wrong target is a durable change rather than a cosmetic
+    one. ``_chmod_local`` is the function the *file* path has always used for this; only the
+    directory pass was reaching for the path-based call.
     """
     for path, mode in entries:
         with suppress(OSError):
-            path.chmod(mode)
+            _chmod_local(path, mode, no_follow=True)
 
 
 def _download_resume_offset(local_path: Path | str, size: int | None, remote_path: bytes) -> int:
