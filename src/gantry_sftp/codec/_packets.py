@@ -835,15 +835,15 @@ def encode(packet: Packet) -> bytes:
         packet: The packet to encode.
 
     Returns:
-        Bytes ready to hand to a transport. The result of feeding these to a
+        Bytes ready to hand to a transport, in a single allocation -- a WRITE's payload is
+        copied once, into the returned frame. The result of feeding these to a
         :class:`~gantry_sftp.codec.FrameSplitter` is a frame that :func:`decode` turns back
         into an equal packet.
     """
     writer = WireWriter()
     writer.write_uint8(packet.packet_type)
     packet.encode_body(writer)
-    body = writer.getvalue()
-    return len(body).to_bytes(4, "big") + body
+    return writer.frame()
 
 
 def decode(frame: memoryview | bytes) -> Packet:

@@ -212,7 +212,8 @@ exists today:
   from a real server. Every one of the 27 carries a byte-level fixture asserted in both
   directions, which is a stronger claim than a round trip, because a round trip agrees with
   any consistently wrong layout
-- wire primitives and an incremental frame splitter, so no frame payload is ever copied
+- wire primitives and an incremental frame splitter, so a payload is never copied on the way in
+  and is copied exactly once on the way out — straight into the frame handed to the transport
 - the client state machine: handshake, deterministic request-id allocation, and
   request/response correlation that survives out-of-order replies
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
@@ -770,7 +771,9 @@ finally:
 
 `read_at(handle, offset, length)` returns `bytes`; `readinto_at(handle, buffer, offset)` fills a
 buffer you already own and is the zero-copy form; `write_at(handle, offset, data)` is the other
-direction. Reads at an explicit offset are idempotent and safe to fan out. Writes are not
+direction, and takes a `memoryview` without materialising it — the payload is copied once, into
+the outgoing frame, which is the floor for a send. Reads at an explicit offset are idempotent
+and safe to fan out. Writes are not
 retried and never will be blindly, because two tasks writing the same range is a race no client can
 arbitrate, exactly as with two processes and `pwrite`.
 

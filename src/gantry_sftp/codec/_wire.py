@@ -127,19 +127,34 @@ class WireReader:
 class WireWriter:
     """Incremental builder for a frame body.
 
-    Requests are small and structural, so this builds into a ``bytearray``. Bulk payloads
-    do not go through here: a WRITE's data is appended as a single buffer rather than
-    being copied field by field.
+    The writer keeps the pieces it is given and joins them once, into a buffer of exactly
+    the right size, when the caller asks for the result. Nothing is copied on the way in.
+    That is what makes the ``memoryview``-end-to-end rule true on the *send* side as well
+    as the receive side: a WRITE's payload is copied exactly once, straight into the frame
+    that goes to the transport (D-112). Building into a ``bytearray`` instead copied every
+    uploaded byte three times -- into the builder, again to materialise it, and again to
+    put the length prefix in front.
+
+    One copy is the floor without handing the transport a header and a payload as two
+    separate buffers, which is an interface change this does not need; see D-112 for the
+    measurement that decided against it.
+
+    **The writer does not own what it is handed.** A buffer written here is referenced,
+    not copied, until :meth:`getvalue` or :meth:`frame` materialises it, so a caller must
+    not mutate a buffer in between. Encoding is synchronous and materialises immediately,
+    so the window is one function call wide -- but it is a window, and it did not exist
+    when this copied on the way in.
     """
 
-    __slots__ = ("_buf",)
+    __slots__ = ("_chunks", "_size")
 
     def __init__(self) -> None:
-        self._buf = bytearray()
+        self._chunks: list[bytes | memoryview] = []
+        self._size = 0
 
     def __len__(self) -> int:
         """Bytes written so far."""
-        return len(self._buf)
+        return self._size
 
     def write_uint8(self, value: int) -> None:
         """Append an unsigned byte.
@@ -149,7 +164,8 @@ class WireWriter:
         """
         if not 0 <= value <= _UINT8_MAX:
             raise ValueError(f"uint8 out of range: {value}")
-        self._buf.append(value)
+        self._chunks.append(value.to_bytes(1, "big"))
+        self._size += 1
 
     def write_uint32(self, value: int) -> None:
         """Append a big-endian 32-bit unsigned integer.
@@ -159,7 +175,8 @@ class WireWriter:
         """
         if not 0 <= value <= _UINT32_MAX:
             raise ValueError(f"uint32 out of range: {value}")
-        self._buf += value.to_bytes(4, "big")
+        self._chunks.append(value.to_bytes(4, "big"))
+        self._size += 4
 
     def write_uint64(self, value: int) -> None:
         """Append a big-endian 64-bit unsigned integer.
@@ -169,11 +186,13 @@ class WireWriter:
         """
         if not 0 <= value <= _UINT64_MAX:
             raise ValueError(f"uint64 out of range: {value}")
-        self._buf += value.to_bytes(8, "big")
+        self._chunks.append(value.to_bytes(8, "big"))
+        self._size += 8
 
     def write_bytes(self, value: bytes | memoryview) -> None:
         """Append raw bytes with no length prefix."""
-        self._buf += value
+        self._chunks.append(value)
+        self._size += len(value)
 
     def write_string(self, value: bytes | memoryview) -> None:
         """Append a length-prefixed binary string.
@@ -182,8 +201,22 @@ class WireWriter:
             ValueError: If ``value`` is longer than a ``uint32`` length can describe.
         """
         self.write_uint32(len(value))
-        self._buf += value
+        self._chunks.append(value)
+        self._size += len(value)
 
     def getvalue(self) -> bytes:
-        """Return the accumulated body."""
-        return bytes(self._buf)
+        """Return the accumulated body, in a single allocation."""
+        return b"".join(self._chunks)
+
+    def frame(self) -> bytes:
+        """Return the body behind its ``uint32`` length prefix, in a single allocation.
+
+        The prefix is the body's length, which the writer already knows -- so a frame needs
+        no size calculation per packet type and no second pass over what has been written.
+
+        Raises:
+            OverflowError: If the body is longer than a ``uint32`` length can describe. No
+                single field can reach that -- :meth:`write_string` refuses first -- so it
+                takes a packet built from billions of fields to get here.
+        """
+        return b"".join([self._size.to_bytes(4, "big"), *self._chunks])

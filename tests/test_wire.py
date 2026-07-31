@@ -74,6 +74,84 @@ def test_mixed_sequence_round_trips_in_order(values: list[tuple[str, int | bytes
     assert r.at_end
 
 
+# --- the running size, and the frame derived from it -------------------------------------
+
+
+@given(values=st.lists(field_values, max_size=30))
+def test_the_running_size_is_the_length_of_what_was_written(
+    values: list[tuple[str, int | bytes]],
+):
+    # `frame()` takes its length prefix from this counter rather than from the joined bytes,
+    # so a field that adds the wrong amount writes a legal frame with a wrong prefix -- which
+    # is a desynchronised stream rather than a parse error, and shows up at the *next* packet.
+    w = WireWriter()
+    for kind, value in values:
+        FIELD_CODECS[kind][0](w, value)
+    assert len(w) == len(w.getvalue())
+
+
+@given(values=st.lists(field_values, max_size=30))
+def test_a_frame_is_its_body_behind_a_uint32_length(values: list[tuple[str, int | bytes]]):
+    w = WireWriter()
+    for kind, value in values:
+        FIELD_CODECS[kind][0](w, value)
+    body = w.getvalue()
+    assert w.frame() == len(body).to_bytes(4, "big") + body
+
+
+def test_an_empty_frame_is_a_zero_length_and_nothing_else():
+    assert WireWriter().frame() == b"\x00\x00\x00\x00"
+    assert WireWriter().getvalue() == b""
+    assert len(WireWriter()) == 0
+
+
+def test_write_bytes_appends_without_a_length_prefix():
+    # Used by DATA and EXTENDED_REPLY, whose payload runs to the end of the frame and
+    # therefore carries no length of its own.
+    w = WireWriter()
+    w.write_uint8(1)
+    w.write_bytes(b"tail")
+    assert w.getvalue() == b"\x01tail"
+    assert len(w) == 5
+
+
+# --- what "no copy on the way in" means, stated as behaviour -----------------------------
+
+
+def test_the_writer_references_a_buffer_rather_than_copying_it():
+    # This is the observable form of the memoryview-end-to-end rule on the send side, not a
+    # feature: a payload handed to the writer is not copied until the frame is materialised,
+    # which is what makes an upload cost one copy per byte instead of three (D-112). It is
+    # pinned because the cheap "fix" for the aliasing it implies is to copy on the way in,
+    # which would silently put the two extra passes back.
+    buffer = bytearray(b"before")
+    w = WireWriter()
+    w.write_string(buffer)
+    buffer[0:6] = b"after!"
+    assert bytes(WireReader(w.getvalue()).read_string()) == b"after!"
+
+
+def test_materialising_twice_gives_the_same_bytes():
+    # The join is not destructive: `getvalue()` and `frame()` can each be called more than
+    # once, and calling one does not consume what the other would return.
+    w = WireWriter()
+    w.write_uint32(7)
+    w.write_string(b"path")
+    assert w.getvalue() == w.getvalue()
+    assert w.frame() == w.frame()
+    assert w.frame()[4:] == w.getvalue()
+
+
+@given(value=st.binary(max_size=512))
+def test_a_memoryview_field_encodes_exactly_as_the_bytes_spelling(value: bytes):
+    # A caller's buffer reaches the wire as a view; that must not change a single byte of
+    # what the wire sees.
+    as_bytes, as_view = WireWriter(), WireWriter()
+    as_bytes.write_string(value)
+    as_view.write_string(memoryview(value))
+    assert as_view.frame() == as_bytes.frame()
+
+
 # --- non-UTF-8 is normal, not exceptional ----------------------------------------------
 
 

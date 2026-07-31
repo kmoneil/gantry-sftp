@@ -56,6 +56,11 @@ from gantry_sftp.codec import (
 from gantry_sftp.codec._packets import _DECODERS
 from gantry_sftp.exceptions import ProtocolError
 
+# The codec neither knows nor needs this -- it is what `session/` will actually put in a
+# WRITE by default, imported rather than restated so the bulk-payload cases below keep
+# tracking the real one if it moves.
+from gantry_sftp.session._limits import PREFERRED_WRITE_LENGTH
+
 
 def decode_frame(wire: bytes):
     """Round a full frame through the splitter, the way a transport would."""
@@ -300,6 +305,38 @@ def test_golden_decode(packet, wire: bytes):
 @pytest.mark.parametrize(("packet", "wire"), GOLDEN)
 def test_golden_length_prefix_matches_body(packet, wire: bytes):
     assert int.from_bytes(wire[:4], "big") == len(wire) - 4
+
+
+# --- the bulk payload, which is the case the copy-free rule is about ---------------------
+
+
+@pytest.mark.parametrize("size", [0, 1, 7, 4096, PREFERRED_WRITE_LENGTH])
+def test_a_write_frames_a_bulk_payload_at_every_interesting_size(size: int):
+    # `encode` derives the length prefix from a running count rather than from the joined
+    # body (D-112), so the sizes that matter are the ones where an off-by-one in that count
+    # would still produce a parseable frame. A prefix short by one desynchronises the stream
+    # at the *next* packet, which is the failure this library's reassembler exists to
+    # prevent, so it is asserted here rather than left to a round trip.
+    payload = bytes(range(256)) * (size // 256) + bytes(range(size % 256))
+    frame = encode(Write(request_id=9, handle=b"\x00\x00\x00\x01", offset=1 << 40, data=payload))
+
+    assert int.from_bytes(frame[:4], "big") == len(frame) - 4
+    assert len(frame) == 4 + 1 + 4 + 4 + 4 + 8 + 4 + size  # prefix, type, id, handle, offset
+    decoded = decode_frame(frame)
+    assert isinstance(decoded, Write)
+    assert decoded.data == payload
+    assert decoded.offset == 1 << 40
+
+
+@pytest.mark.parametrize("size", [0, 1, 7, 4096, PREFERRED_WRITE_LENGTH])
+def test_a_write_payload_encodes_the_same_as_bytes_or_as_a_memoryview(size: int):
+    # `Write.data` accepts a view so a caller's buffer reaches the wire without being
+    # materialised first. The two spellings must not differ by a byte.
+    payload = bytes(range(256)) * (size // 256) + bytes(range(size % 256))
+    common = {"request_id": 9, "handle": b"\x00\x00\x00\x01", "offset": 1 << 40}
+    assert encode(Write(data=memoryview(payload), **common)) == encode(
+        Write(data=payload, **common)
+    )
 
 
 # --- SYMLINK: the field order that contradicts the specification ------------------------
