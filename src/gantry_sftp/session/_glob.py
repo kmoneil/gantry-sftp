@@ -39,6 +39,16 @@ nothing to blow up.
   could not return a match set even in principle. See :mod:`gantry_sftp.session._session`.
 - **Case-insensitive matching of non-ASCII bytes.** Folding is ASCII-only, because a remote
   name is bytes of unknown encoding and folding UTF-8 by byte is simply wrong.
+
+**Not supported and not yet decided, which is a different thing (D-106).** POSIX bracket
+sub-expressions -- character classes ``[[:digit:]]``, equivalence classes ``[[=a=]]`` and
+collating symbols ``[[.a.]]`` -- are supported by ``glob(3)`` and implemented here not at all.
+``glob("*.[[:digit:]]")` matches **nothing** rather than every digit, silently, against a
+spelling that works in `sftp(1)` today. That is a gap rather than one of the decisions above:
+the three entries in this list are declined for reasons that do not transfer -- brace expansion
+is a BSD/glibc extension, whereas this is in the POSIX standard named in the first line of this
+docstring. Found by the libc differential fuzz in ``tests/test_glob.py``, which excludes them
+with a comment naming the card and starts failing the moment they are implemented.
 """
 
 from __future__ import annotations
@@ -243,8 +253,16 @@ def _match_class(pattern: bytes, start: int, byte: int, *, case_sensitive: bool)
 
     Returns:
         The index just past the closing ``]``, or ``None`` if the byte did not match. An
-        unterminated ``[`` is not an error: it is a literal ``[``, which is what ``glob(3)``
-        does and what any caller who globbed a filename containing a bracket expects.
+        unterminated ``[`` is not an error: it is a literal ``[``, which is what any caller who
+        globbed a filename containing a bracket expects.
+
+    Note:
+        That used to read "which is what ``glob(3)`` does", and **glibc has no single answer to
+        match**: an unterminated ``[`` is undefined in POSIX, and measured against glibc's
+        ``fnmatch(3)``, ``[abc`` matches ``[abc`` literally while ``[*-`` matches nothing. So
+        this is our decision, taken because it is the predictable one, rather than the
+        reference's behaviour copied. The differential fuzz in ``tests/test_glob.py`` excludes
+        unterminated classes for exactly this reason and says so.
     """
     p = start + 1
     negated = p < len(pattern) and pattern[p] in _NEGATE

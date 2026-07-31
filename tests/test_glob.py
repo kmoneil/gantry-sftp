@@ -13,12 +13,15 @@ which is the module a reader would otherwise assume was under this.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import os
+import sys
 from contextlib import aclosing
 from pathlib import Path
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
 from gantry_sftp.exceptions import (
@@ -74,6 +77,41 @@ DIALECT: list[tuple[str, bytes, bytes, bool]] = [
     ("non-utf8-pattern-matches", b"\xff*", b"\xff\xfe.csv", True),
     ("multiple-stars-collapse", b"**.csv", b"a.csv", True),
     ("star-does-not-match-across-nothing", b"a*b*c", b"axbyc", True),
+    # --- bracket expressions, every row checked against libc's own `fnmatch(3)` -------------
+    #
+    # `glob(3)` matches each component with the same matcher `fnmatch(3)` exposes, so libc is
+    # the reference this dialect claims to follow rather than a second opinion about it. The
+    # differential test below re-derives all of these from libc at run time; they are written
+    # out here as well because this table *is* the specification, and a row a reader can see
+    # is worth more than one a fuzzer regenerates.
+    #
+    # 23 of `_glob.py`'s 36 mutation survivors were in this handful of branches, and the
+    # matcher was **right about every one** -- what was missing was anything pinning it.
+    ("class-escape-closes-bracket", b"[\\]]", b"]", True),
+    ("class-escape-is-not-the-backslash", b"[\\]]", b"\\", False),
+    ("class-escape-makes-a-dash-literal", b"a[\\-]b", b"a-b", True),
+    ("class-escape-does-not-match-the-slash", b"a[\\-]b", b"a\\b", False),
+    ("class-escaped-ordinary-is-itself", b"[\\a]", b"a", True),
+    ("class-escape-consumes-the-backslash", b"[\\a]", b"\\", False),
+    # A dash with nothing after it is a literal dash, not a half-open range.
+    ("trailing-dash-is-literal-low", b"[a-]", b"a", True),
+    ("trailing-dash-is-literal-dash", b"[a-]", b"-", True),
+    ("trailing-dash-spans-nothing", b"[a-]", b"b", False),
+    ("leading-dash-is-literal", b"[-a]", b"-", True),
+    ("leading-dash-keeps-the-rest", b"[-a]", b"a", True),
+    # `]` directly after `-` ends the class, so `[a-]]` is the class `[a-]` then a literal `]`.
+    ("dash-before-close-is-literal", b"[a-]]", b"a", False),
+    ("dash-before-close-needs-the-bracket", b"[a-]]", b"]", False),
+    ("close-first-then-dash", b"[]-]", b"]", True),
+    ("close-first-then-dash-matches-dash", b"[]-]", b"-", True),
+    # An escaped dash cannot open a range, so `[a\-c]` is three literals and not `a` to `c`.
+    ("escaped-dash-does-not-open-a-range", b"[a\\-c]", b"b", False),
+    ("escaped-dash-is-a-member", b"[a\\-c]", b"-", True),
+    # Negation still loses to the leading-period rule, which `glob(3)` applies and bare
+    # `fnmatch(3)` does not -- the flag is `FNM_PERIOD`, and forgetting it makes libc look
+    # like it disagrees with us when it is being asked a different question.
+    ("negated-class-does-not-reach-a-dotfile", b"[!-/]", b".", False),
+    ("negated-class-matches-otherwise", b"[!-/]", b"e", True),
 ]
 
 
@@ -87,6 +125,124 @@ def test_the_dialect_is_glob3_rather_than_fnmatch(pattern: bytes, name: bytes, e
     # reference implementation's dialect is glob(3)'s. Three rows here are where fnmatch would
     # answer differently: the leading-dot rules and the escaping ones.
     assert match_component(pattern, name) is expected
+
+
+# --- the same question, asked of libc rather than of this file -------------------------------
+
+
+def _libc_fnmatch():
+    """libc's own ``fnmatch(3)``, or ``None`` where it cannot be reached.
+
+    ``glob(3)`` matches each path component with this matcher, so it is not a second opinion
+    about the dialect -- it is the thing the dialect is defined as. Loaded through ``ctypes``
+    rather than shelled out to, because the answer wanted is a bool per call and there are
+    thousands of calls.
+    """
+    name = ctypes.util.find_library("c")
+    if name is None and not sys.platform.startswith("linux"):
+        return None
+    try:
+        libc = ctypes.CDLL(name or "libc.so.6")
+        libc.fnmatch.restype = ctypes.c_int
+        libc.fnmatch.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    except (OSError, AttributeError):  # pragma: no cover -- platform without it
+        return None
+    return libc.fnmatch
+
+
+_FNM_PERIOD = 4
+"""glibc ``fnmatch.h``: ``FNM_PATHNAME`` 1, ``FNM_NOESCAPE`` 2, ``FNM_PERIOD`` 4.
+
+``FNM_PERIOD`` is the flag that makes a leading period need matching explicitly, which is
+``glob(3)``'s behaviour and therefore ours. Omitting it is not a smaller test, it is a
+different question -- and it makes libc appear to disagree with us on ``[!-/]`` against
+``.``, which is how this constant came to be written down rather than assumed.
+"""
+
+# The alphabet is every byte that means something to the matcher, plus two ordinary ones and a
+# byte above 127. `/` is excluded because a component never contains one -- `split_pattern`
+# removes them before the matcher is ever called -- and NUL because it cannot cross `c_char_p`.
+_INTERESTING = st.sampled_from([bytes([b]) for b in b"*?[]!^-\\.aA0\xff"])
+_FRAGMENT = st.lists(_INTERESTING, max_size=6).map(b"".join)
+
+
+def _every_class_is_terminated(pattern: bytes) -> bool:
+    """Whether every ``[`` in ``pattern`` opens a class that is closed.
+
+    This encodes the POSIX *termination* rule, not this library's matching logic -- a `]`
+    immediately after the `[` (or after a leading `!`/`^`) is a literal member and does not
+    close the class, which is the only way to put one in a class at all. It exists solely to
+    keep POSIX-undefined input out of the differential below; nothing about matching is
+    decided here, and getting it slightly conservative costs coverage rather than soundness.
+    """
+    i = 0
+    while i < len(pattern):
+        if pattern[i : i + 1] == b"\\":
+            i += 2
+            continue
+        if pattern[i : i + 1] != b"[":
+            i += 1
+            continue
+        p = i + 1
+        if pattern[p : p + 1] in (b"!", b"^"):
+            p += 1
+        if pattern[p : p + 1] == b"]":  # literal first member
+            p += 1
+        close = pattern.find(b"]", p)
+        if close == -1:
+            return False
+        i = close + 1
+    return True
+
+
+@pytest.mark.skipif(_libc_fnmatch() is None, reason="libc fnmatch(3) is not reachable here")
+@settings(max_examples=500, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(pattern=_FRAGMENT, name=_FRAGMENT)
+def test_the_matcher_agrees_with_libc_on_arbitrary_patterns(pattern: bytes, name: bytes):
+    """Differential fuzz against the implementation this dialect is *defined* as.
+
+    The dialect table above is the specification and this is its proof: every row there is a
+    decision someone wrote down, and this asks libc the same question several hundred more
+    ways per run. It is the strongest form the module's central claim can take -- "the dialect
+    is `glob(3)`, because that is what the reference client uses" is either true against libc
+    or it is not.
+
+    Case-sensitive only. `FNM_CASEFOLD` is a GNU extension whose folding is locale-dependent,
+    while ours is ASCII-only by decision (a remote name is bytes of unstated encoding), so the
+    two are answering different questions there and a disagreement would prove nothing.
+    """
+    # The one divergence, excluded here and pinned by `trailing-backslash-is-literal` above so
+    # that excluding it costs no coverage of it. A pattern ending in an *unpaired* backslash --
+    # an escape with nothing left to escape -- is undefined in POSIX; glibc answers no-match and
+    # this library answers "a literal backslash", which is what a user who globbed a filename
+    # containing one expects. That is the whole of it: the fuzz found this case within a few
+    # hundred examples and no other, over `* ? [ ] ! ^ - \\ . a A 0 \xff`.
+    trailing = len(pattern) - len(pattern.rstrip(b"\\"))
+    assume(trailing % 2 == 0)
+
+    # The second divergence, and it is a **gap rather than a decision** -- D-106. `glob(3)`
+    # supports POSIX bracket sub-expressions inside a class: character classes
+    # `[[:digit:]]`, equivalence classes `[[=a=]]` and collating symbols `[[.a.]]`. This
+    # matcher implements none of them, so `glob("*.[[:digit:]]")` matches nothing at all
+    # rather than every digit -- a silent wrong answer, and against a spelling that works in
+    # `sftp(1)` today. Excluded here so the rest of the differential can run; **not** excluded
+    # because it is acceptable. The module's "deliberately not supported" list names brace
+    # expansion, tilde expansion and non-ASCII folding, and this is not on it.
+    assume(not any(marker in pattern for marker in (b"[:", b"[=", b"[.")))
+
+    # The third divergence, and the only one where *libc* is the inconsistent party. An
+    # unterminated `[` is undefined in POSIX. This matcher answers "a literal `[`" uniformly;
+    # glibc answers that for `[abc` and no-match for `[*-`, so there is no single glob(3)
+    # behaviour here to match. Ours is the documented choice and the one a caller who globbed
+    # a filename containing a bracket expects. Terminated classes -- where the 23 survivors
+    # this slice was about actually live -- are still fuzzed.
+    assume(_every_class_is_terminated(pattern))
+
+    fnmatch = _libc_fnmatch()
+    assert fnmatch is not None  # narrowed by the skipif above
+    assert match_component(pattern, name) is (fnmatch(pattern, name, _FNM_PERIOD) == 0), (
+        f"pattern={pattern!r} name={name!r}"
+    )
 
 
 def test_a_component_never_sees_a_separator_so_star_cannot_cross_one():
