@@ -74,6 +74,7 @@ from gantry_sftp.exceptions import (
 )
 from gantry_sftp.session import (
     DirEntry,
+    DownloadResult,
     EntryKind,
     GlobMatch,
     Mode,
@@ -104,6 +105,7 @@ __all__ = [
     "ConnectError",
     "DestinationCollisionError",
     "DirEntry",
+    "DownloadResult",
     "EntryKind",
     "GlobMatch",
     "HostKeyError",

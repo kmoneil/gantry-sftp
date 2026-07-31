@@ -399,8 +399,9 @@ async def test_a_connection_that_dies_mid_transfer_reconnects_and_resumes(tmp_pa
     )
 
     assert recipe.calls == 2, "the first connection did not die, so nothing was resumed"
-    partial_size = len(payload) - moved
-    assert 0 < partial_size < len(payload), "the first attempt transferred nothing to resume from"
+    assert 0 < moved.adopted < len(payload), "the first attempt transferred nothing to resume from"
+    assert moved.transferred == len(payload) - moved.adopted
+    assert moved.size == len(payload), "the resumed halves must add up to the file"
     assert local.read_bytes() == payload
 
 
@@ -431,5 +432,8 @@ async def test_a_dying_connection_without_resume_still_finishes_it_from_zero(tmp
         Recipe(dies_once), lambda sftp: sftp.get(str(source), local), attempts=3, backoff=0
     )
 
-    assert moved == len(payload), "without resume the second attempt must send the whole file"
+    assert moved.transferred == len(payload), (
+        "without resume the second attempt must send the whole file"
+    )
+    assert moved.adopted == 0
     assert local.read_bytes() == payload

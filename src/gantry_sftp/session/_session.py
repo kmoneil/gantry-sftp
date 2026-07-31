@@ -116,6 +116,7 @@ from gantry_sftp.session._dispatch import Dispatcher
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
+    DownloadResult,
     ProgressCallback,
     download_handle,
     read_range_into,
@@ -2783,9 +2784,10 @@ class Session:
         no_follow: bool = False,
         resume: bool = False,
         verify_size: bool = True,
+        verify: Verify = Verify.SIZE,
         preserve_times: bool = False,
         mode: int | Mode | str | None = None,
-    ) -> int:
+    ) -> DownloadResult:
         """Download ``remote_path`` to ``local_path``.
 
         The size is taken from a STAT so the transfer is bounded, the progress callback has a
@@ -2825,6 +2827,46 @@ class Session:
                 snapshot of unknown completeness.
 
                 It is a length comparison, not a hash: it catches truncation and nothing else.
+                Turning it off is reported as
+                :data:`~gantry_sftp.session.SizeCheck.SKIPPED` rather than being silent.
+
+            verify: Which rung of DESIGN.md 6's ladder to check the *content* against, on top
+                of the length ``verify_size`` compares. Reported as
+                :attr:`~gantry_sftp.session.DownloadResult.content_check`; a *mismatch* raises
+                :class:`~gantry_sftp.exceptions.TransferError`.
+
+                :data:`~gantry_sftp.session.Verify.SIZE` -- the default -- checks no content,
+                which is what every release before 0.11 did and could not say. It is the same
+                default ``put`` has, for the same reason: both other rungs cost something.
+
+                :data:`~gantry_sftp.session.Verify.HASH` is rung 1, one round trip and no
+                payload, and it needs ``check-file@openssh.com`` -- which nearly no endpoint
+                has, so this reports
+                :data:`~gantry_sftp.session.ContentCheck.UNAVAILABLE` far more often than it
+                reports a pass. That is the point of the value existing.
+
+                :data:`~gantry_sftp.session.Verify.REREAD` is rung 2 and works against
+                **every** server, because it asks for nothing but ``READ``. On this side that
+                means downloading the file a second time into ``$TMPDIR`` and comparing it
+                against what was just written, so it costs a second transfer and scratch disk
+                equal to the file.
+
+                **It proves something narrower here than it does on ``put``, and the
+                difference is worth knowing rather than assuming.** Uploading, rung 2 proves
+                the server holds what you sent. Downloading, both copies come from the same
+                place, so what it actually checks is the *local* half: this library's
+                reassembly, its offsets, and the disk they were written to. Rung 1 is the
+                end-to-end check on this side, when the server can answer it.
+
+                **This is the parameter ``get`` could not have while it returned an ``int``**
+                (D-99): a rung that cannot run has to be reportable, and a content check that
+                silently passes when it did not happen is the one outcome the whole ladder
+                exists to prevent.
+
+                On a resume it also selects the rung the adopted prefix is gated on, which is
+                what ``put``'s ``verify`` has always done. A resume that adopts the *whole*
+                file is gated over the whole file, so that gate is the content check and is
+                reported as both.
 
             preserve_times: Stamp the local file with the remote file's atime and mtime instead
                 of the time of the download. **Off by default**, matching ``scp -p`` and
@@ -2837,11 +2879,13 @@ class Session:
                 partial.
 
                 **A server that reports no times leaves the local file stamped with now**, and
-                says so nowhere: ``get`` returns a byte count, and widening that to a result
-                object for one uncommon case is a worse trade than documenting it here. Read
-                :attr:`~gantry_sftp.session.DirEntry.modified` or ``stat()`` first if you need
-                to know whether there was a timestamp to preserve. v3 carries seconds, so
-                sub-second precision is lost whatever this is set to.
+                since 0.11 it says so:
+                :attr:`~gantry_sftp.session.DownloadResult.times` is ``UNAVAILABLE`` rather
+                than ``PRESERVED``. Until then ``get`` returned a byte count and this
+                docstring argued that widening it for one uncommon case was the worse trade;
+                D-99 found the case was not one, and not uncommon enough to be worth a
+                paragraph of apology in place of a field. v3 carries seconds, so sub-second
+                precision is lost whatever this is set to.
             mode: Permission bits for the local file. ``None`` -- the default -- leaves it at
                 the ``0o600`` this library creates every download with, so a downloaded file is
                 private to you unless you say otherwise.
@@ -2863,8 +2907,17 @@ class Session:
                 first file rather than silently mirroring a tree at the wrong permissions.
 
         Returns:
-            Bytes written **by this call**. On a resume that is the remainder, not the file's
-            size, and on a resume of an already-complete file it is ``0``.
+            A :class:`~gantry_sftp.session.DownloadResult` describing what happened: what
+            moved, what was already there, which checks ran and which could not.
+            :attr:`~gantry_sftp.session.DownloadResult.transferred` is what this call wrote --
+            on a resume the remainder, and ``0`` for a file that was already complete --
+            while :attr:`~gantry_sftp.session.DownloadResult.size` is what the local file
+            holds now.
+
+            **This was an ``int`` until 0.11 and the break is deliberate** (D-99). A call that
+            only wants the count reads ``.transferred``; there is no ``int`` subclass to make
+            the old spelling keep working, because a type that lies about what it is turns
+            every downstream ``isinstance`` into an accident that happens to work.
 
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O -- today,
@@ -2875,13 +2928,19 @@ class Session:
             NoSuchFileError: If the remote path does not exist.
             ServerError: If the server refuses.
             TransferError: If the transfer fails partway, if ``resume`` cannot establish a
-                safe offset, or if ``verify_size`` finds fewer bytes arrived than the server
-                said there were.
+                safe offset, if ``verify_size`` finds fewer bytes arrived than the server
+                said there were, or if ``verify`` finds the content disagrees.
         """
         require_local_io("get()")
         _check_local_path(local_path, method="get()")
         encoded = self._resolve(remote_path)
         requested_mode = resolve_mode(mode, caller="get()")
+        # Normalised rather than trusted, for the reason `put` gives: `Verify` is a `StrEnum`,
+        # so `verify="size"` arrives as a plain `str` from anyone not running a type checker
+        # and every `verify is Verify.SIZE` below would be False while `==` was True. Here that
+        # would fall past both named rungs into the `else`, so asking for the *default* would
+        # silently download the file a second time.
+        wanted = Verify(verify)
         with operation(session_logger, "get", remote=encoded, local=local_path) as record:
             attributes, opened = await self._stat_and_open_for_download(
                 encoded, together=not resume
@@ -2892,25 +2951,27 @@ class Session:
             # partial being *ours* makes its length trustworthy; it does not make its contents a
             # prefix of this remote file. A partial left by a previous run against a different
             # source is the same corruption as on the upload side, and it is caught here before
-            # the first READ. `get` returns an `int`, so this can refuse but cannot report --
-            # see D-38.
-            _ = await self._gate_resume(encoded, local_path, start, Verify.SIZE)
+            # the first READ. It refused but could not report until D-99 gave `get` somewhere
+            # to say so -- see D-38 for the refusal.
+            resume_check = await self._gate_resume(encoded, local_path, start, wanted)
+            times_result = _preservation(preserve_times, attributes.times)
             if resume and start == attributes.size:
                 # Already complete: nothing to open and nothing to move. Deliberately *after*
                 # the gate rather than before it -- this is the case that adopts the entire file
                 # and returns success having verified nothing, which makes it the one most worth
                 # gating, not the one to skip for a round trip.
-                #
-                # The mode is still applied, and skipping it here would be the silent wrong
-                # answer this argument exists to prevent: the destination the caller named
-                # exists, they said what permissions it should have, and "it was already there"
-                # is not an answer to that. The partial was not necessarily left by this
-                # library, so its mode is not necessarily the 0o600 a download creates.
-                if local_bits is not None:
-                    _chmod_local(local_path, local_bits, no_follow=no_follow)
-                record["bytes"] = 0
-                record["adopted"] = start
-                return 0
+                return self._already_complete(
+                    encoded,
+                    local_path,
+                    record,
+                    adopted=start,
+                    mode=local_bits,
+                    no_follow=no_follow,
+                    times=attributes.times if preserve_times else None,
+                    times_result=times_result,
+                    resume_check=resume_check,
+                    verify=wanted,
+                )
 
             # Already open on the default path -- the concurrent pair above returns the handle.
             # The resume path opens here instead, after the gate and after the early return that
@@ -2938,23 +2999,125 @@ class Session:
                 raise
             await self.close(handle)
             record["bytes"] = transferred
-            # Rung 3, and it costs no round trip: the STAT above is the one `get` already makes.
-            # `start + transferred` rather than `transferred`, because a resume returns only the
-            # remainder and comparing that against the whole file would fail every resume.
-            if (
-                verify_size
-                and attributes.size is not None
-                and start + transferred != attributes.size
-            ):
-                raise TransferError(
-                    f"{encoded!r} is {attributes.size} bytes but the download ended after "
-                    f"{start + transferred}; it was truncated or the file shrank underneath it",
-                    transferred=start + transferred,
-                    offset=start + transferred,
-                    remote_path=encoded,
-                    local_path=str(local_path),
-                )
-            return transferred
+            size_check = _confirm_download_size(
+                encoded,
+                local_path,
+                arrived=start + transferred,
+                announced=attributes.size,
+                asked=verify_size,
+            )
+            content_check = await self._verify_downloaded_content(
+                encoded, local_path, start + transferred, wanted
+            )
+            return DownloadResult(
+                transferred,
+                encoded,
+                Path(local_path),
+                size_check,
+                times=times_result,
+                content_check=content_check,
+                resume_check=resume_check,
+                adopted=start,
+                mode=local_bits,
+            )
+
+    def _already_complete(
+        self,
+        remote_path: bytes,
+        local_path: Path | str,
+        record: dict[str, object],
+        *,
+        adopted: int,
+        mode: int | None,
+        no_follow: bool,
+        times: Times | None,
+        times_result: TimePreservation,
+        resume_check: ResumeCheck,
+        verify: Verify,
+    ) -> DownloadResult:
+        """Finish a resume that found the local file already whole, without opening anything.
+
+        **The metadata is still applied, and skipping it is the silent wrong answer this whole
+        path exists to avoid**: the destination the caller named exists, they said what
+        permissions and timestamps it should have, and "it was already there" is not an answer
+        to that. The partial was not necessarily left by this library, so neither its mode nor
+        its times are necessarily anything in particular -- its mtime is the moment the
+        *interrupted* run last wrote to it, which is exactly the fabricated-but-plausible
+        timestamp D-79 is about.
+
+        The times half of that was missing until D-99, and it was missing invisibly: ``get``
+        returned a byte count, so a caller who passed ``preserve_times=True`` and resumed a
+        complete file got a plausible wrong mtime and no way to notice. Building the result
+        type is what surfaced it, which is the argument for result types.
+
+        Both go on a fresh ``O_NOFOLLOW`` descriptor rather than on the path, for the reason
+        :func:`_chmod_local` gives: the containment check is old by now.
+
+        Returns:
+            The result, with ``content_check`` derived from the gate rather than from a second
+            comparison. A resume that adopts the whole file has just had the whole file
+            compared against the remote one at the rung ``verify`` names, so re-running it
+            would be a duplicate -- and for
+            :data:`~gantry_sftp.session.Verify.REREAD` a duplicate is a second full download.
+        """
+        if mode is not None:
+            _chmod_local(local_path, mode, no_follow=no_follow)
+        if times is not None:
+            _stamp_local(local_path, times, no_follow=no_follow)
+        record["bytes"] = 0
+        record["adopted"] = adopted
+        return DownloadResult(
+            0,
+            remote_path,
+            Path(local_path),
+            SizeCheck.MATCHED,
+            times=times_result,
+            content_check=_gate_as_content_check(resume_check, verify),
+            resume_check=resume_check,
+            adopted=adopted,
+            mode=mode,
+        )
+
+    async def _verify_downloaded_content(
+        self, path: bytes, local_path: Path | str, expected: int, verify: Verify
+    ) -> ContentCheck:
+        """Check the file that was just written against what the server holds, at ``verify``.
+
+        The mirror of :meth:`_verify_content`, and separate from it only for the message: the
+        comparison is identical -- a remote range against a local one -- but "the upload is
+        corrupt" is the wrong sentence to hand somebody whose download it was.
+
+        Args:
+            path: What was read.
+            local_path: What was written, and what is being checked.
+            expected: Bytes the local file should hold. ``adopted + transferred``, not what
+                this call moved, which differs under ``resume``.
+            verify: Which rung to try.
+
+        Raises:
+            TransferError: If the content disagrees.
+        """
+        if verify is Verify.SIZE:
+            return ContentCheck.SKIPPED
+        if verify is Verify.HASH:
+            agreed = await self._hashes_agree(path, local_path, start=0, length=expected)
+            if agreed is None:
+                return ContentCheck.UNAVAILABLE
+            reached = ContentCheck.HASHED
+        else:
+            agreed = await self._reread_agrees(path, local_path, start=0, length=expected)
+            reached = ContentCheck.REREAD
+        if not agreed:
+            raise TransferError(
+                f"{local_path} does not hold the contents of {path!r}: it is {expected} bytes "
+                f"long, as it should be, and the bytes differ. The download is corrupt rather "
+                f"than short, which is the failure a size check cannot see",
+                transferred=expected,
+                offset=0,
+                remote_path=path,
+                local_path=str(local_path),
+            )
+        return reached
 
     async def _download_into(
         self,
@@ -3554,17 +3717,24 @@ class Session:
                 # every worker finishing inside another's await adds to a value it read before
                 # the others finished. The lost update understates the byte count, and it is
                 # the same trap `download_many_concurrently` documents in `benchmarks/`.
-                state.moved.append(
-                    await self.get(
-                        item.remote,
-                        item.target,
-                        progress=progress,
-                        no_follow=True,
-                        resume=resume,
-                        preserve_times=preserve_times,
-                        mode=requested_mode,
-                    )
+                #
+                # The byte count is kept and the rest of each `DownloadResult` is dropped, which
+                # is what `put_tree` already does with its `UploadResult`s. `TreeResult` stays a
+                # summary: `skipped` is bounded by the number of *problems* and is worth holding
+                # in full, per-file results are bounded by the number of *files*, and a tree of
+                # a hundred thousand of them should not cost a hundred thousand objects for a
+                # report almost nobody reads. A caller who wants them calls `get` per file --
+                # which is what the consumer behind D-99 does.
+                result = await self.get(
+                    item.remote,
+                    item.target,
+                    progress=progress,
+                    no_follow=True,
+                    resume=resume,
+                    preserve_times=preserve_times,
+                    mode=requested_mode,
                 )
+                state.moved.append(result.transferred)
 
             await for_each_bounded(
                 self._walk_for_download(
@@ -5095,10 +5265,10 @@ def _chmod_local(path: Path | str, mode: int, *, no_follow: bool) -> None:
         os.close(fd)
 
 
-def _stamp_local(path: Path | str, times: Times) -> None:
-    """Apply times to a local directory that is already complete, without following a link.
+def _stamp_local(path: Path | str, times: Times, *, no_follow: bool = True) -> None:
+    """Apply times to a local path that is already complete, without following a link to it.
 
-    The mirror of :func:`_chmod_local`, and it exists for the same reason: this pass runs
+    The mirror of :func:`_chmod_local`, and it exists for the same reason: the tree pass runs
     *after* the walk that containment-checked the path, so the check is old by the time the
     stamp lands and a local attacker has had the whole transfer to swap the directory for a
     symlink. ``os.utime`` on a path follows one; on a descriptor opened ``O_NOFOLLOW`` there
@@ -5109,12 +5279,95 @@ def _stamp_local(path: Path | str, times: Times) -> None:
     ``os.utime in os.supports_fd`` -- and it is the shape ``session/_platform.py`` describes
     for stamping metadata generally. ``os.supports_follow_symlinks`` is a separate probe this
     library does not make, so relying on it would be a third capability to degrade.
+
+    Args:
+        path: What to stamp.
+        times: The atime and mtime to apply.
+        no_follow: Refuse to stamp through a symlink. Defaults to ``True`` because every
+            recursive call site is inside a destination tree that must not be escaped. A
+            single ``get`` passes its own ``no_follow``, which is off by default: pointing a
+            download at a link you made yourself is legitimate, and stamping it would
+            otherwise fail where writing to it succeeded.
     """
-    fd = os.open(path, os.O_RDONLY | NO_FOLLOW)
+    fd = os.open(path, os.O_RDONLY | (NO_FOLLOW if no_follow else 0))
     try:
         os.utime(fd, (times.atime, times.mtime))
     finally:
         os.close(fd)
+
+
+def _preservation(asked: bool, times: Times | None) -> TimePreservation:
+    """Which of the three outcomes a ``preserve_times`` request reached.
+
+    ``UNAVAILABLE`` is the one worth having: a server that answers ``STAT`` with no times
+    leaves the local file stamped with the moment it was downloaded, which looks entirely
+    plausible and is wrong. Nothing said so before D-99.
+    """
+    if not asked:
+        return TimePreservation.SKIPPED
+    return TimePreservation.PRESERVED if times is not None else TimePreservation.UNAVAILABLE
+
+
+def _gate_as_content_check(resume_check: ResumeCheck, verify: Verify) -> ContentCheck:
+    """Report a whole-file resume gate as the content check it already performed.
+
+    Only correct where the adopted prefix *is* the whole file, which is the one caller. The
+    gate compared every byte against the remote file at the rung ``verify`` names, so the
+    answer is not inferred from it -- it is it.
+
+    ``Verify.SIZE`` still reports ``SKIPPED`` even though the gate opportunistically tries
+    rung 1, matching ``put``: this field answers "which content check did you ask for and what
+    did it find", and the gate's own answer is on
+    :attr:`~gantry_sftp.session.DownloadResult.resume_check`.
+    """
+    if verify is Verify.SIZE:
+        return ContentCheck.SKIPPED
+    if resume_check is ResumeCheck.MATCHED:
+        return ContentCheck.HASHED if verify is Verify.HASH else ContentCheck.REREAD
+    return ContentCheck.UNAVAILABLE
+
+
+def _confirm_download_size(
+    remote_path: bytes,
+    local_path: Path | str,
+    *,
+    arrived: int,
+    announced: int | None,
+    asked: bool,
+) -> SizeCheck:
+    """Rung 3 on the download, which costs no round trip -- ``get`` already made that ``STAT``.
+
+    Args:
+        remote_path: What was read, for the error.
+        local_path: What was written, for the error.
+        arrived: ``adopted + transferred``, not what this call moved: a resume returns only
+            the remainder and comparing that against the whole file would fail every resume.
+        announced: The size the server reported, or ``None`` if it reported none.
+        asked: ``verify_size``. ``False`` reports ``SKIPPED`` and compares nothing.
+
+    Returns:
+        Which of the three answerable outcomes happened. A *mismatch* is not among them.
+        ``SKIPPED`` wins over ``UNAVAILABLE`` when both apply, because a caller who turned the
+        check off is told that rather than told the server was quiet -- they did not ask, so
+        whether it could have been answered never came up.
+
+    Raises:
+        TransferError: If fewer bytes arrived than the server said there were.
+    """
+    if not asked:
+        return SizeCheck.SKIPPED
+    if announced is None:
+        return SizeCheck.UNAVAILABLE
+    if arrived != announced:
+        raise TransferError(
+            f"{remote_path!r} is {announced} bytes but the download ended after "
+            f"{arrived}; it was truncated or the file shrank underneath it",
+            transferred=arrived,
+            offset=arrived,
+            remote_path=remote_path,
+            local_path=str(local_path),
+        )
+    return SizeCheck.MATCHED
 
 
 def _stamp_local_directories(entries: Sequence[tuple[Path, Times]]) -> None:

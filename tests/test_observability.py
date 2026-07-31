@@ -801,7 +801,7 @@ async def test_the_counters_move_over_a_real_session(tmp_path: Path):
 
         moved = await sftp.get(str(tmp_path / "data.csv"), tmp_path / "out.csv")
 
-        assert moved == 100_000
+        assert moved.transferred == 100_000
         assert sftp.requests_sent >= 4  # STAT, OPEN, at least one READ, CLOSE
         assert sftp.replies_received == sftp.requests_sent
         assert sftp.bytes_received > 100_000  # payload plus framing

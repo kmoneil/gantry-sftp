@@ -57,13 +57,19 @@ costs one extra digest per 64 KiB of payload, and is the largest block that is c
 
 
 class Verify(StrEnum):
-    """Which rung of DESIGN.md 6's ladder an upload should try to reach.
+    """Which rung of DESIGN.md 6's ladder a transfer should try to reach.
 
     Names what the caller *wants*. What they got is reported back on
-    :attr:`~gantry_sftp.session.UploadResult.content_check`, because a rung can be asked for
+    :attr:`~gantry_sftp.session.UploadResult.content_check` or
+    :attr:`~gantry_sftp.session.DownloadResult.content_check`, because a rung can be asked for
     and be unavailable -- rung 1 is absent from almost every server in the field -- and
     silently settling for a weaker check than the one that was requested is the exact failure
     this ladder is documented to prevent.
+
+    **Both directions accept it as of 0.11** (D-99). ``get`` could not until then, and the
+    blocker was its return type rather than any missing machinery: an ``int`` had nowhere to
+    report ``UNAVAILABLE``. On a resume it also selects the rung the adopted prefix is gated
+    on, in either direction.
     """
 
     SIZE = "size"
@@ -81,7 +87,12 @@ class Verify(StrEnum):
     """Rung 2: read the bytes back and compare them. Works against **any** server, because it
     asks for nothing but ``READ``, and costs a second transfer plus temporary local disk equal
     to the file. That is the price of the only content check available on an endpoint with no
-    ``check-file``, which is nearly all of them."""
+    ``check-file``, which is nearly all of them.
+
+    **It proves less on a download than on an upload.** Uploading, it proves the server holds
+    what was sent. Downloading, both copies come from the same place, so what it checks is the
+    local half -- this library's reassembly, its offsets, and the disk they were written to.
+    Worth asking for; not the same claim, and rung 1 is the end-to-end one on that side."""
 
 
 class ContentCheck(StrEnum):

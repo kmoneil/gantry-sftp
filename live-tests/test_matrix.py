@@ -143,7 +143,7 @@ async def test_a_file_round_trips_through_every_server(server: MatrixServer, tmp
     async with connected(server) as sftp:
         result = await sftp.put(source, str(remote))
         assert result.transferred == len(payload)
-        assert await sftp.get(str(remote), local) == len(payload)
+        assert (await sftp.get(str(remote), local)).transferred == len(payload)
 
     assert remote.read_bytes() == payload
     assert local.read_bytes() == payload
@@ -179,6 +179,48 @@ async def test_rung_3_is_satisfied_by_every_server(server: MatrixServer, tmp_pat
     )
     assert result.transferred == len(payload)
     assert remote.read_bytes() == payload
+
+
+async def test_a_download_reports_every_check_it_ran_through_every_server(
+    server: MatrixServer, tmp_path: Path
+):
+    """`get(verify=)` against three real servers, including the one that answers rung 1.
+
+    The unit suite drives fakes, so all of it would pass against a client that asked the wrong
+    question and believed its own answer. This is the row that cannot: paramiko implements
+    ``check-file`` and reports ``HASHED``, OpenSSH and asyncssh do not and report
+    ``UNAVAILABLE`` -- and **``UNAVAILABLE`` is the outcome the parameter exists for**, since
+    it is what nearly every endpoint in the field answers. A version that let a missing rung
+    read as a pass would look identical on the paramiko row alone.
+
+    Rung 2 runs everywhere by construction: it asks for nothing but ``READ``.
+    """
+    payload = b"id,total\n1,42\n" * 91  # 1274 bytes: not a round number, not one packet
+    remote = server.root / "downloadable.csv"
+    remote.write_bytes(payload)
+
+    async with connected(server) as sftp:
+        plain = await sftp.get(str(remote), tmp_path / "plain.csv")
+        hashed = await sftp.get(str(remote), tmp_path / "hashed.csv", verify=Verify.HASH)
+        reread = await sftp.get(str(remote), tmp_path / "reread.csv", verify=Verify.REREAD)
+        waived = await sftp.get(str(remote), tmp_path / "waived.csv", verify_size=False)
+
+    assert plain.content_check is ContentCheck.SKIPPED
+    assert plain.size_check is SizeCheck.MATCHED, (
+        f"{server.name} did not report a size, so rung 3 degraded to {plain.size_check.value}"
+    )
+    assert plain.transferred == len(payload)
+    assert plain.local_path == tmp_path / "plain.csv"
+
+    expected = ContentCheck.HASHED if server.name == "paramiko" else ContentCheck.UNAVAILABLE
+    assert hashed.content_check is expected, (
+        f"{server.name} answered {hashed.content_check.value} to rung 1"
+    )
+    assert reread.content_check is ContentCheck.REREAD
+    assert waived.size_check is SizeCheck.SKIPPED
+
+    for name in ("plain", "hashed", "reread", "waived"):
+        assert (tmp_path / f"{name}.csv").read_bytes() == payload
 
 
 async def test_rung_3_reaches_whole_trees_through_every_server(

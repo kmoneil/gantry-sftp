@@ -35,7 +35,7 @@ from gantry_sftp.codec import (
     encode,
 )
 from gantry_sftp.exceptions import TransferError
-from gantry_sftp.session import Publish, PublishMechanism, open_session
+from gantry_sftp.session import Publish, PublishMechanism, ResumeCheck, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -69,9 +69,11 @@ async def test_a_resumed_download_completes_a_partial_file(tmp_path: Path):
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        written = await sftp.get(str(remote), local, resume=True)
+        result = await sftp.get(str(remote), local, resume=True)
 
-    assert written == len(CONTENT) - 40_000, "it re-sent bytes it already had"
+    assert result.transferred == len(CONTENT) - 40_000, "it re-sent bytes it already had"
+    assert result.adopted == 40_000
+    assert result.size == len(CONTENT), "the result must describe the file, not the remainder"
     assert local.read_bytes() == CONTENT
 
 
@@ -86,9 +88,13 @@ async def test_a_resumed_download_with_no_partial_transfers_the_whole_file(tmp_p
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        written = await sftp.get(str(remote), tmp_path / "fresh.bin", resume=True)
+        result = await sftp.get(str(remote), tmp_path / "fresh.bin", resume=True)
 
-    assert written == len(CONTENT)
+    assert result.transferred == len(CONTENT)
+    assert result.adopted == 0
+    assert result.resume_check is ResumeCheck.SKIPPED, (
+        "nothing was adopted to have an opinion about"
+    )
     assert (tmp_path / "fresh.bin").read_bytes() == CONTENT
 
 
@@ -106,7 +112,11 @@ async def test_a_resumed_download_of_an_already_complete_file_moves_nothing(tmp_
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        assert await sftp.get(str(remote), local, resume=True) == 0
+        result = await sftp.get(str(remote), local, resume=True)
+
+    assert result.transferred == 0
+    assert result.adopted == len(CONTENT)
+    assert result.size == len(CONTENT)
 
     assert local.read_bytes() == CONTENT
     assert local.stat().st_mtime_ns == before, "the file was rewritten to transfer nothing"
@@ -160,9 +170,9 @@ async def test_a_download_without_resume_still_truncates(tmp_path: Path):
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        written = await sftp.get(str(remote), local)
+        result = await sftp.get(str(remote), local)
 
-    assert written == 1000
+    assert result.transferred == 1000
     assert local.read_bytes() == CONTENT[:1000]
 
 
@@ -495,10 +505,12 @@ async def test_a_download_killed_partway_resumes_to_a_byte_identical_file(tmp_pa
         partial = local.stat().st_size
         assert 0 < partial < len(big), "the transfer was not actually interrupted"
 
-        written = await sftp.get(str(remote), local, resume=True)
+        result = await sftp.get(str(remote), local, resume=True)
 
     assert local.read_bytes() == big
-    assert written == len(big) - partial
+    assert result.transferred == len(big) - partial
+    assert result.adopted == partial
+    assert result.size == len(big)
 
 
 async def test_an_upload_killed_partway_resumes_to_a_byte_identical_file(tmp_path: Path):

@@ -36,6 +36,7 @@ import gantry_sftp
 import gantry_sftp.session
 import gantry_sftp.sync as sync_module
 from gantry_sftp import (
+    DownloadResult,
     NoSuchFileError,
     OpenFlag,
     Session,
@@ -329,10 +330,13 @@ def test_a_blocking_round_trip_moves_the_bytes(tmp_path: Path):
         assert isinstance(transport, SyncTransport)
         assert isinstance(sftp, SyncSession)
         result = sftp.put(source, str(tmp_path / "uploaded.csv").encode())
-        transferred = sftp.get(str(tmp_path / "uploaded.csv").encode(), tmp_path / "back.csv")
+        fetched = sftp.get(str(tmp_path / "uploaded.csv").encode(), tmp_path / "back.csv")
 
     assert result.transferred == len(source.read_bytes())
-    assert transferred == len(source.read_bytes())
+    # The blocking surface hands back the same result type the async one does -- the portal
+    # carries an object across the thread boundary exactly as it carries an int.
+    assert isinstance(fetched, DownloadResult)
+    assert fetched.transferred == len(source.read_bytes())
     assert (tmp_path / "back.csv").read_bytes() == source.read_bytes()
 
 
@@ -561,7 +565,7 @@ def test_several_threads_share_one_session_over_one_connection(tmp_path: Path):
         def fetch(index: int) -> int:
             return sftp.get(
                 str(tmp_path / f"src-{index}.bin").encode(), tmp_path / f"dst-{index}.bin"
-            )
+            ).transferred
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             transferred = list(pool.map(fetch, range(8)))

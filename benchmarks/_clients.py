@@ -194,7 +194,7 @@ class GantryClient(Client):
     async def download(self, remote: Path, local: Path) -> tuple[float, int]:
         async with self._transport() as transport, open_session(transport) as sftp:
             started = time.perf_counter()
-            written = await sftp.get(str(remote), local)
+            written = (await sftp.get(str(remote), local)).transferred
             elapsed = time.perf_counter() - started
         return elapsed, written
 
@@ -240,7 +240,7 @@ class GantryClient(Client):
             for _ in range(warmups):
                 await sftp.get(str(remote), local)
             started = time.perf_counter()
-            written = await sftp.get(str(remote), local)
+            written = (await sftp.get(str(remote), local)).transferred
             elapsed = time.perf_counter() - started
         return elapsed, written
 
@@ -261,7 +261,7 @@ class GantryClient(Client):
             started = time.perf_counter()
             moved = 0
             for remote in remotes:
-                moved += await sftp.get(str(remote), into / remote.name)
+                moved += (await sftp.get(str(remote), into / remote.name)).transferred
             elapsed = time.perf_counter() - started
         return elapsed, moved
 

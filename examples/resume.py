@@ -93,8 +93,15 @@ async def resume_a_download(sftp: Session, remote: str, local: Path) -> None:
     partial = size_of(local)
     print(f"  interrupted with {partial:,} of {len(PAYLOAD):,} bytes on disk")
 
-    moved = await sftp.get(remote, local, resume=True)
-    print(f"  resumed, moved {moved:,} more (a fresh download would have moved {len(PAYLOAD):,})")
+    result = await sftp.get(remote, local, resume=True)
+    print(
+        f"  resumed, moved {result.transferred:,} more "
+        f"(a fresh download would have moved {len(PAYLOAD):,})"
+    )
+    # `adopted` is what was already on disk and `size` is the two added up, so a resume can
+    # report the file rather than only this call's share of it.
+    print(f"  adopted {result.adopted:,}, file is now {result.size:,} bytes")
+    print(f"  the adopted prefix was checked: {result.resume_check.value}")
 
     if not matches_payload(local):
         raise AssertionError("the resumed file does not match the source")

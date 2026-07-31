@@ -46,7 +46,7 @@ async def test_connect_moves_a_file_over_a_real_connection(ssh_server: SSHServer
     async with connect("127.0.0.1", **connect_kwargs(ssh_server)) as sftp:  # type: ignore[arg-type]
         result = await sftp.put(source, str(remote).encode())
         assert result.transferred == len(payload)
-        assert await sftp.get(str(remote).encode(), back) == len(payload)
+        assert (await sftp.get(str(remote).encode(), back)).transferred == len(payload)
 
     assert remote.read_bytes() == payload
     assert back.read_bytes() == payload

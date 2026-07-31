@@ -84,8 +84,11 @@ async def main() -> None:
             result = await sftp.put(source, str(remote).encode())
             print(f"put   {result.transferred} bytes  mechanism={result.mechanism.value}")
 
-            transferred = await sftp.get(str(remote).encode(), back)
-            print(f"get   {transferred} bytes  ->  {back.name}")
+            fetched = await sftp.get(str(remote).encode(), back)
+            print(
+                f"get   {fetched.transferred} bytes  ->  {back.name}  "
+                f"size_check={fetched.size_check.value}"
+            )
             print(f"stat  {describe(await sftp.stat(str(remote).encode()))}")
 
             # `OpenFlag` is the name D-58 was about: `Session.open` is typed on it, and until

@@ -93,6 +93,7 @@ from gantry_sftp.session import (
     DEFAULT_SESSION_OPTIONS,
     DirectoryScan,
     DirEntry,
+    DownloadResult,
     GlobMatch,
     Mode,
     ProgressCallback,
@@ -707,10 +708,11 @@ class SyncSession:
         no_follow: bool = False,
         resume: bool = False,
         verify_size: bool = True,
+        verify: Verify = Verify.SIZE,
         preserve_times: bool = False,
         mode: int | Mode | str | None = None,
-    ) -> int:
-        """Download a file, returning the number of bytes transferred."""
+    ) -> DownloadResult:
+        """Download a file, returning a report of what it did."""
         return self._run(
             partial(
                 self._session.get,
@@ -721,6 +723,7 @@ class SyncSession:
                 no_follow=no_follow,
                 resume=resume,
                 verify_size=verify_size,
+                verify=verify,
                 preserve_times=preserve_times,
                 mode=mode,
             )

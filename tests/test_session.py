@@ -372,8 +372,8 @@ async def test_get_downloads_a_file(tmp_path: Path):
     server = FakeServer(content=content)
     destination = tmp_path / "out.bin"
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        written = await sftp.get("/remote", destination)
-    assert written == len(content)
+        result = await sftp.get("/remote", destination)
+    assert result.transferred == len(content)
     assert destination.read_bytes() == content
 
 
@@ -473,9 +473,9 @@ async def test_a_session_against_a_real_sftp_server(tmp_path: Path):
         # defaults -- which is what makes the derived request size exact.
         assert sftp.limits.max_read_length is not None
         assert (await sftp.stat(str(source))).size == len(content)
-        written = await sftp.get(str(source), destination)
+        result = await sftp.get(str(source), destination)
 
-    assert written == len(content)
+    assert result.transferred == len(content)
     assert destination.read_bytes() == content
 
 

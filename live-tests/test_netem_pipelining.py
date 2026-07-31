@@ -577,7 +577,7 @@ async def test_the_shipped_defaults_reach_the_channel_window(shape_link, ssh_ser
         # exchanging keys costs about a second at 50 ms and belongs to no pipeline depth;
         # timing it here once produced a 3x "regression" that was entirely key exchange.
         started = time.perf_counter()
-        transferred = await sftp.get(str(source), destination)
+        transferred = (await sftp.get(str(source), destination)).transferred
         elapsed = time.perf_counter() - started
 
     assert transferred == file_size(source)
@@ -668,7 +668,7 @@ async def test_neither_process_is_saturated_at_five_milliseconds(shape_link, ssh
             own_cpu_seconds(),
             process_cpu_seconds(child),
         )
-        transferred = await sftp.get(str(source), destination)
+        transferred = (await sftp.get(str(source), destination)).transferred
         elapsed = time.perf_counter() - started
         ours = own_cpu_seconds() - ours_before
         theirs = process_cpu_seconds(child) - theirs_before
@@ -719,7 +719,7 @@ async def test_a_transfer_survives_latency_and_loss_and_is_byte_identical(
     link = shape_link(rtt_ms=50.0, loss_percent=1.0)
 
     async with connect(ssh_server) as transport, open_session(transport) as sftp:
-        transferred = await sftp.get(str(source), destination)
+        transferred = (await sftp.get(str(source), destination)).transferred
 
     assert transferred == file_size(source), link.describe()
     assert_identical(source, destination)

@@ -245,8 +245,15 @@ async def test_the_local_path_still_takes_both_of_the_types_it_declares(tmp_path
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        assert await sftp.get(os.fsencode(source), tmp_path / "as-path.txt") == len(b"payload")
-        assert await sftp.get(os.fsencode(source), str(tmp_path / "as-str.txt")) == len(b"payload")
+        as_path = await sftp.get(os.fsencode(source), tmp_path / "as-path.txt")
+        as_str = await sftp.get(os.fsencode(source), str(tmp_path / "as-str.txt"))
+
+    assert (as_path.transferred, as_str.transferred) == (len(b"payload"), len(b"payload"))
+    # Both spellings come back normalised: the result carries the destination as a `Path`
+    # whichever of the two the caller passed in, so a consumer writing a manifest does not
+    # have to normalise it a second time.
+    assert as_path.local_path == tmp_path / "as-path.txt"
+    assert as_str.local_path == tmp_path / "as-str.txt"
 
     assert (tmp_path / "as-path.txt").read_bytes() == b"payload"
     assert (tmp_path / "as-str.txt").read_bytes() == b"payload"

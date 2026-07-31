@@ -674,10 +674,11 @@ async def test_a_resumed_download_that_is_already_complete_still_applies_the_mod
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        transferred = await sftp.get(str(source).encode(), destination, resume=True, mode=PRIVATE)
+        result = await sftp.get(str(source).encode(), destination, resume=True, mode=PRIVATE)
 
-    assert transferred == 0
+    assert result.transferred == 0
     assert bits(destination) == PRIVATE
+    assert result.mode == PRIVATE, "the result must report the bits it actually set"
 
 
 # --- trees ------------------------------------------------------------------------------------

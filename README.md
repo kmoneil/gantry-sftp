@@ -245,6 +245,13 @@ exists today:
   name folding, so it covers Unicode normalisation and Windows trailing dots for free
 - **atomic publish**: `put()` stages, flushes and renames, and tells you which mechanism it
   actually used
+- **both transfers report what they did**: `put()` and, as of 0.11, `get()` return a result
+  object rather than a byte count — which checks ran, which could not, what a resume adopted,
+  and whether the timestamps survived. **This is a break**: `await sftp.get(...)` is a
+  `DownloadResult`, and the old integer is its `.transferred`
+- **content verification both directions**: `verify=` reaches rungs 1 and 2 of the ladder on
+  `get()` as well as `put()`, and reports `unavailable` rather than success when a rung could
+  not run
 - **resume**, both directions, opt-in and labelled with what it actually proves, on single
   files and, as of 0.10, on whole trees
 - **trees transfer concurrently on request**: `get_tree(concurrency=8)` feeds a bounded worker
@@ -389,7 +396,7 @@ Everything keeps its shape, including the parts that could not survive the bound
 | async | blocking |
 | --- | --- |
 | `async with connect(...) as sftp` | `with connect(...) as sftp` |
-| `await sftp.get(...)` | `sftp.get(...)`, returning the same `int` |
+| `await sftp.get(...)` | `sftp.get(...)`, returning the same `DownloadResult` |
 | `async for entry in sftp.walk(...)` | `for entry in sftp.walk(...)`, an ordinary iterator |
 | `async with sftp.scandir(p) as entries` | `with sftp.scandir(p) as entries`, still a context manager, because it still holds a directory handle |
 | `async with sftp.open_file(p) as f` | `with sftp.open_file(p) as f`, the same, for the same reason: it holds a file handle |
@@ -1030,6 +1037,13 @@ result.files, result.directories, result.transferred  # 3 2 2520
 result.complete  # False -- read result.skipped
 ```
 
+**A tree returns a summary, not a result per file**, in both directions: `get_tree` keeps each
+`DownloadResult.transferred` and drops the rest, exactly as `put_tree` does with its
+`UploadResult`s. `skipped` is carried in full because it is bounded by the number of
+*problems*; per-file results are bounded by the number of *files*, and a tree of a hundred
+thousand of them should not cost a hundred thousand objects for a report almost nobody reads.
+If you need the per-file verdicts, call `get` or `put` yourself over a `walk` or a `glob`.
+
 **Every name the server supplies is validated before it becomes a local path**, and the
 finished path is re-checked against the destination once symlinks are resolved. A server
 answering `../../etc/cron.d/x` gets an `UnsafePathError` and nothing is written. This is the
@@ -1250,6 +1264,29 @@ result.durable  # True: the bytes reached stable storage before the rename
 result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
 ```
 
+**`get` returns the same shape for the other direction**, and did not until 0.11 — it returned
+a byte count, which is why the verification ladder below reached only one way:
+
+```python
+result = await sftp.get("/incoming/report.csv", "report.csv")
+
+result.transferred  # 41310 — what *this call* moved; on a resume, the remainder
+result.adopted  # 0 — what was already on disk and was kept
+result.size  # 41310 — adopted + transferred: what the local file holds now
+result.local_path  # PosixPath('report.csv'), whichever spelling you passed in
+result.remote_path  # b'/incoming/report.csv', as it went on the wire
+result.size_check  # matched | unavailable | skipped (rung 3, below)
+result.content_check  # hashed | reread | unavailable | skipped (rungs 1 and 2, below)
+result.resume_check  # matched | unavailable | skipped (what the adopted prefix proved)
+result.times  # preserved | unavailable | skipped
+result.mode  # 0o600, or None when the mode was left where a download creates it
+```
+
+`transferred` is the field the old `int` was, so `bytes = await sftp.get(...)` becomes
+`bytes = (await sftp.get(...)).transferred`. There is deliberately **no `int` subclass** to
+keep the old spelling working: a type that lies about what it is turns every downstream
+`isinstance` and every arithmetic use into an accident that happens to work.
+
 | Mechanism       | When                                                      | Atomic                          |
 | --------------- | --------------------------------------------------------- | ------------------------------- |
 | `posix-rename`  | The server implements `posix-rename@openssh.com`          | Yes, even over an existing file |
@@ -1344,8 +1381,10 @@ found: it may be another publisher's, and it is the only evidence of what went w
 
 The download side is gated too, including the case where the local file is *already complete*.
 That one adopts the whole file and returns success having moved nothing, which makes it the
-one most worth checking rather than the one to skip. `get` returns an `int`, so it can refuse
-but has nothing to report `unavailable` on.
+one most worth checking rather than the one to skip — and since 0.11 it reports as well as
+refuses: `get` returns a `DownloadResult` whose `resume_check` says which of the three
+happened. A resume that adopts the *whole* file has compared the whole file, so that same
+answer is its `content_check` rather than being measured twice.
 
 **`resume=True` with `atomic=True` needs an explicit `staging_name`**, and raises `ValueError`
 without one. Not because `CREAT|EXCL` refuses to adopt a leftover staging file; it never
@@ -1413,10 +1452,23 @@ success:
 A **mismatch** never appears as a value: it raises `TransferError`, and under `atomic` it
 raises *before the rename*, so corrupt content never becomes the destination.
 
-`verify=` is on `put` and not on `get`. The download side has the local file already, so
-"read it back" means downloading twice, and rung 1 there is reachable through `check_file()`
-directly; the blocker on a `get(verify=)` is that `get` returns an `int` and so has nowhere to
-report `unavailable`, a silent degrade being the one outcome this ladder exists to prevent.
+**`verify=` is on both directions as of 0.11**, and until then it was on `put` only — the
+blocker was the return type rather than the machinery. `get` returned an `int`, so a rung that
+could not run had nowhere to report `unavailable` and the only options left were to pass
+silently or fail the transfer, a silent degrade being the one outcome this ladder exists to
+prevent. `get` returns a `DownloadResult` now (D-99) and both rungs are reachable:
+
+```python
+result = await sftp.get("/incoming/big.iso", "big.iso", verify=Verify.HASH)
+result.content_check  # hashed | reread | unavailable | skipped
+```
+
+**Rung 2 proves something narrower downloading than it does uploading**, which is worth knowing
+rather than assuming. Uploading, it proves the server holds what you sent. Downloading, both
+copies come from the same place, so what it checks is the *local* half — this library's
+reassembly, its offsets, and the disk they were written to. Rung 1 is the end-to-end check on
+this side, when the server can answer it, and `unavailable` is what it answers on nearly every
+endpoint.
 
 If you call `check_file()` yourself, leave `block_size` alone. It defaults to
 `CHECK_FILE_BLOCK_SIZE` (64 KiB) because that is the largest block paramiko answers correctly:
@@ -1432,8 +1484,8 @@ Rung 3 is not free of decisions, so here is what it actually does:
 | when | after the transfer | **before the rename**, against the staging file, so a short upload never becomes the destination. In place, necessarily after |
 | cost | nothing; `get` already makes that `STAT` | one extra `STAT`, measured rather than assumed, and it ties on every shaped profile (`benchmarks/`) |
 | on mismatch | `TransferError` carrying both paths and the offset | `TransferError`; the staging file is removed and the destination is left alone |
-| server won't report a size | check skipped, download still succeeds | `result.size_check` is `unavailable` |
-| turning it off | `get(..., verify_size=False)` | no flag; see below |
+| server won't report a size | `result.size_check` is `unavailable`, download still succeeds | `result.size_check` is `unavailable` |
+| turning it off | `get(..., verify_size=False)`, reported as `skipped` | no flag; see below |
 
 ```python
 result = await sftp.put("report.csv", "/incoming/report.csv")
@@ -1446,7 +1498,7 @@ and a successful call. `verify_size=False` exists for reading something that is 
 changing size underneath you, and makes the result a snapshot of unknown completeness.
 
 There is no matching flag on `put()`: we control the source there, so a length disagreement is
-wrong every time, and `SizeCheck` has no `skipped` value as a result. The cost is one `STAT`
+wrong every time, and `skipped` is a value only a download ever reports. The cost is one `STAT`
 per upload, and it was benchmarked rather than assumed. On every shaped profile the small-file
 upload row ties with paramiko and asyncssh, because one round trip is invisible beside the ones a
 transfer already spends. paramiko's `put` has done the same

@@ -63,7 +63,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | ------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `quickstart.py`           | the shortest program that moves a file: `connect()` in one call, and a whole session's worth of types imported from `gantry_sftp` with nothing reaching into `gantry_sftp.codec` |
 | `blocking.py`             | `gantry_sftp.sync`: a `with` instead of an `async with`, `walk` / `glob` as ordinary iterators, `scandir` still a context manager because it still holds a handle, a typed error crossing the thread flat — and `BoundPortal`, for several sessions on one loop or a backend other than asyncio |
-| `download.py`             | `get()`, the progress callback, and where the pipelining happens                                       |
+| `download.py`             | `get()`, the `DownloadResult` it returns, the progress callback, and where the pipelining happens      |
 | `file_object.py`          | `open_file()`: a header, a tail, a range and an append without staging the file -- plus `read_at` / `readinto_at` fanned out over one handle, which is what the cursor form cannot do, and why block size is the one performance decision this surface hands you |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
@@ -79,7 +79,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `preserve_times.py`       | `preserve_times=` both directions, `UploadResult.times`, `entry.modified` — and why `longname` cannot carry a usable date |
 | `permissions.py`          | `mode=` and `Mode.PRESERVE` both directions, `chmod()`, `UploadResult.mode` — why an upload is world-readable without it, and why a `chmod` afterwards is not the same thing |
 | `links.py`                | `symlink()` / `readlink()` / `chown()` / `utime()` / `truncate()` / `fstat()`, one ATTRS flag per call, and `follow_symlinks=False` — where it works, where it is refused, and the one place Linux itself makes it impossible |
-| `verify_content.py`       | `verify=Verify.HASH` / `Verify.REREAD`, `content_check`, `resume_check` — and a resume that passes the size check while publishing a corrupt file |
+| `verify_content.py`       | `verify=Verify.HASH` / `Verify.REREAD` on `put()` **and** `get()`, `content_check`, `resume_check`, and what rung 2 does not prove on a download — plus a resume that passes the size check while publishing a corrupt file |
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |
 | `concurrent_transfers.py` | many `get()`s over one session, measured overlap, where an error lands once you fan out — and `get_tree(concurrency=)`, which is a bounded pool rather than the same thing with a loop, plus `resume=` over a finished tree |
 | `cancellation.py`         | cancelling a `get()` and a `put()` mid-flight, what the unwind costs, and the staging file that is not left behind |

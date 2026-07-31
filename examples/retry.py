@@ -134,8 +134,8 @@ async def main() -> None:
         )
 
         print(f"  connections used: {connections}")
-        print(f"  moved on the second: {moved:,} of {len(PAYLOAD):,} bytes")
-        print(f"  the first carried the rest: {len(PAYLOAD) - moved:,}")
+        print(f"  moved on the second: {moved.transferred:,} of {len(PAYLOAD):,} bytes")
+        print(f"  the first carried the rest: {moved.adopted:,}")
 
         if local.read_bytes() != PAYLOAD:
             raise AssertionError("the resumed download does not match the source")

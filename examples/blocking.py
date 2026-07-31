@@ -94,7 +94,9 @@ def main() -> None:
 
             result = sftp.put(source, str(remote).encode())
             print(f"put   {result.transferred} bytes  mechanism={result.mechanism.value}")
-            print(f"get   {sftp.get(str(remote).encode(), back)} bytes  ->  {back.name}")
+            print(
+                f"get   {sftp.get(str(remote).encode(), back).transferred} bytes  ->  {back.name}"
+            )
             print(f"same bytes: {back.read_bytes() == source.read_bytes()}\n")
 
             # An async generator, driven by an ordinary `for`.
@@ -131,9 +133,11 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 sizes = list(
                     pool.map(
-                        lambda index: sftp.get(
-                            str(base / "nested" / f"part-{index % 4}.csv").encode(),
-                            workdir / f"fan-{index}.csv",
+                        lambda index: (
+                            sftp.get(
+                                str(base / "nested" / f"part-{index % 4}.csv").encode(),
+                                workdir / f"fan-{index}.csv",
+                            ).transferred
                         ),
                         range(8),
                     )

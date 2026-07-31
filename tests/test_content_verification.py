@@ -65,6 +65,7 @@ from gantry_sftp.session import (
     ContentCheck,
     Publish,
     ResumeCheck,
+    SizeCheck,
     Verify,
     open_session,
 )
@@ -104,6 +105,11 @@ class HashingServer:
     cannot see. ``corrupts`` breaks that link: the bytes are counted and discarded, so the
     server keeps whatever it was given to hold. Set its length to the local file's and you have
     the only failure that matters -- the right number of the wrong bytes.
+
+    ``serves`` is the same trick pointed the other way, for the download side: READ answers
+    from it while ``check-file`` still hashes ``holds``. Same length, different bytes, and a
+    ``get`` lands a file that passes rung 3 and fails rung 1 -- which is the failure a download
+    could not report at all until ``get`` returned something with a field for it (D-99).
     """
 
     def __init__(
@@ -114,8 +120,10 @@ class HashingServer:
         implements: bool | None = None,
         refuses_check: bool = False,
         corrupts: bool = False,
+        serves: bytes | None = None,
     ) -> None:
         self.holds = bytearray(holds)
+        self.serves = bytearray(holds if serves is None else serves)
         self.advertises = advertises
         self.implements = advertises if implements is None else implements
         self.refuses_check = refuses_check
@@ -190,7 +198,7 @@ class HashingServer:
             self.opened.append(packet.filename)
             self._reply(Handle(rid, b"h"))
         elif isinstance(packet, Read):
-            chunk = bytes(self.holds[packet.offset : packet.offset + packet.length])
+            chunk = bytes(self.serves[packet.offset : packet.offset + packet.length])
             self._reply(Data(rid, memoryview(chunk)) if chunk else Status(rid, StatusCode.EOF))
         elif isinstance(packet, Write):
             self.written += packet.data
@@ -200,6 +208,7 @@ class HashingServer:
                 end = packet.offset + len(packet.data)
                 self.holds.extend(bytes(end - len(self.holds)) if end > len(self.holds) else b"")
                 self.holds[packet.offset : end] = packet.data
+                self.serves = self.holds
             self._reply(Status(rid, StatusCode.OK))
         elif isinstance(packet, Extended) and packet.name == CHECK_FILE:
             self._check_file(packet)
@@ -656,6 +665,149 @@ async def test_corrupt_content_never_becomes_the_destination(tmp_path: Path):
     assert b"Remove" in b"".join(k.encode() for k in server.kinds), "the staging file is discarded"
 
 
+# --- the same two rungs, on the download ------------------------------------------------------
+#
+# `get(verify=)` did not exist until D-99, and the blocker was the return type rather than the
+# machinery: both rungs compare a remote range against a local one and have always been
+# direction-agnostic. What `get` had nowhere to report was `unavailable`, and a content check
+# that silently passes when it did not happen is the outcome DESIGN.md 6 exists to prevent.
+
+
+async def test_a_download_verify_hash_reports_the_rung_it_reached(tmp_path: Path):
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get(b"/remote.bin", local, verify=Verify.HASH)
+
+    assert result.content_check is ContentCheck.HASHED
+    assert result.size_check is SizeCheck.MATCHED
+    assert local.read_bytes() == payload
+
+
+async def test_a_download_verify_hash_is_unavailable_without_the_extension(tmp_path: Path):
+    """The answer nearly every real endpoint gives, and the reason the field is not a bool.
+
+    Nothing here fails: the file arrives, its length is checked, and the content check reports
+    that it could not run. Returning ``True`` would be a lie and raising would refuse a working
+    server over a missing optional extension.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload, advertises=False, implements=False)
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get(b"/remote.bin", local, verify=Verify.HASH)
+
+    assert result.content_check is ContentCheck.UNAVAILABLE
+    assert result.size_check is SizeCheck.MATCHED, "rung 3 still ran; only rung 1 was missing"
+    assert local.read_bytes() == payload
+
+
+async def test_a_download_of_the_right_length_and_the_wrong_bytes_is_refused(tmp_path: Path):
+    """The failure a download could not previously report, staged the only way it can be.
+
+    The server serves one thing and hashes another, both the same length, so rung 3 passes on
+    the way past and rung 1 is the only thing between the caller and a plausible wrong file.
+    """
+    server = HashingServer(holds=b"correct " * 16, serves=b"WRONG!! " * 16)
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as exc:
+            _ = await sftp.get(b"/remote.bin", local, verify=Verify.HASH)
+
+    assert exc.value.args[0] == (
+        f"{local} does not hold the contents of b'/remote.bin': it is 128 bytes long, as it "
+        "should be, and the bytes differ. The download is corrupt rather than short, which is "
+        "the failure a size check cannot see"
+    )
+    assert exc.value.transferred == 128
+    assert exc.value.remote_path == b"/remote.bin"
+    assert exc.value.local_path == str(local)
+    # Left on disk: it is the caller's file and the only evidence of what arrived.
+    assert local.read_bytes() == b"WRONG!! " * 16
+
+
+async def test_a_download_verify_reread_needs_no_extension_at_all(tmp_path: Path):
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload, advertises=False, implements=False)
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get(b"/remote.bin", local, verify=Verify.REREAD)
+
+    assert result.content_check is ContentCheck.REREAD
+    assert server.checks == []
+    assert local.read_bytes() == payload
+
+
+async def test_a_download_verifies_nothing_by_default(tmp_path: Path):
+    # The default is the behaviour every release before 0.11 had. What is new is that it says
+    # so instead of being indistinguishable from a check that passed.
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get(b"/remote.bin", local)
+
+    assert result.content_check is ContentCheck.SKIPPED
+    assert server.checks == [], "the default must not cost a round trip"
+
+
+async def test_a_download_verify_selects_the_rung_the_resume_gate_uses(tmp_path: Path):
+    """``verify=`` steers the resume gate too, which is what ``put``'s has always done.
+
+    Rung 2 needs no extension, so a server with no ``check-file`` gates on ``REREAD`` rather
+    than degrading to ``UNAVAILABLE`` -- the one case where asking for the more expensive rung
+    buys a stronger claim about the bytes already on disk.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload, advertises=False, implements=False)
+    local = tmp_path / "partial.bin"
+    local.write_bytes(payload[:64])
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        degraded = await sftp.get(b"/remote.bin", tmp_path / "a.bin", resume=True)
+        result = await sftp.get(b"/remote.bin", local, resume=True, verify=Verify.REREAD)
+
+    assert degraded.resume_check is ResumeCheck.SKIPPED, "nothing was on disk to adopt"
+    assert result.resume_check is ResumeCheck.MATCHED
+    assert result.adopted == 64
+    assert local.read_bytes() == payload
+
+
+async def test_a_resume_that_adopts_the_whole_file_reports_the_gate_as_the_content_check(
+    tmp_path: Path,
+):
+    """The one place the two fields are the same measurement, and it is not an inference.
+
+    A resume of an already-complete file compares every byte against the remote one at the rung
+    ``verify`` names, and then returns without opening anything. Re-running that comparison to
+    populate ``content_check`` separately would be a duplicate -- and under ``REREAD`` a
+    duplicate is a second full download.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    local = tmp_path / "complete.bin"
+    local.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        hashed = await sftp.get(b"/remote.bin", local, resume=True, verify=Verify.HASH)
+        default = await sftp.get(b"/remote.bin", local, resume=True)
+
+    assert hashed.transferred == 0
+    assert hashed.resume_check is ResumeCheck.MATCHED
+    assert hashed.content_check is ContentCheck.HASHED
+
+    # `Verify.SIZE` still reports SKIPPED even though the gate opportunistically hashes,
+    # matching `put`: this field answers what the *caller asked for* and found.
+    assert default.resume_check is ResumeCheck.MATCHED
+    assert default.content_check is ContentCheck.SKIPPED
+
+
 # --- the knob itself ---------------------------------------------------------------------------
 
 
@@ -677,6 +829,39 @@ async def test_verify_accepts_the_string_spelling(tmp_path: Path):
         )
 
     assert result.content_check is ContentCheck.REREAD
+
+
+async def test_a_download_verify_accepts_the_string_spelling(tmp_path: Path):
+    """The same normalisation on the download, where getting it wrong is worse than on `put`.
+
+    ``get``'s rung ladder falls through to rung 2 if neither named rung matches, so an
+    un-normalised ``verify="size"`` -- the *default*, spelled as a string -- would silently
+    download the file a second time. Both spellings are asserted here rather than only the
+    interesting one, because the failure lands on the boring one.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        reread = await sftp.get(b"/remote.bin", tmp_path / "a.bin", verify="reread")  # type: ignore[arg-type]
+        default = await sftp.get(b"/remote.bin", tmp_path / "b.bin", verify="size")  # type: ignore[arg-type]
+
+    assert reread.content_check is ContentCheck.REREAD
+    assert default.content_check is ContentCheck.SKIPPED
+
+
+async def test_an_unknown_verify_name_on_a_download_is_refused_rather_than_ignored(
+    tmp_path: Path,
+):
+    # A silently ignored `verify="hsah"` is a download the caller believes was verified, and
+    # here it would also cost a full second transfer while being wrong about it.
+    server = HashingServer(holds=b"payload " * 16)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as exc:
+            _ = await sftp.get(b"/remote.bin", tmp_path / "out.bin", verify="hsah")  # type: ignore[arg-type]
+
+    assert exc.value.args[0] == "'hsah' is not a valid Verify"
 
 
 async def test_an_unknown_verify_name_is_refused_rather_than_ignored(tmp_path: Path):

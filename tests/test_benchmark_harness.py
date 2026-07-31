@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -238,13 +239,15 @@ async def test_the_warm_download_row_times_a_later_transfer_and_not_the_first(mo
         def __init__(self) -> None:
             self.gets = 0
 
-        async def get(self, remote: str, local: Path) -> int:
+        async def get(self, remote: str, local: Path) -> object:
             self.gets += 1
             # The warmups are slow and the timed transfer is fast, which is the opposite of
             # reality and the point: if the clock spanned a warmup the elapsed time could not
             # come out below its duration.
             await anyio.sleep(0.05 if self.gets <= 2 else 0.0)
-            return self.gets
+            # A result object rather than an int since D-99, and the fake has to answer the
+            # same shape or it stops modelling the thing the harness calls.
+            return SimpleNamespace(transferred=self.gets)
 
     session = FakeSession()
 

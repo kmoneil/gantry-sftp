@@ -450,7 +450,7 @@ async def test_a_download_puts_its_stat_and_open_in_flight_together(tmp_path: Pa
         async with open_session(server) as sftp:  # type: ignore[arg-type]
             moved = await sftp.get(b"/incoming.bin", tmp_path / "landed.bin")
 
-    assert moved == len(payload)
+    assert moved.transferred == len(payload)
     assert (tmp_path / "landed.bin").read_bytes() == payload
     held = [{type(request).__name__ for request in waiting} for waiting in server.rendezvous]
     assert {"Stat", "Open"} in held, f"the barrier was met, but not by the STAT/OPEN pair: {held}"

@@ -14,6 +14,7 @@ from gantry_sftp.session._dispatch import Dispatcher, Exchange
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
+    DownloadResult,
     ProgressCallback,
     download_handle,
     read_range_into,
@@ -145,6 +146,7 @@ __all__ = [
     "DirEntry",
     "DirectoryScan",
     "Dispatcher",
+    "DownloadResult",
     "Durability",
     "EntryKind",
     "Exchange",

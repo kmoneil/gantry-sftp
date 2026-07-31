@@ -205,7 +205,10 @@ async def test_resuming_a_transfer_over_a_real_ssh_connection(ssh_server, tmp_pa
             )
         partial = downloaded.stat().st_size
         assert 0 < partial < len(payload), "the download was not actually interrupted"
-        assert await sftp.get(str(source), downloaded, resume=True) == len(payload) - partial
+        resumed = await sftp.get(str(source), downloaded, resume=True)
+        assert resumed.transferred == len(payload) - partial
+        assert resumed.adopted == partial
+        assert resumed.size == len(payload)
 
         with pytest.raises(StopPartwayError):
             _ = await sftp.put(

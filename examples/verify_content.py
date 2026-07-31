@@ -22,6 +22,12 @@ The library never reports a rung it did not reach. `result.content_check` says U
 rather than success when a rung was asked for and could not run, because "not checked" quietly
 reading as "checked and fine" is the failure the ladder exists to prevent.
 
+`verify=` is on **both** directions as of 0.11. It could not be on `get` before that, and the
+blocker was the return type rather than the machinery: `get` returned an `int`, so a rung that
+could not run had nowhere to be reported and the only options were to pass silently or fail the
+transfer. `get` returns a `DownloadResult` now (D-99) and the rungs mean the same thing -- with
+one asymmetry worth knowing, printed below.
+
 The second half is the sharper one. `resume=True` continues from the size the server reports,
 and a size match proves the byte *count* agrees. A remote partial of the right length from the
 wrong source -- a previous run against a different file, a truncated staging file, another
@@ -96,6 +102,35 @@ async def verify_an_upload(sftp: Session, source: Path, remote: str) -> None:
     print(f"    read {len(PAYLOAD):,} bytes back and compared them -- a second transfer")
 
 
+async def verify_a_download(sftp: Session, workdir: Path, remote: str) -> None:
+    """The same two rungs pointed the other way, and what each one actually proves here."""
+    print("\nVerifying a download")
+
+    plain = await sftp.get(remote, workdir / "plain.bin")
+    print(f"  default            size_check={plain.size_check} content_check={plain.content_check}")
+
+    # Rung 1 is the strong one on this side: the server hashes what it holds and we hash what
+    # landed, so it is a real end-to-end check of the file that arrived.
+    hashed = await sftp.get(remote, workdir / "hashed.bin", verify=Verify.HASH)
+    print(f"  verify=hash        content_check={hashed.content_check}")
+    if hashed.content_check == "unavailable":
+        print("    ^ no check-file here either, which is the normal case in both directions")
+
+    # Rung 2 proves something narrower downloading than it does uploading, and the difference
+    # is worth stating rather than leaving to be assumed. Uploading, it proves the server holds
+    # what you sent. Downloading, the bytes come from the same place twice -- so what it
+    # actually checks is the *local* half: our reassembly, our offsets, and the disk they were
+    # written to. Worth asking for; not the same claim.
+    reread = await sftp.get(remote, workdir / "reread.bin", verify=Verify.REREAD)
+    print(f"  verify=reread      content_check={reread.content_check}")
+    print("    proves the local file matches a second read -- our write path, not the link")
+
+    # Rung 3 has an opt-out on this side, because a remote file can legitimately be changing
+    # size underneath. Turning it off is reported rather than silent.
+    unchecked = await sftp.get(remote, workdir / "unchecked.bin", verify_size=False)
+    print(f"  verify_size=False  size_check={unchecked.size_check}")
+
+
 async def resume_onto_a_partial_from_the_wrong_source(
     sftp: Session, workdir: Path, remote: str
 ) -> None:
@@ -159,9 +194,13 @@ async def main() -> None:
 
         async with connect(destination, workdir) as sftp:
             await verify_an_upload(sftp, source, base)
+            await verify_a_download(sftp, workdir, base)
             await resume_onto_a_partial_from_the_wrong_source(sftp, workdir, base)
 
-        print("\nRung 3 always runs. Rungs 1 and 2 run when you ask, and say which one you got.")
+        print(
+            "\nRung 3 always runs on an upload and can be waived on a download. Rungs 1 and 2\n"
+            "run when you ask, in either direction, and say which one you got."
+        )
 
 
 if __name__ == "__main__":

@@ -243,7 +243,11 @@ async def test_verify_size_false_accepts_the_short_download(tmp_path: Path):
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         moved = await sftp.get(b"/remote.bin", local, verify_size=False)
 
-    assert moved == 10
+    assert moved.transferred == 10
+    # Turning the check off is reported rather than being silent. The download is a snapshot
+    # of unknown completeness and the result is where that is written down -- an `int` had
+    # nowhere to say it, which is the half of D-99 the verification ladder cared about.
+    assert moved.size_check is SizeCheck.SKIPPED
     assert local.read_bytes() == b"x" * 10
 
 
@@ -257,7 +261,8 @@ async def test_a_server_that_reports_no_size_cannot_be_size_checked(tmp_path: Pa
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         moved = await sftp.get(b"/remote.bin", local)
 
-    assert moved == 10
+    assert moved.transferred == 10
+    assert moved.size_check is SizeCheck.UNAVAILABLE, "not passed, and not refused"
     assert local.read_bytes() == b"x" * 10
 
 
@@ -268,7 +273,8 @@ async def test_a_full_download_passes_the_check(tmp_path: Path):
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         moved = await sftp.get(b"/remote.bin", local)
 
-    assert moved == 64
+    assert moved.transferred == 64
+    assert moved.size_check is SizeCheck.MATCHED
     assert local.read_bytes() == b"y" * 64
 
 
@@ -287,7 +293,9 @@ async def test_a_resumed_download_compares_the_whole_file_not_the_remainder(tmp_
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         moved = await sftp.get(b"/remote.bin", local, resume=True)
 
-    assert moved == 60, "the remainder, not the whole file"
+    assert moved.transferred == 60, "the remainder, not the whole file"
+    assert moved.size == 100, "and `size` is the whole file, which is why it exists"
+    assert moved.size_check is SizeCheck.MATCHED
     assert local.read_bytes() == b"z" * 100
 
 
@@ -453,20 +461,25 @@ async def test_a_tree_whose_server_will_not_stat_is_not_reported_as_unverified(
     """The decision D-71 asked for, recorded as a test so it cannot drift into an accident.
 
     ``put`` distinguishes "the lengths agreed" from "the server would not say" -- that is why
-    :class:`SizeCheck` has two values rather than being a boolean. ``put_tree`` **discards
-    that**: it keeps ``result.transferred`` from each :class:`UploadResult` and drops
-    ``size_check``, so a tree of ten thousand files onto a server that refuses every ``STAT``
-    completes with ``complete is True`` and no indication that rung 3 never happened.
+    :class:`SizeCheck` is an enum rather than a boolean. ``put_tree`` **discards that**: it
+    keeps ``result.transferred`` from each :class:`UploadResult` and drops ``size_check``, so a
+    tree of ten thousand files onto a server that refuses every ``STAT`` completes with
+    ``complete is True`` and no indication that rung 3 never happened.
 
-    That is a real loss of information and it is deliberate for now. ``TreeResult`` is shared by
-    ``get_tree``, ``put_tree`` and ``rmtree``; only ``put_tree`` has a per-file verdict to
-    aggregate, because ``get`` returns an ``int`` and ``rmtree`` moves no bytes. A field that
-    can only be populated honestly by one of three constructors is a worse trap than the
-    silence -- it would read as "verified" on the two paths that never set it.
+    That is a real loss of information and it is deliberate. **The reason it used to be
+    deliberate has expired and the decision was re-taken rather than inherited** (D-99): the
+    old argument was that only ``put_tree`` has a per-file verdict to aggregate, because
+    ``get`` returned an ``int``; ``get`` now returns a
+    :class:`~gantry_sftp.session.DownloadResult` and ``get_tree`` drops it in exactly the same
+    way. What holds the line now is memory: ``TreeResult.skipped`` is bounded by the number of
+    *problems* and is worth carrying in full, per-file results are bounded by the number of
+    *files*, and a tree of a hundred thousand of them should not cost a hundred thousand
+    objects for a report almost nobody reads.
 
-    What would change the decision: a caller who needs the distinction, or ``get`` growing a
-    result object of its own. Until then this test pins the behaviour so the gap is visible in
-    the suite rather than only in a card.
+    What would change it: a caller who needs the distinction, for whom the answer today is to
+    call ``get`` or ``put`` per file and keep the results -- which is what the consumer behind
+    D-99 does. Until then this test pins the behaviour so the gap is visible in the suite
+    rather than only in a card.
     """
     source = tmp_path / "outgoing"
     source.mkdir()
@@ -512,5 +525,6 @@ async def test_an_honest_round_trip_passes_the_check_on_a_real_server(tmp_path: 
         moved = await sftp.get(str(tmp_path / "uploaded.bin"), destination)
 
     assert result.size_check is SizeCheck.MATCHED
-    assert moved == len(content)
+    assert moved.size_check is SizeCheck.MATCHED
+    assert moved.transferred == len(content)
     assert destination.read_bytes() == content

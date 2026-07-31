@@ -132,9 +132,9 @@ async def by_predicate(sftp: Session, directory: str, into: Path) -> list[bytes]
         if not entry.is_file or not re.fullmatch(r"[a-z]+\.csv", entry.name):
             continue
         remote = join_remote(drop, check_listed_name(entry.filename, directory=drop))
-        written = await sftp.get(remote, local_child(into, entry.filename))
+        fetched = await sftp.get(remote, local_child(into, entry.filename))
         taken.append(remote)
-        print(f"    {os.fsdecode(entry.filename)}  ({written} bytes)")
+        print(f"    {os.fsdecode(entry.filename)}  ({fetched.transferred} bytes)")
     return taken
 
 
@@ -193,8 +193,8 @@ async def main() -> None:
             print("\nfetching every match of **/*.csv:")
             async with aclosing(sftp.glob(f"{target}/**/*.csv")) as found:
                 async for match in found:
-                    written = await sftp.get(match.path, local_child(into, match.name))
-                    print(f"    {os.fsdecode(match.name)}  ({written} bytes)")
+                    fetched = await sftp.get(match.path, local_child(into, match.name))
+                    print(f"    {os.fsdecode(match.name)}  ({fetched.transferred} bytes)")
 
             print("\nthe same job with a regex, which no pattern can express:")
             picked = workdir / "picked"

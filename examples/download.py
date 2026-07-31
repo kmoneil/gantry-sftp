@@ -45,7 +45,7 @@ async def main() -> None:
                 open_session(transport) as sftp,
             ):
                 print(f"downloading {remote}")
-                written = await sftp.get(str(remote), local, progress=bar)
+                result = await sftp.get(str(remote), local, progress=bar)
         else:
             if remote_path is None:
                 sys.exit("usage: python examples/download.py user@host /remote/path")
@@ -55,10 +55,15 @@ async def main() -> None:
                 open_session(transport) as sftp,
             ):
                 print(f"downloading {remote_path} from {host}")
-                written = await sftp.get(remote_path, local, progress=bar)
+                result = await sftp.get(remote_path, local, progress=bar)
 
-        print(f"\n{written} bytes -> {local}")
+        # `get` returns a report rather than a byte count (D-99). `transferred` is what this
+        # call moved; `size` is what the file holds, and the two differ on a resume.
+        print(f"\n{result.transferred} bytes -> {result.local_path}")
         print(f"on disk: {local.stat().st_size} bytes")
+        print(
+            f"size check: {result.size_check.value}   content check: {result.content_check.value}"
+        )
 
 
 if __name__ == "__main__":

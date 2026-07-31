@@ -44,6 +44,7 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import anyio
@@ -58,12 +59,15 @@ from gantry_sftp.codec import (
 )
 from gantry_sftp.exceptions import ProtocolError, TransferError, TransferTimeoutError
 from gantry_sftp.session._dispatch import Dispatcher, Exchange
+from gantry_sftp.session._publish import SizeCheck, TimePreservation
+from gantry_sftp.session._verify import ContentCheck, ResumeCheck
 
 __all__ = [
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_PIPELINE_DEPTH",
     "BufferSink",
     "DescriptorSink",
+    "DownloadResult",
     "ProgressCallback",
     "Sink",
     "Span",
@@ -611,3 +615,66 @@ async def read_range_into(
 
 ProgressReporter = Callable[[int, int | None], None]
 """Plain-callable spelling of :class:`ProgressCallback`, for annotating callers."""
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadResult:
+    """What one ``get`` actually did.
+
+    Returned rather than an ``int`` because the byte count was never the whole answer and,
+    until 0.11, the rest of it was computed and thrown away (D-99). A ``get`` establishes the
+    remote file's size, gates whatever a resume adopted, stamps the local file, sets its mode
+    and checks the length that arrived -- and had one integer to report all of it through. The
+    visible consequence was that ``get`` could not offer ``verify=`` at all: with nowhere to
+    say ``unavailable``, a content check that could not run would have had to either pass
+    silently or fail the transfer, and DESIGN.md 6's ladder exists to make that exact silence
+    impossible.
+
+    It lives here rather than beside :class:`~gantry_sftp.session.UploadResult`, which is in
+    ``_publish.py``, because that module is about how an upload *becomes visible* and a
+    download publishes nothing. The two types are re-exported side by side, which is where a
+    reader compares them.
+
+    A caller who only wants the count reads :attr:`transferred`; a caller who resumed reads
+    :attr:`size`, because ``transferred`` is the remainder and not the file.
+
+    Attributes:
+        transferred: Bytes written **by this call**. On a resume that is the remainder, and on
+            a resume of an already-complete file it is ``0``.
+        remote_path: What was read, as it was sent on the wire.
+        local_path: What was written.
+        size_check: Whether what arrived was checked against the size the server reported --
+            rung 3 of DESIGN.md 6's ladder. A mismatch raises rather than appearing here.
+        times: Whether the remote file's timestamps survived onto the local one. ``SKIPPED``
+            unless ``preserve_times=True`` was asked for. ``UNAVAILABLE`` is the case the
+            docstring for ``preserve_times`` used to have to apologise for in prose: a server
+            that reports no times leaves the local file stamped with now, and this is where it
+            says so.
+        content_check: Whether the *content* was verified, and by which rung. ``SKIPPED``
+            unless ``verify=`` asked for one.
+        resume_check: Whether the partial a resume adopted was proven to be a prefix of the
+            remote file. ``SKIPPED`` when nothing was adopted.
+        adopted: Bytes that were already on local disk and were kept. ``0`` unless ``resume``.
+        mode: The permission bits the local file was left with, or ``None`` when ``mode=`` was
+            not passed and it stayed at the ``0o600`` every download is created with.
+    """
+
+    transferred: int
+    remote_path: bytes
+    local_path: Path
+    size_check: SizeCheck
+    times: TimePreservation = TimePreservation.SKIPPED
+    content_check: ContentCheck = ContentCheck.SKIPPED
+    resume_check: ResumeCheck = ResumeCheck.SKIPPED
+    adopted: int = 0
+    mode: int | None = None
+
+    @property
+    def size(self) -> int:
+        """Bytes the local file holds now: :attr:`adopted` plus :attr:`transferred`.
+
+        The number a caller almost always means. ``transferred`` alone answers "what did this
+        call cost", which is the question a progress meter asks and not the one a manifest
+        does -- and a resumed transfer is exactly where the two differ.
+        """
+        return self.adopted + self.transferred

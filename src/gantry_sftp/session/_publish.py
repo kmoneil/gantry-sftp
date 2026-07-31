@@ -110,26 +110,27 @@ class Durability(StrEnum):
 
 
 class SizeCheck(StrEnum):
-    """Whether the published file's length was confirmed against the local file's.
+    """Whether a transferred file's length was confirmed against the other side's.
 
     This is rung 3 of DESIGN.md 6's verification ladder, the one that section says runs
     *always*. Until 0.8 it ran nowhere, so a truncated upload published successfully and a
     short download returned successfully -- while four documents said a size check had
-    happened. Two values rather than a boolean because "the server would not say" is a
-    different fact from "the lengths agreed", and a caller who cares needs to tell them apart.
+    happened. More than a boolean because "the server would not say" is a different fact from
+    "the lengths agreed", and a caller who cares needs to tell them apart.
 
     A **mismatch** is not one of the values. It raises
     :class:`~gantry_sftp.exceptions.TransferError` instead, because a file of the wrong
     length is not a result to report -- and on the atomic path the check runs before the
     rename, so the destination is never published at all.
 
-    Unlike :class:`Durability` there is no ``SKIPPED``, and that is a decision. Section 6 says
-    *always*, and on the upload side we control the source: a local file whose length
-    disagrees with what the server ended up holding is wrong every time, with none of the
-    "the remote file is legitimately changing" cases that earn ``get`` its ``verify_size``
-    flag.
+    **``SKIPPED`` exists for the download only, and the asymmetry is the decision.** On the
+    upload side we control the source: a local file whose length disagrees with what the
+    server ended up holding is wrong every time, so there is no opt-out and ``put`` never
+    reports this value. Downloading, the remote file can legitimately be changing underneath
+    -- which is what earns ``get`` its ``verify_size`` flag, and what that flag turns off has
+    to be reportable or the result would claim a check that did not run.
 
-    **There is no opt-out because the measurement did not justify one.** The cost is one
+    **The upload has no opt-out because the measurement did not justify one.** The cost is one
     ``STAT`` per upload, and 0.8 shipped it unconditionally while promising a ``verify_size``
     flag once ``put``'s argument list had room. Benchmarking it removed the reason. On every
     shaped profile the small-file upload row is a three-way tie with paramiko and asyncssh --
@@ -144,15 +145,21 @@ class SizeCheck(StrEnum):
     """
 
     MATCHED = "matched"
-    """The server reported a length and it equalled the local file's."""
+    """The other side reported a length and it equalled this side's."""
 
     UNAVAILABLE = "unavailable"
     """Nothing could be compared: the server refused the ``STAT``, or answered one carrying no
     size. Both collapse here because the consequence is identical -- the length is unknown --
-    and neither fails the upload, for the reason the ``limits`` probe does not fail a
+    and neither fails the transfer, for the reason the ``limits`` probe does not fail a
     connection: a measurement that cannot be taken is not evidence that the thing being
     measured is broken. Rare in practice; OpenSSH, asyncssh and paramiko all report a size.
     The honest answer where it happens is that rung 3 was not available, not that it passed."""
+
+    SKIPPED = "skipped"
+    """``get(verify_size=False)``, which is the only way to reach this value. The download ran
+    without comparing what arrived against what was announced, because the caller said the
+    remote file is legitimately changing size. What comes back is then a snapshot of unknown
+    completeness, and this is the field that says so."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,9 +21,28 @@ import os
 import time
 from pathlib import Path
 
+import anyio
 import pytest
 
-from gantry_sftp.codec import Attrs, Times
+from gantry_sftp.codec import (
+    Attrs,
+    AttrsReply,
+    Close,
+    Data,
+    FrameSplitter,
+    Handle,
+    Init,
+    LStat,
+    Open,
+    Read,
+    Stat,
+    Status,
+    StatusCode,
+    Times,
+    Version,
+    decode,
+    encode,
+)
 from gantry_sftp.session import (
     DirEntry,
     Publish,
@@ -46,6 +65,56 @@ KNOWN_ATIME = 1_600_000_007
 def needs_real_server() -> None:
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+
+class TimelessServer:
+    """A server whose ``STAT`` carries a size and no times.
+
+    Legal, and not rare: filexfer v3 attributes are a flags word, so ``ACMODTIME`` being
+    absent is a server saying it has no opinion rather than a server misbehaving. There is no
+    way to make a real ``sftp-server`` do it, which is why this is a fake -- and the case it
+    stages is the one ``preserve_times`` cannot satisfy and used to pass over in silence.
+    """
+
+    def __init__(self, *, content: bytes = b"") -> None:
+        self.content = content
+        self._splitter = FrameSplitter()
+        self._outbox = bytearray()
+        self._has_output = anyio.Event()
+
+    async def send(self, data: bytes | memoryview) -> None:
+        for frame in self._splitter.feed(data):
+            self._dispatch(decode(frame))
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if not self._outbox:
+            await self._has_output.wait()
+        chunk = bytes(self._outbox[:max_bytes])
+        del self._outbox[:max_bytes]
+        if not self._outbox:
+            self._has_output = anyio.Event()
+        return chunk
+
+    def _reply(self, packet: object) -> None:
+        self._outbox += encode(packet)  # type: ignore[arg-type]
+        self._has_output.set()
+
+    def _dispatch(self, packet: object) -> None:
+        if isinstance(packet, Init):
+            self._reply(Version(3, ()))
+            return
+        rid = packet.request_id  # type: ignore[union-attr]
+        if isinstance(packet, Stat | LStat):
+            self._reply(AttrsReply(rid, Attrs(size=len(self.content))))
+        elif isinstance(packet, Open):
+            self._reply(Handle(rid, b"h"))
+        elif isinstance(packet, Read):
+            chunk = self.content[packet.offset : packet.offset + packet.length]
+            self._reply(Data(rid, memoryview(chunk)) if chunk else Status(rid, StatusCode.EOF))
+        elif isinstance(packet, Close):
+            self._reply(Status(rid, StatusCode.OK))
+        else:
+            self._reply(Status(rid, StatusCode.OK))
 
 
 def stamped(path: Path, payload: bytes = b"payload") -> Path:
@@ -155,6 +224,63 @@ async def test_both_publish_paths_preserve(tmp_path: Path, atomic: bool):
     assert int(destination.stat().st_mtime) == KNOWN_MTIME
 
 
+async def test_a_resumed_download_that_is_already_complete_is_still_stamped(tmp_path: Path):
+    """D-99's bug: the early return applied the mode and silently skipped the timestamps.
+
+    A resume that finds the local file already whole returns without opening anything, and
+    until 0.11 that path stamped nothing -- so ``preserve_times=True`` left the file carrying
+    the moment the *interrupted* run last wrote to it. That is D-79's failure exactly: a
+    fabricated timestamp that looks entirely plausible, on a call that reported success.
+
+    It was invisible because ``get`` returned a byte count. Building
+    :class:`~gantry_sftp.session.DownloadResult` is what surfaced it -- the field had to say
+    ``PRESERVED`` or ``SKIPPED`` on a path where the caller had asked and neither was true.
+
+    The mode half was already right and is asserted alongside, because the argument the code
+    makes for one is the argument for the other: the destination exists, the caller said what
+    metadata it should carry, and "it was already there" is not an answer to that.
+    """
+    needs_real_server()
+    payload = b"payload"
+    complete = tmp_path / "complete.bin"
+    complete.write_bytes(payload)
+    os.utime(complete, (KNOWN_ATIME - 500_000, KNOWN_MTIME - 500_000))
+    # Stamped *after* the copy: reading a file updates its atime, so building the destination
+    # from `source.read_bytes()` would move the very timestamp this test is about.
+    source = stamped(tmp_path / "source.bin", payload)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.get(
+            str(source).encode(), complete, resume=True, preserve_times=True, mode=0o640
+        )
+
+    assert result.transferred == 0, "nothing was moved, which is what makes this the early path"
+    assert result.times is TimePreservation.PRESERVED
+    assert int(complete.stat().st_mtime) == KNOWN_MTIME
+    assert int(complete.stat().st_atime) == KNOWN_ATIME
+    assert complete.stat().st_mode & 0o777 == 0o640
+
+
+async def test_a_download_from_a_server_that_reports_no_times_says_so(tmp_path: Path):
+    """The third state, which used to be a paragraph of apology in ``get``'s docstring.
+
+    A server that answers ``STAT`` with no times leaves the local file stamped with now. That
+    is a wrong answer rather than a missing one, and before D-99 ``get`` had nowhere to say it
+    had happened -- the docstring told the caller to go and ``stat()`` the file first instead.
+    """
+    server = TimelessServer(content=b"payload")
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get(b"/remote.bin", local, preserve_times=True)
+
+    assert result.times is TimePreservation.UNAVAILABLE
+    assert local.read_bytes() == b"payload"
+
+
 async def test_a_resumed_download_is_stamped_once_it_is_whole(tmp_path: Path):
     # Applied after the last write, not during: a write updates mtime, so stamping a partial
     # file would be undone by the bytes that finish it.
@@ -168,9 +294,10 @@ async def test_a_resumed_download_is_stamped_once_it_is_whole(tmp_path: Path):
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        moved = await sftp.get(str(source).encode(), partial, resume=True, preserve_times=True)
+        result = await sftp.get(str(source).encode(), partial, resume=True, preserve_times=True)
 
-    assert moved == len(payload) - 10_000
+    assert result.transferred == len(payload) - 10_000
+    assert result.times is TimePreservation.PRESERVED
     assert partial.read_bytes() == payload
     assert int(partial.stat().st_mtime) == KNOWN_MTIME
 

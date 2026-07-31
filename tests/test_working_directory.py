@@ -305,7 +305,11 @@ async def test_every_reading_method_resolves_against_the_working_directory(tmp_p
         assert [entry.path async for entry in sftp.walk(b"nested")] == [under + b"/nested"]
         assert [match.path async for match in sftp.glob(b"*.csv")] == [under + b"/data.csv"]
 
-        assert await sftp.get(b"data.csv", tmp_path / "fetched.csv") == len(b"id,total\n1,42\n")
+        fetched = await sftp.get(b"data.csv", tmp_path / "fetched.csv")
+        assert fetched.transferred == len(b"id,total\n1,42\n")
+        # The result reports the path that was actually read, prefix and all, which is the
+        # question a caller with a working directory set is most likely to be asking.
+        assert fetched.remote_path == under + b"/data.csv"
         assert (tmp_path / "fetched.csv").read_bytes() == b"id,total\n1,42\n"
 
     # The decoy is untouched: nothing above reached the file beside the working directory.
