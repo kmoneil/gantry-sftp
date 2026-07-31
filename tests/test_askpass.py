@@ -16,6 +16,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,16 @@ def test_the_helper_is_removed_when_the_connection_ends():
     assert not helper.parent.exists()
 
 
+def test_the_directory_is_named_after_this_library_so_a_leak_can_be_attributed():
+    # The removal above is what stops a leak; this is what makes one *attributable* if the
+    # process is killed between the mkdtemp and the rmtree. A directory in `/tmp` called
+    # `tmpab12cd` tells an operator nothing, and this is a directory that briefly holds the
+    # helper `ssh` runs to answer a password prompt.
+    with askpass_environment("secret") as env:
+        directory = Path(env["SSH_ASKPASS"]).parent
+        assert directory.name.startswith("gantry-sftp-askpass-")
+
+
 def test_the_helper_is_removed_even_when_the_body_raises():
     # The failure path is the one that matters: a connection that fails is exactly when a
     # credential-adjacent temporary file would be left behind.
@@ -165,6 +176,35 @@ def test_the_helper_is_removed_even_when_the_body_raises():
     helper = captured[0]
     assert not helper.exists()
     assert not helper.parent.exists()
+
+
+def test_a_cleanup_that_cannot_finish_does_not_replace_the_connection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The reason the removal passes ``ignore_errors=True``, asserted rather than commented.
+
+    A connection that fails is the case this whole path exists for, and the caller needs the
+    exception that says *why* -- not a ``PermissionError`` from tidying up after it. The
+    failure is made with real filesystem permissions rather than a stubbed ``rmtree``: a
+    read-only parent is what actually stops the final ``rmdir``, and stubbing the function
+    under test would only confirm which argument was passed to it.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def fail_with_an_undeletable_directory() -> None:
+        with askpass_environment("secret") as env:
+            # Read-only *parent*: the helper can still be unlinked, the `rmdir` of the
+            # directory itself cannot.
+            tmp_path.chmod(0o500)
+            assert Path(env["SSH_ASKPASS"]).exists()
+            raise RuntimeError("connection failed")
+
+    try:
+        with pytest.raises(RuntimeError) as refused:
+            fail_with_an_undeletable_directory()
+        assert refused.value.args[0] == "connection failed"
+    finally:
+        tmp_path.chmod(0o700)
 
 
 # --- the base environment ------------------------------------------------------------------

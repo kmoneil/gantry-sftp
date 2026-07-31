@@ -161,6 +161,28 @@ def askpass_environment(
             the prompt it is for.
         NotImplementedError: On Windows. The helper is a POSIX shell script, and this has
             never been run against Windows OpenSSH.
+
+    Note:
+        The body is :func:`_askpass_environment` and **that split is for the mutation lane**
+        (D-107), not for structure. mutmut does not instrument a decorated function -- copying
+        one for its trampoline can re-run the decorator's side effects, so it declines them
+        all -- which left this function, the one that writes an executable, sets ``0700``, puts
+        a secret in a child environment and ``rmtree``s it in a ``finally``, generating exactly
+        two mutants for its whole length. Undecorated, the body is instrumented. Do not fold it
+        back in; if mutmut ever grows an ``allow_decorators``, delete the wrapper instead.
+    """
+    yield from _askpass_environment(password, env=env)
+
+
+def _askpass_environment(
+    password: str, *, env: Mapping[str, str] | None = None
+) -> Iterator[dict[str, str]]:
+    """The body of :func:`askpass_environment`; see there for what it does and why it is split.
+
+    Yields:
+        The child environment, exactly once. ``yield from`` in the wrapper forwards a throw at
+        the yield point straight into this generator, so the ``finally`` below still runs on
+        the failure path -- which is the whole reason the removal is written as one.
     """
     _validate_password(password)
     if sys.platform.startswith("win"):

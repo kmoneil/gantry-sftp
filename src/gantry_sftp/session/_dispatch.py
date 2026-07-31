@@ -495,6 +495,17 @@ class Dispatcher:
         requests outstanding on the server, and their replies will arrive; without this the
         routing table would keep a dead exchange alive for each one, which is a leak that
         grows with every timeout.
+
+        Note:
+            D-107 costed splitting this into an undecorated body so the mutation lane could see
+            it -- mutmut skips decorated functions -- and **the split was measured and
+            reverted**. The body is four statements with no operator, literal or comparison in
+            them, so it yields two mutants (``Exchange(self)`` and the ``add`` replaced with
+            ``None``) which the suite already kills on contact. The ``finally`` that is this
+            method's whole reason to exist is *still* not something mutmut can remove, so the
+            indirection bought an extra frame and no coverage. The same split on
+            :func:`~gantry_sftp.transport._askpass.askpass_environment` turned 2 mutants into
+            45 and found two real gaps; that one stayed.
         """
         exchange = Exchange(self)
         self._exchanges.add(exchange)
