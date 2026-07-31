@@ -220,7 +220,11 @@ def test_windows_refuses_rather_than_writing_a_script_it_cannot_run(monkeypatch)
     monkeypatch.setattr(sys, "platform", "win32")
     with pytest.raises(NotImplementedError) as exc, askpass_environment("secret"):
         pytest.fail("should not have yielded an environment")
-    assert exc.value.args[0].startswith("password= is not supported on Windows:")
+    assert exc.value.args[0] == (
+        "password= is not supported on Windows: the askpass helper is a POSIX shell "
+        "script and Windows OpenSSH's prompting path has never been exercised here. "
+        "Use key-based authentication, or supply your own SSH_ASKPASS via env="
+    )
 
 
 def test_the_password_is_validated_before_anything_is_written(tmp_path, monkeypatch):
