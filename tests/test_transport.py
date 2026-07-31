@@ -244,6 +244,14 @@ async def test_the_close_record_carries_its_fields_as_data(
 
     closed = [r for r in caplog.records if r.getMessage().startswith("closed pid=")]
     assert len(closed) == 1
+    # The sentence as well as the fields, which is this file's own lesson turned around: the
+    # first version of this test asserted the structured half and left the rendered half
+    # unread, so the pid could be dropped from the message and the unit suffix changed with
+    # nothing failing. Both halves or neither -- a record is read by a person *and* a sink.
+    assert closed[0].getMessage() == (
+        f"closed pid={transport.pid} returncode={transport.returncode} "
+        f"stderr={len(transport.stderr_text)}B"
+    )
     fields = record_fields(closed[0])
     assert fields["operation"] == "close"
     assert fields["event"] == "ok"
