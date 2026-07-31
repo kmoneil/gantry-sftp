@@ -93,6 +93,14 @@ profile and their date, come out of ``benchmarks/`` when it is run; they are not
 and are not committed anywhere, because a number in a docstring ages without anybody noticing
 (D-23, D-88, D-94).
 
+**What it costs is this depth times the derived request size**, about 16 MiB at the shipped
+defaults, and that is the whole of a transfer's memory: neither direction accumulates a *file*.
+Downloading, the payload is placed with ``os.pwrite`` and dropped, and what bounds the total is
+the exchange's reply deque -- at most ``depth`` entries, because that is how many reads are
+outstanding. Uploading, the bound is the codec's outstanding map, which holds each ``WRITE``
+with its payload until the reply. Same figure, two mechanisms; README's "What a transfer costs
+in memory" states the expression and `tests/test_packaging.py` derives it from the constants.
+
 That cost belongs to the transport rather than to this scheduler, and it is paid once per
 connection: a session that moves several files amortises it, which is an argument for
 ``ControlMaster`` and for reusing a session, not for a different depth here. An earlier

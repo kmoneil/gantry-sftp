@@ -264,6 +264,15 @@ exists today:
   event loop, as a facade over the async code rather than a second implementation of it, with
   the parity between the two derived from the async signatures by a test, not maintained by
   hand
+- **name matching**: `glob()` in `sftp(1)`'s own `glob(3)` dialect rather than `fnmatch`'s, so
+  the dotfile rule that keeps a drop directory's half-written staging files out of a match is
+  the one the reference client has. A match carries a path this library built out of validated
+  parts — and for a filter no pattern can express, the same two calls are public
+- **an fsspec filesystem**: `gantry_sftp.fsspec` makes `pd.read_parquet("gantry-sftp://…")`
+  work, over the blocking surface rather than a second concurrency runtime. It registers
+  **nothing** on import, because `sftp://` is already claimed inside fsspec by an
+  implementation that sets `AutoAddPolicy` — taking a protocol from another library is a
+  decision the caller makes in writing, not a side effect of installing this one
 - a test lane that drives the genuine OpenSSH `sftp-server` over a pipe, with no ssh, no keys,
   no network and no containers, and a `live-tests/` lane that runs a real `sshd`, including a
   `tc netem`-shaped link where the pipelining claims are actually measured
@@ -496,6 +505,16 @@ a defect on the other side rather than a preference:
   `TypeError` on the other side; here an entry the server did not describe is `"other"`, and
   a broken symlink is reported rather than dropped or raised.
 
+**Errors change shape at this boundary, deliberately.** fsspec's contract is `FileNotFoundError`
+— `AbstractFileSystem.info` is documented to raise it, `exists` is written around it, and pandas
+tests for it by name — so the adapter translates: `NoSuchFileError` becomes `FileNotFoundError`
+and `PermissionDeniedError` becomes `PermissionError`, with the original on `__cause__` so the
+status code and the server's message survive. Everywhere else in this library an
+[`SFTPError` is not an `OSError`](#when-the-connection-fails), and it stays that way; the
+translation happens here and nowhere else. The predicates you get through `fs` are fsspec's too,
+which means they swallow every exception including a refusal — reach for
+[`Session.exists`](#is-it-there) when "not there" and "not allowed to look" have to differ.
+
 ### The URL form
 
 ```
@@ -505,7 +524,7 @@ gantry-sftp://[user[:password]@]host[:port]/absolute/path[?parameters]
 The path is always absolute — fsspec has no way to express a relative one — so `cwd=` is how
 you name a relative root. fsspec parses the authority and hands the **query string back
 unparsed**, so these parameters are this library's own, and they are the arguments
-[`connect()`](#connect) already takes:
+[`connect()`](#status) already takes:
 
 | | |
 | --- | --- |

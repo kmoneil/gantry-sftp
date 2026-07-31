@@ -14,6 +14,12 @@ Three loggers, named so a caller can turn on exactly the volume they want:
     genuinely per-frame -- a 16 MiB download is a few hundred lines, a recursive tree is
     thousands. Enable it for a protocol question, not as a matter of course.
 
+**The first two carry their fields as data, not only inside the message** (D-98). Every record
+they emit has an ``extra`` mapping under :data:`LOG_FIELDS`, read back with
+:func:`record_fields`, so a JSON sink indexes ``operation`` / ``bytes`` / ``elapsed`` instead of
+re-parsing a sentence this module formatted. ``frames`` deliberately does not: it renders through
+``codec.describe``, which returns a string by design, and a frame dump is text.
+
 **The library raises errors; it does not log them.** There is exactly one WARNING in the tree --
 a retryable failure that :func:`~gantry_sftp.session.with_reconnect` swallowed and retried -- and
 it exists because that is the one failure a caller never sees. Everything else that goes wrong

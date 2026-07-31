@@ -243,8 +243,12 @@ class SessionOptions:
             which also makes teardown unbounded against a peer that has stopped answering.
         idle_timeout: Seconds of total silence during a bulk transfer. A large transfer over a
             slow link is healthy so long as bytes keep arriving, so this fires only on silence.
-        depth: Default requests in flight per transfer. Raising it past the default buys
-            nothing: one session is one channel is one 2 MiB window.
+        depth: Default requests in flight per transfer, and therefore what a transfer costs
+            in memory: peak is ``depth`` x the derived request size, about 16 MiB at the
+            shipped defaults and the same in both directions. Raising it past the default
+            buys nothing -- one session is one channel is one 2 MiB window -- so this is a
+            knob for *lowering*, when a container's limit is what binds. See README,
+            "What a transfer costs in memory".
     """
 
     request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT
