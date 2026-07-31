@@ -12,11 +12,13 @@ because what it exercises is the concurrency.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
+from gantry_sftp._logging import record_fields
 from gantry_sftp.codec import Read
 from gantry_sftp.exceptions import DestinationCollisionError
 from gantry_sftp.session import Publish, open_session
@@ -380,3 +382,87 @@ async def test_a_real_concurrent_upload_writes_each_file_only_where_it_belongs(t
     assert result.files == len(bodies)
     for name, body in bodies.items():
         assert (destination / name).read_bytes() == body, f"{name} holds the wrong bytes"
+
+
+# --- what the survivors found: a forwarded bound, and a record nobody read (D-105) -----------
+
+
+async def test_put_trees_max_depth_reaches_the_local_walk(tmp_path: Path):
+    """``max_depth`` is forwarded to ``walk_local`` and nothing proved it arrived.
+
+    The remote side of this is covered -- ``test_max_depth_stops_the_descent_and_says_so`` and
+    its zero-depth sibling pin ``walk``. The *upload* side forwards the same argument to a
+    different walker and had no test at all, so nulling it or dropping it from the call both
+    survived the suite. The consequence is not a wrong number: a caller who bounds a recursive
+    upload to one level gets the **whole tree** sent, which on a drop directory is every byte
+    below it going somewhere it was deliberately not asked to go.
+
+    Asserted by depth rather than by file count, because a count is satisfied by any tree of
+    the right size and the thing under test is *where* the walk stopped.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    build_tree(source)
+    shallow = tmp_path / "shallow"
+    unbounded = tmp_path / "unbounded"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        bounded = await sftp.put_tree(source, str(shallow), max_depth=1)
+        whole = await sftp.put_tree(source, str(unbounded))
+
+    # `build_tree` puts `leaf.txt` two levels down, which is what `max_depth=1` must exclude.
+    assert (shallow / "top.csv").exists(), "the root's own files are inside a depth of one"
+    assert (shallow / "sub").is_dir(), "one level down is inside a depth of one"
+    assert not (shallow / "sub" / "deeper").exists(), (
+        "max_depth=1 descended two levels, so it did not reach walk_local"
+    )
+    # And the unbounded run is the control: without it, a put_tree that silently uploaded
+    # nothing at all would satisfy every assertion above.
+    assert (unbounded / "sub" / "deeper" / "leaf.txt").exists()
+    assert whole.files > bounded.files
+
+
+async def test_the_put_tree_record_carries_its_fields_as_data(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The operation record's structured half, which is the fourth site of one pattern.
+
+    D-105's three previous slices each found the machine-readable half of something whose
+    human-readable half was tested well: an invariant two docstrings assert, an exception's
+    carried fields beside a message pinned to the character, and a log record's fields beside a
+    pinned sentence. This is the same shape again -- the ``operation`` name could be nulled,
+    case-mangled or replaced with ``XXput_treeXX``, and ``local`` and ``remote`` could each be
+    nulled or deleted, with nothing failing.
+
+    It matters here for the reason D-98 exists: these fields are what an operator's tooling
+    filters and joins on. A dashboard that groups transfers by ``operation`` silently loses
+    every tree upload if the name changes, and the message still reads correctly.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    (source / "only.csv").write_bytes(b"id\n1\n")
+    destination = tmp_path / "uploaded"
+
+    with caplog.at_level(logging.DEBUG, logger="gantry_sftp.session"):
+        async with (
+            open_local_server_transport(cwd=tmp_path) as transport,
+            open_session(transport) as sftp,
+        ):
+            _ = await sftp.put_tree(source, str(destination))
+
+    records = [r for r in caplog.records if record_fields(r).get("operation") == "put_tree"]
+    assert records, "the tree upload emitted no record naming itself put_tree"
+    start = record_fields(records[0])
+    assert start["operation"] == "put_tree"
+    assert start["event"] == "start"
+    assert start["local"] == str(source)
+    assert start["remote"] == str(destination)
