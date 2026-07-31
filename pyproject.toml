@@ -370,7 +370,19 @@ source_paths = ["src/"]
 # half was blocked upstream from 2026-07-26 until mutmut 3.7.0 shipped
 # `fix(#525): implement full async-gen wrapper`; see D-21. Scope a working run with a
 # wildcard rather than by editing this line: `mutmut run "gantry_sftp.session._retry*"`.
-only_mutate = ["src/gantry_sftp/codec/*", "src/gantry_sftp/session/*"]
+#
+# **And `transport/`, which the Definition of Done does not name and which needs the lane
+# most.** The rule says "codec and correctness layer"; it was written before this package held
+# the argument-injection defence (`_argv.py`) and the credential path (`_askpass.py`), which
+# are the two files in this library where a missed test costs an injected `ssh` flag or a
+# leaked password rather than a wrong timestamp. Reading them is not evidence: the 0.11 review
+# called `_localpath.py` exemplary on the same basis, and D-105's sixth slice then found that a
+# server could name a file `CON.a.txt` and reach the console.
+only_mutate = [
+    "src/gantry_sftp/codec/*",
+    "src/gantry_sftp/session/*",
+    "src/gantry_sftp/transport/*",
+]
 pytest_add_cli_args_test_selection = ["tests/"]
 # `tests/test_packaging.py` is ignored for the same reason and it is worth stating
 # separately, because the symptom is different: it resolves the repository root through
@@ -389,6 +401,12 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # glob matches nothing, so the allowlist looks stale and the *inverse* test passes
 # vacuously. Worth naming rather than just ignoring: a test that resolves the repo root
 # does not merely fail here, it can also pass for the wrong reason.
+# `tests/test_argv.py` needs no ignore but does carry one `skipif`, and the reason belongs
+# with this list because the cause is the same family: mutmut wraps every mutated function in
+# a trampoline, so the *call stack* is one frame deeper than it is outside the lane. A test
+# asserting a `warnings.warn` `stacklevel` therefore measures a different thing here. It skips
+# on `MUTANT_UNDER_TEST`, which mutmut sets for the whole run, so ordinary runs are unchanged.
+# Without the skip the lane cannot start at all: stats collection fails on that one assertion.
 # `tests/test_sync_facade.py` is the fifth, and it is the first with a different root
 # cause: it does not resolve the repository root, it introspects `Session` itself. Under
 # mutmut the class carries the trampoline's own members -- `xǁSessionǁ__init____mutmut_1`,

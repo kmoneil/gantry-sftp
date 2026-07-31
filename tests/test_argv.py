@@ -8,6 +8,8 @@ strings below execute commands when passed to a real ssh without `--`.
 from __future__ import annotations
 
 import itertools
+import os
+from pathlib import Path
 
 import pytest
 
@@ -223,10 +225,42 @@ def test_a_host_that_looks_like_an_option_is_refused(host: str):
     )
 
 
-@pytest.mark.parametrize("user", ["-oProxyCommand=id", "-l root"])
-def test_a_username_that_looks_like_an_option_is_refused(user: str):
-    with pytest.raises(ValueError):
-        build_ssh_argv("h", user=user)
+def test_a_username_that_looks_like_an_option_is_refused():
+    """The same assertion the host gets, which the user did not have.
+
+    `test_a_host_that_looks_like_an_option_is_refused` above pins its message
+    character-for-character; this one was a bare `pytest.raises(ValueError)`, so every message
+    in `_validate_user` could be replaced with `None` and the suite stayed green. Two
+    validators, the same threat, and only one of them held to the Definition of Done's rule
+    that a message is pinned rather than a type -- which is the asymmetry the *path* checks
+    already had a memory written about.
+    """
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", user="-oProxyCommand=id")
+    assert exc.value.args[0] == "user may not begin with '-': '-oProxyCommand=id'"
+
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", user="-l root")
+    assert exc.value.args[0] == "user may not begin with '-': '-l root'"
+
+    # Whitespace is a separate branch with a separate message, and a username containing one
+    # is how a second argument gets smuggled in where argv is built by a shell rather than us.
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", user="bob root")
+    assert exc.value.args[0] == "user may not contain whitespace: 'bob root'"
+
+
+@pytest.mark.parametrize("char", ["\x00", "\n", "\r"])
+def test_control_characters_are_refused_in_a_user_and_say_which_argument(char: str):
+    """The third `_validate_user` branch, and the one whose label was mutable.
+
+    The message is built by `_reject_control_characters(value, what=...)`, so `what` is the
+    only thing distinguishing "host" from "user" in the text an operator reads. It could be
+    `None`, or `"USER"`, with nothing noticing.
+    """
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", user=f"bob{char}evil")
+    assert exc.value.args[0] == f"user may not contain {char!r}: {f'bob{char}evil'!r}"
 
 
 @pytest.mark.parametrize("char", ["\x00", "\n", "\r"])
@@ -249,6 +283,18 @@ def test_a_newline_in_an_option_value_is_refused(char: str):
 def test_a_newline_in_an_option_name_is_refused(char: str):
     with pytest.raises(ValueError):
         build_ssh_argv("h", options={f"Compression{char}ProxyCommand id": "yes"})
+
+
+def test_whitespace_in_an_option_name_is_refused():
+    """Its own branch and its own message, and the message was never read.
+
+    A space in an ssh option *name* would make `-o` carry two words, so the tail becomes a
+    directive we did not intend to send. The equals-sign case below pins its text; this one
+    had nothing.
+    """
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", options={"Proxy Command": "id"})
+    assert exc.value.args[0] == "ssh option name may not contain whitespace: 'Proxy Command'"
 
 
 def test_an_option_name_containing_equals_is_refused():
@@ -484,3 +530,52 @@ def test_windows_falls_back_to_a_bare_name_when_nothing_is_found(tmp_path):
 
 def test_windows_without_systemroot_falls_back_to_a_bare_name():
     assert resolve_ssh_executable(platform="win32", environ={}) == "ssh.exe"
+
+
+def test_the_uppercase_spelling_of_systemroot_is_read_too(tmp_path: Path):
+    """The fallback spelling, which existed for a reason and was never exercised.
+
+    Windows environment variable names are case-insensitive, and a process can perfectly well
+    have inherited `SYSTEMROOT` rather than `SystemRoot` -- but `os.environ` is a plain
+    case-*sensitive* mapping on the platform these tests run on, which is why the code asks
+    twice. Every existing case here passes `SystemRoot`, so the second lookup could be deleted,
+    misspelled, or lowercased with nothing failing: `ssh.exe` is also the answer when the
+    lookup finds nothing, so the fallback and the failure are indistinguishable unless the
+    directory is actually there.
+    """
+    system32 = tmp_path / "System32" / "OpenSSH"
+    system32.mkdir(parents=True)
+    (system32 / "ssh.exe").write_bytes(b"")
+
+    found = resolve_ssh_executable(platform="win32", environ={"SYSTEMROOT": str(tmp_path)})
+    assert found == str(system32 / "ssh.exe")
+    # And the canonical spelling still wins when both are present, because it is asked first.
+    both = resolve_ssh_executable(
+        platform="win32", environ={"SystemRoot": str(tmp_path), "SYSTEMROOT": "/nowhere"}
+    )
+    assert both == str(system32 / "ssh.exe")
+
+
+@pytest.mark.skipif(
+    "MUTANT_UNDER_TEST" in os.environ,
+    reason="mutmut's trampoline adds a frame, so stack depth is not what it is outside it",
+)
+def test_the_insecure_option_warning_is_attributed_to_the_caller():
+    """`stacklevel` decides whose line the warning names, and nothing was reading it.
+
+    A warning is only actionable if it points at the code that asked for the weakening. The
+    value is 3 -- `_merged_options`, `build_ssh_argv`, the caller -- and it could be 4, which
+    blames whatever called *the caller* and sends a reader looking in the wrong file.
+
+    **Skipped under mutmut, and the reason is worth stating rather than hiding in a marker.**
+    Every mutated function is wrapped in a trampoline, so the call chain gains a frame and
+    `stacklevel=3` lands inside `mutmut/mutation/trampoline.py`. Nothing about the library is
+    different; the instrumentation changes the very thing this measures. The consequence is
+    that the `stacklevel` mutant survives the lane permanently and is **not** an untested
+    line -- it is tested here, in every ordinary run, and the lane simply cannot credit it.
+    """
+    with pytest.warns(InsecureOptionWarning) as record:
+        _ = build_ssh_argv("h", options={"StrictHostKeyChecking": "no"})
+
+    assert len(record) == 1
+    assert record[0].filename == __file__, "the warning blamed a frame that is not the caller"
