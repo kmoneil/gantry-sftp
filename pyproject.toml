@@ -365,7 +365,12 @@ venv = ".venv"
 # ---------------------------------------------------------------------------
 [tool.mutmut]
 source_paths = ["src/"]
-only_mutate = ["src/gantry_sftp/codec/*"]
+# Both layers, which is what the Definition of Done asks for -- "codec **and correctness
+# layer** carry a mutmut run" -- and which was not achievable until 0.11. The `session/`
+# half was blocked upstream from 2026-07-26 until mutmut 3.7.0 shipped
+# `fix(#525): implement full async-gen wrapper`; see D-21. Scope a working run with a
+# wildcard rather than by editing this line: `mutmut run "gantry_sftp.session._retry*"`.
+only_mutate = ["src/gantry_sftp/codec/*", "src/gantry_sftp/session/*"]
 pytest_add_cli_args_test_selection = ["tests/"]
 # `tests/test_packaging.py` is ignored for the same reason and it is worth stating
 # separately, because the symptom is different: it resolves the repository root through
@@ -384,9 +389,19 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # glob matches nothing, so the allowlist looks stale and the *inverse* test passes
 # vacuously. Worth naming rather than just ignoring: a test that resolves the repo root
 # does not merely fail here, it can also pass for the wrong reason.
+# `tests/test_sync_facade.py` is the fifth, and it is the first with a different root
+# cause: it does not resolve the repository root, it introspects `Session` itself. Under
+# mutmut the class carries the trampoline's own members -- `xǁSessionǁ__init____mutmut_1`,
+# `...__mutmut_orig`, one pair per mutant -- so the parity check reports several hundred
+# "async methods with no blocking form" and the baseline never starts. It was invisible
+# until 0.11 because it only fires when `session/` is the mutated package, which is the
+# lane D-21 has never been able to run. Ignoring it kills nothing: mutmut mutates function
+# *bodies*, and this file asserts on names, signatures and return annotations, so it cannot
+# fail for any mutant.
 pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
     "--ignore=tests/test_lanes.py",
     "--ignore=tests/test_namespace_and_connect.py",
+    "--ignore=tests/test_sync_facade.py",
 ]
