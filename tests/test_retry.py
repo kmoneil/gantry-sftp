@@ -42,6 +42,9 @@ from gantry_sftp.transport import Transport, find_sftp_server, open_local_server
 
 pytestmark = pytest.mark.anyio
 
+DEADLINE = 10.0
+"""Bound on the tests whose failure mode is a loop that never ends rather than a wrong answer."""
+
 
 def server_error(code: StatusCode) -> ServerError:
     return ServerError(f"server returned {code.name}", code=int(code), message=code.name.encode())
@@ -203,9 +206,17 @@ async def test_attempts_below_one_is_refused():
 
 
 async def test_a_recipe_that_cannot_connect_is_retried_and_then_gives_up():
+    """Bounded, because the ways this can break are all "it never stops".
+
+    Every mutation that survives the assertions below is a non-terminating loop -- the counter
+    not incrementing, counting the wrong way, or the give-up condition needing *both* halves
+    instead of either. Each is caught, but caught by hanging, and a suite that detects a
+    runaway retry by running out of wall clock is one nobody can run locally. `fail_after`
+    turns all three into a fast failure without weakening anything.
+    """
     recipe = Recipe(unusable_transport)
 
-    with pytest.raises(ConnectError) as exc:
+    with pytest.raises(ConnectError) as exc, anyio.fail_after(DEADLINE):
         _ = await with_reconnect(recipe, unreached, attempts=3, backoff=0)
 
     assert recipe.calls == 3, "it did not use all the attempts it was given"
@@ -224,6 +235,54 @@ async def test_a_single_attempt_carries_no_note_about_attempts():
     assert not hasattr(exc.value, "__notes__")
 
 
+async def test_the_second_attempt_is_already_enough_to_carry_the_note():
+    """The boundary between the two tests either side of this one, which neither covered.
+
+    `_note_attempts` is `if attempt > 1`, and the pair above and below it check attempt 1 (no
+    note) and attempt 3 (note). Two is the first value where the branch actually decides
+    something, and `> 1` mutated to `> 2` passed both of them -- so the note silently went
+    missing from exactly the case it is most useful in, a link that drops once and gives up.
+    """
+    recipe = Recipe(unusable_transport)
+
+    with pytest.raises(ConnectError) as exc, anyio.fail_after(DEADLINE):
+        _ = await with_reconnect(recipe, unreached, attempts=2, backoff=0)
+
+    assert recipe.calls == 2
+    assert exc.value.__notes__ == ["gave up after 2 of 2 attempt(s), all retryable"]
+
+
+async def test_the_session_tunables_reach_the_session_each_attempt(tmp_path: Path):
+    """`request_timeout`, `idle_timeout` and `depth` are documented as forwarded. Proven here.
+
+    Three distinct values on purpose. Nulling any one of them survived the suite, and so did
+    *shifting* them along -- `request_timeout=request_timeout` becoming `idle_timeout=...` and
+    so on down the call, which hands the caller's request timeout to the idle timeout and is
+    the failure a matching pair of values could not see. Distinct numbers make a swap visible.
+
+    Read off the session rather than inferred from timing: a behavioural probe would have to
+    wait one of these out, which makes a slow test that proves the same thing less directly.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    seen: dict[str, object] = {}
+
+    async def record(sftp: Session) -> str:
+        seen["request_timeout"] = sftp._request_timeout  # noqa: SLF001 -- no public accessor
+        seen["idle_timeout"] = sftp._idle_timeout  # noqa: SLF001 -- likewise
+        seen["depth"] = sftp.depth
+        return "done"
+
+    recipe = Recipe(partial(open_local_server_transport, cwd=tmp_path))
+    moved = await with_reconnect(
+        recipe, record, request_timeout=11.0, idle_timeout=22.0, depth=3, backoff=0
+    )
+
+    assert moved == "done"
+    assert seen == {"request_timeout": 11.0, "idle_timeout": 22.0, "depth": 3}
+
+
 async def test_the_backoff_doubles_and_is_capped(monkeypatch: pytest.MonkeyPatch):
     slept: list[float] = []
 
@@ -233,7 +292,7 @@ async def test_the_backoff_doubles_and_is_capped(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("gantry_sftp.session._retry.anyio.sleep", record)
     recipe = Recipe(unusable_transport)
 
-    with pytest.raises(ConnectError):
+    with pytest.raises(ConnectError), anyio.fail_after(DEADLINE):
         _ = await with_reconnect(recipe, unreached, attempts=6, backoff=1.0, backoff_max=4.0)
 
     # Five waits for six attempts, doubling until the ceiling holds it.

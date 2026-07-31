@@ -1059,3 +1059,24 @@ async def test_a_reconnect_is_the_one_thing_this_library_warns_about(
     assert "reconnecting in 0.0s" in message
     # The stderr it carries is multi-line and partly server-supplied. Not in the log line.
     assert "\n" not in message
+
+    # And the structured half, which is the whole of D-98 and was asserted nowhere. The
+    # sentence above was pinned; `extra=` could be dropped entirely, every field nulled or
+    # shifted onto its neighbour, and `"reconnect"` mangled to `"RECONNECT"`, with nothing
+    # failing -- 21 mutation survivors on one logging call. A record whose message reads
+    # correctly and whose fields are empty is worse than no record, because the sink that
+    # was built to key on them silently indexes nothing.
+    assert record_fields(warnings[0]) == {
+        "operation": "reconnect",
+        "event": "retrying",
+        "attempt": 1,
+        "attempts": 2,
+        "error": "ConnectError",
+        "delay": 0.01,
+    }
+    # Numbers stay numbers -- `fields_of` converts everything else, and a threshold alert on
+    # `attempt` is the reason the key exists at all.
+    fields = record_fields(warnings[0])
+    assert isinstance(fields["attempt"], int)
+    assert isinstance(fields["attempts"], int)
+    assert isinstance(fields["delay"], float)
