@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -49,7 +49,7 @@ def describe(entry: DirEntry) -> str:
 
 
 @asynccontextmanager
-async def connect(destination: str | None, workdir: Path) -> AsyncIterator[Session]:
+async def connect(destination: str | None, workdir: Path) -> AsyncGenerator[Session]:
     """A session, either to a local `sftp-server` or over `ssh` to a real host."""
     if destination is None:
         async with (

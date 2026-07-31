@@ -73,7 +73,7 @@ bar, and returning.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, contextmanager
 from datetime import datetime
 from functools import partial
@@ -872,7 +872,7 @@ class BoundPortal:
         env: Mapping[str, str] | None = None,
         ssh_executable: str | None = None,
         session: SessionOptions = DEFAULT_SESSION_OPTIONS,
-    ) -> Iterator[SyncSession]:
+    ) -> Generator[SyncSession]:
         """Open an ``ssh`` connection and a session over it, on this portal.
 
         Blocking form of :func:`gantry_sftp.connect`, whose docstring documents every argument
@@ -912,7 +912,7 @@ class BoundPortal:
         ssh_executable: str | None = None,
         env: Mapping[str, str] | None = None,
         password: str | None = None,
-    ) -> Iterator[SyncTransport]:
+    ) -> Generator[SyncTransport]:
         """Spawn ``ssh`` and yield the connected transport, on this portal.
 
         Blocking form of :func:`gantry_sftp.open_ssh_transport`, whose docstring documents
@@ -945,7 +945,7 @@ class BoundPortal:
         server_path: str | os.PathLike[str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
         env: Mapping[str, str] | None = None,
-    ) -> Iterator[SyncTransport]:
+    ) -> Generator[SyncTransport]:
         """Spawn a local ``sftp-server`` on a pipe and yield the transport, on this portal.
 
         Blocking form of :func:`gantry_sftp.transport.open_local_server_transport`. No ``ssh``,
@@ -969,7 +969,7 @@ class BoundPortal:
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
         depth: int = DEFAULT_PIPELINE_DEPTH,
-    ) -> Iterator[SyncSession]:
+    ) -> Generator[SyncSession]:
         """Handshake over a transport and yield a ready session, on this portal.
 
         Blocking form of :func:`gantry_sftp.open_session`, whose docstring documents every
@@ -1023,7 +1023,7 @@ def connect(
     env: Mapping[str, str] | None = None,
     ssh_executable: str | None = None,
     session: SessionOptions = DEFAULT_SESSION_OPTIONS,
-) -> Iterator[SyncSession]:
+) -> Generator[SyncSession]:
     """Open an ``ssh`` connection and a session over it, and yield the session.
 
     ::
@@ -1071,7 +1071,7 @@ def open_ssh_transport(
     ssh_executable: str | None = None,
     env: Mapping[str, str] | None = None,
     password: str | None = None,
-) -> Iterator[SyncTransport]:
+) -> Generator[SyncTransport]:
     """Spawn ``ssh`` and yield the connected transport.
 
     Blocking form of :func:`gantry_sftp.open_ssh_transport`, whose docstring documents every
@@ -1110,7 +1110,7 @@ def open_local_server_transport(
     server_path: str | os.PathLike[str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
-) -> Iterator[SyncTransport]:
+) -> Generator[SyncTransport]:
     """Spawn a local ``sftp-server`` on a pipe and yield the transport.
 
     Blocking form of :func:`gantry_sftp.transport.open_local_server_transport`. No ``ssh``, no
@@ -1135,7 +1135,7 @@ def open_session(
     request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
     depth: int = DEFAULT_PIPELINE_DEPTH,
-) -> Iterator[SyncSession]:
+) -> Generator[SyncSession]:
     """Handshake over a transport and yield a ready session.
 
     Blocking form of :func:`gantry_sftp.open_session`, whose docstring documents every argument

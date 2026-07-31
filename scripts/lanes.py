@@ -86,7 +86,10 @@ class Lane:
 LANES: tuple[Lane, ...] = (
     Lane(
         name="gates",
-        summary="ruff, mypy, ty, complexipy, the uv.lock check and the exec-bit check",
+        summary=(
+            "ruff, mypy, ty, complexipy, the deprecation check, the uv.lock check and the "
+            "exec-bit check"
+        ),
         tool="pre-commit",
         args=("run", "--all-files"),
         needs=(

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -106,7 +106,7 @@ async def main() -> None:
         connections = 0
 
         @asynccontextmanager
-        async def recipe() -> AsyncIterator[Transport]:
+        async def recipe() -> AsyncGenerator[Transport]:
             """A new transport per attempt -- and the first one dies partway through."""
             nonlocal connections
             connections += 1

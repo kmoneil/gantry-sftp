@@ -79,15 +79,17 @@ packages = ["src/gantry_sftp"]
 # that cannot run is worse than an absent one. It stays in the repository, in CI, and gating --
 # what changes is only that it is not part of what a user receives.
 #
-# The repository furniture goes for the same reason: a CI workflow and a pre-commit config
-# describe how this project is developed, not what was installed. `.gitignore` is *not* in the
-# list because hatchling force-includes it whatever the excludes say -- tried both spellings and
-# measured the tarball -- and a line that does nothing is worse than an absent one.
+# The repository furniture goes for the same reason: a CI workflow, a pre-commit config and the
+# deprecation lane's pyright config describe how this project is developed, not what was
+# installed. `.gitignore` is *not* in the list because hatchling force-includes it whatever the
+# excludes say -- tried both spellings and measured the tarball -- and a line that does nothing
+# is worse than an absent one.
 [tool.hatch.build.targets.sdist]
 exclude = [
   "benchmarks",
   ".github",
   ".pre-commit-config.yaml",
+  "pyrightconfig.deprecations.json",
   ".complexipy_cache",
   ".hypothesis",
   ".pytest_cache",
@@ -131,6 +133,7 @@ dev = [
   "pre-commit>=4.0",
   "mutmut>=3.2",
   "trio>=0.33.0",
+  "basedpyright>=1.39.9",
 ]
 
 # ---------------------------------------------------------------------------
@@ -255,6 +258,13 @@ enable_error_code = [
   "ignore-without-code",
   "unused-awaitable",
   "explicit-override",
+  # PEP 702. Off by default in mypy, and it is the rule that turns "a checker somewhere
+  # mentioned this" into a failed commit. It does not yet catch the `@contextmanager` +
+  # `-> Iterator[T]` form -- mypy's bundled typeshed still declares `contextmanager` as one
+  # un-deprecated overload -- which is why the basedpyright deprecation lane in
+  # .pre-commit-config.yaml exists as well. Keep both: this one starts catching that form the
+  # moment mypy vendors a newer typeshed, and it already catches everything else.
+  "deprecated",
 ]
 
 # fsspec ships no `py.typed` and has no stubs on PyPI, so `import fsspec` is an error under
@@ -267,7 +277,9 @@ enable_error_code = [
 # subclass an `Any` base carry an inline `# type: ignore[misc]` naming this same reason, so the
 # debt is visible at the two places it is actually taken rather than only here.
 #
-# Remove both when fsspec ships `py.typed`.
+# Remove both when fsspec ships `py.typed` -- and `useLibraryCodeForTypes` under
+# `[tool.pyright]` below, which is the same decision taken for the same package in the third
+# checker's spelling.
 [[tool.mypy.overrides]]
 module = ["fsspec", "fsspec.*"]
 ignore_missing_imports = true
@@ -280,6 +292,12 @@ include = ["src"]
 
 [tool.ty.environment]
 python = ".venv"
+
+# ty reports a deprecated call as a *warning*, and a warning does not fail `ty check`. A rule
+# that reports without failing is a rule nobody reads, so it is escalated. Same typeshed gap as
+# mypy's: this does not yet see the `@contextmanager` + `-> Iterator[T]` form.
+[tool.ty.rules]
+deprecated = "error"
 
 # ---------------------------------------------------------------------------
 # complexipy -- cognitive complexity (SonarQube S3776), distinct from mccabe
@@ -335,6 +353,33 @@ typeCheckingMode = "standard"
 pythonVersion = "3.13"
 venvPath = "."
 venv = ".venv"
+# fsspec ships no `py.typed`, and pyright's default is to infer types from an untyped package's
+# *source* anyway. For a library annotated as thoroughly as fsspec is -- which is to say not at
+# all -- that inference reads a parameter's default value as its declared type, and manufactures
+# a contract the library does not have. It produced seven errors in `fsspec.py`, and all seven
+# were checked against fsspec 2026.6.0's own source before this line was written:
+#
+#   - `get_file`/`put_file` take `callback=<NoOpCallback instance>`, so `NoOpCallback` was
+#     inferred as the parameter type and any other `Callback` was an error. fsspec's own
+#     `AbstractFileSystem.get` calls `self.get_file(..., callback=child)` with a *branched*
+#     callback, so the library itself passes what pyright rejected.
+#   - `AbstractBufferedFile.__init__` defaults `block_size="default"` and `cache_type=
+#     "readahead"`, so passing the `int` its docstring asks for was an error. Its body reads
+#     `self.DEFAULT_BLOCK_SIZE if block_size in ["default", None] else block_size`.
+#   - `_upload_chunk`'s base body is a docstring and a comment, so its return was inferred
+#     `None` and our `bool` was an incompatible override. Two shipped implementations,
+#     `ftp.py` and `jupyter.py`, `return True` / `return False`.
+#
+# So: not seven findings, one -- an untyped dependency being treated as typed. PEP 561 says a
+# package without `py.typed` is not typed, `[[tool.mypy.overrides]]` above already takes that
+# position for the same package, and a checker that disagrees with the other two about the
+# *same* dependency is a third opinion nobody can act on. The alternative was seven
+# `# pyright: ignore` comments marking false positives as if they were debts.
+#
+# What it costs, stated rather than discovered: calls into fsspec are unchecked here, exactly
+# as they already are under mypy. anyio ships `py.typed` and is unaffected -- measured, not
+# assumed. Remove this when fsspec ships `py.typed`, together with the mypy override.
+useLibraryCodeForTypes = false
 
 # ---------------------------------------------------------------------------
 # mutmut -- codec and correctness layer carry a mutation run

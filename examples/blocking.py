@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -52,7 +52,7 @@ from gantry_sftp.sync import (
 
 
 @contextmanager
-def session_for(destination: str | None, workdir: Path) -> Iterator[SyncSession]:
+def session_for(destination: str | None, workdir: Path) -> Generator[SyncSession]:
     """A blocking session, one call where there is a host and two where there is not."""
     if destination is not None:
         user, _, host = destination.rpartition("@")

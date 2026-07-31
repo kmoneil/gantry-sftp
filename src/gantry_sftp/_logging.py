@@ -49,7 +49,7 @@ for what that trade does and does not buy.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import PurePath
 from time import monotonic
@@ -229,7 +229,7 @@ def record_fields(record: logging.LogRecord) -> dict[str, object]:
 
 
 @contextmanager
-def operation(logger: logging.Logger, name: str, **fields: object) -> Iterator[dict[str, object]]:
+def operation(logger: logging.Logger, name: str, **fields: object) -> Generator[dict[str, object]]:
     """Log the start and the end of one operation, with what it moved and how long it took.
 
     The yielded dictionary is where the body reports what it did -- ``result["bytes"] = n`` --

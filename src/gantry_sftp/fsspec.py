@@ -105,7 +105,7 @@ from gantry_sftp.session import (
 from gantry_sftp.sync import BoundPortal, SyncSession
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Generator, Mapping
     from datetime import datetime
     from typing import IO
 
@@ -209,7 +209,7 @@ def _bridge(callback: Callback | None) -> ProgressCallback | None:
 
 
 @contextmanager
-def _translated(path: str) -> Iterator[None]:
+def _translated(path: str) -> Generator[None]:
     """Re-raise this library's errors as the ones fsspec's callers catch.
 
     :class:`~gantry_sftp.SFTPError` is deliberately not an ``OSError`` -- a protocol failure is
@@ -708,7 +708,7 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
             self.sftp.makedirs(remote, exist_ok=exist_ok)
 
     @contextmanager
-    def _creating(self, remote: str) -> Iterator[None]:
+    def _creating(self, remote: str) -> Generator[None]:
         """Translate a refused ``MKDIR`` into the error fsspec's callers expect.
 
         v3 answers a failed ``MKDIR`` with the contentless ``FAILURE`` -- OpenSSH sends the

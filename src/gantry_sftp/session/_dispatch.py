@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from typing import override
 
@@ -488,7 +488,7 @@ class Dispatcher:
     # --- exchanges -------------------------------------------------------------------------
 
     @contextmanager
-    def exchange(self) -> Iterator[Exchange]:
+    def exchange(self) -> Generator[Exchange]:
         """Open an exchange for one operation, and retire it when the block ends.
 
         Retiring matters on the failure path. An operation abandoned by a timeout leaves

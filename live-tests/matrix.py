@@ -36,7 +36,7 @@ import socket
 import stat
 import subprocess
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,7 +98,7 @@ def unavailable_reason(name: str) -> str | None:
 
 
 @contextmanager
-def running_server(name: str, root: Path) -> Iterator[MatrixServer]:
+def running_server(name: str, root: Path) -> Generator[MatrixServer]:
     """Start ``name``, yield how to reach it, and stop it on the way out."""
     if name == "openssh":
         with _running_openssh(root) as server:
@@ -117,7 +117,7 @@ def running_server(name: str, root: Path) -> Iterator[MatrixServer]:
 
 
 @contextmanager
-def _running_openssh(root: Path) -> Iterator[MatrixServer]:
+def _running_openssh(root: Path) -> Generator[MatrixServer]:
     with sshd.running_sshd(root) as server:
         connect = dict(sshd.connect_kwargs(server))
         connect["host"] = "127.0.0.1"
@@ -172,7 +172,7 @@ def _free_port() -> int:
 
 
 @contextmanager
-def _listening_asyncssh(name: str, **listen_kwargs: Any) -> Iterator[None]:
+def _listening_asyncssh(name: str, **listen_kwargs: Any) -> Generator[None]:
     """Run ``asyncssh.listen`` on its own thread and event loop for the block's duration.
 
     Extracted because two servers here need it -- the matrix's key-authenticating one and the
@@ -215,7 +215,7 @@ def _listening_asyncssh(name: str, **listen_kwargs: Any) -> Iterator[None]:
 
 
 @contextmanager
-def _running_asyncssh(root: Path) -> Iterator[MatrixServer]:
+def _running_asyncssh(root: Path) -> Generator[MatrixServer]:
     assert asyncssh is not None
     host_key = _keypair(root, "asyncssh_host")
     client_key = _keypair(root, "asyncssh_client")
@@ -255,7 +255,7 @@ def password_server_unavailable_reason() -> str | None:
 
 
 @contextmanager
-def running_password_server(root: Path, *, password: str) -> Iterator[MatrixServer]:
+def running_password_server(root: Path, *, password: str) -> Generator[MatrixServer]:
     """A real SSH server that accepts exactly one password and offers nothing else.
 
     **Not OpenSSH, and the reason is measured rather than a preference.** ``live-tests`` runs
@@ -329,7 +329,7 @@ def running_password_server(root: Path, *, password: str) -> Iterator[MatrixServ
 
 
 @contextmanager
-def _running_paramiko(root: Path) -> Iterator[MatrixServer]:
+def _running_paramiko(root: Path) -> Generator[MatrixServer]:
     assert paramiko is not None
     host_key_path = _keypair(root, "paramiko_host")
     client_key_path = _keypair(root, "paramiko_client")

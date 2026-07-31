@@ -12,7 +12,7 @@ agreeing on an offset and nothing smaller than two connections can test it.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -134,7 +134,7 @@ class Recipe:
 
 
 @asynccontextmanager
-async def unusable_transport() -> AsyncIterator[Transport]:
+async def unusable_transport() -> AsyncGenerator[Transport]:
     """A recipe that never yields anything, because the operation never runs."""
     raise ConnectError("could not connect")
     yield  # pragma: no cover -- unreachable, and required to make this a generator
@@ -381,7 +381,7 @@ async def test_a_connection_that_dies_mid_transfer_reconnects_and_resumes(tmp_pa
     connections = 0
 
     @asynccontextmanager
-    async def dies_once() -> AsyncIterator[Transport]:
+    async def dies_once() -> AsyncGenerator[Transport]:
         nonlocal connections
         connections += 1
         async with open_local_server_transport(cwd=tmp_path) as transport:
@@ -418,7 +418,7 @@ async def test_a_dying_connection_without_resume_still_finishes_it_from_zero(tmp
     connections = 0
 
     @asynccontextmanager
-    async def dies_once() -> AsyncIterator[Transport]:
+    async def dies_once() -> AsyncGenerator[Transport]:
         nonlocal connections
         connections += 1
         async with open_local_server_transport(cwd=tmp_path) as transport:

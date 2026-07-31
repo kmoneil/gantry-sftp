@@ -68,6 +68,26 @@ repos:
         pass_filenames: false
         require_serial: true
 
+      # Deprecation lane -- NOT a third type gate. `pyrightconfig.deprecations.json` turns
+      # typeCheckingMode off and leaves exactly one rule on, so this fails a commit only for
+      # calling something a stub marks @deprecated (PEP 702). It is separate from
+      # `[tool.pyright]`, which stays IDE-alignment-only, because pyright's standard mode
+      # reports errors in fsspec.py that come from fsspec shipping no types.
+      #
+      # It is here because it is the only checker in this repo that can currently see the
+      # `@contextmanager` + `-> Iterator[T]` deprecation: pyright's bundled typeshed carries
+      # the overload pair, mypy's and ty's still carry the old single overload. Both of those
+      # have the rule enabled in pyproject.toml too, so they take over when their typeshed
+      # catches up -- this lane covers the gap, and covers the whole repo rather than just
+      # `src`, since a deprecated spelling taught in an example gets copied into shipped code.
+      - id: deprecations
+        name: no deprecated APIs (basedpyright, reportDeprecated)
+        entry: .venv/bin/basedpyright -p pyrightconfig.deprecations.json
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
       - id: uv-lock
         name: uv lock is in sync with pyproject
         entry: env UV_CACHE_DIR=/workspace/.uv-cache uv lock --check

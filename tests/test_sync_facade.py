@@ -250,12 +250,12 @@ def parameters(function: Any) -> list[inspect.Parameter]:
 def test_connect_takes_exactly_the_async_arguments():
     """Including `session=SessionOptions(...)`, so the tunables reach the blocking surface too."""
     assert parameters(connect) == parameters(async_connect)
-    assert inspect.signature(connect).return_annotation == "Iterator[SyncSession]"
+    assert inspect.signature(connect).return_annotation == "Generator[SyncSession]"
 
 
 def test_open_ssh_transport_takes_exactly_the_async_arguments():
     assert parameters(open_ssh_transport) == parameters(async_open_ssh_transport)
-    assert inspect.signature(open_ssh_transport).return_annotation == "Iterator[SyncTransport]"
+    assert inspect.signature(open_ssh_transport).return_annotation == "Generator[SyncTransport]"
 
 
 def test_open_local_server_transport_takes_exactly_the_async_arguments():

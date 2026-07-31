@@ -23,7 +23,7 @@ import os
 import socket
 import subprocess
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -352,7 +352,7 @@ def _scan_host_key(port: int, root: Path) -> Path:
 
 
 @contextmanager
-def running_sshd(root: Path) -> Iterator[SSHServer]:
+def running_sshd(root: Path) -> Generator[SSHServer]:
     """Start an sshd on localhost that accepts one key and serves the sftp subsystem.
 
     Runs unprivileged, which works because it only ever authenticates the user already running

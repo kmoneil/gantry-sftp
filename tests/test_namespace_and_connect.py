@@ -25,7 +25,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -360,7 +360,7 @@ async def test_connect_applies_the_session_options_it_is_given(monkeypatch: pyte
     seen: dict[str, object] = {}
 
     @asynccontextmanager
-    async def fake_transport(host: str, **kwargs: object) -> AsyncIterator[Transport]:
+    async def fake_transport(host: str, **kwargs: object) -> AsyncGenerator[Transport]:
         seen.update(kwargs, host=host)
         async with open_local_server_transport() as transport:
             yield transport
@@ -387,7 +387,7 @@ async def test_connect_defaults_match_the_two_call_spelling(monkeypatch: pytest.
         pytest.skip("sftp-server not installed (ships in openssh-server)")
 
     @asynccontextmanager
-    async def fake_transport(host: str, **kwargs: object) -> AsyncIterator[Transport]:
+    async def fake_transport(host: str, **kwargs: object) -> AsyncGenerator[Transport]:
         async with open_local_server_transport() as transport:
             yield transport
 

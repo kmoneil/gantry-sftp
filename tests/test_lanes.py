@@ -12,6 +12,7 @@ an `__init__.py` to suit a test would make a shipping decision on a test's behal
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -79,6 +80,70 @@ def test_the_workflow_spells_out_no_test_command_of_its_own() -> None:
 def test_the_pre_push_hook_runs_the_fast_lane_and_not_a_second_spelling_of_it() -> None:
     fast = lanes.LANES_BY_NAME["fast"]
     assert " ".join(fast.args) in PRECOMMIT_TEXT
+
+
+# ---------------------------------------------------------------------------
+# The deprecation lane
+# ---------------------------------------------------------------------------
+
+
+def test_the_deprecation_hook_is_wired_to_a_config_that_exists() -> None:
+    """The hook and its config are two files, and only one of them fails loudly when deleted.
+
+    `basedpyright -p <missing file>` is an error, but a config that has quietly lost
+    `reportDeprecated` is a hook that runs, prints `0 errors` and checks nothing -- which is
+    the failure mode this asserts against, because it looks exactly like passing.
+    """
+    assert "-p pyrightconfig.deprecations.json" in PRECOMMIT_TEXT
+    config = json.loads((REPO_ROOT / "pyrightconfig.deprecations.json").read_text(encoding="utf-8"))
+    assert config["reportDeprecated"] == "error"
+    # Type checking is off on purpose: `[tool.pyright]` is the IDE's config and is not a gate,
+    # and this lane must not become a third one by accident.
+    assert config["typeCheckingMode"] == "off"
+
+
+def test_the_deprecation_lane_covers_every_directory_of_python_in_the_repository() -> None:
+    """Scope is the whole repository, not `src`, unlike mypy and ty.
+
+    An example is documentation people copy and a test is the pattern the next test is written
+    from, so a deprecated spelling in either is on its way into shipped code.
+    """
+    config = json.loads((REPO_ROOT / "pyrightconfig.deprecations.json").read_text(encoding="utf-8"))
+    assert {"src", "tests", "examples", "live-tests", "benchmarks", "scripts"} <= set(
+        config["include"]
+    )
+    # mutants/ is a generated copy of src/ and would double every finding in it.
+    assert "mutants" in config["exclude"]
+
+
+def test_the_ide_checker_treats_an_untyped_dependency_as_untyped() -> None:
+    """Three checkers, one dependency, one answer about whether it is typed.
+
+    pyright's default is to infer types from an untyped package's source, which for fsspec reads
+    each parameter's *default value* as its declared type -- `callback=NoOpCallback()` becomes
+    `callback: NoOpCallback`, `block_size="default"` becomes `block_size: str`. That produced
+    seven errors in `fsspec.py`, every one of them a contract fsspec does not have (D-109). PEP
+    561 and the mypy override beside it both say a package with no `py.typed` is not typed; this
+    is that same answer in the third checker's spelling, and flipping it back would reintroduce
+    the seven as if they were findings.
+    """
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        pyright = tomllib.load(handle)["tool"]["pyright"]
+    assert pyright["useLibraryCodeForTypes"] is False
+
+
+def test_both_in_venv_checkers_have_the_deprecation_rule_on() -> None:
+    """The lane above is a stopgap, and a stopgap nobody revisits is a permanent dependency.
+
+    mypy's and ty's bundled typeshed still declare `contextmanager` as a single un-deprecated
+    overload, so neither sees the `-> Iterator[T]` form that D-108 removed; both start seeing it
+    the moment they vendor a newer snapshot, and only if the rule is enabled by then.
+    """
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        config = tomllib.load(handle)["tool"]
+    assert "deprecated" in config["mypy"]["enable_error_code"]
+    # ty reports deprecation as a warning, and `ty check` exits 0 on warnings.
+    assert config["ty"]["rules"]["deprecated"] == "error"
 
 
 @pytest.mark.parametrize("lane", lanes.LANES, ids=lambda lane: lane.name)

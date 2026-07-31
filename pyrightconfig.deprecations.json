@@ -1,0 +1,17 @@
+{
+  "include": ["src", "tests", "examples", "live-tests", "benchmarks", "scripts"],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    ".venv-mac",
+    "mutants",
+    "_plans",
+    "_tmp",
+    "_reports"
+  ],
+  "typeCheckingMode": "off",
+  "reportDeprecated": "error",
+  "pythonVersion": "3.13",
+  "venvPath": ".",
+  "venv": ".venv"
+}

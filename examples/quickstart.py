@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -44,7 +44,7 @@ from gantry_sftp.transport import open_local_server_transport
 
 
 @asynccontextmanager
-async def session_for(destination: str | None, workdir: Path) -> AsyncIterator[Session]:
+async def session_for(destination: str | None, workdir: Path) -> AsyncGenerator[Session]:
     """A session, one call where there is a host and two where there is not."""
     if destination is not None:
         user, _, host = destination.rpartition("@")

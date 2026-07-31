@@ -41,7 +41,7 @@ import shutil
 import stat
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import override
@@ -136,7 +136,7 @@ def _validate_password(password: str) -> None:
 @contextmanager
 def askpass_environment(
     password: str, *, env: Mapping[str, str] | None = None
-) -> Iterator[dict[str, str]]:
+) -> Generator[dict[str, str]]:
     """Yield a child environment that can answer ``ssh``'s password prompt.
 
     The helper is written to a private temporary directory for the life of the ``with`` block

@@ -31,7 +31,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -326,7 +326,7 @@ def _netem_arguments(*, rtt_ms: float, loss_percent: float, rate_mbit: float | N
 @contextmanager
 def shape(
     *, rtt_ms: float, loss_percent: float = 0.0, rate_mbit: float | None = None
-) -> Iterator[ShapedLink]:
+) -> Generator[ShapedLink]:
     """Shape loopback for the duration of the block, and measure what that produced.
 
     Args:

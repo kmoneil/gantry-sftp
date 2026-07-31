@@ -357,7 +357,13 @@ every few years: Debian, Fedora and conda-forge rebuild from the sdist and run t
 validate their build, and `examples/` is tested documentation with a README of its own.
 """
 
-WITHHELD = ("benchmarks", ".github", ".pre-commit-config.yaml", ".complexipy_cache")
+WITHHELD = (
+    "benchmarks",
+    ".github",
+    ".pre-commit-config.yaml",
+    "pyrightconfig.deprecations.json",
+    ".complexipy_cache",
+)
 """Top-level entries an sdist must **not** carry, and each one is a decision.
 
 `benchmarks/` needs paramiko and asyncssh -- the Python cryptography this library exists not to
@@ -368,6 +374,10 @@ one. It stays in the repository, in CI and gating; it is simply not part of what
 `.complexipy_cache` is in this list because it **was shipping**, unnoticed, until the tarball was
 opened and looked at -- the same class of silent packaging defect as the missing licence text
 this module was written for. A lint cache in a distribution is not a style question.
+
+`pyrightconfig.deprecations.json` goes with `.pre-commit-config.yaml` for the same reason it sits
+beside it: it is the config for a hook, and the hook is not shipped either. A user who receives
+the sdist gets no `basedpyright` to read it.
 
 `.gitignore` is deliberately absent from both lists: hatchling force-includes it whatever the
 excludes say, measured on a real build, so asserting either way would be asserting about

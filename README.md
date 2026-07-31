@@ -2328,7 +2328,7 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 
 | lane | what it proves | needs, beyond `uv sync` |
 | --- | --- | --- |
-| `lanes.py gates` | ruff, mypy `--strict`, ty, complexipy, the `uv.lock` check, the exec bit | nothing; POSIX only |
+| `lanes.py gates` | ruff, mypy `--strict`, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit | nothing; POSIX only |
 | `lanes.py fast` | unit tests, the real `sftp-server` rows, every example as a subprocess | `openssh-server` for some rows |
 | `lanes.py live` | a real `sshd` on localhost: transport, `ssh` environment, cancellation, handles | `openssh-server` |
 | `lanes.py matrix` | one client against three servers: OpenSSH, asyncssh, paramiko | `uv sync --group bench` |
@@ -2342,6 +2342,13 @@ reason next to each one, so opting a lane out of gating is a written act rather 
 
 Type checking is deliberately two-tool: mypy is stricter and catches gaps ty misses. A
 finding gets fixed at the source, never silenced with an ignore.
+
+Calling a deprecated API is a gate of its own, over the whole repository rather than over `src`
+alone — a deprecated spelling taught in an example is one that gets copied into shipped code.
+mypy's `deprecated` error code and ty's `deprecated` rule both run, and a third hook runs
+`basedpyright` with type checking switched off and `reportDeprecated` switched on, because the
+three checkers vendor different typeshed snapshots and the one that already carries a
+deprecation is not always the one you were going to run.
 
 `tests/` and `examples/` need no network and are what `fast` runs. Every example is executed
 as a subprocess, because an example that has drifted out of sync with the library is a

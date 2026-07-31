@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -84,7 +84,7 @@ def server(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[MatrixSer
 
 
 @asynccontextmanager
-async def connected(server: MatrixServer) -> AsyncIterator[Session]:
+async def connected(server: MatrixServer) -> AsyncGenerator[Session]:
     """A session against ``server``, over a real ``ssh`` connection."""
     connect = dict(server.connect)
     host = str(connect.pop("host"))

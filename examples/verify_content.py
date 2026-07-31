@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -59,7 +59,7 @@ def read_bytes(path: Path) -> bytes:
 
 
 @asynccontextmanager
-async def connect(destination: str | None, workdir: Path) -> AsyncIterator[Session]:
+async def connect(destination: str | None, workdir: Path) -> AsyncGenerator[Session]:
     """A session, either to a local `sftp-server` or over `ssh` to a real host."""
     if destination is None:
         async with (
