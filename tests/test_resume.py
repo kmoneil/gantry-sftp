@@ -138,6 +138,12 @@ async def test_a_local_partial_longer_than_the_remote_is_refused(tmp_path: Path)
         f"what is being downloaded"
     )
     assert exc.value.offset == 5000
+    # The carried state, not only the sentence. `TransferError` is documented as carrying
+    # bytes-transferred, offset and both paths, and a refusal that names neither file is one
+    # a caller cannot act on -- see the note above `test_a_download_cannot_resume...`.
+    assert exc.value.transferred == 0, "nothing moved, and 0 is a fact rather than a default"
+    assert exc.value.remote_path == str(remote).encode()
+    assert exc.value.local_path == str(local)
     assert local.read_bytes() == CONTENT[:5000], "the local file was touched despite the refusal"
 
 
@@ -302,6 +308,10 @@ async def test_a_remote_partial_longer_than_the_local_file_is_refused(tmp_path: 
         f"cannot resume: {str(destination).encode()!r} is 5000 bytes on the server and the "
         f"local file is only 1000, so what is there is not a prefix of what we are sending"
     )
+    assert exc.value.transferred == 0
+    assert exc.value.offset == 5000, "the offset is what the *server* already holds"
+    assert exc.value.remote_path == str(destination).encode()
+    assert exc.value.local_path == str(source)
     assert destination.read_bytes() == CONTENT[:5000], "the destination was touched anyway"
 
 
@@ -406,6 +416,11 @@ async def test_a_download_cannot_resume_from_a_server_that_reports_no_size(tmp_p
         "resume needs a size for b'/remote.bin' and this server did not report one, "
         "so a local partial cannot be checked against it"
     )
+    assert exc.value.remote_path == b"/remote.bin"
+    assert exc.value.local_path == str(local)
+    # No offset, deliberately: there is no offset to continue from, which is the whole refusal.
+    assert exc.value.offset is None
+    assert exc.value.transferred == 0
 
 
 async def test_an_upload_cannot_resume_onto_a_server_that_reports_no_size(tmp_path: Path):
@@ -420,6 +435,10 @@ async def test_an_upload_cannot_resume_onto_a_server_that_reports_no_size(tmp_pa
         "resume needs a size for b'/remote.bin' and this server did not report one, "
         "so there is no offset to continue from and nothing to check it against"
     )
+    assert exc.value.remote_path == b"/remote.bin"
+    assert exc.value.local_path == str(source)
+    assert exc.value.offset is None
+    assert exc.value.transferred == 0
 
 
 # --- interrupted for real, then resumed --------------------------------------------------------
