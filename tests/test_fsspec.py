@@ -31,7 +31,12 @@ from pathlib import Path
 import fsspec
 import pytest
 from anyio.from_thread import start_blocking_portal
-from fsspec.registry import known_implementations, register_implementation, registry
+from fsspec.registry import (
+    _registry,
+    known_implementations,
+    register_implementation,
+    registry,
+)
 
 from gantry_sftp.exceptions import CapabilityError
 from gantry_sftp.fsspec import (
@@ -118,13 +123,29 @@ def _restore_registry():
     The registry is process-global, so a test that claims ``sftp`` would otherwise decide what
     every later test in the session resolves -- which is the very failure mode this card is
     about, reproduced inside our own suite.
+
+    **Through ``_registry`` rather than ``registry``, and that is D-104.**
+    ``fsspec.registry.registry`` is a ``MappingProxyType`` over ``_registry`` -- read-only, and
+    with no ``clear``. So the guarded call this used to make,
+    ``registry.clear() if hasattr(registry, "clear") else None``, evaluated to ``None`` on
+    every run and the loop underneath it only ever *added* the snapshot back. Anything a test
+    registered survived the "restore", and the fixture read as though it worked.
+
+    What that cost: `test_importing_the_library_registers_nothing` passed only because it sits
+    above `test_override_displaces_the_incumbent_deliberately` in this file. Reorder them --
+    which is what mutmut does, since it runs the tests most relevant to a mutant first -- and
+    the assertion fails. It is the ordering dependence the Definition of Done forbids outright,
+    hidden behind a fixture written to prevent exactly it.
+
+    Restored by clear-and-update on the real dict rather than by replaying
+    ``register_implementation``: a snapshot is only reversible if removals are undone too, and
+    that is also what fsspec's own suite does.
     """
-    live = dict(registry)
+    live = dict(_registry)
     known = dict(known_implementations)
     yield
-    registry.clear() if hasattr(registry, "clear") else None
-    for name, cls in live.items():
-        register_implementation(name, cls, clobber=True)
+    _registry.clear()
+    _registry.update(live)
     known_implementations.clear()
     known_implementations.update(known)
 
@@ -196,6 +217,25 @@ def test_registering_our_own_name_twice_is_not_an_error():
     register()
     register()
     assert fsspec.get_filesystem_class(PROTOCOL) is GantrySFTPFileSystem
+
+
+def test_the_registry_is_pristine_after_every_test_that_claimed_a_name():
+    """D-104. The same assertion as the first test in this file, from the other side.
+
+    `test_importing_the_library_registers_nothing` sits *above* the four tests that register,
+    so it only ever saw a clean registry -- and passed for that reason rather than because
+    `_restore_registry` worked. It did not: `registry` is a `MappingProxyType` with no
+    `clear`, so the fixture's guarded call evaluated to `None` and nothing was ever removed.
+
+    Placing the same check *below* them pins the invariant from both ends, so the pair cannot
+    both pass unless the fixture genuinely restores. That is what makes this file independent
+    of collection order, which the Definition of Done requires and which mutmut -- running the
+    tests most relevant to a mutant first -- is what actually exposed.
+    """
+    for name in ("sftp", "ssh"):
+        assert registry.get(name) is not GantrySFTPFileSystem, f"{name} outlived its test"
+    assert known_implementations[name]["class"] == "fsspec.implementations.sftp.SFTPFileSystem"
+    assert "some-other-fs" not in registry
 
 
 # --- the credential -------------------------------------------------------------------------
