@@ -31,6 +31,7 @@ from gantry_sftp.session import (
     local_child,
     unsafe_reason,
 )
+from gantry_sftp.session import _localpath as localpath
 from gantry_sftp.session._session import _chmod_local_directories, _stamp_local_directories
 
 # --- names that must never become a filename ----------------------------------------------
@@ -117,10 +118,56 @@ def test_every_reserved_device_name_is_covered():
         assert unsafe_reason(name.encode() + b".txt", windows=True) is not None
 
 
-def test_the_platform_decides_when_it_is_not_stated():
-    # Injectable for the tests, and correct by default: the rules follow the machine the
-    # file is being written to.
-    assert unsafe_reason(b"CON") == (None if os.name != "nt" else "the reserved device name 'con'")
+def test_a_reserved_name_survives_more_than_one_extension(tmp_path: Path):
+    """`CON.a.txt` is the console too, so the stem is what precedes the *first* dot.
+
+    Windows resolves a device name before it looks at the directory and ignores everything
+    from the first period on -- so `con.a.txt`, `nul.b.c` and plain `con` are the same device.
+    Splitting from the right instead would read the stem of `con.a.txt` as `con.a`, find
+    nothing reserved, and hand a recursive download a path that opens the console. Every
+    existing row here has at most one extension, which is why that survived.
+    """
+    for name in (b"con.a.txt", b"CON.a.txt", b"nul.b.c", b"lpt1.x.y.z"):
+        assert unsafe_reason(name, windows=True) is not None, name
+    # And a name that merely *contains* a device name after the first dot is fine.
+    assert unsafe_reason(b"report.con", windows=True) is None
+    assert unsafe_reason(b"a.con.txt", windows=True) is None
+
+
+def test_a_name_that_is_not_ascii_is_judged_rather_than_crashing():
+    """The Windows rules read the stem as text, and a server-supplied name need not be ASCII.
+
+    The decode is `("ascii", "replace")` and both halves are load-bearing: without the error
+    handler this raises `UnicodeDecodeError` on the first non-ASCII byte, and the handler's
+    name is case-sensitive, so `"REPLACE"` raises `LookupError`. Either turns a name check
+    into a crash, on input the far end chooses -- and nothing here had ever passed a non-ASCII
+    name through the Windows branch.
+    """
+    for name in (b"caf\xe9.txt", b"\xff\xfe", b"\xc3\xa9con", b"co\xe9"):
+        # The answer is "allowed"; the point is that there *is* an answer.
+        assert unsafe_reason(name, windows=True) is None, name
+    # A non-ASCII byte does not smuggle a device name past the check either.
+    assert unsafe_reason(b"con\xe9", windows=True) is None
+    assert unsafe_reason(b"con.\xe9", windows=True) is not None
+
+
+def test_the_platform_decides_when_it_is_not_stated(monkeypatch: pytest.MonkeyPatch):
+    """Both branches, because on Linux the interesting one never ran.
+
+    This used to be a single assertion conditioned on `os.name`, which on every machine that
+    runs this suite reduces to "POSIX rules apply on POSIX" -- true, and it proves nothing
+    about the default the argument exists to override. `os.name` is what the module reads, so
+    it is what the test sets.
+    """
+    monkeypatch.setattr(localpath.os, "name", "posix")
+    assert unsafe_reason(b"CON") is None
+    assert unsafe_reason(b"back\\slash") is None
+
+    monkeypatch.setattr(localpath.os, "name", "nt")
+    assert unsafe_reason(b"CON") == "the reserved device name 'con'"
+    assert unsafe_reason(b"back\\slash") == "a character Windows does not allow in a filename"
+    # The separator-and-dots rules are platform-independent and stay so under either default.
+    assert unsafe_reason(b"..") == "a relative directory entry"
 
 
 def test_the_refusal_carries_the_name_and_the_reason():
@@ -187,6 +234,11 @@ def test_a_symlinked_destination_directory_is_caught(tmp_path: Path):
     assert exc.value.reason == "a path that escapes the destination directory"
     assert exc.value.destination == str(destination)
     assert "which is not inside" in exc.value.args[0]
+    # And the offending *name*, which is the field that says which entry to go and look at.
+    # `reason` and `destination` were asserted here and `name` was not, so it could be dropped
+    # from this raise while the other two kept the test green -- and a containment refusal that
+    # names the destination but not the entry is one a caller cannot act on without re-walking.
+    assert exc.value.name == b"passwd"
 
 
 def test_a_file_that_is_itself_a_symlink_out_is_caught(tmp_path: Path):
