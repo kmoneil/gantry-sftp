@@ -118,8 +118,32 @@ def _fill(path: Path, size: int, seed: int) -> None:
             written += len(chunk)
 
 
+@dataclass(frozen=True, slots=True)
+class Corpus:
+    """What every scenario transfers, named rather than looked up by string.
+
+    A dataclass rather than the ``dict[str, object]`` this used to be. That dict cost its one
+    consumer four ``assert isinstance`` lines to get typed paths back out, which is the shape of
+    boilerplate that grows a statement every time a scenario needs a new file -- and it was
+    already enough to push the profile test over ruff's statement ceiling when D-113 added a row.
+
+    Attributes:
+        large: The 16 MiB file the download scenarios fetch.
+        small: The 8 KiB files, in a fixed order so a ``[:count]`` slice is the same corpus on
+            every profile.
+        upload_source: A local 16 MiB file, distinct from ``large`` so an upload that silently
+            did nothing cannot be verified against the file it was supposed to have sent.
+        upload_dir: Where uploads land on the server.
+    """
+
+    large: Path
+    small: tuple[Path, ...]
+    upload_source: Path
+    upload_dir: Path
+
+
 @pytest.fixture(scope="session")
-def corpus(ssh_server: SSHServer) -> dict[str, object]:
+def corpus(ssh_server: SSHServer) -> Corpus:
     """Files on the server for the clients to fetch, and a local file to send.
 
     Session-scoped: building 16 MiB per profile would put the file system in the measurement.
@@ -144,12 +168,12 @@ def corpus(ssh_server: SSHServer) -> dict[str, object]:
     destinations = ssh_server.root / "uploads"
     destinations.mkdir(exist_ok=True)
 
-    return {
-        "large": large,
-        "small": small,
-        "upload_source": upload_source,
-        "upload_dir": destinations,
-    }
+    return Corpus(
+        large=large,
+        small=tuple(small),
+        upload_source=upload_source,
+        upload_dir=destinations,
+    )
 
 
 @pytest.fixture(scope="session")

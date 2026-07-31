@@ -54,6 +54,27 @@ from datetime import UTC, datetime
 MIB = 1024 * 1024
 
 
+def own_cpu_seconds() -> float:
+    """User + system CPU consumed by **this process alone**, in seconds.
+
+    The counterpart of :func:`cpu_seconds`, and the two answer different questions. That one
+    includes the children because the thesis is that the expensive work *relocated* into a C
+    subprocess, and a counter blind to the child would report the relocation as free. This one
+    excludes them because there is a second question the wide window cannot answer: what a
+    *second* transport would cost us.
+
+    More ``ssh`` children are more channels and more windows, but one process is one GIL, and
+    every session's reader task, framing, decode and ``pwrite`` runs on it. So underneath the
+    2 MiB channel window DESIGN.md 5.1 measured there is a second ceiling, it is a bandwidth
+    number rather than a byte count, and it is this figure that sets it (D-113).
+
+    Returns:
+        Seconds of CPU, monotonically non-decreasing within a process.
+    """
+    mine = resource.getrusage(resource.RUSAGE_SELF)
+    return mine.ru_utime + mine.ru_stime
+
+
 def cpu_seconds() -> float:
     """User + system CPU consumed by this process and its reaped children, in seconds.
 
@@ -64,9 +85,8 @@ def cpu_seconds() -> float:
     Returns:
         Seconds of CPU, monotonically non-decreasing within a process.
     """
-    mine = resource.getrusage(resource.RUSAGE_SELF)
     theirs = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return mine.ru_utime + mine.ru_stime + theirs.ru_utime + theirs.ru_stime
+    return own_cpu_seconds() + theirs.ru_utime + theirs.ru_stime
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,10 +98,16 @@ class Sample:
         cpu_seconds: CPU for the whole session -- connect, operation, close -- because the
             ``ssh`` child's usage only becomes visible once it is reaped. See the module
             docstring.
+        own_cpu_seconds: The share of ``cpu_seconds`` spent in *this* process. Collected on
+            every sample because it costs one ``getrusage`` call that was already being made,
+            and reported by one scenario: for the two comparison libraries it is almost all of
+            ``cpu_seconds``, and for this one it is the ceiling a second connection would run
+            into. See :class:`CpuCeiling`.
     """
 
     wall_seconds: float
     cpu_seconds: float
+    own_cpu_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +132,11 @@ class Measurement:
     def cpu_seconds(self) -> float:
         """Median session CPU."""
         return statistics.median(s.cpu_seconds for s in self.samples)
+
+    @property
+    def own_cpu_seconds(self) -> float:
+        """Median CPU spent in this process, excluding the ``ssh`` child."""
+        return statistics.median(s.own_cpu_seconds for s in self.samples)
 
     @property
     def fastest_wall_seconds(self) -> float:
@@ -136,6 +167,10 @@ class Measurement:
         omits it rather than dividing by zero.
         """
         return self.cpu_seconds / (self.bytes_moved / MIB) if self.bytes_moved else 0.0
+
+    @property
+    def mib_moved(self) -> float:
+        return self.bytes_moved / MIB
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,9 +519,15 @@ async def take_samples(
     samples: list[Sample] = []
     moved = 0
     for _ in range(repeats):
-        before = cpu_seconds()
+        before, own_before = cpu_seconds(), own_cpu_seconds()
         wall, moved = await run_once()
-        samples.append(Sample(wall_seconds=wall, cpu_seconds=cpu_seconds() - before))
+        samples.append(
+            Sample(
+                wall_seconds=wall,
+                cpu_seconds=cpu_seconds() - before,
+                own_cpu_seconds=own_cpu_seconds() - own_before,
+            )
+        )
     return Measurement(scenario=scenario, client=client, bytes_moved=moved, samples=tuple(samples))
 
 
@@ -515,6 +556,119 @@ HEADER = (
     "| client | wall s | MiB/s | session CPU s | CPU s/MiB | spread | vs baseline |\n"
     "| ------ | ------ | ----- | ------------- | --------- | ------ | ----------- |"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CpuCeiling:
+    """What *this process's* own CPU would allow, for one direction, net of connecting.
+
+    DESIGN.md 5.1 measured the ceiling above this one -- OpenSSH's 2 MiB channel window -- and
+    concluded that the route past it is more transports or a native one. That conclusion is
+    about the *link*, and it silently assumes the Python side scales alongside it. It does
+    not: more ``ssh`` children are more channels and more windows, but one process is one GIL,
+    and every session's reader task, framing, decode and ``pwrite`` runs on it. This is the
+    second ceiling, and it is a bandwidth number rather than a byte count (D-113).
+
+    **The connect measurement is subtracted rather than left to the reader**, which is the one
+    place this departs from the module docstring's convention. That convention is right for the
+    published matrix, where every client is measured the same wide way and a reader comparing
+    two rows has the connect cost in both. Here the output is a *ceiling asserted against a
+    plan*, so leaving a fixed cost in it would understate the ceiling by an amount that shrinks
+    as the file grows -- which is the same mistake D-23 found the matrix making with TCP slow
+    start, one layer down.
+
+    Attributes:
+        direction: ``"download"`` or ``"upload"``, for the report.
+        transfer: The transfer, measured cold like every other row.
+        connect: ``connect_and_close`` by the same client on the same link, moving no bytes.
+    """
+
+    direction: str
+    transfer: Measurement
+    connect: Measurement
+
+    def __post_init__(self) -> None:
+        if not self.transfer.bytes_moved:
+            raise ValueError(f"{self.direction} moved no bytes; there is no ceiling to derive")
+        if self.connect.bytes_moved:
+            raise ValueError(
+                f"the connect measurement moved {self.connect.bytes_moved} bytes; it is meant "
+                f"to be the session lifecycle on its own"
+            )
+
+    @property
+    def own_cpu_seconds(self) -> float:
+        """Our CPU for the transfer alone, with the session lifecycle taken out.
+
+        Floored at zero. The subtraction is of two medians from different sample sets, so on a
+        profile where connecting costs about what the transfer does it can legitimately go
+        negative -- and a negative CPU cost is a measurement artefact, not a finding.
+        """
+        return max(self.transfer.own_cpu_seconds - self.connect.own_cpu_seconds, 0.0)
+
+    @property
+    def own_cpu_seconds_per_mib(self) -> float:
+        return self.own_cpu_seconds / self.transfer.mib_moved
+
+    @property
+    def ceiling_mib_per_second(self) -> float:
+        """MiB/s this process could sustain if its own CPU were the only constraint.
+
+        An **upper** bound and deliberately a generous one: it assumes a whole core available
+        and perfect overlap with the ``ssh`` child, neither of which a real deployment gets. A
+        route past the channel window that would need more than this does not have a link
+        problem.
+
+        Infinite when no CPU was measurable at all, which means the sample was too short to
+        register against the clock tick. Reported as infinite rather than papered over, because
+        a ceiling derived from an unmeasurable cost is not a ceiling.
+        """
+        per_mib = self.own_cpu_seconds_per_mib
+        return 1.0 / per_mib if per_mib else float("inf")
+
+    @property
+    def headroom(self) -> float:
+        """How many times the measured throughput would fit under the ceiling.
+
+        The number the card is actually for. Large means the link is the constraint and Python
+        is nowhere near it; near 1.0 means this process is the constraint and no amount of
+        channel window would help.
+        """
+        return self.ceiling_mib_per_second / self.transfer.throughput_mib_per_second
+
+
+CPU_CEILING_HEADER = (
+    "| direction | our CPU s/MiB | implied ceiling MiB/s | measured MiB/s | headroom |\n"
+    "| --------- | ------------- | --------------------- | -------------- | -------- |"
+)
+
+
+def render_cpu_ceiling(ceilings: Sequence[CpuCeiling]) -> str:
+    """The second ceiling, per direction.
+
+    A separate table from :func:`render_scenario` rather than two more columns on it, for the
+    reason ``SizeSweep`` gets its own: this is not a comparison and it has no baseline. It is
+    one client measured against a *constraint*, and rendering it beside "vs baseline" would
+    invite exactly the reading it is not -- that ours is being scored against paramiko's Python
+    CPU, which is a different and already-published row.
+    """
+    rows = "\n".join(
+        f"| {c.direction} | {c.own_cpu_seconds_per_mib:.4f} "
+        f"| {c.ceiling_mib_per_second:.0f} "
+        f"| {c.transfer.throughput_mib_per_second:.1f} "
+        f"| {c.headroom:.1f}x |"
+        for c in ceilings
+    )
+    return (
+        "#### our own CPU per byte, and the ceiling it implies\n\n"
+        f"{CPU_CEILING_HEADER}\n{rows}\n\n"
+        "Not a comparison, and not a throughput claim: it is the bound on **more transports**. "
+        "One process is one GIL however many `ssh` children it spawns, so the route past the "
+        "2 MiB channel window that DESIGN.md 5.1 names runs into this instead. The connect "
+        "cost is subtracted; the ceiling assumes a whole core and perfect overlap with the "
+        "child, so it is generous by construction. Headroom is how many times the measured "
+        "rate fits under it (D-113).\n"
+    )
 
 
 def render_scenario(

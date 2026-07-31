@@ -32,10 +32,12 @@ from pathlib import Path
 import pytest
 from _clients import BASELINE, Client, GantryClient, ParamikoClient, available, library_versions
 from _harness import (
+    CpuCeiling,
     Environment,
     Measurement,
     SizePoint,
     SizeSweep,
+    render_cpu_ceiling,
     render_report,
     render_scenario,
     render_size_sweep,
@@ -44,7 +46,7 @@ from _harness import (
 )
 from sshd import SFTP_SERVER_CANDIDATES, SSHServer, first_existing
 
-from conftest import SweepFile
+from conftest import Corpus, SweepFile
 
 pytestmark = pytest.mark.anyio
 
@@ -178,6 +180,14 @@ CAVEATS = (
     "The `concurrent` small-file row is **gantry-sftp against gantry-sftp**, like the atomic "
     "publish row: same files, same one connection, sequential versus overlapped. It is not a "
     "claim about the other two libraries.",
+    "**The `our own CPU per byte` table runs on the unshaped profile only, and it is the one "
+    "row that subtracts the connect cost** rather than leaving it for the reader. Both are "
+    "the same decision: it derives a *ceiling* that unbuilt work gets ranked against, so a "
+    "link constraint or a fixed per-session cost left inside it would understate the ceiling "
+    "by an amount that changes with the file size. It is an upper bound and a generous one -- "
+    "a whole core, perfect overlap with the `ssh` child -- and what it bounds is **more "
+    "transports**, since one process is one GIL however many `ssh` children it spawns "
+    "(D-113).",
     "Our upload row is `atomic=False, fsync=False`, which is the work the other two do. What "
     "our default costs is the separate `atomic publish` scenario.",
     "**The `throughput against size` sweeps are the one place a connection is reused, and "
@@ -366,6 +376,77 @@ async def _scenario_upload(
         produced = upload_dir / f"{client.name}-up.bin"
         assert _identical(produced, source), f"{client.name} uploaded the wrong bytes"
     return measurements
+
+
+async def _scenario_cpu_ceiling(
+    clients: Sequence[Client], profile: Profile, source: Path, upload_dir: Path, workdir: Path
+) -> list[CpuCeiling]:
+    """The second ceiling: what our own Python costs per byte, both directions (D-113).
+
+    **Unshaped only, and that is the whole design of the row.** Every other profile puts a
+    constraint between this process and the server, and a link constraint is exactly what this
+    must not measure: on a 50 ms link the transfer is idle most of the time and the CPU per
+    *byte* would come out the same while the CPU per *second* collapsed. The question is what
+    this process can push when nothing else is stopping it, so it is asked on the one link that
+    is not stopping anything.
+
+    Us against a constraint rather than against another library. The comparison libraries'
+    Python CPU is already published in every table's CPU column and is a different argument --
+    that the work relocated. This one is about what a *second* transport would run into, and
+    the answer is the same whether or not paramiko is installed.
+
+    Both directions, because they are not symmetric: the download places payloads with
+    ``os.pwrite`` and drops them, while the upload holds each ``WRITE`` with its payload in the
+    codec's outstanding map until the reply. Same memory bound, two mechanisms -- and, it turns
+    out, two different per-byte costs.
+    """
+    gantry = next((c for c in clients if isinstance(c, GantryClient)), None)
+    # Two preconditions, one exit. The shaped half is taken on four of the five profiles and is
+    # the row's whole design; the `gantry is None` half is unreachable in practice, since
+    # gantry_sftp is always importable here, and is kept because the sequence is typed as
+    # `Client` and a scenario that indexed into it blindly would fail confusingly.
+    if gantry is None or profile.rtt_ms is not None:
+        return []
+    landed = workdir / "gantry-ceiling.bin"
+    published = upload_dir / "gantry-ceiling-up.bin"
+    scenario = "our own CPU per byte"
+
+    # The subtrahend. Same client, same link, same sample count, moving no bytes -- so what it
+    # measures is exactly the part of the transfer rows that is not the transfer.
+    connect = await take_samples(
+        gantry.connect_and_close,
+        scenario=scenario,
+        client="gantry-sftp (connect only)",
+        repeats=REPEATS,
+    )
+    ceilings = [
+        CpuCeiling(
+            direction="download 16 MiB",
+            transfer=await take_samples(
+                lambda: gantry.download(source, landed),
+                scenario=scenario,
+                client="gantry-sftp (download)",
+                repeats=REPEATS,
+            ),
+            connect=connect,
+        ),
+        CpuCeiling(
+            direction="upload 16 MiB (in place)",
+            transfer=await take_samples(
+                lambda: gantry.upload(source, published),
+                scenario=scenario,
+                client="gantry-sftp (upload)",
+                repeats=REPEATS,
+            ),
+            connect=connect,
+        ),
+    ]
+    # Verified like every other row. A transfer that returned early would report a ceiling for
+    # work it did not do, and a ceiling is the one output here that something else gets ranked
+    # against.
+    assert _identical(landed, source), "the download for the CPU row holds the wrong bytes"
+    assert _identical(published, source), "the upload for the CPU row holds the wrong bytes"
+    return ceilings
 
 
 async def _scenario_small_files(
@@ -774,7 +855,7 @@ async def test_benchmark_profile(
     profile: Profile,
     request: pytest.FixtureRequest,
     ssh_server: SSHServer,
-    corpus: dict[str, object],
+    corpus: Corpus,
     tmp_path: Path,
     report: ReportSink,
 ) -> None:
@@ -802,14 +883,8 @@ async def test_benchmark_profile(
         )
         description = link.describe()
 
-    large = corpus["large"]
-    assert isinstance(large, Path)
-    upload_source = corpus["upload_source"]
-    assert isinstance(upload_source, Path)
-    upload_dir = corpus["upload_dir"]
-    assert isinstance(upload_dir, Path)
-    small = corpus["small"]
-    assert isinstance(small, list)
+    large, small = corpus.large, corpus.small
+    upload_source, upload_dir = corpus.upload_source, corpus.upload_dir
 
     sections = [
         render_scenario(
@@ -885,6 +960,12 @@ async def test_benchmark_profile(
                 baseline_client="gantry-sftp (in place)",
             )
         )
+    # The unshaped-only gate lives in the scenario rather than here, like every other
+    # precondition a scenario has about the link it needs.
+    ceilings = await _scenario_cpu_ceiling(clients, profile, large, upload_dir, tmp_path)
+    if ceilings:
+        sections.append(render_cpu_ceiling(ceilings))
+
     sweeps: list[SizeSweep] = []
     if profile.sweep_repeats is not None:
         # Requested lazily like `shape_link`, so a selection that runs no sweep writes no

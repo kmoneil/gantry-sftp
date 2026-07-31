@@ -37,6 +37,7 @@ timeout that must not fire are exactly the shapes anyio papers over differently.
 from __future__ import annotations
 
 import os
+import resource
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -590,6 +591,109 @@ async def test_the_shipped_defaults_reach_the_channel_window(shape_link, ssh_ser
         f"{link.describe()}: Session.get at defaults took {elapsed:.3f}s against a "
         f"{budget:.3f}s budget derived from {at_window}"
     )
+
+
+# --- the ceiling underneath the ceiling (D-113) ----------------------------------------------
+
+
+CLOCK_TICKS_PER_SECOND = os.sysconf("SC_CLK_TCK")
+
+SATURATED = 0.90
+"""Share of one core above which a process is the constraint rather than a participant.
+
+Not 1.00: a process pinned at 90% of a core across a whole transfer is not going to be freed
+by a wider channel window, and asking for 100% would make the assertion unfalsifiable on any
+machine with a timer interrupt.
+"""
+
+
+def process_cpu_seconds(pid: int) -> float:
+    """User + system CPU of one live process, read from ``/proc`` rather than at reap.
+
+    ``getrusage(RUSAGE_CHILDREN)`` cannot see a child until it has been waited for, which is
+    why `benchmarks/_harness.py` measures a whole session rather than a transfer. Here the
+    question is what the child is doing *during* one transfer, so the only instrument is
+    ``/proc/<pid>/stat`` -- Linux-only, which this lane already is, since it needs ``tc``.
+
+    Fields 14 and 15 (1-indexed, per ``proc(5)``) are ``utime`` and ``stime`` in clock ticks.
+    The split is on ``") "`` rather than on whitespace because field 2 is the executable name
+    in parentheses and may itself contain spaces.
+    """
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / CLOCK_TICKS_PER_SECOND
+
+
+def own_cpu_seconds() -> float:
+    """User + system CPU of this process alone."""
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_utime + usage.ru_stime
+
+
+async def test_neither_process_is_saturated_at_five_milliseconds(shape_link, ssh_server, tmp_path):
+    """Whose constraint the 5 ms shortfall is -- asked, rather than attributed.
+
+    DESIGN.md 5.1 explains the 5 ms profile falling short of its channel window with *"a 2 MiB
+    window at 5 ms implies 377 MiB/s and the pipe cannot deliver that whatever the window
+    says"*. That is a claim about the link, and it was never checked against the two candidates
+    on this side of the pipe: this process's Python, and the ``ssh`` child's. Both are now
+    known to be in range rather than orders away -- `benchmarks/` measures our own ceiling at a
+    few hundred MiB/s on an unshaped link (D-113) -- so "the pipe" is an attribution with a
+    live alternative rather than the only possibility.
+
+    This is the instrument that separates them, and it is deliberately **not** a throughput
+    assertion. It measures what fraction of one core each process spends across a warm
+    transfer at the shipped defaults. A process at or near a whole core is the constraint and
+    no channel window would free it; two processes well below it leave the link as the
+    explanation, which is what DESIGN.md 5.1 says and what this then evidences rather than
+    assumes.
+
+    Both directions of the result are useful and neither fails the run on throughput, which is
+    why the assertion is on *saturation* and not on a rate. A machine slower than this one
+    would legitimately saturate and should say so loudly rather than being told its link is
+    slow.
+    """
+    link = shape_link(rtt_ms=5.0)
+    source = random_file(tmp_path / "source.bin", 16 * MEBIBYTE)
+    destination = tmp_path / "landed.bin"
+
+    async with connect(ssh_server) as transport, open_session(transport) as sftp:
+        # Warm, for D-81's reason: a cold transfer spends its opening round trips in TCP slow
+        # start, and CPU sampled across those would be averaged over a wall clock that the
+        # congestion window -- not either process -- was stretching.
+        await sftp.get(str(source), destination)
+
+        child = transport.pid
+        started, ours_before, theirs_before = (
+            time.perf_counter(),
+            own_cpu_seconds(),
+            process_cpu_seconds(child),
+        )
+        transferred = await sftp.get(str(source), destination)
+        elapsed = time.perf_counter() - started
+        ours = own_cpu_seconds() - ours_before
+        theirs = process_cpu_seconds(child) - theirs_before
+
+    assert transferred == file_size(source)
+    assert_identical(source, destination)
+
+    rate = transferred / elapsed / MEBIBYTE
+    report = (
+        f"{link.describe()}: {rate:.1f} MiB/s, this process {ours / elapsed:.0%} of a core, "
+        f"the ssh child {theirs / elapsed:.0%}"
+    )
+    assert ours / elapsed < SATURATED, (
+        f"{report} -- our own Python is the constraint here, so DESIGN.md 5.1's attribution "
+        f"of the 5 ms shortfall to the link does not hold on this machine"
+    )
+    assert theirs / elapsed < SATURATED, (
+        f"{report} -- the ssh child is the constraint here, which is a different finding from "
+        f"either the link or our scheduler and is not what 5.1 claims"
+    )
+    # A transfer neither process was doing any work for would satisfy both assertions above
+    # and prove nothing. This is the calibration: the instrument has to be able to see CPU
+    # before its silence means anything.
+    assert ours > 0.0, f"{report} -- no CPU was measurable in this process"
+    assert theirs > 0.0, f"{report} -- no CPU was measurable in the ssh child"
 
 
 # --- and it still has to be correct ---------------------------------------------------------

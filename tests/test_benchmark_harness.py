@@ -42,6 +42,7 @@ for _extra in (_BENCHMARKS, _ROOT / "live-tests"):
 
 from _harness import (  # noqa: E402
     Comparison,
+    CpuCeiling,
     Environment,
     Measurement,
     Sample,
@@ -49,6 +50,8 @@ from _harness import (  # noqa: E402
     SizeSweep,
     _command_output,
     cpu_seconds,
+    own_cpu_seconds,
+    render_cpu_ceiling,
     render_report,
     render_scenario,
     render_size_sweep,
@@ -65,13 +68,21 @@ def burn_in_a_child() -> None:
     subprocess.run([sys.executable, "-c", BURN], check=True)
 
 
-def measurement(client: str, walls: list[float], cpus: list[float], moved: int) -> Measurement:
+def measurement(
+    client: str,
+    walls: list[float],
+    cpus: list[float],
+    moved: int,
+    own: list[float] | None = None,
+) -> Measurement:
+    mine = own if own is not None else cpus
     return Measurement(
         scenario="s",
         client=client,
         bytes_moved=moved,
         samples=tuple(
-            Sample(wall_seconds=w, cpu_seconds=c) for w, c in zip(walls, cpus, strict=True)
+            Sample(wall_seconds=w, cpu_seconds=c, own_cpu_seconds=o)
+            for w, c, o in zip(walls, cpus, mine, strict=True)
         ),
     )
 
@@ -330,6 +341,110 @@ async def test_cpu_is_measured_per_sample_rather_than_cumulatively():
     first, second = result.samples
     assert first.cpu_seconds > 0.01
     assert second.cpu_seconds < first.cpu_seconds * 1.8
+
+
+# --- the second ceiling (D-113) -------------------------------------------------------------
+
+MIB = 1024 * 1024
+
+
+def ceiling(
+    *, transfer_own: float, connect_own: float, walls: list[float], moved: int
+) -> CpuCeiling:
+    return CpuCeiling(
+        direction="download",
+        transfer=measurement(
+            "g", walls, [9.0] * len(walls), moved, own=[transfer_own] * len(walls)
+        ),
+        connect=measurement("g (connect)", [0.1], [9.0], 0, own=[connect_own]),
+    )
+
+
+def test_own_cpu_seconds_excludes_a_reaped_childs_time():
+    """The distinction the whole row rests on, proven against a child that really burns CPU.
+
+    ``cpu_seconds`` and ``own_cpu_seconds`` differing is not enough on its own -- two counters
+    that both grew would satisfy that. What is asserted is that essentially all of the child's
+    work lands in one and essentially none of it in the other.
+    """
+    before_all, before_own = cpu_seconds(), own_cpu_seconds()
+    burn_in_a_child()
+    combined, mine = cpu_seconds() - before_all, own_cpu_seconds() - before_own
+
+    assert combined > 0.05, "the child did not burn enough CPU for this test to mean anything"
+    assert mine < combined / 2
+    assert mine >= 0.0
+
+
+def test_the_ceiling_is_the_reciprocal_of_the_cost_net_of_connecting():
+    # 2.0 s of our CPU for the transfer, 1.0 s of it the session lifecycle, over 8 MiB:
+    # 0.125 s/MiB, so 8 MiB/s if our CPU were the only thing in the way.
+    c = ceiling(transfer_own=2.0, connect_own=1.0, walls=[2.0], moved=8 * MIB)
+    assert c.own_cpu_seconds == 1.0
+    assert c.own_cpu_seconds_per_mib == 0.125
+    assert c.ceiling_mib_per_second == 8.0
+    # Measured 4 MiB/s against a ceiling of 8: the link is leaving half the CPU unused.
+    assert c.headroom == 2.0
+
+
+def test_the_connect_cost_is_subtracted_and_a_row_that_forgot_it_would_read_lower():
+    """The subtraction is the row's one departure from the module's convention, so it is pinned.
+
+    A ceiling derived without it is not slightly wrong, it is wrong by a factor that changes
+    with the file size -- which is the same shape of mistake D-23 found the matrix making with
+    TCP slow start one layer down.
+    """
+    with_connect = ceiling(transfer_own=2.0, connect_own=1.0, walls=[1.0], moved=1 * MIB)
+    without = ceiling(transfer_own=2.0, connect_own=0.0, walls=[1.0], moved=1 * MIB)
+    assert with_connect.ceiling_mib_per_second == 1.0
+    assert without.ceiling_mib_per_second == 0.5
+    assert with_connect.ceiling_mib_per_second > without.ceiling_mib_per_second
+
+
+def test_a_connect_measurement_costlier_than_the_transfer_floors_at_zero_rather_than_negative():
+    """Two medians from different sample sets can cross. A negative CPU cost is an artefact.
+
+    Floored rather than raised, because the profiles where it can happen are the ones where the
+    transfer is trivially short -- and refusing to render a row there would remove the row from
+    exactly the runs a reader is most likely to be checking by hand.
+    """
+    c = ceiling(transfer_own=0.5, connect_own=2.0, walls=[1.0], moved=4 * MIB)
+    assert c.own_cpu_seconds == 0.0
+    assert c.own_cpu_seconds_per_mib == 0.0
+    assert c.ceiling_mib_per_second == float("inf")
+
+
+def test_a_ceiling_needs_a_transfer_that_moved_bytes_and_a_connect_row_that_did_not():
+    with pytest.raises(ValueError) as no_bytes:
+        ceiling(transfer_own=1.0, connect_own=0.0, walls=[1.0], moved=0)
+    assert no_bytes.value.args[0] == "download moved no bytes; there is no ceiling to derive"
+
+    with pytest.raises(ValueError) as moved:
+        CpuCeiling(
+            direction="download",
+            transfer=measurement("g", [1.0], [1.0], 8 * MIB),
+            connect=measurement("g (connect)", [1.0], [1.0], 4096),
+        )
+    assert moved.value.args[0] == (
+        "the connect measurement moved 4096 bytes; it is meant to be the session lifecycle "
+        "on its own"
+    )
+
+
+def test_the_ceiling_table_says_what_it_is_not():
+    """The prose is load-bearing: this table is the one most likely to be misread as a claim.
+
+    It carries a MiB/s figure and no baseline, so a reader skimming for throughput numbers
+    finds a big one. The table has to say, in the report itself, that the number bounds more
+    transports rather than describing a transfer.
+    """
+    rendered = render_cpu_ceiling(
+        [ceiling(transfer_own=2.0, connect_own=1.0, walls=[2.0], moved=8 * MIB)]
+    )
+    assert "| download | 0.1250 | 8 | 4.0 | 2.0x |" in rendered
+    assert "Not a comparison" in rendered
+    assert "one GIL" in rendered
+    assert "D-113" in rendered
 
 
 def test_the_report_carries_every_caveat_and_the_environment():
