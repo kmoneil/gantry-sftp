@@ -315,6 +315,11 @@ paths = ["src"]
 # the library is a confident, wrong answer somebody will copy. Each one runs as a subprocess
 # and skips cleanly without openssh-server.
 testpaths = ["tests", "examples"]
+# `tests/` on the path so `live-tests/` can import `server_contract` -- one contract asked of a
+# fake here and of the matrix's three servers there, which is the whole point of D-114 and does
+# not work if each lane keeps its own copy. Declarative rather than a `sys.path` insert walking
+# up from `__file__`: that shape has broken three modules under mutmut already.
+pythonpath = ["tests"]
 # Setting norecursedirs REPLACES pytest's defaults rather than extending them, so the
 # defaults are restated here. Dropping `.*` makes hypothesis warn that .hypothesis is
 # being collected.

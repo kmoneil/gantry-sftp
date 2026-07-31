@@ -187,9 +187,15 @@ class TreeServer:
         if parent in self.tree:
             self.tree[parent] = tuple(e for e in self.tree[parent] if e.filename != name)
 
-    def _dispatch(self, packet) -> None:
-        self.seen.append(packet)
-        handlers = {
+    def handlers(self) -> dict[type, object]:
+        """What this server answers, as data rather than as a table built inside a branch.
+
+        Public and a method rather than a local in :meth:`_dispatch`, because
+        ``tests/test_contract.py`` derives this fake's declared capabilities from it -- a
+        declaration written beside the fake is true when it is written and quietly false a year
+        later, and the failure is silent: the contract narrows and every remaining row passes.
+        """
+        return {
             Init: self._on_init,
             OpenDir: self._on_opendir,
             ReadDir: self._on_readdir,
@@ -202,7 +208,10 @@ class TreeServer:
             RmDir: self._on_rmdir,
             RealPath: self._on_realpath,
         }
-        handler = handlers.get(type(packet))
+
+    def _dispatch(self, packet) -> None:
+        self.seen.append(packet)
+        handler = self.handlers().get(type(packet))
         if handler is None:
             self._reply(Status(packet.request_id, StatusCode.FAILURE, b"unscripted"))
             return
@@ -254,13 +263,30 @@ class TreeServer:
         self._reply(Name(packet.request_id, self.tree[path]))
 
     def _on_open(self, packet: Open) -> None:
+        """A directory **opens**, and it is the ``READ`` that refuses.
+
+        **Corrected 2026-07-31 by the contract lane (D-114).** This used to answer
+        ``NO_SUCH_FILE`` for a directory, which is a server that does not exist: `sftp-server`
+        calls ``open(2)``, Linux permits ``O_RDONLY`` on a directory, and ``EISDIR`` arrives at
+        the first ``read(2)`` as the v3 ``FAILURE`` catch-all. Probed against the real server
+        rather than recalled. Every error path a test drove through the old behaviour was being
+        driven at the wrong request.
+        """
+        if packet.filename in self.tree:
+            self._reply(Handle(packet.request_id, self._handle_for(packet.filename)))
+            return
         if packet.filename not in self.files:
             self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
             return
         self._reply(Handle(packet.request_id, self._handle_for(packet.filename)))
 
     def _on_read(self, packet: Read) -> None:
-        content = self.files[self._handles[packet.handle]]
+        path = self._handles[packet.handle]
+        if path in self.tree:
+            # What `read(2)` on a directory fd answers, folded into v3's catch-all.
+            self._reply(Status(packet.request_id, StatusCode.FAILURE, b"Failure"))
+            return
+        content = self.files[path]
         chunk = content[packet.offset : packet.offset + packet.length]
         if chunk:
             self._reply(Data(packet.request_id, memoryview(chunk)))
@@ -268,6 +294,17 @@ class TreeServer:
             self._reply(Status(packet.request_id, StatusCode.EOF))
 
     def _on_close(self, packet: Close) -> None:
+        """A handle this server never issued, or has already closed, is ``NO_SUCH_FILE``.
+
+        **Corrected 2026-07-31 by the contract lane (D-114)**, which is the first thing to ask
+        this fake and the reference the same question. It used to answer ``OK`` to every
+        ``CLOSE``, including one for a handle it had never heard of -- so a proof that something
+        closed *the right* handle could not be told apart from a proof that it closed anything.
+        """
+        if packet.handle not in self._handles:
+            self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"No such file"))
+            return
+        del self._handles[packet.handle]
         self.open_handles.discard(packet.handle)
         self._reply(Status(packet.request_id, StatusCode.OK))
 
