@@ -7,6 +7,7 @@ a pipe, and the ssh failure cases are made to fail before any connection is atte
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import anyio
 import pytest
 
 import gantry_sftp
+from gantry_sftp._logging import record_fields
 from gantry_sftp.codec import (
     Close,
     Codec,
@@ -44,6 +46,12 @@ async def _receive_until_closed(transport) -> None:
     """Read until the peer hangs up. Isolated so pytest.raises wraps one statement."""
     while True:
         await transport.receive()
+
+
+async def _send_until_the_child_goes(transport) -> None:
+    """Write until the pipe breaks. Isolated so `pytest.raises` wraps one statement."""
+    for _ in range(2048):
+        await transport.send(b"x" * 4096)
 
 
 async def _open_and_close(opener) -> None:
@@ -150,8 +158,35 @@ async def test_using_a_closed_transport_raises_rather_than_hanging(tmp_path: Pat
         with pytest.raises(ConnectError) as exc:
             await transport.receive()
         assert exc.value.args[0] == "transport is closed"
-        with pytest.raises(ConnectError):
+        # `send` has its own copy of the check and its own message, and only `receive`'s was
+        # read. Every message in `send` could be replaced with `None` with this test green.
+        with pytest.raises(ConnectError) as exc:
             await transport.send(b"anything")
+        assert exc.value.args[0] == "transport is closed"
+
+
+async def test_a_send_after_the_child_has_gone_says_the_child_has_gone(tmp_path: Path):
+    """The other `send` failure, which has a different message for a different cause.
+
+    "transport is closed" is *us* having closed it; this is the child going away underneath a
+    write, which is what a dropped link looks like from the sending side. Two causes, two
+    messages, and neither was asserted -- so the pair could be swapped and a reader chasing a
+    dropped connection would be told they had closed it themselves.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    async with open_local_server_transport(cwd=tmp_path) as transport:
+        await transport.send(b"\x00\x00\x00\x01\xff")  # not a frame; the server gives up
+        with pytest.raises(ConnectError) as exc:
+            await _send_until_the_child_goes(transport)
+        assert exc.value.args[0] == "ssh exited while we were writing to it"
+        # `returncode` is deliberately *not* asserted, in either direction, and the reason is
+        # worth the lines. `receive` shields a short `wait()` after end-of-stream so the exit
+        # status travels with the error; `send` has no such wait, so whether the child has
+        # been reaped by the time the write fails is a race -- and it lands differently on the
+        # two backends. Asserting "is not None" fails on asyncio and "is None" fails on trio.
+        # The message is the contract here; the status belongs to the `receive` path.
 
 
 async def test_a_cancelled_transfer_still_reaps_the_child(tmp_path: Path):
@@ -185,6 +220,37 @@ async def test_end_of_stream_reports_the_children_stderr(tmp_path: Path):
             await _receive_until_closed(transport)
         assert exc.value.args[0] == "connection closed by the remote end"
         assert exc.value.returncode is not None
+
+
+async def test_the_close_record_carries_its_fields_as_data(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """The other half of D-98, in the package the mutation lane could not see until 0.11.
+
+    `_retry`'s warning had this exact defect and it was fixed there; the transport's `close`
+    record has the same shape and nobody had read its fields either. `extra=` could be dropped
+    outright, every field nulled or shifted onto its neighbour, and `"close"` mangled to
+    `"CLOSE"`, with the sentence still rendering correctly and nothing failing.
+
+    The values are asserted against the transport rather than restated, so a record that
+    reports some *other* process's exit is a failure rather than a matching constant.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    with caplog.at_level(logging.DEBUG, logger="gantry_sftp.transport"):
+        async with open_local_server_transport(cwd=tmp_path) as transport:
+            pass
+
+    closed = [r for r in caplog.records if r.getMessage().startswith("closed pid=")]
+    assert len(closed) == 1
+    fields = record_fields(closed[0])
+    assert fields["operation"] == "close"
+    assert fields["event"] == "ok"
+    assert fields["pid"] == transport.pid
+    assert fields["returncode"] == transport.returncode
+    assert fields["returncode"] is not None, "logged before the reap, so the status is not real"
+    assert isinstance(fields["stderr_bytes"], int)
 
 
 # --- stderr is captured, but not without limit -------------------------------------------
