@@ -87,7 +87,7 @@ and the ceiling is reached with room to spare rather than exactly.
 more than an initial TCP congestion window in flight immediately, so the opening round trips
 are spent waiting for that window to open rather than for the server. The same download is
 measurably faster as a connection's second transfer than as its first, and the warm figure
-reaches most of what the 2 MiB channel window implies once the three metadata round trips
+reaches most of what the 2 MiB channel window implies once the metadata round trips
 ``get`` makes -- ``STAT``, ``OPEN``, ``CLOSE`` -- are subtracted. Both figures, with their link
 profile and their date, come out of ``benchmarks/`` when it is run; they are not repeated here
 and are not committed anywhere, because a number in a docstring ages without anybody noticing

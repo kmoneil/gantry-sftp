@@ -45,11 +45,14 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+import anyio
 import pytest
 
 from gantry_sftp.codec import OpenFlag
 from gantry_sftp.session import Publish, Session, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from test_dispatch import DEADLINE as RENDEZVOUS_DEADLINE
+from test_dispatch import Rendezvous
 from test_publish import FSYNC_NAME, POSIX_RENAME_NAME, STAGED, TARGET, PublishingServer
 
 pytestmark = pytest.mark.anyio
@@ -421,3 +424,64 @@ async def test_an_extension_is_probed_once_per_session_and_not_once_per_file(
     assert len(first) == len(second) + 1, (
         "the probe is exactly one round trip, and it should be the only difference"
     )
+
+
+# --- and the serial depth, which is what D-110 actually changed ------------------------------
+
+
+async def test_a_download_puts_its_stat_and_open_in_flight_together(tmp_path: Path) -> None:
+    """The count did not move and the *depth* did, so the count cannot be what proves it.
+
+    ``get`` still sends four requests -- the test above pins that -- and D-110 did not remove
+    one, it removed a *wait*. The STAT and the OPEN are both addressed by path and neither
+    reads the other's answer, so on the default path the ordering between them was incidental.
+
+    Proved with :class:`~test_dispatch.Rendezvous` rather than with a clock. It answers nothing
+    until two requests are waiting on it, so a client that sends its STAT and waits for the
+    reply before sending its OPEN can never make it respond: this test either passes because
+    the two were genuinely in flight together, or it hangs and fails on the deadline. There is
+    no threshold to tune and nothing a fast machine can fake, which a latency assertion could
+    not manage on any link this suite can shape.
+    """
+    payload = bytes(range(256)) * 3
+    server = Rendezvous({b"/incoming.bin": payload}, release_at=2)
+
+    with anyio.fail_after(RENDEZVOUS_DEADLINE):
+        async with open_session(server) as sftp:  # type: ignore[arg-type]
+            moved = await sftp.get(b"/incoming.bin", tmp_path / "landed.bin")
+
+    assert moved == len(payload)
+    assert (tmp_path / "landed.bin").read_bytes() == payload
+    held = [{type(request).__name__ for request in waiting} for waiting in server.rendezvous]
+    assert {"Stat", "Open"} in held, f"the barrier was met, but not by the STAT/OPEN pair: {held}"
+
+
+async def test_a_resumed_download_keeps_its_stat_and_open_sequential(tmp_path: Path) -> None:
+    """The exemption, asserted as an exemption rather than left to the ``resume=`` branch.
+
+    Resuming needs the size before anything else happens: the offset is derived from it, the
+    D-38 gate refuses on it, and a resume of an already-complete file returns **without opening
+    anything at all**. Issuing the OPEN concurrently there would send a request for a transfer
+    that is not going to happen, and on the complete-file path would leak the handle it opened.
+
+    Asserted at the seam rather than through ``get``, because what is being pinned is that the
+    resume path asks for the sequential form -- a test that only checked a resumed download
+    still worked would pass over a version that had quietly made it concurrent.
+    """
+    requires_sftp_server()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"z" * 4096)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        before = sftp.requests_sent
+        attributes, handle = await sftp._stat_and_open_for_download(  # noqa: SLF001
+            str(source).encode(), together=False
+        )
+        assert sftp.requests_sent - before == 1, "the sequential form sent more than the STAT"
+        assert handle is None, (
+            "the sequential form opened a handle the resume path had not asked for"
+        )
+        assert attributes.size == 4096

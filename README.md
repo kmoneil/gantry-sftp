@@ -2237,18 +2237,31 @@ The table above bounds bytes in flight, which is the right lever for a big file 
 one for a directory of small ones. On a link with latency, what a small transfer costs is round
 trips, and this is the number to multiply by your RTT:
 
-| Operation | Round trips | Which ones |
-| --- | --- | --- |
-| `stat` / `lstat` / `realpath` / `getsize` | 1 | itself |
-| `get` | 3 + `ceil(size / request size)` | `STAT`, `OPEN`, the `READ`s, `CLOSE` |
-| `put(publish=Publish(atomic=False, fsync=False))` | 3 + `ceil(size / request size)` | `OPEN`, the `WRITE`s, `CLOSE`, `STAT` |
-| `put` (the default, atomic and flushed) | 5 + `ceil(size / request size)` | the four above plus `fsync@openssh.com` and the rename |
-| `listdir` / `scandir` | 2 + one `READDIR` per reply the server chooses to split the directory into | `OPENDIR`, the `READDIR`s, `CLOSE` |
+**Requests and round trips are not the same number**, and the difference is the whole of what
+`depth` buys. A request that waits for its own reply before the next one is sent costs a round
+trip; requests in flight together cost one between them. Both columns are here because a reader
+sizing a WAN transfer needs the second and a reader reading a frame dump sees the first.
+
+| Operation | Requests | Round trips | Which ones |
+| --- | --- | --- | --- |
+| `stat` / `lstat` / `realpath` / `getsize` | 1 | 1 | itself |
+| `get` | 3 + `ceil(size / request size)` | **2** + 1 for the reads | `STAT` **and** `OPEN` together, the `READ`s, `CLOSE` |
+| `put(publish=Publish(atomic=False, fsync=False))` | 3 + `ceil(size / request size)` | 3 + 1 for the writes | `OPEN`, the `WRITE`s, `CLOSE`, `STAT` |
+| `put` (the default, atomic and flushed) | 5 + `ceil(size / request size)` | 5 + 1 for the writes | the four above plus `fsync@openssh.com` and the rename |
+| `listdir` / `scandir` | 2 + one `READDIR` per reply the server chooses to split the directory into | the same | `OPENDIR`, the `READDIR`s, `CLOSE` |
 
 The `READ`s and `WRITE`s pipeline — that is what `depth` is for — so they cost one round trip
-in total rather than one each, provided the file is smaller than `depth × request size`. The
-metadata ones do not: they are strictly sequential, which is why they dominate a small transfer
-and round to nothing on a large one.
+in total rather than one each, provided the file is smaller than `depth × request size`.
+
+**`get`'s `STAT` and `OPEN` go out together**, which is why it makes four requests and waits
+three times. Neither reads the other's answer on the default path, so the ordering between them
+was costing a round trip for nothing. Resuming is the exception and keeps them sequential: the
+offset is derived from the size, the safety gate refuses on it, and a resume of an
+already-complete file returns without opening anything at all.
+
+The metadata waits are what dominate a small transfer and round to nothing on a large one. On a
+200 ms link a 1 KiB `get` is three round trips and the bytes are a rounding error; a 16 MiB one
+is the same three plus however long the pipeline takes to move the file.
 
 **The atomic publish costs more on the endpoints that advertise no extensions**, and that is the
 MOVEit / GoAnywhere / Cleo / Sterling class this library was written for. `posix-rename` is one

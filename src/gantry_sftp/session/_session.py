@@ -2707,6 +2707,72 @@ class Session:
             )
         return reached
 
+    async def _stat_and_open_for_download(
+        self, path: bytes, *, together: bool
+    ) -> tuple[Attrs, bytes | None]:
+        """The ``STAT`` and the ``OPEN`` a download begins with, in one round trip where it can.
+
+        Both requests are addressed by path and neither reads the other's answer, so on the
+        default path there is nothing between them that makes them sequential -- the ordering
+        was incidental. Issued together they cost one round trip instead of two, which is one
+        of the four a small ``get`` makes and about a quarter of its latency on any link where
+        a round trip costs anything (D-110). ``tests/test_round_trips.py`` pins the count.
+
+        **``together=False`` is the resume path and it is a correctness requirement rather than
+        an optimisation declined.** Resuming needs the size before anything else happens:
+        :func:`_download_resume_offset` derives the offset from it, :meth:`_gate_resume` refuses
+        on it, and a resume of an already-complete file returns without opening anything at all.
+        Opening concurrently there would send an ``OPEN`` for a transfer that is not going to
+        happen.
+
+        **What the caller sees when it fails is unchanged**, which was checked against all three
+        servers in the matrix rather than reasoned about. A missing path answers ``NO_SUCH_FILE``
+        from *both* requests everywhere, so the exception is the same class with the same message
+        either way. For a directory every server's ``STAT`` succeeds and it is the ``OPEN`` that
+        decides -- permitted by OpenSSH, refused by asyncssh and paramiko -- and the ``OPEN``
+        decides in the sequential arrangement too. The group is flattened here because an anyio
+        task group wraps even a single failure, and control flow above routes on flat ``except``.
+
+        Returns:
+            The attributes, and the handle when one was opened. ``None`` for the handle on the
+            resume path, where the caller opens later or returns without opening.
+
+        Raises:
+            ServerError: Whatever either request was refused with, flat rather than grouped.
+        """
+        if not together:
+            return await self.stat(path), None
+
+        # One-element collectors rather than two `| None` locals: a task group returns nothing,
+        # and appending keeps both results at their real types instead of widening them to
+        # optional and then narrowing again at a `return` the type checker cannot verify.
+        described: list[Attrs] = []
+        opened: list[bytes] = []
+
+        async def _describe() -> None:
+            described.append(await self.stat(path))
+
+        async def _open() -> None:
+            opened.append(await self.open(path, OpenFlag.READ))
+
+        try:
+            async with anyio.create_task_group() as pair:
+                # `_ =` because anyio's `start_soon` returns a handle and mypy's
+                # `unused-awaitable` rightly refuses a discarded one; the repo spells it this
+                # way at every other fan-out site.
+                _ = pair.start_soon(_describe)
+                _ = pair.start_soon(_open)
+        except BaseExceptionGroup as group:
+            # The OPEN can win while the STAT loses, which leaves a handle nobody asked for and
+            # nobody will close. A reply that never arrived is the reaper's job (D-75); one that
+            # did arrive is ours, and it is closed here rather than at the call site because this
+            # is the only frame that still has it.
+            if opened:
+                await _close_quietly(self, opened[0])
+            raise _flatten_exception_group(group) from None
+
+        return described[0], opened[0]
+
     async def get(
         self,
         remote_path: bytes | str,
@@ -2817,7 +2883,9 @@ class Session:
         encoded = self._resolve(remote_path)
         requested_mode = resolve_mode(mode, caller="get()")
         with operation(session_logger, "get", remote=encoded, local=local_path) as record:
-            attributes = await self.stat(encoded)
+            attributes, opened = await self._stat_and_open_for_download(
+                encoded, together=not resume
+            )
             local_bits = _download_mode(requested_mode, attributes, encoded)
             start = _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
             # DESIGN.md 6's gate, on the direction that is usually assumed safe. The local
@@ -2844,7 +2912,10 @@ class Session:
                 record["adopted"] = start
                 return 0
 
-            handle = await self.open(encoded, OpenFlag.READ)
+            # Already open on the default path -- the concurrent pair above returns the handle.
+            # The resume path opens here instead, after the gate and after the early return that
+            # must not open anything at all.
+            handle = opened if opened is not None else await self.open(encoded, OpenFlag.READ)
             try:
                 transferred = await self._download_into(
                     local_path,

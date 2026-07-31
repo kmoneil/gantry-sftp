@@ -200,15 +200,32 @@ class Rendezvous:
         return
 
 
-def stat_paths_waiting_together(server: Rendezvous) -> list[set[bytes]]:
-    """The paths whose STATs were held by the barrier at the same moment.
+def paths_waiting_together(server: Rendezvous) -> list[set[bytes]]:
+    """The paths of every path-addressed request held by the barrier at the same moment.
 
     Named rather than inlined because the assertion it feeds is the point of these tests: a
-    barrier of two could in principle be satisfied by one pipelined transfer issuing two
-    READs, so what is asserted is that two *different* operations were waiting together.
+    barrier could in principle be satisfied by one pipelined operation issuing several
+    requests, so what is asserted is that two *different* operations were waiting together --
+    two distinct paths, since each operation here works on one file.
+
+    **It reads every path-bearing request rather than only the STATs, and that is a
+    correction.** It was `Stat`-only while a `get` issued exactly one STAT and issued it first,
+    so one STAT stood for one operation. D-110 made `get` issue its STAT and its OPEN together,
+    which broke that correspondence in the direction that matters: a barrier of two latched on
+    one operation's own pair, the helper saw a single path, and the tests failed. Had they been
+    written the other way round -- asserting a count rather than the paths -- they would have
+    gone on passing while proving nothing, which is the reason to widen the helper rather than
+    lower the barrier.
     """
     return [
-        {request.path for request in waiting if isinstance(request, Stat)}
+        # `Stat.path` and `Open.filename` are the same idea under two names, which is the
+        # draft's spelling rather than ours -- so the two branches are the packet layout
+        # showing through, not a distinction this helper is drawing.
+        {
+            request.path if isinstance(request, Stat) else request.filename
+            for request in waiting
+            if isinstance(request, Stat | Open)
+        }
         for waiting in server.rendezvous
     ]
 
@@ -223,7 +240,11 @@ async def test_two_downloads_are_in_flight_at_once(tmp_path: Path):
     deadline -- against the version of this library that put a lock around every operation.
     """
     files = {b"/a.bin": bytes(range(256)) * 4, b"/b.bin": bytes(range(128, 256)) * 8}
-    server = Rendezvous(files, release_at=2)
+    # Three, not two: since D-110 a single `get` opens with a STAT and an OPEN together, so a
+    # barrier of two is satisfiable by one transfer and would stop being a deadlock detector.
+    # Three cannot be reached by one `get`, which holds exactly that pair before it can make
+    # any further progress.
+    server = Rendezvous(files, release_at=3)
 
     with anyio.fail_after(DEADLINE):
         async with open_session(server) as sftp:  # type: ignore[arg-type]
@@ -233,7 +254,7 @@ async def test_two_downloads_are_in_flight_at_once(tmp_path: Path):
 
     assert (tmp_path / "a.bin").read_bytes() == files[b"/a.bin"]
     assert (tmp_path / "b.bin").read_bytes() == files[b"/b.bin"]
-    assert {b"/a.bin", b"/b.bin"} in stat_paths_waiting_together(server), (
+    assert {b"/a.bin", b"/b.bin"} in paths_waiting_together(server), (
         "the two transfers never had a request in flight together"
     )
 
@@ -259,12 +280,14 @@ async def test_two_one_shot_requests_each_get_their_own_reply():
                 group.start_soon(stat_into, b"/large")
 
     assert sizes == {b"/small": 3, b"/large": 9000}
-    assert {b"/small", b"/large"} in stat_paths_waiting_together(server)
+    assert {b"/small", b"/large"} in paths_waiting_together(server)
 
 
 async def test_a_transfer_and_a_one_shot_share_the_connection(tmp_path: Path):
     files = {b"/data.bin": bytes(range(256)) * 2, b"/other": bytes(11)}
-    server = Rendezvous(files, release_at=2)
+    # Three: the transfer's own STAT/OPEN pair is two, and the one-shot STAT is the third. See
+    # `test_two_downloads_are_in_flight_at_once` for why two no longer proves anything here.
+    server = Rendezvous(files, release_at=3)
     seen: list[int | None] = []
 
     with anyio.fail_after(DEADLINE):
@@ -279,7 +302,7 @@ async def test_a_transfer_and_a_one_shot_share_the_connection(tmp_path: Path):
 
     assert seen == [11]
     assert (tmp_path / "data.bin").read_bytes() == files[b"/data.bin"]
-    assert {b"/data.bin", b"/other"} in stat_paths_waiting_together(server)
+    assert {b"/data.bin", b"/other"} in paths_waiting_together(server)
 
 
 # --- routing ------------------------------------------------------------------------------
