@@ -62,8 +62,24 @@ def test_every_name_in_all_resolves():
     assert missing == [], f"in __all__ but not importable: {missing}"
 
 
-def test_all_is_sorted_so_a_new_name_lands_somewhere_predictable():
-    assert list(gantry_sftp.__all__) == sorted(gantry_sftp.__all__)
+def test_all_carries_each_name_once():
+    """Ordering is ruff's ``RUF022``; this asserts the part a sort check cannot see.
+
+    **This test used to assert ``list(__all__) == sorted(__all__)``, and that was a second,
+    weaker copy of a rule the lint gate already enforces.** The two agreed by luck until
+    ``LOG_FIELDS`` arrived (D-98): ``RUF022`` sorts isort-style -- ``SCREAMING_CASE`` constants
+    first, then classes, then functions -- while ``sorted()`` is codepoint order, and the first
+    multi-word constant in the list is where they part company. A restatement that has to be
+    kept in step with a linter is a restatement that will eventually contradict it, and the
+    linter is the one that runs on every commit.
+
+    What ruff cannot check is a *duplicate*: ``__all__`` with a name twice is still sorted, and
+    still exports correctly, so nothing else in this suite would notice.
+    """
+    duplicated = sorted(
+        {name for name in gantry_sftp.__all__ if gantry_sftp.__all__.count(name) > 1}
+    )
+    assert duplicated == [], f"named more than once in __all__: {duplicated}"
 
 
 def test_the_namespace_is_not_vacuous():

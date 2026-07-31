@@ -36,7 +36,7 @@ from contextlib import AbstractAsyncContextManager
 
 import anyio
 
-from gantry_sftp._logging import session_logger, summarise
+from gantry_sftp._logging import fields_of, session_logger, summarise
 from gantry_sftp.codec import StatusCode
 from gantry_sftp.exceptions import (
     AuthenticationError,
@@ -246,6 +246,18 @@ async def with_reconnect[T](
                 attempts,
                 summarise(error),
                 delay,
+                # The one WARNING is also the one record an alert is most likely to be written
+                # on, so it carries the same fields as everything else: `error` is the class
+                # name, matching what a failed operation records, and `attempt`/`attempts` are
+                # numbers because "the third of three" is a threshold question.
+                extra=fields_of(
+                    operation="reconnect",
+                    event="retrying",
+                    attempt=attempt,
+                    attempts=attempts,
+                    error=type(error).__name__,
+                    delay=delay,
+                ),
             )
         await anyio.sleep(delay)
         delay = min(delay * 2, backoff_max)

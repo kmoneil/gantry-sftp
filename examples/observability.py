@@ -21,12 +21,19 @@ Named ``observability.py`` rather than ``logging.py`` because a script's own dir
 ``sys.path[0]``: a file called ``logging.py`` next to it shadows the standard library module for
 everything the process imports afterwards, and the traceback blames ``anyio``.
 
+**Every field is on the record as data, not only inside the message.** That is what the JSON
+section below is: a formatter of about ten lines turns these records into one object per line,
+with `operation`, `bytes` and `elapsed` as keys a sink can index -- which is what Cloud Logging,
+CloudWatch and Datadog all want. Without it a deployment ends up writing a parser for our
+sentences, and the first time one is reworded somebody's alerting stops firing silently.
+
 The last section is the part worth reading twice. Every path and message in a dump was chosen by
 the server, and this prints one that is trying to forge a log record and clear your terminal.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import tempfile
@@ -34,6 +41,7 @@ from pathlib import Path
 
 import anyio
 
+from gantry_sftp import record_fields
 from gantry_sftp.codec import Attrs as PacketAttrs
 from gantry_sftp.codec import Name, NameEntry, Status, StatusCode, describe
 from gantry_sftp.session import open_session
@@ -94,6 +102,52 @@ async def transfer(workdir: Path, destination: str | None, remote_dir: str | Non
         )
 
 
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line, with this library's fields as indexable keys.
+
+    The whole recipe. `record_fields()` returns the fields the library attached, or `{}` for a
+    record from anywhere else -- including another library's, since a formatter installed on the
+    root logger sees everything.
+
+    Two things it does *not* have to do, and both are the library's decisions rather than this
+    formatter's luck. It does not have to guess types: `bytes` and `elapsed` arrive as numbers,
+    so `bytes > 1e9` is a query rather than a substring match. And it does not have to sanitise:
+    a remote path is escaped before it is attached, so a name the server chose cannot forge a
+    record, and it is pure ASCII, so `json.dumps(...).encode()` cannot fail on a filename that
+    was never valid UTF-8 in the first place.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "severity": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            **record_fields(record),
+        }
+        return json.dumps(payload)
+
+
+async def show_json_records(workdir: Path) -> None:
+    """The same operations again, through the formatter above."""
+    print("\nthe same records as JSON, which is what a container's log sink wants:\n")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    session = logging.getLogger("gantry_sftp.session")
+    session.addHandler(handler)
+    session.propagate = False
+    source = workdir / "for-json.csv"
+    _ = source.write_bytes(b"id,value\n7,x\n")
+    try:
+        async with (
+            open_local_server_transport(cwd=workdir) as transport,
+            open_session(transport) as sftp,
+        ):
+            _ = await sftp.put(source, str(workdir / "json-published.csv"))
+    finally:
+        session.removeHandler(handler)
+        session.propagate = True
+
+
 def show_the_renderer_is_pure() -> None:
     """`describe` needs no session, no server and no logging configured -- it is a function."""
     print("\nthe renderer on its own, with nothing running:")
@@ -121,7 +175,13 @@ async def main() -> None:
 
     configure(frames=True)
     with tempfile.TemporaryDirectory(prefix="gantry-example-") as scratch:
-        await transfer(Path(scratch), destination, remote_dir)
+        workdir = Path(scratch)
+        await transfer(workdir, destination, remote_dir)
+        if destination is None:
+            # Frames off for this part: the point is the shape of a session record, and a
+            # per-packet dump beside it would bury the four lines worth reading.
+            logging.getLogger("gantry_sftp.frames").setLevel(logging.INFO)
+            await show_json_records(workdir)
 
     show_the_renderer_is_pure()
 

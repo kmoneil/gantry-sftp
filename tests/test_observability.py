@@ -20,6 +20,8 @@ all of them at once. Checking one surface at a time is how the frame-locals leak
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -34,8 +36,10 @@ from hypothesis import strategies as st
 from gantry_sftp._logging import (
     MASKED,
     MAX_VALUE_CHARS,
+    OUR_OWN_VOCABULARY,
     mask_environment,
     operation,
+    record_fields,
     summarise,
 )
 from gantry_sftp.codec import (
@@ -510,6 +514,237 @@ def test_nothing_is_rendered_when_the_logger_is_off(caplog: pytest.LogCaptureFix
     assert caplog.records == []
 
 
+# --- the fields as data, not only as a sentence (D-98) ------------------------------------
+
+
+def emit(logger_name: str, name: str, **fields):
+    """Run one operation and return the records it produced."""
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger(logger_name)
+    handler = Capture()
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        with operation(logger, name, **fields) as record:
+            record["bytes"] = 4096
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    return records
+
+
+def test_every_field_arrives_as_data_and_not_only_inside_the_message():
+    """The defect D-98 describes, stated as its own test.
+
+    A record that *formats* correctly and carries nothing queryable is exactly what shipped
+    before: the fields were assembled, rendered into the message, and discarded. So this
+    asserts the attribute rather than the text, which is the half the old tests could not see.
+    """
+    start, finish = emit("gantry_sftp.session", "get", remote=b"/incoming/a.csv", local="out.csv")
+
+    assert record_fields(start) == {
+        "operation": "get",
+        "event": "start",
+        "remote": "/incoming/a.csv",
+        "local": "out.csv",
+    }
+    fields = record_fields(finish)
+    assert fields["event"] == "ok"
+    assert fields["bytes"] == 4096
+    assert isinstance(fields["elapsed"], float)
+
+
+def test_the_fields_survive_a_real_formatter_rather_than_only_caplog():
+    """``caplog`` keeps the record object, so it cannot tell a working ``extra`` from a broken one.
+
+    A colliding ``extra`` key raises at *emit* time -- inside ``Formatter.format`` or the
+    handler -- which is the failure mode that turns a logging call into an application crash.
+    So this drives a real ``StreamHandler`` with a real ``Formatter``, and the format string
+    names one of our fields so the record has to actually carry it.
+    """
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s | op=%(gantry)s"))
+    logger = logging.getLogger("gantry_sftp.session")
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        with operation(logger, "put", remote=b"/incoming/a.csv") as record:
+            record["bytes"] = 7
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    written = stream.getvalue().splitlines()
+    assert len(written) == 2
+    assert written[0].startswith("DEBUG put start remote=b'/incoming/a.csv' | op={")
+    assert "'operation': 'put'" in written[0]
+    assert "'bytes': 7" in written[1]
+
+
+def test_a_json_formatter_can_serialise_every_field_this_library_emits():
+    """The sink this card exists for, and the one a `bytes` field would break.
+
+    Cloud Logging, CloudWatch and Datadog all ingest one JSON object per line. A remote path is
+    `bytes` on the wire and need not be valid UTF-8, so neither the raw value nor a lenient
+    decode survives ``json.dumps(...).encode()`` -- the first is not serialisable and the second
+    produces lone surrogates that the encode step refuses. The escaped rendering does.
+    """
+    records = emit("gantry_sftp.session", "get", remote=b"/incoming/caf\xe9.csv", local="out.csv")
+    for record in records:
+        line = json.dumps({"message": record.getMessage(), **record_fields(record)})
+        # `.encode()` is the step that refuses a lone surrogate, and it is what a sink does to
+        # the line before writing it. A field carrying the raw name would fail here.
+        assert json.loads(line.encode("utf-8").decode("utf-8"))["message"]
+        assert json.loads(line)["remote"] == "/incoming/caf\\xe9.csv"
+
+
+def test_a_field_is_escaped_but_not_wrapped_in_reprs_quotes():
+    """Both halves matter, and they pull in opposite directions.
+
+    Escaped, because a name the server chose can otherwise forge a record or drive a terminal --
+    the same rule the frame dumper follows. Unquoted, because ``repr``'s framing becomes part of
+    the value a sink indexes, so an operator filtering on the path they know would match nothing
+    and would have to learn to write our rendering instead. That is re-parsing our text one
+    layer in, which is the defect rather than the fix.
+    """
+    (start, _) = emit("gantry_sftp.session", "get", remote=b"/incoming/" + HOSTILE)
+    remote = record_fields(start)["remote"]
+    assert isinstance(remote, str)
+    assert remote.startswith("/incoming/")
+    assert "\n" not in remote
+    assert "\x1b" not in remote
+    assert "\\n" in remote
+    assert not remote.startswith(("'", "b"))
+
+
+def test_a_number_stays_a_number_so_a_threshold_alert_can_be_written():
+    # The whole point of a field over a sentence: `bytes > 1e9` is a query, `"bytes=1024"` is a
+    # substring match that also matches 10240.
+    (_, finish) = emit("gantry_sftp.session", "get", remote=b"/a")
+    assert record_fields(finish)["bytes"] == 4096
+    assert not isinstance(record_fields(finish)["bytes"], str)
+
+
+def test_our_own_vocabulary_is_not_escaped_because_nobody_can_query_a_quoted_value():
+    (start, _) = emit("gantry_sftp.session", "get_tree", remote=b"/a")
+    assert record_fields(start)["operation"] == "get_tree"
+    assert record_fields(start)["event"] == "start"
+
+
+def test_every_name_in_our_own_vocabulary_is_a_value_this_library_chooses():
+    """The property behind the exemption, rather than the list.
+
+    A key is exempt from escaping only if its value comes from a *closed* set this library
+    enumerates. Adding a key here whose value the far end supplies would put an unescaped,
+    attacker-chosen string on a log record -- so the reason each one qualifies is written down,
+    and this test is what stops the set growing without one.
+    """
+    reasons = {
+        "operation": "one of this library's own method names",
+        "event": "one of start / ok / failed / retrying",
+        "error": "a Python exception class name",
+        "mechanism": "a PublishMechanism member's name",
+    }
+    assert set(OUR_OWN_VOCABULARY) == set(reasons)
+
+
+def test_a_failure_carries_the_exception_class_as_a_field():
+    logger = logging.getLogger("gantry_sftp.session")
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        with pytest.raises(ValueError), operation(logger, "put", remote=b"/a"):
+            raise ValueError("no")
+    finally:
+        logger.removeHandler(handler)
+
+    fields = record_fields(records[-1])
+    assert fields["event"] == "failed"
+    assert fields["error"] == "ValueError"
+    assert isinstance(fields["elapsed"], float)
+
+
+def test_a_result_key_that_shadows_a_field_does_not_crash_the_log_call():
+    """``fields_of(**a, **b)`` raises ``TypeError`` on a shared key -- inside a logging call.
+
+    No call site does it today, which is exactly why it needs a test: the failure would be an
+    application crash in whatever path happened to be logging, discovered by a user.
+    """
+    logger = logging.getLogger("gantry_sftp.session")
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        with operation(logger, "get", remote=b"/first") as record:
+            record["remote"] = b"/second"
+    finally:
+        logger.removeHandler(handler)
+
+    # The later value wins, which is the right answer: what an operation *recorded* is more
+    # current than what it was called with.
+    assert record_fields(records[-1])["remote"] == "/second"
+
+
+def test_a_collection_field_keeps_its_shape_instead_of_becoming_one_long_string():
+    """The bug this found, kept as its own test.
+
+    ``argv`` and the steering environment render well past the 96-character cap, so capping the
+    rendered *collection* truncated the spawn record mid-key -- and that record exists precisely
+    to say which variables were set. A list stays a list and a mapping stays a mapping; the cap
+    applies to each scalar inside, where it was always meant to.
+    """
+    (start, _) = emit(
+        "gantry_sftp.transport",
+        "spawn",
+        argv=["ssh", "-o", "StrictHostKeyChecking=yes", "-s", "--", "h", "sftp"],
+        steering={"SSH_ASKPASS": "/run/gantry/helper.sh", "SSH_ASKPASS_REQUIRE": "force"},
+    )
+    fields = record_fields(start)
+    assert fields["argv"] == ["ssh", "-o", "StrictHostKeyChecking=yes", "-s", "--", "h", "sftp"]
+    assert fields["steering"] == {
+        "SSH_ASKPASS": "/run/gantry/helper.sh",
+        "SSH_ASKPASS_REQUIRE": "force",
+    }
+
+
+def test_a_scalar_inside_a_collection_is_still_escaped_and_capped():
+    # The cap moved, it did not go: a server-chosen name inside a list is still bounded, and a
+    # key is escaped as thoroughly as a value because a caller's own env overlay reaches here.
+    (start, _) = emit("gantry_sftp.transport", "spawn", argv=[b"x" * 400], steering={"A\nB": "v"})
+    fields = record_fields(start)
+    # The cap counts the *unquoted* rendering, since that is what the field carries -- the
+    # three characters of `b'` and the closing quote are framing this surface does not keep.
+    unquoted = repr(b"x" * 400)[2:-1]
+    assert fields["argv"][0] == unquoted[:MAX_VALUE_CHARS] + f"+{len(unquoted) - MAX_VALUE_CHARS}"
+    assert list(fields["steering"]) == ["A\\nB"]
+
+
+def test_record_fields_tolerates_a_record_from_anywhere_else():
+    other = logging.LogRecord("other.library", logging.INFO, __file__, 1, "hello", None, None)
+    assert record_fields(other) == {}
+
+
 # --- summarising an exception for a log line ----------------------------------------------
 
 
@@ -724,15 +959,26 @@ async def test_a_password_reaches_no_surface_this_library_has(
         "stderr": error.stderr,
         "log records": "\n".join(record.getMessage() for record in caplog.records),
         "log arguments": "\n".join(repr(record.args) for record in caplog.records),
+        # D-98 added a surface, so it is added here rather than tested somewhere else: the
+        # structured fields are a second place every value now lands, and this test exists
+        # because checking surfaces one at a time is how the last leak survived.
+        "structured fields": "\n".join(repr(record_fields(r)) for r in caplog.records),
+        # The whole record dictionary, so an `extra` key attached anywhere -- including one
+        # added later, outside `fields_of` -- is covered without this list being updated.
+        "record attributes": "\n".join(repr(vars(r)) for r in caplog.records),
     }
     leaked = sorted(name for name, rendered in surfaces.items() if canary in rendered)
     assert leaked == [], f"the password reached: {', '.join(leaked)}"
 
     # And the record that would have carried it says so, rather than omitting the variable --
     # "an askpass answer was configured" is the fact a failed password auth needs.
-    spawn = [r.getMessage() for r in caplog.records if r.getMessage().startswith("spawned pid=")]
+    spawn = [r for r in caplog.records if r.getMessage().startswith("spawned pid=")]
     assert len(spawn) == 1
-    assert f"'GANTRY_SFTP_ASKPASS_ANSWER': '{MASKED}'" in spawn[0]
+    assert f"'GANTRY_SFTP_ASKPASS_ANSWER': '{MASKED}'" in spawn[0].getMessage()
+    # The masking reaches the field as well as the sentence, which is the half that would
+    # otherwise be a new hole behind an old test.
+    assert MASKED in str(record_fields(spawn[0])["steering"])
+    assert record_fields(spawn[0])["operation"] == "spawn"
 
 
 async def test_the_spawn_record_names_the_variables_that_arm_the_helper(

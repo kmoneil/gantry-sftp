@@ -1973,6 +1973,64 @@ line per frame is a disk to fill.
 `gantry_sftp.codec.describe(packet)` is the renderer, and it is public and pure: pass it any
 packet and get the same line back, with no logging configured and no session running.
 
+### Structured output: the fields are on the record, not only in the message
+
+Every record the `session` and `transport` loggers emit carries its fields **as data** as well
+as in the sentence, under one `LogRecord` attribute. So a JSON sink indexes them instead of
+re-parsing text this library formatted:
+
+```python
+import json, logging
+from gantry_sftp import record_fields
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            **record_fields(record),
+        })
+```
+
+```json
+{"severity": "DEBUG", "message": "put ok local='data.csv' remote=b'/incoming/data.csv' bytes=13 mechanism='POSIX_RENAME' elapsed=0.002s",
+ "operation": "put", "event": "ok", "local": "data.csv", "remote": "/incoming/data.csv",
+ "bytes": 13, "mechanism": "POSIX_RENAME", "elapsed": 0.0018}
+```
+
+`record_fields(record)` returns `{}` for a record from anywhere else, so the formatter is safe
+on the root logger. The attribute name is `LOG_FIELDS` if you would rather read it directly.
+
+**Three keys are on every record**, and they are what a query selects on before any of the rest:
+
+| | |
+| --- | --- |
+| `operation` | `get`, `put`, `get_tree`, `put_tree`, `rmtree`, `spawn`, `close`, `reconnect` |
+| `event` | `start`, `ok`, `failed`, `retrying` — the field a "started but never finished" query needs |
+| `elapsed` | seconds, on the closing record. `error` joins it on a failure, carrying the exception's class name |
+
+The rest are per operation: `remote` and `local`; `bytes`; `files`, `directories` and `skipped`
+on a tree; `mechanism` on a `put`; `pid`, `argv`, `returncode` and `steering` on the transport;
+`attempt`, `attempts` and `delay` on the retry warning.
+
+Three properties worth knowing, because they are decisions rather than accidents:
+
+- **Numbers stay numbers.** `bytes` and `elapsed` arrive as an int and a float, so `bytes > 1e9`
+  is a query rather than a substring match that also catches 10240.
+- **Names are escaped, and not wrapped in quotes.** A remote name is chosen by the server, so it
+  gets the same `repr` escaping the frame dump uses — a `\n` cannot forge a record and the value
+  is pure ASCII, which matters because a filename that was never valid UTF-8 would otherwise
+  break `json.dumps(...).encode()` in the sink. What it does *not* get is `repr`'s surrounding
+  quotes, since those would become part of the value you filter on.
+- **A list stays a list and a mapping stays a mapping.** `argv` is an array and `steering` an
+  object, each scalar inside escaped and capped, rather than one long truncated string.
+
+**The frame dump carries no fields, deliberately.** `gantry_sftp.frames` renders through
+`codec.describe(packet)`, which returns a string by design — the codec renders, the session seam
+emits, and a test enforces the split. A frame dump is text and stays text.
+
+Runnable: `examples/observability.py`.
+
 ### Counters
 
 `Session` carries cumulative totals beside the instantaneous gauges, and both are in its `repr`:

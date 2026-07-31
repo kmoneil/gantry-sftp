@@ -29,7 +29,7 @@ from typing import override
 import anyio
 from anyio.abc import Process
 
-from gantry_sftp._logging import mask_environment, transport_logger
+from gantry_sftp._logging import fields_of, mask_environment, transport_logger
 from gantry_sftp.exceptions import ConnectError, _flatten_exception_group
 from gantry_sftp.transport._argv import (
     DEFAULT_SUBSYSTEM,
@@ -284,11 +284,19 @@ class SubprocessTransport:
         # connection that ended and one that was killed. Guarded because `text()` decodes the
         # whole stderr buffer, and a teardown must not pay for a record nobody asked for.
         if transport_logger.isEnabledFor(logging.DEBUG):
+            stderr_bytes = len(self._stderr.text())
             transport_logger.debug(
                 "closed pid=%s returncode=%s stderr=%dB",
                 self._process.pid,
                 self._process.returncode,
-                len(self._stderr.text()),
+                stderr_bytes,
+                extra=fields_of(
+                    operation="close",
+                    event="ok",
+                    pid=self._process.pid,
+                    returncode=self._process.returncode,
+                    stderr_bytes=stderr_bytes,
+                ),
             )
 
     async def _close_stdin(self) -> None:
@@ -389,11 +397,19 @@ async def _open_process_transport(
 
     transport = SubprocessTransport(process, argv, stderr, askpass_armed=askpass_armed)
     if transport_logger.isEnabledFor(logging.DEBUG):
+        steering = mask_environment(_steering_variables(env))
         transport_logger.debug(
             "spawned pid=%s argv=%r steering=%r",
             process.pid,
             list(argv),
-            mask_environment(_steering_variables(env)),
+            steering,
+            extra=fields_of(
+                operation="spawn",
+                event="ok",
+                pid=process.pid,
+                argv=list(argv),
+                steering=steering,
+            ),
         )
     try:
         try:

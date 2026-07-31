@@ -49,13 +49,17 @@ from pathlib import PurePath
 from time import monotonic
 
 __all__ = [
+    "LOG_FIELDS",
     "MASKED",
     "MAX_VALUE_CHARS",
+    "OUR_OWN_VOCABULARY",
     "SENSITIVE_ENVIRONMENT_KEYS",
     "SENSITIVE_KEY_MARKERS",
+    "fields_of",
     "frames_logger",
     "mask_environment",
     "operation",
+    "record_fields",
     "session_logger",
     "summarise",
     "transport_logger",
@@ -70,12 +74,52 @@ frames_logger = logging.getLogger("gantry_sftp.frames")
 MASKED = "<redacted>"
 """What a masked value renders as. The same spelling :class:`gantry_sftp.transport.Secret` uses."""
 
+_SHORTEST_LITERAL = 2
+"""Length of the shortest quoted ``repr`` there is: two quote characters and nothing between."""
+
 MAX_VALUE_CHARS = 96
 """Characters of one rendered field a record will carry before it says how many it dropped.
 
 The same bound :data:`gantry_sftp.codec.MAX_FIELD_BYTES` puts on a frame dump, for the same
 reason: a remote path is chosen by the server, and a record per file is a per-file decision about
 how much of the operator's disk this fills.
+"""
+
+LOG_FIELDS = "gantry"
+"""The ``LogRecord`` attribute every structured field is attached under (D-98).
+
+**One attribute holding a mapping, rather than one attribute per field**, and the reason is
+that :mod:`logging` reserves its own: passing ``extra={"name": ...}`` or ``{"module": ...}``
+raises ``KeyError: "Attempt to overwrite 'name' in LogRecord"`` **at emit time**, which turns a
+log call into an application crash in whatever code path happened to log. Nesting under one
+attribute of our own makes that collision impossible by construction rather than by a key list
+somebody has to keep checking -- including for fields added later, which is the half a list
+does not cover.
+
+A formatter reads it with :func:`record_fields`, or directly::
+
+    getattr(record, "gantry", {})
+
+Records this library emits before an operation exists -- there are none today -- would carry
+nothing, so a formatter must tolerate the attribute being absent. That is what
+:func:`record_fields` is for.
+"""
+
+OUR_OWN_VOCABULARY = frozenset({"operation", "event", "error", "mechanism"})
+"""Field keys whose values this library chooses from a fixed set, so they are not escaped.
+
+Every other value on a record is ``repr``-escaped, because a remote name is chosen by the
+server and an unescaped one in a log stream can forge a record or drive a terminal. These four
+are not: ``operation`` is one of this library's own method names, ``event`` is one of four
+words, ``error`` is a Python class name and ``mechanism`` is an enum member's name. Escaping
+them produces ``"operation": "'get'"``, which nobody will write an alert against -- the quotes
+become part of the value the sink indexes.
+
+**The failure direction is deliberate.** Forgetting to add a key here over-escapes a field,
+which reads badly; adding one wrongly would let a value the far end chose through unescaped.
+So this list is short, closed, and every entry is a value with a *finite* set of possibilities
+that this library enumerates -- which is the property `tests/test_observability.py` asserts,
+rather than the list itself.
 """
 
 SENSITIVE_ENVIRONMENT_KEYS = frozenset({"GANTRY_SFTP_ASKPASS_ANSWER"})
@@ -121,6 +165,63 @@ def _is_sensitive(key: str) -> bool:
     return any(marker in folded for marker in SENSITIVE_KEY_MARKERS)
 
 
+def fields_of(**fields: object) -> dict[str, dict[str, object]]:
+    """Build the ``extra=`` mapping for one record, with every value made sink-safe.
+
+    Use it wherever a record is emitted outside :func:`operation`::
+
+        logger.debug("spawned pid=%s", pid, extra=fields_of(operation="spawn", pid=pid))
+
+    **The values are the same ones the message renders**, converted by the same function, which
+    is what stops the two drifting: a field that reads one way in the text and another in the
+    JSON is worse than not having the field.
+
+    Numbers stay numbers, because a threshold alert on ``bytes`` is the point of having the key
+    at all. Everything else is ``repr``-escaped and capped exactly as in the message -- and for
+    a remote path that is a decision rather than a formality. A server chooses its own names, so
+    a path is neither guaranteed to be valid UTF-8 nor safe to hand to a sink raw: `bytes` is
+    not JSON-serialisable at all, a lenient decode produces lone surrogates that
+    ``json.dumps(...).encode()`` then refuses, and an unescaped name can carry the control
+    characters a frame dump escapes for the same reason. ``repr`` of ``bytes`` is pure ASCII and
+    survives every sink.
+
+    Args:
+        **fields: The record's fields, in the key set documented on :func:`operation`.
+
+    Returns:
+        A mapping suitable for ``extra=``, with everything nested under :data:`LOG_FIELDS`.
+    """
+    return _extra(fields)
+
+
+def _extra(fields: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    """:func:`fields_of` for a mapping that is already assembled.
+
+    Separate from the keyword form for one reason, and it is a crash rather than a style
+    preference: ``fields_of(**a, **b)`` raises ``TypeError`` when ``a`` and ``b`` share a key,
+    inside a logging call, in whatever code path happened to be logging. Merging into a dict
+    literal first lets the later value win -- which is also the right answer, since what an
+    operation *recorded* is more current than what it was *called with*.
+    """
+    return {LOG_FIELDS: {key: _field(key, value) for key, value in fields.items()}}
+
+
+def record_fields(record: logging.LogRecord) -> dict[str, object]:
+    """The structured fields on ``record``, or an empty mapping if it carries none.
+
+    The accessor a formatter should use, so that "which attribute" is this library's decision to
+    change rather than a string in everybody's configuration.
+
+    Args:
+        record: Any log record, including one from another library.
+
+    Returns:
+        The fields, or ``{}``.
+    """
+    fields = getattr(record, LOG_FIELDS, None)
+    return dict(fields) if isinstance(fields, dict) else {}
+
+
 @contextmanager
 def operation(logger: logging.Logger, name: str, **fields: object) -> Iterator[dict[str, object]]:
     """Log the start and the end of one operation, with what it moved and how long it took.
@@ -134,11 +235,25 @@ def operation(logger: logging.Logger, name: str, **fields: object) -> Iterator[d
     transfer that was cancelled after 40 seconds looks exactly like one that hung unless
     something says so.
 
+    **Every field is on the record as data as well as in the message** (D-98), under the
+    :data:`LOG_FIELDS` attribute, so a JSON sink indexes them instead of re-parsing text this
+    library formatted. Three keys are added here rather than by the call site, and they are the
+    ones an operator filters on before any of the others:
+
+    ``operation``
+        ``name``, so a query can select every ``get`` without matching the message.
+    ``event``
+        ``"start"``, ``"ok"`` or ``"failed"`` -- the one field that says which of the pair a
+        record is, and the one a "started but never finished" query needs.
+    ``elapsed``
+        Seconds, on the closing record only. ``error`` joins it on a failure, carrying the
+        exception's class name.
+
     Args:
         logger: Where the records go, so the caller's module names itself.
         name: The operation, in the spelling a user would recognise -- ``get``, ``put_tree``.
-        **fields: Rendered onto both records. Untrusted values are safe: everything goes
-            through :func:`repr`.
+        **fields: Rendered onto both records, and attached to both. Untrusted values are safe:
+            everything goes through :func:`repr`.
 
     Yields:
         A dictionary to record results into.
@@ -146,7 +261,12 @@ def operation(logger: logging.Logger, name: str, **fields: object) -> Iterator[d
     started = monotonic()
     result: dict[str, object] = {}
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("%s start%s", name, _render(fields))
+        logger.debug(
+            "%s start%s",
+            name,
+            _render(fields),
+            extra=_extra({"operation": name, "event": "start", **fields}),
+        )
     try:
         yield result
     except BaseException as error:
@@ -156,18 +276,37 @@ def operation(logger: logging.Logger, name: str, **fields: object) -> Iterator[d
             # `result` too: a tree that failed on its ninth file has recorded eight, and how far
             # it got is the first thing anyone asks. It is empty for an operation that failed
             # before recording anything, which renders as nothing at all.
+            elapsed = monotonic() - started
             logger.debug(
                 "%s failed%s%s %s elapsed=%.3fs",
                 name,
                 _render(fields),
                 _render(result),
                 type(error).__name__,
-                monotonic() - started,
+                elapsed,
+                extra=_extra(
+                    {
+                        "operation": name,
+                        "event": "failed",
+                        **fields,
+                        **result,
+                        "error": type(error).__name__,
+                        "elapsed": elapsed,
+                    }
+                ),
             )
         raise
     if logger.isEnabledFor(logging.DEBUG):
+        elapsed = monotonic() - started
         logger.debug(
-            "%s ok%s%s elapsed=%.3fs", name, _render(fields), _render(result), monotonic() - started
+            "%s ok%s%s elapsed=%.3fs",
+            name,
+            _render(fields),
+            _render(result),
+            elapsed,
+            extra=_extra(
+                {"operation": name, "event": "ok", **fields, **result, "elapsed": elapsed}
+            ),
         )
 
 
@@ -201,15 +340,86 @@ def _render(fields: Mapping[str, object]) -> str:
     return "".join(f" {key}={_value(value)}" for key, value in fields.items())
 
 
+def _field(key: str, value: object) -> object:
+    """One value as *data* rather than as text, for the ``extra=`` mapping.
+
+    Numbers and booleans pass through, because a threshold alert on ``bytes`` or a filter on a
+    boolean is the reason to have the key rather than the sentence. So do the four keys in
+    :data:`OUR_OWN_VOCABULARY`, whose values this library picks from a closed set -- a quoted
+    ``"'get'"`` is not a value anybody can query on.
+
+    Everything else -- a remote path most of all -- goes through exactly the rendering
+    :func:`_value` applies to the message, which is ``repr`` plus the cap. See :func:`fields_of`
+    for why that escaping is load-bearing on this surface too and not merely inherited from the
+    text one.
+    """
+    if key in OUR_OWN_VOCABULARY and isinstance(value, str):
+        return value
+    return _structured(value)
+
+
+def _structured(value: object) -> object:
+    """One value, keeping a collection's shape instead of flattening it into a string.
+
+    **The cap belongs on a scalar, not on a rendered collection**, and getting that wrong made
+    the field carry *less* than the sentence it came from -- the exact inversion D-98 exists to
+    fix. ``argv`` and the steering environment render past 96 characters easily, so capping the
+    whole ``repr`` truncated the spawn record mid-key: the one thing that record is for is
+    which variables were set, and this repository has already paid to learn that ``SSH_ASKPASS``
+    alone arms nothing while ``SSH_ASKPASS_REQUIRE`` does.
+
+    So a list stays a list and a mapping stays a mapping -- which a JSON sink indexes as an
+    array and an object rather than as one long string -- and the cap and the escaping apply to
+    each scalar inside. Mapping *keys* go through the same escaping as values: a caller's own
+    ``env=`` overlay reaches this surface, and a key is as capable of carrying a newline as a
+    value is.
+    """
+    if isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, Mapping):
+        return {_scalar(key): _structured(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_structured(item) for item in value]
+    return _scalar(value)
+
+
+def _scalar(value: object) -> str:
+    """One leaf value: escaped as the message escapes it, capped, and without the quotes."""
+    return _capped(_unquoted(_rendered(value)))
+
+
 def _value(value: object) -> str:
     if isinstance(value, bool | int | float):
         return str(value)
-    if isinstance(value, PurePath):
-        # `str(path)` rather than `repr(path)`: the escaping is identical, since it is applied
-        # to the string either way, and `'/incoming/x'` reads better than `PosixPath('/incoming/x')`
-        # in a line that already says which field it is.
-        return _capped(repr(str(value)))
-    return _capped(repr(value))
+    return _capped(_rendered(value))
+
+
+def _rendered(value: object) -> str:
+    """``repr`` of one value, with a ``Path`` rendered as the string inside it.
+
+    `str(path)` rather than `repr(path)`: the escaping is identical, since it is applied to the
+    string either way, and `'/incoming/x'` reads better than `PosixPath('/incoming/x')` in a
+    line that already says which field it is.
+    """
+    return repr(str(value)) if isinstance(value, PurePath) else repr(value)
+
+
+def _unquoted(rendered: str) -> str:
+    r"""``repr``'s escaping without ``repr``'s outer quotes, for a field a sink will index.
+
+    The quotes are framing for a *sentence*: in ``remote=b'/incoming/x'`` they say where the
+    value ends. In a JSON field they become part of the value, so an operator filtering on
+    ``/incoming/x`` matches nothing and has to learn to write ``b'/incoming/x'`` instead --
+    which is re-parsing our rendering, one layer in, and the thing D-98 is about.
+
+    **Only the framing goes; every escape stays.** A newline is still ``\n`` and a
+    non-ASCII byte still ``\xe9``, so a name the server chose cannot forge structure or drive
+    a terminal, and a lone surrogate cannot break the sink's own encoder. Anything whose
+    ``repr`` is not a quoted literal -- a list, a dict -- is returned untouched.
+    """
+    body = rendered[1:] if rendered.startswith(("b'", 'b"')) else rendered
+    quoted = len(body) >= _SHORTEST_LITERAL and body[0] == body[-1] and body[0] in {"'", '"'}
+    return body[1:-1] if quoted else rendered
 
 
 def _capped(rendered: str) -> str:

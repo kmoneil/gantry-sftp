@@ -44,6 +44,7 @@ sending readers to files they could not obtain (D-47). The README is what ships.
 from __future__ import annotations
 
 from gantry_sftp._connect import connect
+from gantry_sftp._logging import LOG_FIELDS, record_fields
 from gantry_sftp.codec import Attrs, OpenFlag, Owner, Times
 from gantry_sftp.exceptions import (
     AuthenticationError,
@@ -90,6 +91,7 @@ from gantry_sftp.session import (
 from gantry_sftp.transport import open_ssh_transport
 
 __all__ = [
+    "LOG_FIELDS",
     "Attrs",
     "AuthenticationError",
     "CapabilityError",
@@ -134,6 +136,7 @@ __all__ = [
     "local_child",
     "open_session",
     "open_ssh_transport",
+    "record_fields",
     "with_reconnect",
 ]
 
