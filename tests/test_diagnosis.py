@@ -24,6 +24,7 @@ from gantry_sftp.transport import (
     missing_executable_hint,
     password_auth_hint,
 )
+from gantry_sftp.transport._diagnosis import _offered_methods
 
 # --- Captured verbatim from OpenSSH 10.0p2 -----------------------------------------------
 
@@ -242,6 +243,135 @@ def test_an_argv_with_no_batchmode_at_all_falls_back_to_the_answerable_diagnosis
     hint = password_auth_hint(PASSWORD_REFUSED_BY_OPENSSH, argv=bare, askpass_armed=False)
     assert "no way to answer" in hint
     assert "BatchMode" not in hint
+
+
+# --- the two parsers, against shapes a well-formed capture never has ------------------------
+#
+# Both read attacker-influenced input: `_offered_methods` parses text a server had a hand in,
+# and `_option_value` reads an argv the caller may have built themselves. Every case above uses
+# one tidy refusal line and an argv this library produced, which left thirteen mutants alive in
+# the two of them -- all of them about the shapes a real capture eventually has.
+
+
+def test_every_refusal_line_is_read_not_just_until_the_first_gap():
+    """Driven at `_offered_methods` directly, because the hint absorbs the difference.
+
+    Routing these through `password_auth_hint` was the first attempt and it killed none of
+    them: the hint only asks whether the offered set *intersects* the interactive methods, so
+    a parser that reads too much or too little usually lands on the same yes/no. The parser is
+    the unit with the behaviour, so it is the unit under test.
+
+    `ssh` emits more than one `Permission denied (...)` when it tries several identities, and
+    `StderrBuffer` glues a head and a tail together, so several of them interleaved with
+    ordinary lines is what a real capture looks like.
+    """
+    # A line with no marker in the middle must not stop the scan.
+    interleaved = (
+        "dev@a: Permission denied (publickey).\n"
+        "debug1: Next authentication method: password\n"
+        "dev@b: Permission denied (password).\n"
+    )
+    assert _offered_methods(interleaved) == frozenset({"publickey", "password"})
+
+    # Nor must a marker line whose list never closes.
+    unterminated = "dev@a: Permission denied (publickey\ndev@b: Permission denied (password).\n"
+    assert _offered_methods(unterminated) == frozenset({"password"})
+
+
+def test_the_method_list_ends_at_the_first_close_paren():
+    """A bracket later in the line must not extend the list to reach it.
+
+    Server-supplied text lands on these lines, and a banner containing a parenthesis with a
+    comma in it would otherwise be read as a method list -- turning a publickey-only refusal
+    into one that appears to offer a password, which is a hint pointing at the wrong cause.
+    """
+    trailing = "dev@h: Permission denied (publickey). (ask an admin,password resets here)\n"
+    assert _offered_methods(trailing) == frozenset({"publickey"})
+
+    # The shape that actually distinguishes first-from-last: a bare `password` token after it.
+    hostile = "dev@h: Permission denied (publickey). (a,password)\n"
+    assert _offered_methods(hostile) == frozenset({"publickey"}), "read to the last bracket"
+
+
+def test_only_the_first_marker_on_a_line_starts_the_list():
+    """Two markers in one line: the first opens the list, not the last."""
+    doubled = "Permission denied (password). Permission denied (publickey).\n"
+    assert _offered_methods(doubled) == frozenset({"password"})
+
+
+def test_an_empty_method_name_is_dropped_rather_than_counted():
+    """`(publickey,)` names one method and a stray comma.
+
+    Asserted on the set rather than through the hint, where an empty string could never have
+    changed the answer -- it is not one of the interactive methods either way.
+    """
+    assert _offered_methods("dev@h: Permission denied (publickey,).\n") == frozenset({"publickey"})
+    assert _offered_methods("dev@h: Permission denied ().\n") == frozenset()
+    assert _offered_methods("dev@h: Permission denied (,).\n") == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("argv", "why"),
+    [
+        pytest.param(["ssh", "-o"], "a bare -o with nothing after it", id="trailing-bare-o"),
+        pytest.param(
+            ["ssh", "BatchMode=yes", "-s", "--", "h", "sftp"],
+            "the value present but not as an option",
+            id="value-without-its-o",
+        ),
+        pytest.param(["ssh", "-s", "--", "h", "sftp", "-o"], "a stray trailing -o", id="stray-o"),
+    ],
+)
+def test_reading_an_option_off_a_ragged_argv_neither_raises_nor_invents(argv, why):
+    """`_option_value` indexes past its own element, so the end of argv is where it breaks.
+
+    Every existing case here passes an argv this library built, which is always well-formed.
+    The docstring says argv "is not always ours" -- so these are the shapes that follow from
+    taking that seriously: an option with no value, an option at the very end, and a value
+    that never had an `-o` in front of it. None may raise, and none may be read as `yes`.
+    """
+    hint = password_auth_hint(PASSWORD_REFUSED_BY_OPENSSH, argv=argv, askpass_armed=False)
+    assert "no way to answer" in hint, f"{why} was misread as BatchMode=yes"
+    assert "BatchMode" not in hint
+
+
+def test_an_option_at_the_very_end_of_argv_is_still_read():
+    """The complement of the ragged cases: last-pair is well-formed and must be found.
+
+    `-o BatchMode=yes` as the final two elements is an ordinary command line, and a bounds
+    check one element too cautious would skip exactly it -- reporting "no way to answer" for a
+    connection whose own `BatchMode` is the answer. The ragged cases above cannot catch that,
+    because being too cautious gives them the result they want.
+    """
+    argv = ["ssh", "-s", "--", "h", "sftp", "-o", "BatchMode=yes"]
+    hint = password_auth_hint(PASSWORD_REFUSED_BY_OPENSSH, argv=argv, askpass_armed=False)
+    assert "BatchMode=yes" in hint
+
+
+def test_an_argument_that_merely_contains_the_option_name_is_not_an_option():
+    """`--BatchMode=yes` is a typo, not an `-o`, and must not be read as one.
+
+    The joined form is matched by checking `[:2] == "-o"` *and* the name at offset 2. Only the
+    second half was exercised, so the two could be an `or` -- and then any argument at all
+    whose third character onward begins `BatchMode=` is read as the option. `--BatchMode=yes`
+    is the realistic instance: a plausible mistake, present in argv, and it would make the
+    hint name an option `ssh` never received.
+    """
+    argv = ["ssh", "--BatchMode=yes", "-s", "--", "h", "sftp"]
+    hint = password_auth_hint(PASSWORD_REFUSED_BY_OPENSSH, argv=argv, askpass_armed=False)
+    assert "no way to answer" in hint
+    assert "BatchMode" not in hint
+
+
+def test_the_option_value_is_the_one_after_the_dash_o_not_the_one_before():
+    """Order matters and off-by-one goes both ways.
+
+    `-o` takes the argument that *follows* it. Reading the one before finds whatever happened
+    to precede the flag, which in a real command line is another option's value.
+    """
+    argv = ["ssh", "BatchMode=no", "-o", "BatchMode=yes", "-s", "--", "h", "sftp"]
+    hint = password_auth_hint(PASSWORD_REFUSED_BY_OPENSSH, argv=argv, askpass_armed=False)
+    assert "BatchMode=yes" in hint, "the argument before the flag was read instead of after it"
 
 
 def test_the_interactive_methods_are_both_of_the_ones_a_helper_can_answer():
