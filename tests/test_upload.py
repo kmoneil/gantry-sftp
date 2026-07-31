@@ -22,7 +22,7 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.exceptions import TransferError, TransferTimeoutError
+from gantry_sftp.exceptions import ProtocolError, TransferError, TransferTimeoutError
 from gantry_sftp.session import (
     ServerLimits,
     negotiate_transfer_sizes,
@@ -45,11 +45,15 @@ class WritableServer:
         refuse_at: int | None = None,
         silent: bool = False,
         delay_replies: bool = False,
+        answer_writes_with_a_handle: bool = False,
     ) -> None:
         self.stored = bytearray()
         self.refuse_at = refuse_at
         self.silent = silent
         self.delay_replies = delay_replies
+        # A WRITE is answered with STATUS by the draft. A server that answers with anything
+        # else is not one this client can go on talking to, and nothing exercised that branch.
+        self.answer_writes_with_a_handle = answer_writes_with_a_handle
         self.writes: list[tuple[int, int]] = []
         self.max_in_flight = 0
         self._in_flight = 0
@@ -78,15 +82,25 @@ class WritableServer:
         if not isinstance(packet, Write):
             self._reply(Status(packet.request_id, StatusCode.FAILURE, b"unscripted"))  # type: ignore[union-attr]
             return
+        self._on_write(packet)
 
+    def _on_write(self, packet: Write) -> None:
+        """A write, and every scripted way of mishandling one.
+
+        Split out of `_dispatch` so each is a branch here rather than another early return
+        there -- the misbehaviours are what this fake exists for and they will keep growing.
+        """
         self._in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self._in_flight)
         self.writes.append((packet.offset, len(packet.data)))
 
         if self.silent:
             return
+        self._in_flight -= 1
+        if self.answer_writes_with_a_handle:
+            self._reply(Handle(packet.request_id, HANDLE))
+            return
         if self.refuse_at is not None and packet.offset >= self.refuse_at:
-            self._in_flight -= 1
             self._reply(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"read-only"))
             return
 
@@ -94,7 +108,6 @@ class WritableServer:
         if len(self.stored) < end:
             self.stored.extend(bytes(end - len(self.stored)))
         self.stored[packet.offset : end] = packet.data
-        self._in_flight -= 1
         self._reply(Status(packet.request_id, StatusCode.OK))
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
@@ -205,8 +218,50 @@ async def test_a_refused_write_reports_the_offset_and_progress(tmp_path: Path):
     assert exc.value.offset == 256
     # Acknowledged bytes only. Counting at send time would overstate what survived.
     assert exc.value.transferred == 256
-    assert "PERMISSION_DENIED" in exc.value.args[0]
-    assert "read-only" in exc.value.args[0]
+    assert exc.value.args[0] == "server refused a write at offset 256: PERMISSION_DENIED read-only"
+
+
+async def test_a_refused_write_names_the_remote_file_it_refused(tmp_path: Path):
+    """`remote_path` is documented as "carried on errors for diagnosis" and was carried nowhere.
+
+    Every test in this file left `upload_handle`'s `remote_path=` at its `None` default, so the
+    field could be dropped from both error paths without a single failure -- and a transfer
+    error that does not say *which file* is one a caller with eight concurrent uploads cannot
+    act on. Passed explicitly here so the plumbing is what is under test rather than the default.
+    """
+    content = bytes(1024)
+    source = tmp_path / "in.bin"
+    source.write_bytes(content)
+    server = WritableServer(refuse_at=256)
+
+    with pytest.raises(TransferError) as exc:
+        await push(server, source, write_length=64, depth=1, remote_path=b"/incoming/in.bin")
+
+    assert exc.value.remote_path == b"/incoming/in.bin"
+    assert exc.value.offset == 256
+    assert exc.value.transferred == 256
+
+
+async def test_a_write_answered_with_something_other_than_a_status_is_refused(tmp_path: Path):
+    """The reply shape the draft does not allow, from a server that sends it anyway.
+
+    `WRITE` is answered by `STATUS`. A server answering with a `HANDLE` is either broken or
+    hostile, and continuing would mean treating an unparsed reply as an acknowledgement -- so
+    the bytes would be counted as written when nothing said they were. This branch existed with
+    no test at all: the whole `isinstance(response, Status)` guard could be inverted or deleted
+    and the suite stayed green.
+    """
+    source = tmp_path / "in.bin"
+    source.write_bytes(bytes(256))
+    server = WritableServer(answer_writes_with_a_handle=True)
+
+    with pytest.raises(ProtocolError) as exc:
+        await push(server, source, write_length=64, depth=1)
+
+    assert exc.value.args[0] == "server answered a WRITE with Handle"
+    # The id is what ties the complaint to a frame in the dump, so it is part of the finding.
+    assert exc.value.request_id is not None
+    assert not isinstance(exc.value, BaseExceptionGroup)
 
 
 async def test_a_failure_escapes_as_a_flat_exception_not_an_exception_group(tmp_path: Path):
@@ -240,8 +295,35 @@ async def test_a_silent_server_times_out(tmp_path: Path):
 
     with pytest.raises(TransferTimeoutError) as exc:
         await push(server, source, write_length=64, idle_timeout=0.25)
-    assert "no response from the server for 0.25s" in exc.value.args[0]
+    # Four, because 256 bytes at 64 apiece all go out before any reply is due. The count is
+    # the actionable half of this message -- "one outstanding" and "the whole file
+    # outstanding" call for different responses -- so it is pinned rather than elided.
+    assert exc.value.args[0] == "no response from the server for 0.25s with 4 write(s) outstanding"
+    # The carried state, which said nothing before: how much survived, and which file. A
+    # timeout is the case a caller most wants to resume from, and resuming needs the count.
+    assert exc.value.transferred == 0
+    assert exc.value.remote_path is None, "not passed here; the next test passes it"
     assert not isinstance(exc.value, BaseExceptionGroup)
+
+
+async def test_a_timed_out_upload_names_the_file_and_what_it_had_acknowledged(tmp_path: Path):
+    """The same error with both fields populated, which is how a caller sees it in practice.
+
+    Split from the test above rather than folded into it: that one pins the message and the
+    zero, this one pins that the two fields are *plumbed*, and a single test could pass while
+    either half was hard-coded.
+    """
+    source = tmp_path / "in.bin"
+    source.write_bytes(bytes(256))
+    server = WritableServer(silent=True, refuse_at=None)
+
+    with pytest.raises(TransferTimeoutError) as exc:
+        await push(
+            server, source, write_length=64, idle_timeout=0.25, remote_path=b"/incoming/in.bin"
+        )
+
+    assert exc.value.remote_path == b"/incoming/in.bin"
+    assert exc.value.transferred == 0
 
 
 @pytest.mark.parametrize(("depth", "write_length"), [(0, 64), (-1, 64), (1, 0)])
