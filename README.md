@@ -2231,6 +2231,42 @@ Issuing past the ceiling is deliberate, so that a server which clamps the reques
 reaches it, but the bytes in flight are the window's business. More depth buys memory
 pressure. The thing that would buy throughput is a second connection.
 
+### What an operation costs in round trips
+
+The table above bounds bytes in flight, which is the right lever for a big file and the wrong
+one for a directory of small ones. On a link with latency, what a small transfer costs is round
+trips, and this is the number to multiply by your RTT:
+
+| Operation | Round trips | Which ones |
+| --- | --- | --- |
+| `stat` / `lstat` / `realpath` / `getsize` | 1 | itself |
+| `get` | 3 + `ceil(size / request size)` | `STAT`, `OPEN`, the `READ`s, `CLOSE` |
+| `put(publish=Publish(atomic=False, fsync=False))` | 3 + `ceil(size / request size)` | `OPEN`, the `WRITE`s, `CLOSE`, `STAT` |
+| `put` (the default, atomic and flushed) | 5 + `ceil(size / request size)` | the four above plus `fsync@openssh.com` and the rename |
+| `listdir` / `scandir` | 2 + one `READDIR` per reply the server chooses to split the directory into | `OPENDIR`, the `READDIR`s, `CLOSE` |
+
+The `READ`s and `WRITE`s pipeline — that is what `depth` is for — so they cost one round trip
+in total rather than one each, provided the file is smaller than `depth × request size`. The
+metadata ones do not: they are strictly sequential, which is why they dominate a small transfer
+and round to nothing on a large one.
+
+**The atomic publish costs more on the endpoints that advertise no extensions**, and that is the
+MOVEit / GoAnywhere / Cleo / Sterling class this library was written for. `posix-rename` is one
+request and can overwrite; without it, v3 `RENAME` has to be *tried and allowed to fail* when the
+destination already exists, because the protocol gives no way to ask whether it would — so
+publishing over an existing name becomes `RENAME`, `LSTAT`, `REMOVE`, `RENAME`. Eight round
+trips against the reference server's five, and the extra ones buy a *weaker* guarantee, because
+that ladder has a window in which the destination does not exist. If your consumer polls a drop
+directory and your server has no `posix-rename@openssh.com`, `atomic=False` is not the reckless
+choice it looks like — read the [atomic publish](#atomic-publish) section before deciding.
+
+The extension is probed once per session and the refusal is remembered, so only the first upload
+on a connection pays for finding out. That is another argument for reusing a session.
+
+These counts are asserted, not documented: `tests/test_round_trips.py` pins every row against a
+real `sftp-server`, so a change that adds a round trip fails a test rather than showing up as a
+slow WAN transfer six months later.
+
 ### What a transfer costs in memory
 
 Every serverless and container runtime makes you pick a limit before anything runs, and the
