@@ -517,6 +517,29 @@ def test_walk_and_glob_come_back_as_ordinary_iterators(tmp_path: Path):
     ]
 
 
+def test_a_character_class_and_its_refusal_both_cross_the_thread_boundary(tmp_path: Path):
+    """D-106's two halves through the portal rather than only on the async surface.
+
+    The refusal is the interesting one: it is raised inside the loop thread, before the
+    generator has yielded anything, and it has to arrive here as a flat ``ValueError`` rather
+    than wrapped in whatever the portal used to carry it.
+    """
+    needs_real_server()
+    (tmp_path / "log.1").write_bytes(b"a")
+    (tmp_path / "log.old").write_bytes(b"b")
+
+    with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        rotated = [match.path for match in sftp.glob(str(tmp_path / "log.[[:digit:]]").encode())]
+        assert rotated == [str(tmp_path / "log.1").encode()]
+
+        with pytest.raises(ValueError) as excinfo:
+            list(sftp.glob(str(tmp_path / "log.[[:digits:]]").encode()))
+        assert excinfo.value.args[0].startswith("unknown character class '[:digits:]'")
+
+
 def test_several_threads_share_one_session_over_one_connection(tmp_path: Path):
     """The blocking spelling of this library's headline feature, which is `except` for threads.
 

@@ -33,6 +33,12 @@ portable back to that client -- it is here because pathlib, fsspec and bash all 
 
 **Matching is on bytes.** A remote name need not be valid UTF-8, and decoding leniently makes
 two distinct names match one pattern. The example directory contains such a name on purpose.
+
+**POSIX character classes work, and stop at ASCII.** `log.[[:digit:]]` matches `log.1` and not
+`log.old`, the same as in `sftp(1)`. Which bytes are letters is a property of a *locale*, and a
+remote name is bytes whose encoding the protocol never states, so nothing above 127 is in any
+class -- rather than the answer changing with the `LANG` of whoever runs the script. The last
+section shows what a **misspelled** class name does, which is raise rather than match nothing.
 """
 
 from __future__ import annotations
@@ -62,6 +68,11 @@ def populate(directory: Path) -> None:
     _ = (directory / ".hidden.csv").write_bytes(b"still being written\n")
     # Not valid UTF-8. Ordinary on Linux, and the reason matching runs on bytes.
     _ = (directory / "caf\udce9.csv").write_bytes(b"\xe9")
+    # Rotated logs: the shape a character class is for. `log.[[:digit:]]` takes the first two
+    # and not the third, which no range spelling does as readably.
+    _ = (directory / "log.1").write_bytes(b"yesterday\n")
+    _ = (directory / "log.2").write_bytes(b"the day before\n")
+    _ = (directory / "log.old").write_bytes(b"not a rotation number\n")
     nested = directory / "2026"
     nested.mkdir()
     _ = (nested / "january.csv").write_bytes(b"id,total\n3,99\n")
@@ -152,6 +163,24 @@ async def main() -> None:
             hidden = await show(sftp, f"{target}/.*.csv", "the dotfile, asked for explicitly")
             everything = await show(sftp, f"{target}/**/*.csv", "every level")
             directories = await show(sftp, f"{target}/*/", "a trailing slash means directories")
+            rotated = await show(
+                sftp, f"{target}/log.[[:digit:]]", "a POSIX character class, ASCII-only"
+            )
+            unrotated = await show(
+                sftp, f"{target}/log.[![:digit:]]*", "and the same class, negated"
+            )
+
+            # A class name that does not exist. `glob(3)` answers "no matches" here, which is
+            # indistinguishable from the directory being empty -- so a nightly job with this
+            # typo in it transfers zero files and reports success. This library refuses, and
+            # refuses *before listing anything*, so an empty directory gets the same answer as
+            # a full one.
+            print("\nlog.[[:digits:]]  (plural -- the typo, and there is no such class)")
+            try:
+                async with aclosing(sftp.glob(f"{target}/log.[[:digits:]]")) as found:
+                    _ = [match async for match in found]
+            except ValueError as exc:
+                print(f"    ValueError: {exc}")
 
             # The point of the whole thing: a match carries a path this library built, so it
             # goes straight to `get` with no joining at the call site.
@@ -181,6 +210,9 @@ async def main() -> None:
     assert any(b"/2026/" in path for path in everything)
     # And the trailing slash matched the directory rather than anything in it.
     assert all(path.endswith(b"2026") for path in directories)
+    # The character class took the two rotation numbers and not `log.old`; negated, the reverse.
+    assert sorted(rotated) == [f"{target}/log.1".encode(), f"{target}/log.2".encode()]
+    assert unrotated == [f"{target}/log.old".encode()]
     # The regex is anchored and ASCII-only, so it takes a subset of what `*.csv` took -- and
     # every path it produced is one this library's own join built.
     assert set(matched_by_regex) <= set(top)

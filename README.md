@@ -622,14 +622,27 @@ differ from Python's `fnmatch`, which is what a reader would otherwise assume is
   files, including the dot-prefixed ones this library's own atomic publish creates.
 - **A backslash escapes**, as it does in `sftp(1)`, which passes no `GLOB_NOESCAPE`.
 
-`[abc]`, `[a-z]` and `[!a-z]` (also spelled `[^a-z]`) work. Brace expansion does not: `sftp(1)`
-applies it to `ls` and not to `get`, so there is no consistent behaviour to copy.
+`[abc]`, `[a-z]` and `[!a-z]` (also spelled `[^a-z]`) work, and so do POSIX **character
+classes** — `*.[[:digit:]]`, `[[:upper:]]*`, `[![:space:]]`, and the other names below. Brace
+expansion does not: `sftp(1)` applies it to `ls` and not to `get`, so there is no consistent
+behaviour to copy.
 
 | | |
 | --- | --- |
 | `**` | zero or more directory levels. An **addition** to what `sftp(1)` understands, so a pattern using it is not portable back to that client. Bounded by `max_depth=` |
 | trailing `/` | match directories only, as in a shell |
+| `[[:name:]]` | a POSIX character class inside a bracket expression: `alnum`, `alpha`, `blank`, `cntrl`, `digit`, `graph`, `lower`, `print`, `punct`, `space`, `upper`, `xdigit`. **ASCII-only** — no byte above 127 is in any of them |
 | `case_sensitive=False` | fold ASCII case in the names being matched. Not the directory you typed, since folding that would mean listing `/` to find out whether `/Incoming` is `/incoming`. Non-ASCII bytes are never folded: a remote name is bytes of unstated encoding |
+
+**Character classes stop at ASCII, and a class name that does not exist is an error.** Which
+bytes are letters is a property of a locale — glibc under ISO-8859-1 says `0xff` is one and
+under C says it is not — and a remote name is bytes whose encoding the protocol never states,
+so this library answers the question the same way on every machine instead of guessing. The
+other two POSIX sub-expressions, equivalence classes `[[=a=]]` and collating symbols `[[.a.]]`,
+are *defined* by a locale's collation table and are refused for the same reason. So is a
+misspelled class name: `glob("*.[[:digits:]]")` raises `ValueError` — before anything is
+listed — where `glob(3)` would have quietly matched nothing and let a nightly job transfer zero
+files and report success.
 
 Matching runs on **bytes**, because a remote name need not be valid UTF-8 and a lossy decode
 makes two distinct names match one pattern. Symlinks match but are never descended into, the

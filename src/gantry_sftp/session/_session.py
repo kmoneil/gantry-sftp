@@ -120,7 +120,12 @@ from gantry_sftp.session._download import (
     download_handle,
     read_range_into,
 )
-from gantry_sftp.session._glob import RECURSIVE, match_component, split_pattern
+from gantry_sftp.session._glob import (
+    RECURSIVE,
+    match_component,
+    split_pattern,
+    validate_pattern,
+)
 from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
 from gantry_sftp.session._listing import (
     DOT_ENTRIES,
@@ -3072,6 +3077,15 @@ class Session:
         supported -- `sftp(1)` itself only applies it to ``ls`` and not to ``get`` -- and
         neither is ``~``, which is a server-side path expansion rather than a pattern.
 
+        **POSIX character classes work**: ``*.[[:digit:]]``, ``[[:upper:]]*`` and the other ten
+        names, inside a bracket expression and alongside ordinary members and ranges. They are
+        **ASCII-only** -- no byte above 127 is in any class -- because which bytes are letters
+        is a property of a locale, and a remote name is bytes whose encoding the protocol never
+        states. The other two POSIX sub-expressions, equivalence classes (``[[=a=]]``) and
+        collating symbols (``[[.a.]]``), are *defined* by a locale's collation table and are
+        refused rather than guessed at; so is a class name that does not exist, which is what
+        ``[[:digits:]]`` is. All three raise :exc:`ValueError` before anything is listed.
+
         ``**`` matches zero or more directory levels. It is an **addition** to what `sftp(1)`
         understands, so a pattern using it is not portable back to that client; it is here
         because every ecosystem a caller arrives from has it. A trailing ``**`` means
@@ -3127,6 +3141,11 @@ class Session:
             :meth:`listdir` is for.
 
         Raises:
+            ValueError: If the pattern contains a bracket sub-expression this library will not
+                honour: a character class that does not exist, an equivalence class or a
+                collating symbol. Raised **before any listing**, which is the point of it --
+                a refusal that needed a name to be raised against would answer "no matches" for
+                the same broken pattern whenever the directory happened to be empty.
             UnsafePathError: If the server sends a name that cannot be one path component.
             CapabilityError: If ``pattern`` is relative and this server's default directory is
                 not rooted at ``/``, so joining would build paths it does not mean.
@@ -3146,6 +3165,7 @@ class Session:
                 which of two opposite answers they got.
         """
         encoded = self._resolve(pattern)
+        validate_pattern(encoded)
         await self._require_rooted_paths(encoded, feature="globbing")
         base, components, directories_only = split_pattern(encoded, case_sensitive=case_sensitive)
         if not components:
