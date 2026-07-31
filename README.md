@@ -44,6 +44,12 @@ same sentence as the reason to use it, so it is here rather than at the bottom.
   offset-addressed local I/O and raise `NotImplementedError` on Windows, before anything is
   sent. Everything that only talks to the far end works there. See
   [Requirements](#requirements) for why, and for the full list.
+- **About 16 MiB of memory per concurrent transfer**, which is `depth × request size` and is
+  independent of the file's size — a 40 GB download costs what a 40 MB one does. Lower `depth`
+  for a smaller container. If you are on Cloud Run, Lambda or Fly, note also that **`/tmp` is
+  memory there**, so a staged download counts against your limit twice. See
+  [What a transfer costs in memory](#what-a-transfer-costs-in-memory), which gives the
+  expression and the way to process a file bigger than the container without staging it.
 
 **Your machine already satisfies this and your container probably does not**, which is the
 failure worth pre-empting: it passes locally, then fails on first deploy. Check the image you
@@ -693,6 +699,22 @@ bytes landed, which is what the flag means.
 is re-requested underneath you, so `read(n)` returns `n` bytes unless the file ended, and no
 caller has to loop. At or past the end you get `b""` rather than an exception, because end of
 file is a status the server sends and turning it into an exception would make every loop a `try`.
+
+**This is how a file larger than your memory limit gets processed.** `get` writes to local disk,
+which on Cloud Run, Lambda and Fly is a tmpfs and therefore your memory limit again — so a 40 GB
+file cannot be staged in a 256 MiB container at all. Reading it in blocks can: nothing here holds
+more than the block you ask for, so the ceiling is a number you choose rather than the size of
+the file.
+
+```python
+async with sftp.open_file("/incoming/huge.jsonl") as remote:
+    while block := await remote.read(1 << 20):
+        parse(block)  # 1 MiB at a time, whatever the file weighs
+```
+
+Use `readinto()` into a buffer you allocated once if you want the copy gone too. See
+[What a transfer costs in memory](#what-a-transfer-costs-in-memory) for what the whole-file
+path costs by comparison, which is `depth × request size` and also independent of file size.
 
 ### One file object is one task
 
@@ -2152,7 +2174,7 @@ you should not need.
 | --- | --- | --- | --- |
 | `request_timeout` | `30.0` s | One round trip (the handshake, a `STAT`, an `OPEN`, a `CLOSE`) **and one write**, including the wait for the send lock | Raise for an appliance that thinks slowly; `None` for no bound at all |
 | `idle_timeout` | `60.0` s | A bulk transfer's *silence*, not its duration. A nine-hour download never trips it; sixty seconds with nothing arriving does | Raise if the far end legitimately pauses for minutes mid-transfer |
-| `depth` | `64` | Requests in flight per transfer | Lower it to bound memory on an upload (each in-flight request holds a payload); raising it does not raise throughput, as below |
+| `depth` | `64` | Requests in flight per transfer, and therefore the memory one costs | Lower it to fit a smaller container, as below; raising it does not raise throughput, also below |
 | request size | `261120` bytes | Payload per `READ`/`WRITE` | Not a parameter. Derived per connection from `limits@openssh.com`, clamped to what the server says it will accept |
 
 All three parameters are keyword arguments to `open_session()` (and to `with_reconnect()`,
@@ -2174,6 +2196,62 @@ the connection can hold is the SSH channel window, which is 2 MiB: OpenSSH's
 Issuing past the ceiling is deliberate, so that a server which clamps the request size still
 reaches it, but the bytes in flight are the window's business. More depth buys memory
 pressure. The thing that would buy throughput is a second connection.
+
+### What a transfer costs in memory
+
+Every serverless and container runtime makes you pick a limit before anything runs, and the
+good ones tell you nothing when it is exceeded — Cloud Run and Lambda kill the container with
+no Python traceback at all. So here is the bound, as an expression rather than an anecdote:
+
+```
+peak ≈ concurrent transfers × depth × request size
+     =                    1 ×    64 × 261120 bytes  ≈ 16 MiB per transfer
+```
+
+That is the payload buffering, which is the part that scales. Add a few hundred KiB per
+connection for the frame splitter and the transport's read buffer, and whatever your own
+program holds.
+
+**`depth` is what you lower**, and it is the whole of the knob — `SessionOptions(depth=8)`
+brings a transfer to about 2 MiB, at the cost of throughput on a high-latency link, where the
+requests in flight are what hides the round trip. The request size is not a parameter: it is
+derived per connection from `limits@openssh.com` and clamped to what the server accepts, which
+is the part nobody guesses when sizing a container.
+
+**What multiplies it is concurrency, and you own that number.** One transfer is one `depth`
+worth of buffers. `get_tree(concurrency=8)` is eight. Your own task group over `get` is however
+many you started — `asyncio.gather` over a hundred files is a hundred, which is where a
+comfortable limit stops being comfortable.
+
+The bound is the same in both directions and the reason differs, which matters if you are
+reading the code to check us: **uploading**, the codec holds each `WRITE` — payload included —
+until the server acknowledges it, so `depth` unacknowledged writes are `depth` payloads;
+**downloading**, replies queue in the transfer's own deque until its loop drains them, and at
+most `depth` reads are outstanding, so at most `depth` payloads can be waiting. Neither
+direction accumulates a *file*: a download places each payload with `os.pwrite` at the offset
+its request asked for and drops it, and an upload reads each one with `os.pread` as it goes.
+Transferring a 40 GB file costs the same as transferring a 40 MB one.
+
+**On Cloud Run, Lambda and Fly, `/tmp` is memory.** It is a tmpfs and it counts against the
+same limit as your heap, so a staged download is charged twice — once as the buffers above and
+once as the file. Delete each file when you are done with it inside the loop, or do not stage
+it at all:
+
+**A file larger than the container is still readable, without staging it anywhere.** That is
+what the byte-range surface buys you and it is the reason it exists:
+
+```python
+async with sftp.open_file("/incoming/huge.jsonl") as remote:
+    async for line in stream_lines(remote):  # your parser, fed a block at a time
+        ...
+```
+
+`open_file()` and `read_at` never hold more than the block you ask for, so a 40 GB file goes
+through a 256 MiB container. See [Byte ranges, and a file object](#byte-ranges-and-a-file-object).
+
+None of this is a *measurement* — peak RSS against paramiko and asyncssh is not measured, and
+this section would be true whatever such a comparison said. It is the bound the design
+guarantees, derived from two constants you can read.
 
 ## Requirements
 

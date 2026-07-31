@@ -25,6 +25,11 @@ from pathlib import Path
 import pytest
 
 import gantry_sftp
+from gantry_sftp.session import (
+    DEFAULT_PIPELINE_DEPTH,
+    PREFERRED_READ_LENGTH,
+    PREFERRED_WRITE_LENGTH,
+)
 from gantry_sftp.transport import missing_executable_hint
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -161,6 +166,49 @@ def test_the_readme_quotes_the_missing_ssh_hint_exactly_as_the_code_produces_it(
     produced = " ".join(missing_executable_hint("ssh", errno_value=errno.ENOENT).split())
     quoted = " ".join(readme.split())
     assert f"hint: {produced}" in quoted
+
+
+def test_the_documented_memory_bound_is_derived_from_the_shipped_constants():
+    """D-101. The README states an expression and a number; both come from two constants.
+
+    A platform team sizes a container on this figure, and the failure mode if it drifts is the
+    worst kind: the limit is exceeded in production and Cloud Run and Lambda kill the container
+    with no Python traceback at all. So the number is not allowed to be a number somebody typed
+    once -- if either constant moves, this fails and names the new arithmetic.
+
+    Two constants, and neither is a parameter a caller sets: ``DEFAULT_PIPELINE_DEPTH`` is what
+    ``depth`` defaults to, and ``PREFERRED_READ_LENGTH`` is what the request size is *before*
+    the per-connection clamp, which can only make it smaller. So the documented figure is the
+    ceiling rather than an estimate.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    peak = DEFAULT_PIPELINE_DEPTH * PREFERRED_READ_LENGTH
+    mebibytes = round(peak / 2**20)
+
+    # Whitespace-normalised, as the ssh-hint test is and for the same reason: the README aligns
+    # the expression to read as arithmetic, and a reflow is not a drift in the fact.
+    times = "\u00d7"  # written as an escape; RUF001 is right that the glyph reads as an `x`
+    spelled = " ".join(readme.split())
+    assert f"= 1 {times} {DEFAULT_PIPELINE_DEPTH} {times} {PREFERRED_READ_LENGTH} bytes" in spelled
+    assert f"concurrent transfers {times} depth {times} request size" in spelled
+    assert f"{mebibytes} MiB per transfer" in readme
+    # And the same figure on the deployment screen, which is the one a reader meets first.
+    assert f"About {mebibytes} MiB of memory per concurrent transfer" in readme
+    # The write side shares the bound, so a divergence between the two preferred lengths would
+    # make one of the two directions cost more than the document says.
+    assert PREFERRED_WRITE_LENGTH == PREFERRED_READ_LENGTH
+
+
+def test_the_lowered_depth_example_still_arrives_at_the_number_it_claims():
+    """The README offers `depth=8` as the way into a smaller container and states the result.
+
+    Worth its own assertion because it is the actionable half: a reader who copies the setting
+    is trusting the figure beside it, and that figure is a second place the arithmetic lives.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    lowered = 8
+    assert f"SessionOptions(depth={lowered})" in readme
+    assert f"about {round(lowered * PREFERRED_READ_LENGTH / 2**20)} MiB" in readme
 
 
 # --- No shipped document states a throughput figure (D-88) ----------------------------------
