@@ -275,7 +275,14 @@ exists today:
 - **name matching**: `glob()` in `sftp(1)`'s own `glob(3)` dialect rather than `fnmatch`'s, so
   the dotfile rule that keeps a drop directory's half-written staging files out of a match is
   the one the reference client has. A match carries a path this library built out of validated
-  parts — and for a filter no pattern can express, the same two calls are public
+  parts — and for a filter no pattern can express, the same two calls are public. **A server
+  that will not answer never becomes a short result**: as of 0.11 that covers the `stat` used to
+  settle an entry's kind, which is a **behaviour change** on servers whose listings omit
+  permission bits — a pattern that quietly returned fewer matches there now raises
+- **a walk says which kind of "no" it got**: an entry the server described without type bits, one
+  that was listed and then gone, and one whose `stat` was refused are three different facts and
+  are reported as three, in `Skipped.reason`. `walk` records all three and carries on, because it
+  has somewhere to put them; `glob` raises on the refusal, because it has not
 - **an fsspec filesystem**: `gantry_sftp.fsspec` makes `pd.read_parquet("gantry-sftp://…")`
   work, over the blocking surface rather than a second concurrency runtime. It registers
   **nothing** on import, because `sftp://` is already claimed inside fsspec by an
@@ -428,7 +435,7 @@ between calls.
 from anyio.from_thread import start_blocking_portal
 from gantry_sftp.sync import BoundPortal
 
-with start_blocking_portal(backend="trio") as portal:   # or asyncio, the default
+with start_blocking_portal(backend="trio") as portal:  # or asyncio, the default
     gantry = BoundPortal(portal)
     with gantry.connect("a.example.com") as one, gantry.connect("b.example.com") as two:
         one.get("/data.csv", "a.csv")
@@ -472,6 +479,7 @@ from gantry_sftp.fsspec import register
 register()  # once, at startup -- never on import, and the reason is below
 
 import pandas as pd
+
 frame = pd.read_parquet("gantry-sftp://bob@example.com/incoming/events.parquet")
 ```
 
@@ -486,7 +494,7 @@ decided by import order. So this library claims nothing on import; you say which
 want:
 
 ```python
-register()                       # `gantry-sftp://`, a name nothing else claims
+register()  # `gantry-sftp://`, a name nothing else claims
 register("sftp", override=True)  # take `sftp://`, deliberately and in writing
 ```
 
@@ -658,9 +666,12 @@ same as in `walk`. Nothing is accumulated, since matches are yielded as they are
 async generator and you close it, exactly as with `walk`. A path in the pattern that does not
 exist matches nothing; one that exists and **cannot be read** raises, which is a deliberate
 divergence from `glob(3)`: answering "no matches" when the truth is "I was not allowed to look"
-is a partial success wearing a complete one's clothes. That holds for a directory the pattern
-descends through *and* for a pattern with no wildcard in it at all — only `NO_SUCH_FILE` is an
-empty result, and a refusal to answer never is.
+is a partial success wearing a complete one's clothes. That holds for all three ways a server
+can decline: a directory the pattern descends through, a pattern with no wildcard in it at all,
+and the `stat` that settles an entry's *kind* on a server whose listing does not report it —
+only `NO_SUCH_FILE` is an empty result, and a refusal to answer never is. The third case is
+reachable only on a server that omits permission bits from a listing, which is why it outlived
+the other two.
 
 Runnable: `examples/glob_patterns.py`.
 
@@ -834,8 +845,8 @@ consumer polling the directory can see a partial file while it happens.
 
 ```python
 await sftp.chdir("/incoming/2026")
-await sftp.get("data.csv", "data.csv")     # /incoming/2026/data.csv
-await sftp.getcwd()                        # b'/incoming/2026'
+await sftp.get("data.csv", "data.csv")  # /incoming/2026/data.csv
+await sftp.getcwd()  # b'/incoming/2026'
 ```
 
 **SFTP v3 has no working directory.** There is nothing on the wire to set and nothing to ask, so
@@ -990,15 +1001,15 @@ A **broken** symlink is where the two spellings separate, and the difference is 
 publishing cares about:
 
 ```python
-await sftp.exists("/incoming/yesterday.csv")                        # False -- no file there
-await sftp.exists("/incoming/yesterday.csv", follow_symlinks=False) # True  -- name is taken
-await sftp.islink("/incoming/yesterday.csv")                        # True
+await sftp.exists("/incoming/yesterday.csv")  # False -- no file there
+await sftp.exists("/incoming/yesterday.csv", follow_symlinks=False)  # True  -- name is taken
+await sftp.islink("/incoming/yesterday.csv")  # True
 ```
 
 ### One attribute, and the answer that is missing
 
 ```python
-size = await sftp.getsize("/incoming/data.parquet")   # int | None
+size = await sftp.getsize("/incoming/data.parquet")  # int | None
 when = await sftp.getmtime("/incoming/data.parquet")  # datetime | None, aware, UTC
 ```
 
@@ -2094,13 +2105,16 @@ re-parsing text this library formatted:
 import json, logging
 from gantry_sftp import record_fields
 
+
 class JsonFormatter(logging.Formatter):
     def format(self, record):
-        return json.dumps({
-            "severity": record.levelname,
-            "message": record.getMessage(),
-            **record_fields(record),
-        })
+        return json.dumps(
+            {
+                "severity": record.levelname,
+                "message": record.getMessage(),
+                **record_fields(record),
+            }
+        )
 ```
 
 ```json

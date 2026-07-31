@@ -310,6 +310,34 @@ class TreeServer:
         self._reply(Status(packet.request_id, StatusCode.OK))
 
 
+class SparseAndRefusing(TreeServer):
+    """A listing with no attributes in it, and one path whose stat refuses to answer.
+
+    The combination D-103 lives in, and neither half is exotic: an appliance that omits
+    permission bits from ``READDIR`` is the class DESIGN §7 is written for, and a directory a
+    caller may list but not stat is ordinary anywhere permissions are used at all.
+
+    **It cannot be a real server**, which is the reason this fake exists rather than a lane:
+    OpenSSH always sends permission bits, so nothing reaching a real ``sftp-server`` reaches the
+    settling ``LSTAT`` at all. DESIGN §12 already ruled on that for the predicates, on this
+    exact condition -- *"proven against a fake, the case a fake is legitimately for, since the
+    question is what we decide about a legal answer rather than whether we agree with a real
+    server"* -- so this is the precedent rather than a shortcut taken here.
+    """
+
+    def __init__(self, *, denied: bytes, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.denied = denied
+
+    def _on_stat(self, packet) -> None:
+        if self._resolve(packet.path) == self.denied:
+            self._reply(
+                Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"Permission denied")
+            )
+            return
+        super()._on_stat(packet)
+
+
 async def first_entry(sftp, root: bytes = b"/root"):
     """The first directory a walk reports, with the generator closed properly.
 
@@ -411,9 +439,41 @@ async def test_the_settling_lstat_is_issued_while_the_directory_is_still_open():
     assert kinds.index(LStat) < kinds.index(Close), "the directory was closed before the LSTAT"
 
 
-async def test_an_entry_the_server_will_not_describe_at_all_is_skipped_rather_than_guessed():
-    # Attributes absent *and* the LSTAT refused. Two failures to answer is not evidence of
-    # anything, so it is skipped with a reason rather than sorted into a bucket by guess.
+# --- the three states of a settling stat, one test each (D-103) -----------------------------
+#
+# `_settle_kind` used to answer `UNKNOWN` for all three, so `walk` rendered them with one string
+# that describes only the first: "the server reported no attributes, and a stat did not settle
+# it". Two of the three are not that. `walk` skips all three and continues -- it has a channel
+# and uses it -- while `glob` raises on the refusal, because it has nowhere to record one; the
+# asymmetry is the channel rather than the surface, and `test_glob.py` holds the other half.
+
+
+async def test_an_entry_the_server_answers_without_type_bits_is_skipped_rather_than_guessed():
+    # The state the reason string was written for: the LSTAT *answered*, with no permissions in
+    # it. Two non-answers are not evidence of anything, so it is skipped with a reason rather
+    # than sorted into a bucket by guess.
+    tree = {b"/root": (named(b"mystery", None),)}
+    server = TreeServer(tree=tree, opaque={b"/root/mystery"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        root = await first_entry(sftp)
+
+    assert root.files == ()
+    assert root.directories == ()
+    assert root.skipped[0].reason == SkipReason.UNKNOWN_KIND
+    assert root.skipped[0].reason == (
+        "the server reported no attributes, and a stat did not settle it"
+    )
+
+
+async def test_an_entry_listed_and_then_gone_is_reported_as_vanished_rather_than_unknown():
+    """A race with whoever else writes that directory, and it used to read as the server's fault.
+
+    The listing named it, the settling `LSTAT` answered `NO_SUCH_FILE`, and until D-103 that was
+    swallowed into the same `UNKNOWN` an unhelpful *answer* produces -- so the report said "a
+    stat did not settle it" about a path that was simply gone. This test asserted
+    `UNKNOWN_KIND` before, and its comment said "the LSTAT refused" about a fake answering
+    `NO_SUCH_FILE`: the conflation was in the test as well as in the code.
+    """
     tree = {b"/root": (named(b"mystery", None),)}
     server = TreeServer(tree=tree)
     async with open_session(server) as sftp:  # type: ignore[arg-type]
@@ -421,7 +481,30 @@ async def test_an_entry_the_server_will_not_describe_at_all_is_skipped_rather_th
 
     assert root.files == ()
     assert root.directories == ()
-    assert root.skipped[0].reason == SkipReason.UNKNOWN_KIND
+    assert root.skipped[0].path == b"/root/mystery"
+    assert root.skipped[0].reason == SkipReason.VANISHED
+    assert root.skipped[0].reason == "listed, and then not there when it was stat'd"
+
+
+async def test_a_refused_settling_stat_is_reported_as_a_refusal_and_does_not_stop_the_walk():
+    """The state that had no spelling, and the one `glob` raises on.
+
+    A walk keeps going -- a recursive transfer that died on one unstattable entry would be worse
+    than one that names it, and `TreeResult.skipped` is bounded by problems for exactly this
+    reason. What it must not do is report the refusal as anything other than a refusal.
+    """
+    tree = {b"/root": (named(b"mystery", None), named(b"a.csv", REGULAR, 3))}
+    server = SparseAndRefusing(tree=tree, files={b"/root/a.csv": b"aaa"}, denied=b"/root/mystery")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        root = await first_entry(sftp)
+
+    assert [entry.filename for entry in root.files] == [b"a.csv"], "the walk carried on"
+    assert root.directories == ()
+    assert root.skipped[0].path == b"/root/mystery"
+    assert root.skipped[0].reason == SkipReason.KIND_REFUSED
+    assert root.skipped[0].reason == (
+        "the server reported no attributes, and refused the stat that would settle it"
+    )
 
 
 async def test_max_depth_stops_the_descent_and_says_so():

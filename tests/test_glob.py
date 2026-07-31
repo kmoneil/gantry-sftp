@@ -42,7 +42,7 @@ from gantry_sftp.session._glob import (
     validate_pattern,
 )
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
-from test_recursive import DIRECTORY, REGULAR, SYMLINK, TreeServer, named
+from test_recursive import DIRECTORY, REGULAR, SYMLINK, SparseAndRefusing, TreeServer, named
 
 pytestmark = pytest.mark.anyio
 
@@ -1346,6 +1346,111 @@ async def test_a_character_class_is_ascii_only_against_names_a_real_server_liste
     assert await found(root + b"/?.log") == sorted(
         [root + b"/a.log", root + b"/7.log", root + b"/\xff.log"]
     )
+
+
+# --- D-103: the fourth way a glob can be told nothing --------------------------------------
+#
+# The three above are the literal stat, the listing, and the pattern validator, and each one
+# documents the same rule: only `NO_SUCH_FILE` is swallowed, because a glob answering "no
+# matches" when it means "I was not allowed to look" is a partial success wearing a complete
+# one's clothes. The fourth is the `LSTAT` that settles an entry's *kind*, and it swallowed
+# every `ServerError` into `EntryKind.UNKNOWN`, which `_is_glob_directory` then read as "not a
+# directory".
+#
+# Why no test caught it and no lane could: OpenSSH always sends permission bits, so a real
+# `sftp-server` never reaches the settling stat at all. It is reachable only on a server that
+# omits them -- DESIGN §7's appliance class -- which is why these two are the only tests in this
+# file below the real-server line that use a fake, and why that is stated rather than papered
+# over.
+
+
+SPARSE_TREE = {
+    # `None` is a listing entry with no attributes: the server said the name and nothing else.
+    b"/root": (named(b"mystery", None), named(b"sub", DIRECTORY)),
+    b"/root/sub": (named(b"c.csv", REGULAR, 5),),
+    # A real directory with a real match under it, so what the swallow loses is a loss.
+    b"/root/mystery": (named(b"secret.csv", REGULAR, 9),),
+}
+
+VANISHING_TREE = {
+    # Same listing, and `/root/mystery` is not a path this server has: the name was in the
+    # listing and the settling LSTAT answers NO_SUCH_FILE, which is the race rather than a
+    # refusal.
+    b"/root": (named(b"mystery", None), named(b"sub", DIRECTORY)),
+    b"/root/sub": (named(b"c.csv", REGULAR, 5),),
+}
+
+
+async def test_a_refused_settling_stat_does_not_silently_shorten_a_glob():
+    """The descend site. Without the fix this returns `/root/sub/c.csv` and stops.
+
+    Nothing is raised, nothing is logged as a skip, and the caller gets a shorter list that is
+    indistinguishable from `/root/mystery` having held no matching files -- while the entry that
+    was not searched is the one the server declined to describe, which on a real endpoint is
+    exactly where the interesting files are.
+    """
+    server = SparseAndRefusing(tree=SPARSE_TREE, denied=b"/root/mystery")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(PermissionDeniedError) as denied:
+            _ = await matches(sftp, b"/root/*/*.csv")
+
+    assert denied.value.args[0] == "server returned PERMISSION_DENIED: Permission denied"
+    assert denied.value.path == b"/root/mystery"
+
+
+async def test_a_refused_settling_stat_does_not_silently_drop_a_directory_only_match():
+    """The second site, and the one that loses the *match* rather than what is under it.
+
+    A trailing `/` restricts a pattern to directories, so it asks about kind for every entry it
+    matched -- which makes it the spelling most likely to reach this. Without the fix
+    `/root/mystery` is absent from the result and the result reports success.
+    """
+    server = SparseAndRefusing(tree=SPARSE_TREE, denied=b"/root/mystery")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(PermissionDeniedError) as denied:
+            _ = await matches(sftp, b"/root/*/")
+
+    assert denied.value.args[0] == "server returned PERMISSION_DENIED: Permission denied"
+    assert denied.value.path == b"/root/mystery"
+
+
+async def test_a_stat_that_answers_without_a_type_is_refused_rather_than_read_as_no():
+    """The fifth state, and the likelier one on the servers that reach any of this.
+
+    A server that omits permission bits from a *listing* probably omits them from a `STAT` too,
+    so the entry arrives settled to `UNKNOWN` rather than refused -- narrowing the `except`
+    alone would have fixed the rarer half and left this one silent. `isdir` reached the same
+    fork and refuses, and `_kind_is`'s docstring names this consequence by name: "the reason
+    recursive downloads silently skip directories on some servers".
+    """
+    server = TreeServer(tree=SPARSE_TREE, opaque={b"/root/mystery"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        for pattern in (b"/root/*/*.csv", b"/root/*/"):
+            with pytest.raises(CapabilityError) as refused:
+                _ = await matches(sftp, pattern)
+            assert refused.value.args[0] == (
+                "glob() cannot be answered for b'/root/mystery': the server returned "
+                "attributes with no permission bits, and filexfer v3 carries the file type "
+                "in those bits, so there is nothing here to classify. Returning False would "
+                "report a definite 'no' for a question the server did not answer. Call "
+                "stat() or lstat() and decide from Attrs.permissions, or use walk(), which "
+                "reports an entry it cannot settle as skipped rather than guessing"
+            )
+            assert refused.value.path == b"/root/mystery"
+
+
+async def test_an_entry_that_vanished_between_the_listing_and_the_stat_matches_nothing():
+    """The state the swallow was right about, kept from being fixed away.
+
+    `NO_SUCH_FILE` from the settling stat is a race with whoever else writes that directory, and
+    a path that is not there matches nothing -- the same answer a name that does not match gets.
+    This is the regression the narrowing would most plausibly cause, and it is asserted at both
+    sites: the plain `TreeServer` answers `NO_SUCH_FILE` for a name it never had.
+    """
+    server = TreeServer(tree=VANISHING_TREE)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert await matches(sftp, b"/root/*/*.csv") == [b"/root/sub/c.csv"]
+        assert await matches(sftp, b"/root/*/") == [b"/root/sub"]
 
 
 async def test_a_literal_pattern_that_is_merely_absent_still_matches_nothing(tmp_path: Path):

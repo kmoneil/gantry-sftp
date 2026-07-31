@@ -1307,6 +1307,16 @@ class Session:
         found = entry_kind(attributes)
         if found is not EntryKind.UNKNOWN:
             return found
+        raise self._unclassifiable(path, caller=caller)
+
+    def _unclassifiable(self, path: bytes, *, caller: str) -> CapabilityError:
+        """The refusal for an entry the server described without a type in it.
+
+        A factory rather than a ``raise`` inside :meth:`_classify`, because `glob` reaches this
+        state having already spent the attributes on :meth:`_settle_kind` and must produce the
+        *same* refusal (D-103). One wording, one place -- the alternative is two messages that
+        drift, describing one decision.
+        """
         unclassifiable = CapabilityError(
             f"{caller}() cannot be answered for {path!r}: the server returned "
             f"attributes with no permission bits, and filexfer v3 carries the file type "
@@ -1318,7 +1328,7 @@ class Session:
             path=path,
         )
         unclassifiable.add_note(self._server_note())
-        raise unclassifiable
+        return unclassifiable
 
     async def exists(self, path: bytes | str, *, follow_symlinks: bool = True) -> bool:
         """Whether anything is at ``path``.
@@ -3218,7 +3228,11 @@ class Session:
                 answers for a path that exists and is not a directory.
             CapabilityError: If ``path`` is relative and this server's default directory is
                 not rooted at ``/``, so descending would build paths it does not mean.
-            ServerError: If the server refuses a listing.
+            ServerError: If the server refuses a **listing**. A refusal of the ``LSTAT`` that
+                settles one entry's kind is recorded in that entry's
+                :attr:`~gantry_sftp.session.WalkEntry.skipped` instead and the walk carries on
+                -- see :meth:`_settle_for_walk` for why the two are answered differently, and
+                :class:`~gantry_sftp.session.SkipReason` for the three ways a settle can fail.
         """
         root = self._resolve(path)
         await self._require_rooted_paths(root, feature="walking a tree")
@@ -3257,33 +3271,70 @@ class Session:
         async with self.scandir(directory) as children:
             async for child in children:
                 path = join_remote(directory, child.filename)
-                kind = await self._settle_kind(path, child)
-                if kind is EntryKind.DIRECTORY and at_limit:
+                settled = await self._settle_for_walk(path, child)
+                if isinstance(settled, Skipped):
+                    skipped.append(settled)
+                elif settled is EntryKind.DIRECTORY and at_limit:
                     skipped.append(Skipped(path, child, SkipReason.TOO_DEEP))
-                elif kind is EntryKind.DIRECTORY:
+                elif settled is EntryKind.DIRECTORY:
                     directories.append(child)
-                elif kind is EntryKind.FILE:
+                elif settled is EntryKind.FILE:
                     files.append(child)
                 else:
-                    skipped.append(Skipped(path, child, _skip_reason(kind)))
+                    skipped.append(Skipped(path, child, _skip_reason(settled)))
 
         return WalkEntry(directory, relative, tuple(directories), tuple(files), tuple(skipped))
 
-    async def _settle_kind(self, path: bytes, entry: DirEntry) -> EntryKind:
+    async def _settle_for_walk(self, path: bytes, entry: DirEntry) -> EntryKind | Skipped:
+        """Settle an entry's kind for a walk, where a server that will not answer is not a stop.
+
+        The three states :meth:`_settle_kind` produces, each mapped to what a walk does with it.
+        All three are *reported* and none is fatal, because a walk has somewhere to put them and
+        a recursive transfer that died on one unstattable entry would be worse than one that
+        names it. `glob` reaches the same helper and may only swallow the absence, since it has
+        no such channel -- that asymmetry is D-103's whole subject, and it is the channel rather
+        than the surface that decides it.
+
+        They are three reasons rather than one because they are three different facts about the
+        far end: attributes with no type bits in them, a name that was listed and is now gone,
+        and a server that refused to say. A report that renders all three as "a stat did not
+        settle it" costs its reader the only thing the record exists for.
+        """
+        try:
+            kind = await self._settle_kind(path, entry)
+        except ServerError:
+            return Skipped(path, entry, SkipReason.KIND_REFUSED)
+        if kind is None:
+            return Skipped(path, entry, SkipReason.VANISHED)
+        return kind
+
+    async def _settle_kind(self, path: bytes, entry: DirEntry) -> EntryKind | None:
         """Resolve an entry whose kind the listing did not report.
 
         One ``LSTAT``, and only for the entries that need it -- so a server that sends
         attributes (all the common ones) pays nothing, and a server that does not gets a
         correct walk rather than a fast wrong one. ``LSTAT`` because a symlink must stay a
-        symlink here; if that still settles nothing, the entry is skipped with a reason rather
-        than guessed at.
+        symlink here.
+
+        **Through :meth:`_attrs_or_absent`, and returning ``None`` rather than swallowing, which
+        is the whole of the fix for D-103.** This used to catch ``ServerError`` and answer
+        ``UNKNOWN``, so a server refusing to stat an entry was indistinguishable from one
+        describing it unhelpfully -- and `glob` read that ``UNKNOWN`` as "not a directory" and
+        dropped whatever was underneath it. Three states arrive here as three states: a kind, a
+        ``None`` for an entry that was listed and is no longer there, and a raise for a server
+        that will not say. **Which of the three each caller may swallow is the caller's to
+        answer**, because the answer differs: :meth:`walk` records all of them and continues,
+        :meth:`_is_glob_directory` may only swallow the absence.
+
+        Returns:
+            The settled kind, or ``None`` where the entry is not there any more -- the listing
+            named it and the ``LSTAT`` answered ``NO_SUCH_FILE``, which is a race with whoever
+            else is writing to that directory rather than a refusal.
         """
         if entry.kind is not EntryKind.UNKNOWN:
             return entry.kind
-        try:
-            return entry_kind(await self.lstat(path))
-        except ServerError:
-            return EntryKind.UNKNOWN
+        attributes = await self._attrs_or_absent(path, follow_symlinks=False)
+        return None if attributes is None else entry_kind(attributes)
 
     async def glob(
         self,
@@ -3602,8 +3653,29 @@ class Session:
         permissions for costs one ``LSTAT`` instead of being guessed at -- and ``LSTAT`` is
         what keeps a symlink a symlink, which is what makes "matched but never descended into"
         true rather than aspirational.
+
+        **Absent is ``False``; a refusal and an answer with no type in it both raise, which is
+        D-103.** That is the same rule :meth:`_glob_listing` and :meth:`_glob_literal` state for
+        the other two ways a glob can be told nothing. An entry that is no longer there matches
+        nothing, exactly as a name that does not match matches nothing. But a server that
+        *refuses* the stat, or answers it without the permission bits v3 carries the file type
+        in, has said nothing about the kind -- and `glob` has no ``Skipped`` channel to record
+        that in, so answering "not a directory" would drop the entry, or everything beneath it,
+        into a result that looks complete.
+
+        **The second of those two is the likelier one in the field**, and it is why this method
+        does not stop at narrowing the ``except``: a server that omits permission bits from a
+        *listing* is a server that probably omits them from a ``STAT`` as well, so the entry
+        arrives here settled to ``UNKNOWN`` rather than refused. :meth:`_kind_is` reached the
+        same fork for :meth:`isdir` and answered it the same way, one section up, and its
+        docstring names this exact consequence -- *"the reason recursive downloads silently skip
+        directories on some servers"*. Sharing :meth:`_unclassifiable` is what keeps the two
+        refusals one decision instead of two wordings.
         """
-        return await self._settle_kind(path, entry) is EntryKind.DIRECTORY
+        settled = await self._settle_kind(path, entry)
+        if settled is EntryKind.UNKNOWN:
+            raise self._unclassifiable(path, caller="glob")
+        return settled is EntryKind.DIRECTORY
 
     async def get_tree(
         self,

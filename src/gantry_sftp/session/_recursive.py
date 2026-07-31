@@ -122,6 +122,24 @@ class SkipReason:
 
     SYMLINK = "symlink, and symlinks are not followed"
     UNKNOWN_KIND = "the server reported no attributes, and a stat did not settle it"
+    KIND_REFUSED = "the server reported no attributes, and refused the stat that would settle it"
+    """Distinct from ``UNKNOWN_KIND`` since D-103, because they are different facts.
+
+    That one is a server *answering* unhelpfully -- attributes with no type bits in them. This
+    one is a server declining to answer at all, which is the condition ``glob`` raises on rather
+    than skipping, because it has nowhere to record a skip. Which status the refusal carried is
+    in the log record rather than here: this field is a sentence for a human reading a report,
+    and the frame dump is where a diagnosis is done.
+    """
+
+    VANISHED = "listed, and then not there when it was stat'd"
+    """A race with whoever else writes to that directory, not a refusal.
+
+    The listing named it and the settling ``LSTAT`` answered ``NO_SUCH_FILE``. Reported rather
+    than dropped for the same reason as everything else here: a walk that silently omits a name
+    it *saw* is a walk whose output cannot be compared with the directory.
+    """
+
     NOT_A_FILE = "not a regular file or directory"
     TOO_DEEP = "deeper than max_depth"
     DESTINATION_COLLISION = "the destination filesystem does not tell it apart from an earlier name"
