@@ -439,6 +439,13 @@ async def test_reading_a_write_only_handle_says_no_such_file(tmp_path: Path):
     raise for the same status, because this goes through the transfer scheduler -- which is
     the same choice `get` makes, for the same reason: what a caller needs from a failed range
     is how far it got. Pinned here so the two cannot drift apart quietly.
+
+    It is also the **non-`FAILURE`** half of D-117's first-read message: the sentence says the
+    handle opened and nothing could be read, and stops there. The directory hint is withheld
+    because `NO_SUCH_FILE` carries its own meaning and no server answers it for a directory, so
+    offering one here would be a guess printed as a lead. And `local_path` stays `None`: a
+    range read has no local file, which is the case that keeps "carry both paths" from
+    becoming "invent the second one".
     """
     needs_real_server()
     target = tmp_path / "out.bin"
@@ -451,10 +458,14 @@ async def test_reading_a_write_only_handle_says_no_such_file(tmp_path: Path):
             with pytest.raises(TransferError) as exc:
                 await sftp.read_at(handle, 0, 4)
             assert exc.value.args[0] == (
-                "server refused a read at offset 0: NO_SUCH_FILE No such file"
+                "server refused the first read, at offset 0: NO_SUCH_FILE No such file -- the "
+                "handle opened and then not one byte could be read, so nothing arrived and "
+                "nothing was truncated"
             )
             assert exc.value.transferred == 0
             assert exc.value.offset == 0
+            assert exc.value.local_path is None
+            assert not hasattr(exc.value, "__notes__")
         finally:
             await sftp.close(handle)
 

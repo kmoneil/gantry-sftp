@@ -1349,7 +1349,9 @@ That exception starts at the `REMOVE` rather than after it, which is not the obv
 indistinguishable from one that never ran, so it is assumed to have run. A `REMOVE` the server
 *refused* is a different thing: nothing was removed, and the staging file is cleaned up
 normally. The two cases produce different error notes, one saying the destination was removed
-and the other that it may have been.
+and the other that it may have been. What the *other* two transfer paths leave behind — an
+in-place upload and any download — is in **What a failed transfer leaves behind** below, and
+they do not clean up at all.
 
 `examples/atomic_publish.py` runs all of this against a real server with no arguments.
 
@@ -1420,6 +1422,52 @@ collision risk moving to whoever named it.
 
 `examples/resume.py` interrupts a transfer in each direction and finishes it, and catches
 both refusals so you can see what they say.
+
+### What a failed transfer leaves behind
+
+Three rules, one per path, and each one is a decision rather than whatever the code happened to
+do:
+
+| | what is left on failure | why |
+| --- | --- | --- |
+| `get` | the local destination, holding whatever arrived | it is *your* file, not a staging name of ours — and it is what `resume=True` continues from |
+| `put`, `atomic=False` | a truncated remote destination | in place, the destination *is* the file being written; that is what `atomic=False` means |
+| `put`, atomic (the default) | nothing: the staging file is removed and the destination is untouched | except once the `remove-rename` fallback has issued its `REMOVE`, where the staging file may be the only copy of your data |
+
+The download's rule has a cost, and it is worth stating plainly: **a `get` that fails before its
+first byte leaves a zero-byte file with the right name**, which `if os.path.exists(...)` reads as
+a download that happened. Deleting it instead would break resume, and would delete a path that
+may be a symlink you made — `no_follow` is off by default — so the file stays and the error
+names it:
+
+```python
+try:
+    await sftp.get("/incoming/report.csv", "report.csv")
+except TransferError as failure:
+    failure.local_path  # 'report.csv' — the file that is still there
+    failure.remote_path  # b'/incoming/report.csv'
+    failure.transferred  # 0
+    print(failure.__notes__[0])  # says it was left, and to delete it if you are not resuming
+```
+
+`local_path` is filled for every failure either direction can raise, not only the transfer
+itself: a refused resume, a mode that could not be preserved, a size that did not match.
+
+**And the first read being refused says so**, rather than describing the request. Downloading a
+directory is the case that produces it against a real OpenSSH server — `open(2)` on a directory
+succeeds, `read(2)` does not — and v3's `FAILURE` carries no detail to distinguish it, so the
+message names a directory as something that arrives looking exactly like this without claiming
+it is one:
+
+```
+server refused the first read, at offset 0: FAILURE Failure -- the handle opened and then not
+one byte could be read, so nothing arrived and nothing was truncated. v3's FAILURE says no more
+than 'no', and one thing that reaches here looking exactly like this is a directory: a server
+that lets one be opened refuses at the read instead
+```
+
+Settling it properly would cost a `STAT` on every download to improve one error message, which
+is the wrong trade for a path that had a round trip removed from it deliberately.
 
 One thing worth knowing if you are reading the codec: **`SYMLINK`'s arguments are in the
 opposite order to the specification.** draft-02 says `linkpath, targetpath`; OpenSSH sends

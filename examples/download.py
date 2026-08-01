@@ -6,6 +6,9 @@
 `get()` issues as many READs as the window allows before waiting for any reply, and writes
 each payload at the offset its own request asked for -- never by arrival order, because
 out-of-order completion is the normal case and is the entire point of pipelining.
+
+The last section shows the failure nobody plans for: asking to download something that turns
+out to be a *directory*. It leaves a local file, and the error says which one.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from pathlib import Path
 
 import anyio
 
+from gantry_sftp.exceptions import TransferError
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport
 
@@ -25,6 +29,28 @@ def bar(transferred: int, total: int | None) -> None:
     if total:
         done = 40 * transferred // total
         print(f"\r  [{'#' * done}{'.' * (40 - done)}] {transferred}/{total}", end="", flush=True)
+
+
+async def show_what_a_failure_leaves(sftp, workdir: Path) -> None:
+    """Download something that is a directory, and look at what is left on disk.
+
+    OpenSSH permits `open(2)` on a directory, so the refusal arrives at the *read* -- by which
+    time the destination has been created. It is left where it is rather than deleted: it is
+    your file, not a staging name of the library's, and `resume=True` continues from exactly
+    such a partial. So the error names it, and the note says what to do about it.
+    """
+    a_directory = workdir / "a-directory"
+    a_directory.mkdir()
+    landed = workdir / "not-a-file.bin"
+
+    try:
+        _ = await sftp.get(str(a_directory), landed)
+    except TransferError as failure:
+        print(f"\n{failure.args[0]}")
+        print(f"local_path : {failure.local_path}")
+        print(f"transferred: {failure.transferred}")
+        print(f"still there: {landed.exists()}, {landed.stat().st_size} bytes")
+        print(f"note       : {failure.__notes__[0]}")
 
 
 async def main() -> None:
@@ -46,6 +72,7 @@ async def main() -> None:
             ):
                 print(f"downloading {remote}")
                 result = await sftp.get(str(remote), local, progress=bar)
+                await show_what_a_failure_leaves(sftp, workdir)
         else:
             if remote_path is None:
                 sys.exit("usage: python examples/download.py user@host /remote/path")

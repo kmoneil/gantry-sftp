@@ -351,7 +351,17 @@ class TransferError(SFTPError):
             zero.
         offset: File offset the failing request covered.
         remote_path: The remote file, if known.
-        local_path: The local file, if known.
+        local_path: The local file, if known -- and on a failed ``get`` that is **the file
+            still sitting on disk**, because a download leaves its destination where it is
+            rather than deleting the caller's file. Every failure ``get`` and ``put`` can
+            raise carries it; a byte-range read or write has no local file and leaves it
+            ``None``, which is the case that keeps "both paths" from becoming "invent the
+            second one". It was absent from the download scheduler's errors until D-117 --
+            exactly the path that creates an artefact worth naming.
+
+    A failed transfer may also carry a **note**: :meth:`add_note` is where the transfer paths
+    say what they left behind, since that is a fact about the operation rather than a field
+    with a value. ``str()`` renders the fields; a traceback renders both.
     """
 
     def __init__(

@@ -1296,8 +1296,16 @@ async def test_a_failing_close_on_a_download_does_not_replace_the_error_either(
     # This scripted server has no READ handler, so the read is refused; the point is that the
     # surviving error is the read's -- which carries the offset and the byte count a resume
     # would need -- rather than the close's, which carries neither.
-    assert exc.value.args[0] == "server refused a read at offset 0: FAILURE unscripted"
+    assert exc.value.args[0] == (
+        "server refused the first read, at offset 0: FAILURE unscripted -- the handle opened "
+        "and then not one byte could be read, so nothing arrived and nothing was truncated. "
+        "v3's FAILURE says no more than 'no', and one thing that reaches here looking exactly "
+        "like this is a directory: a server that lets one be opened refuses at the read instead"
+    )
     assert exc.value.transferred == 0
+    # And the error the caller keeps is the one that names the file it left behind (D-117):
+    # the close's refusal carries neither path, so a swap here would lose that too.
+    assert exc.value.local_path == str(tmp_path / "out.bin")
     assert any(isinstance(packet, Close) for packet in server.seen)
 
 

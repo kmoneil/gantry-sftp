@@ -425,11 +425,52 @@ class _Downloader:
             self._eof_at = min(self._eof_at or issued.offset, issued.offset)
             return
         raise TransferError(
-            f"server refused a read at offset {issued.offset}: "
-            f"{response.code.name} {bytes(response.message).decode('utf-8', 'replace')}",
+            self._refusal(issued, response),
             transferred=self._written,
             offset=issued.offset,
             remote_path=self._remote_path,
+        )
+
+    def _refusal(self, issued: _Range, response: Status) -> str:
+        """Describe a refused READ, which is not the same situation at every offset.
+
+        Part way through a transfer, the offset *is* the diagnosis: bytes arrived, and then
+        one range did not. The first read is a different event and used to read as the same
+        one -- ``server refused a read at offset 0`` describes the request rather than what
+        happened, which is that the object opened and then would not be read at all. Nothing
+        was truncated, nothing arrived, and the file that a ``get`` created for it is empty.
+
+        **The cause cannot be read off the reply, so it is not claimed.** Measured across the
+        matrix (``tests/server_contract.py::a_directory_cannot_be_read_as_a_file``): OpenSSH
+        permits ``open(2)`` on a directory and refuses at the ``read(2)`` with v3's catch-all,
+        message ``Failure``; asyncssh refuses the ``OPEN`` with ``Is a directory``; paramiko
+        refuses the ``OPEN`` with ``Failure``. So on the one server that reaches this code
+        path at all there is nothing in the status to match on, and the honest sentence names
+        a directory as *something that arrives looking exactly like this* rather than as the
+        diagnosis. A ``STAT`` to settle it would be a round trip on every download to improve
+        one message, and D-110 had just removed one from this path.
+
+        The hint is withheld for every other status because those codes carry their own
+        meaning -- ``NO_SUCH_FILE`` at the first read is a file that went away between the
+        ``OPEN`` and the ``READ``, and a directory does not answer that anywhere.
+        """
+        said = f"{response.code.name} {bytes(response.message).decode('utf-8', 'replace')}".rstrip()
+        if self._written or issued.offset != self._span.start:
+            return f"server refused a read at offset {issued.offset}: {said}"
+        # Both conditions, because replies arrive out of order: a refusal of the *first* range
+        # can be handled after a later one has already delivered data, and "not one byte could
+        # be read" would then be false.
+        first = (
+            f"server refused the first read, at offset {issued.offset}: {said} -- the handle "
+            f"opened and then not one byte could be read, so nothing arrived and nothing was "
+            f"truncated"
+        )
+        if response.code is not StatusCode.FAILURE:
+            return first
+        return (
+            f"{first}. v3's FAILURE says no more than 'no', and one thing that reaches here "
+            f"looking exactly like this is a directory: a server that lets one be opened "
+            f"refuses at the read instead"
         )
 
     def _dispatch(self, event: Completed) -> None:

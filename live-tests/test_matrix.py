@@ -46,6 +46,7 @@ from gantry_sftp.exceptions import (
     CapabilityError,
     NoSuchFileError,
     ServerError,
+    SFTPError,
     TransferError,
     TransferTimeoutError,
 )
@@ -264,6 +265,50 @@ async def test_a_missing_file_is_reported_as_no_such_file_everywhere(server: Mat
     async with connected(server) as sftp:
         with pytest.raises(NoSuchFileError):
             _ = await sftp.stat(b"/definitely/not/here")
+
+
+async def test_downloading_a_directory_fails_everywhere_and_leaves_a_file_in_one_place(
+    server: MatrixServer, tmp_path: Path
+):
+    """D-117 across the matrix, where the three servers give the client two different shapes.
+
+    `tests/server_contract.py::a_directory_cannot_be_read_as_a_file` establishes that all three
+    refuse and that *where* they refuse is not agreed. This is the consequence of that
+    disagreement for the caller, which the contract cannot state because it is a fact about
+    `get` rather than about a server:
+
+    * **OpenSSH** permits the `OPEN`, so `get` has already created the destination by the time
+      the `READ` is refused. That is a `TransferError`, and the zero-byte file it leaves is
+      what the error has to name.
+    * **asyncssh and paramiko** refuse the `OPEN`, which is a `ServerError` raised before
+      anything local is touched -- so there is no artefact, and nothing to name.
+
+    Asserted as "if a local file exists, the error named it" rather than per server, because the
+    branch that matters is the pairing and not which implementation lands in which half. A
+    server refusing at the `READ` and leaving an unnamed file is the bug; a server refusing at
+    the `OPEN` and leaving nothing is fine.
+    """
+    directory = server.root / "a-directory"
+    directory.mkdir()
+    landed = tmp_path / "not-a-file.bin"
+
+    async with connected(server) as sftp:
+        with pytest.raises(SFTPError) as exc:
+            _ = await sftp.get(str(directory), landed)
+
+    if landed.exists():
+        assert isinstance(exc.value, TransferError), (
+            f"{server.name} left {landed} behind and raised {type(exc.value).__name__}, "
+            f"which carries no local path to name it with"
+        )
+        assert exc.value.local_path == str(landed)
+        assert landed.stat().st_size == 0
+        assert str(landed) in "".join(exc.value.__notes__)
+    else:
+        assert isinstance(exc.value, ServerError), (
+            f"{server.name} refused before the transfer and raised "
+            f"{type(exc.value).__name__} rather than a ServerError"
+        )
 
 
 async def test_an_uploaded_file_is_never_world_readable_through_any_server(

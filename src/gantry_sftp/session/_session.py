@@ -2956,7 +2956,11 @@ class Session:
             ServerError: If the server refuses.
             TransferError: If the transfer fails partway, if ``resume`` cannot establish a
                 safe offset, if ``verify_size`` finds fewer bytes arrived than the server
-                said there were, or if ``verify`` finds the content disagrees.
+                said there were, or if ``verify`` finds the content disagrees. **Every one of
+                them names ``local_path``**, and once the transfer has begun the local file is
+                left exactly where it is -- see :meth:`_download_into` for why deleting it
+                would be the expensive choice rather than the tidy one. A failure before the
+                first ``READ`` creates nothing at all.
         """
         require_local_io("get()")
         _check_local_path(local_path, method="get()")
@@ -2968,85 +2972,94 @@ class Session:
         # would fall past both named rungs into the `else`, so asking for the *default* would
         # silently download the file a second time.
         wanted = Verify(verify)
-        with operation(session_logger, "get", remote=encoded, local=local_path) as record:
-            attributes, opened = await self._stat_and_open_for_download(
-                encoded, together=not resume
-            )
-            local_bits = _download_mode(requested_mode, attributes, encoded)
-            start = _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
-            # DESIGN.md 6's gate, on the direction that is usually assumed safe. The local
-            # partial being *ours* makes its length trustworthy; it does not make its contents a
-            # prefix of this remote file. A partial left by a previous run against a different
-            # source is the same corruption as on the upload side, and it is caught here before
-            # the first READ. It refused but could not report until D-99 gave `get` somewhere
-            # to say so -- see D-38 for the refusal.
-            resume_check = await self._gate_resume(encoded, local_path, start, wanted)
-            times_result = _preservation(preserve_times, attributes.times)
-            if resume and start == attributes.size:
-                # Already complete: nothing to open and nothing to move. Deliberately *after*
-                # the gate rather than before it -- this is the case that adopts the entire file
-                # and returns success having verified nothing, which makes it the one most worth
-                # gating, not the one to skip for a round trip.
-                return self._already_complete(
+        try:
+            with operation(session_logger, "get", remote=encoded, local=local_path) as record:
+                attributes, opened = await self._stat_and_open_for_download(
+                    encoded, together=not resume
+                )
+                local_bits = _download_mode(requested_mode, attributes, encoded)
+                start = (
+                    _download_resume_offset(local_path, attributes.size, encoded) if resume else 0
+                )
+                # DESIGN.md 6's gate, on the direction that is usually assumed safe. The local
+                # partial being *ours* makes its length trustworthy; it does not make its contents a
+                # prefix of this remote file. A partial left by a previous run against a different
+                # source is the same corruption as on the upload side, and it is caught here before
+                # the first READ. It refused but could not report until D-99 gave `get` somewhere
+                # to say so -- see D-38 for the refusal.
+                resume_check = await self._gate_resume(encoded, local_path, start, wanted)
+                times_result = _preservation(preserve_times, attributes.times)
+                if resume and start == attributes.size:
+                    # Already complete: nothing to open and nothing to move. Deliberately *after*
+                    # the gate rather than before it -- this is the case that adopts the entire file
+                    # and returns success having verified nothing, which makes it the one most worth
+                    # gating, not the one to skip for a round trip.
+                    return self._already_complete(
+                        encoded,
+                        local_path,
+                        record,
+                        adopted=start,
+                        mode=local_bits,
+                        no_follow=no_follow,
+                        times=attributes.times if preserve_times else None,
+                        times_result=times_result,
+                        resume_check=resume_check,
+                        verify=wanted,
+                    )
+
+                # Already open on the default path -- the concurrent pair above returns the handle.
+                # The resume path opens here instead, after the gate and after the early return that
+                # must not open anything at all.
+                handle = opened if opened is not None else await self.open(encoded, OpenFlag.READ)
+                try:
+                    transferred = await self._download_into(
+                        local_path,
+                        handle,
+                        size=attributes.size,
+                        depth=depth,
+                        progress=progress,
+                        remote_path=encoded,
+                        no_follow=no_follow,
+                        start_offset=start,
+                        times=attributes.times if preserve_times else None,
+                        mode=local_bits,
+                    )
+                except BaseException:
+                    # Closing is not optional: a leaked handle counts against max-open-handles and
+                    # is invisible from this side until the server starts refusing to open anything.
+                    # It must not replace the transfer's error with one about the close, though --
+                    # the first error is the diagnosis and the second is housekeeping.
+                    await _close_quietly(self, handle)
+                    raise
+                await self.close(handle)
+                record["bytes"] = transferred
+                size_check = _confirm_download_size(
                     encoded,
                     local_path,
-                    record,
+                    arrived=start + transferred,
+                    announced=attributes.size,
+                    asked=verify_size,
+                )
+                content_check = await self._verify_downloaded_content(
+                    encoded, local_path, start + transferred, wanted
+                )
+                return DownloadResult(
+                    transferred,
+                    encoded,
+                    Path(local_path),
+                    size_check,
+                    times=times_result,
+                    content_check=content_check,
+                    resume_check=resume_check,
                     adopted=start,
                     mode=local_bits,
-                    no_follow=no_follow,
-                    times=attributes.times if preserve_times else None,
-                    times_result=times_result,
-                    resume_check=resume_check,
-                    verify=wanted,
                 )
-
-            # Already open on the default path -- the concurrent pair above returns the handle.
-            # The resume path opens here instead, after the gate and after the early return that
-            # must not open anything at all.
-            handle = opened if opened is not None else await self.open(encoded, OpenFlag.READ)
-            try:
-                transferred = await self._download_into(
-                    local_path,
-                    handle,
-                    size=attributes.size,
-                    depth=depth,
-                    progress=progress,
-                    remote_path=encoded,
-                    no_follow=no_follow,
-                    start_offset=start,
-                    times=attributes.times if preserve_times else None,
-                    mode=local_bits,
-                )
-            except BaseException:
-                # Closing is not optional: a leaked handle counts against max-open-handles and
-                # is invisible from this side until the server starts refusing to open anything.
-                # It must not replace the transfer's error with one about the close, though --
-                # the first error is the diagnosis and the second is housekeeping.
-                await _close_quietly(self, handle)
-                raise
-            await self.close(handle)
-            record["bytes"] = transferred
-            size_check = _confirm_download_size(
-                encoded,
-                local_path,
-                arrived=start + transferred,
-                announced=attributes.size,
-                asked=verify_size,
-            )
-            content_check = await self._verify_downloaded_content(
-                encoded, local_path, start + transferred, wanted
-            )
-            return DownloadResult(
-                transferred,
-                encoded,
-                Path(local_path),
-                size_check,
-                times=times_result,
-                content_check=content_check,
-                resume_check=resume_check,
-                adopted=start,
-                mode=local_bits,
-            )
+        except TransferError as failure:
+            # The one place a download's error learns which file it was writing. Every
+            # raise site above is inside this method, so the field is carried by
+            # construction rather than by anybody remembering to pass it.
+            _name_the_local_file(failure, local_path)
+            raise
 
     def _already_complete(
         self,
@@ -3177,6 +3190,21 @@ class Session:
         second chance to whatever the ``O_NOFOLLOW`` above exists to refuse. The creation mode
         stays ``0o600`` regardless of ``mode``, so the widening -- if it is a widening -- happens
         only once there is a complete file to widen.
+
+        **A failed download leaves the file it opened, and the error says where it is** (D-117).
+        That is a decision rather than an omission, and it is the same one
+        :meth:`_put_in_place` makes in the other direction: the destination *is* the caller's
+        named file, not a staging name of ours, so removing it would be deleting their data
+        rather than cleaning up after ourselves. Three things say keep it. ``resume=True``
+        continues from exactly this partial and reads its length off the disk, so a client that
+        deleted on failure would delete what its own retry needs. ``no_follow`` is off by
+        default, so the path may be a symlink the caller made, and an ``unlink`` would remove
+        their link rather than the bytes. And it may hold most of a nine-gigabyte transfer,
+        which is the one thing nobody can get back.
+
+        What that costs is the shape the note below exists to name: a ``get`` of something the
+        server will open and not read leaves a **zero-byte file with the right name**, and
+        ``if os.path.exists`` reads that as a download that happened.
         """
         flags = _LOCAL_WRITE_FLAGS if not start_offset else _LOCAL_RESUME_FLAGS
         fd = os.open(local_path, flags | (NO_FOLLOW if no_follow else 0), 0o600)
@@ -3197,6 +3225,18 @@ class Session:
                 os.fchmod(fd, mode)
             if times is not None:
                 os.utime(fd, (times.atime, times.mtime))
+        except TransferError as failure:
+            # Only here, and not wherever a `TransferError` can reach `get`: this is the one
+            # path that has opened a local file, and the same sentence attached to a refusal
+            # from `_download_mode` or a resume gate would describe a file nothing created.
+            failure.add_note(
+                f"{local_path} was left where it is, holding whatever had arrived when this "
+                f"failed -- nothing here removes it, because the destination is your file "
+                f"rather than a staging name of ours and resume=True continues from exactly "
+                f"this partial. Delete it yourself if you are not going to resume: a file of "
+                f"the right name and the wrong length is what a consumer misreads."
+            )
+            raise
         finally:
             os.close(fd)
         return transferred
@@ -4103,7 +4143,9 @@ class Session:
             PermissionDeniedError: If the server will not create or write the file.
             ServerError: For any other refusal, including a refused ``mode``.
             TransferError: If the transfer fails partway, or if the published length
-                disagrees with the local file's.
+                disagrees with the local file's. Every one names ``local_path``, which on this
+                side is the **source** rather than the staging file -- the staging name is
+                already on the message, and the caller's file is the one they can act on.
         """
         require_local_io("put()")
         _check_local_path(local_path, method="put()")
@@ -4153,11 +4195,18 @@ class Session:
             verify=Verify(verify),
             mode=local_mode(local_path) if requested_mode is Mode.PRESERVE else requested_mode,
         )
-        with operation(session_logger, "put", local=local_path, remote=target) as record:
-            result = await self._publish_upload(upload, target, policy)
-            record["bytes"] = result.transferred
-            record["mechanism"] = result.mechanism.name
-            return result
+        try:
+            with operation(session_logger, "put", local=local_path, remote=target) as record:
+                result = await self._publish_upload(upload, target, policy)
+                record["bytes"] = result.transferred
+                record["mechanism"] = result.mechanism.name
+                return result
+        except TransferError as failure:
+            # The mirror of `get`'s, and it has to be here rather than assumed from that one:
+            # the two directions have disagreed before on exactly this kind of symmetry (D-96,
+            # D-103), so neither is evidence about the other.
+            _name_the_local_file(failure, local_path)
+            raise
 
     async def _publish_upload(
         self, upload: _Upload, target: bytes, policy: Publish
@@ -5414,6 +5463,33 @@ def _gate_as_content_check(resume_check: ResumeCheck, verify: Verify) -> Content
     if resume_check is ResumeCheck.MATCHED:
         return ContentCheck.HASHED if verify is Verify.HASH else ContentCheck.REREAD
     return ContentCheck.UNAVAILABLE
+
+
+def _name_the_local_file(failure: TransferError, local_path: Path | str) -> None:
+    """Fill in the local half of a transfer error, at the boundary that knows it.
+
+    DoD 3 states the contract in as many words -- a ``TransferError`` carries bytes
+    transferred, offset **and both paths** -- and the download's scheduler was passing three of
+    the four (D-117). The missing one is the only thing that names the artefact a failed
+    ``get`` leaves on disk, so it was absent exactly where it mattered most.
+
+    **It is filled here rather than threaded through every raise site, because the schedulers
+    genuinely do not have it.** :func:`~gantry_sftp.session.download_handle` is handed a
+    *descriptor* and :func:`~gantry_sftp.session.upload_handle` reads through one, deliberately:
+    the open flags are a safety decision belonging to the layer that knows where the file is
+    allowed to be, and a scheduler with an fd can just as well write into a pipe, which has no
+    path at all. Passing a name down to be quoted in an error would buy that name back at the
+    cost of the seam. So :meth:`Session.get` and :meth:`Session.put` name it on the way out --
+    which is also what makes the claim exhaustive rather than per-site: a raise site added
+    inside either of them carries the field without anybody remembering to pass it.
+
+    **A site that knows better keeps its answer.** The resume gates and the verification
+    failures build the error with the path already on it, so this fills a blank and never
+    overwrites one -- which is what keeps the innermost, most specific name from being replaced
+    by the outermost.
+    """
+    if failure.local_path is None:
+        failure.local_path = str(local_path)
 
 
 def _confirm_download_size(

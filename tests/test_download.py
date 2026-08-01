@@ -345,24 +345,122 @@ async def test_an_unknown_size_reads_until_eof(tmp_path: Path):
 # --- failures ---------------------------------------------------------------------------------
 
 
-async def test_a_refused_read_reports_how_far_it_got(tmp_path: Path):
-    class Refusing(ScriptedServer):
-        def _handle(self, packet: object) -> None:
-            if isinstance(packet, Read) and packet.offset >= 64:
-                refusal = Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"nope")
-                self._queue(encode(refusal))
-                return
-            super()._handle(packet)
+class RefusingFrom(ScriptedServer):
+    """Refuses every READ at or past ``after``, with a status of our choosing."""
 
-    server = Refusing(bytes(256))
+    def __init__(
+        self,
+        content: bytes,
+        *,
+        after: int = 0,
+        code: StatusCode = StatusCode.PERMISSION_DENIED,
+        message: bytes = b"nope",
+        reverse: bool = False,
+    ) -> None:
+        super().__init__(content, reverse=reverse)
+        self.after = after
+        self.code = code
+        self.message = message
+
+    def _handle(self, packet: object) -> None:
+        if isinstance(packet, Read) and packet.offset >= self.after:
+            self.reads.append((packet.offset, packet.length))
+            self._queue(encode(Status(packet.request_id, self.code, self.message)))
+            return
+        super()._handle(packet)
+
+
+class RefusesOnlyTheFirstRange(ScriptedServer):
+    """Refuses the read at offset 0, with no message, and answers every other range."""
+
+    def _handle(self, packet: object) -> None:
+        if isinstance(packet, Read) and packet.offset == 0:
+            self.reads.append((packet.offset, packet.length))
+            self._queue(encode(Status(packet.request_id, StatusCode.FAILURE)))
+            return
+        super()._handle(packet)
+
+
+async def test_a_refused_read_reports_how_far_it_got(tmp_path: Path):
+    server = RefusingFrom(bytes(256), after=64)
     with pytest.raises(TransferError) as exc:
         await fetch(server, tmp_path / "out", read_length=64, depth=1)
 
     assert exc.value.offset == 64
     # Partial progress is the difference between resuming and restarting, so it is carried.
     assert exc.value.transferred == 64
-    assert "PERMISSION_DENIED" in exc.value.args[0]
-    assert "nope" in exc.value.args[0]
+    # Pinned whole rather than by substring: this is the *part way through* wording, and the
+    # first-read one below has to stay distinguishable from it.
+    assert exc.value.args[0] == "server refused a read at offset 64: PERMISSION_DENIED nope"
+
+
+# --- the first read is a different event from a read that stopped part way (D-117) -----------
+#
+# `server refused a read at offset 0` described the request rather than the situation. At the
+# first read nothing has arrived, so the transfer did not stop part way -- the object opened
+# and would not be read at all, and the local file a `get` created for it is empty. What the
+# *cause* was cannot be recovered from the reply on the one server that reaches this code path:
+# OpenSSH answers a directory read with v3's catch-all and the message `Failure`. So the
+# sentence names a directory as something that arrives looking exactly like this, and does not
+# claim it -- see `tests/server_contract.py::a_directory_cannot_be_read_as_a_file` for the
+# three servers' three different answers.
+
+
+async def test_the_first_read_being_refused_says_so_and_names_a_likely_cause(tmp_path: Path):
+    server = RefusingFrom(bytes(256), after=0, code=StatusCode.FAILURE, message=b"Failure")
+    with pytest.raises(TransferError) as exc:
+        await fetch(server, tmp_path / "out", read_length=64, depth=1)
+
+    assert exc.value.args[0] == (
+        "server refused the first read, at offset 0: FAILURE Failure -- the handle opened and "
+        "then not one byte could be read, so nothing arrived and nothing was truncated. v3's "
+        "FAILURE says no more than 'no', and one thing that reaches here looking exactly like "
+        "this is a directory: a server that lets one be opened refuses at the read instead"
+    )
+    assert exc.value.offset == 0
+    assert exc.value.transferred == 0
+
+
+async def test_a_first_read_refused_with_a_status_that_means_something_gets_no_guess(
+    tmp_path: Path,
+):
+    """The hint is withheld for every code that carries its own meaning.
+
+    A directory does not answer `PERMISSION_DENIED` anywhere, so offering it here would be a
+    guess printed in the position a reader takes for a diagnosis. The first-read framing itself
+    still applies: nothing arrived, and this is not a transfer that stopped part way.
+    """
+    server = RefusingFrom(bytes(256), after=0)
+    with pytest.raises(TransferError) as exc:
+        await fetch(server, tmp_path / "out", read_length=64, depth=1)
+
+    assert exc.value.args[0] == (
+        "server refused the first read, at offset 0: PERMISSION_DENIED nope -- the handle "
+        "opened and then not one byte could be read, so nothing arrived and nothing was "
+        "truncated"
+    )
+
+
+async def test_a_refusal_of_the_first_range_after_data_arrived_is_not_called_the_first_read(
+    tmp_path: Path,
+):
+    """Concurrency breaks the invariant that offset 0 is handled first.
+
+    Replies arrive in whatever order the server sends them, so the refusal of the *first*
+    range can be handled after a later range has already delivered its bytes. "Not one byte
+    could be read" would then be false, and the condition guarding it is a conjunction for
+    exactly this case -- `reverse=True` makes the fake produce it on demand, which no real
+    server does.
+    """
+    server = RefusesOnlyTheFirstRange(bytes(256), reverse=True)
+    with pytest.raises(TransferError) as exc:
+        await fetch(server, tmp_path / "out", read_length=64, depth=4)
+
+    assert exc.value.transferred > 0, "the fake did not deliver a later range first"
+    # And a server that sends no message leaves no dangling space behind the code, which the
+    # download side did not used to strip and the upload side always did.
+    assert exc.value.args[0] == "server refused a read at offset 0: FAILURE"
+    assert exc.value.offset == 0
 
 
 async def test_a_silent_server_times_out_rather_than_hanging(tmp_path: Path):

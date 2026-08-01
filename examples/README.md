@@ -63,7 +63,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | ------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `quickstart.py`           | the shortest program that moves a file: `connect()` in one call, and a whole session's worth of types imported from `gantry_sftp` with nothing reaching into `gantry_sftp.codec` |
 | `blocking.py`             | `gantry_sftp.sync`: a `with` instead of an `async with`, `walk` / `glob` as ordinary iterators, `scandir` still a context manager because it still holds a handle, a typed error crossing the thread flat — and `BoundPortal`, for several sessions on one loop or a backend other than asyncio |
-| `download.py`             | `get()`, the `DownloadResult` it returns, the progress callback, and where the pipelining happens      |
+| `download.py`             | `get()`, the `DownloadResult` it returns, the progress callback, where the pipelining happens — and what a failed download leaves on your disk, since downloading a directory creates a file and then cannot fill it |
 | `file_object.py`          | `open_file()`: a header, a tail, a range and an append without staging the file -- plus `read_at` / `readinto_at` fanned out over one handle, which is what the cursor form cannot do, and why block size is the one performance decision this surface hands you |
 | `atomic_publish.py`       | `put()`, the publish mechanisms, `require_atomic`, and what `atomic=False` costs                       |
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
