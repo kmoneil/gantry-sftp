@@ -188,10 +188,15 @@ nothing.
 CHECK_FILE_REPLY = FIXTURES / "paramiko_check_file_reply.bin"
 """Paramiko 5.0.0's answer to it, same capture.
 
-`check-file` is in **no** secsh draft -- 05, 09 and 13 were each fetched and searched -- so
-this frame and paramiko's `SFTPServer._check_file` are the only sources for the layout. That
-makes the fixture load-bearing rather than a convenience: there is no document to fall back
-on if it goes stale.
+`check-file` **is** specified, in `draft-ietf-secsh-filexfer-extensions-00` 3 -- a different
+draft series from the filexfer one, which is why searching 05, 09 and 13 found nothing and this
+docstring used to conclude there was no document at all (D-118). The *request* matches that
+draft field for field, so the fixture beside this one has a specification behind it.
+
+**This reply does not.** The draft sends `string hash-algo-used` and then the digests, with no
+echoed extension name; paramiko echoes one. So for the reply direction the original sentence
+still holds -- this frame and `SFTPServer._check_file` are the only sources, and the fixture is
+load-bearing rather than a convenience.
 """
 
 
@@ -252,8 +257,65 @@ def test_a_reply_echoing_the_wrong_extension_name_is_refused():
     with pytest.raises(ProtocolError) as exc:
         CheckFileReply.from_reply(ExtendedReply(3, writer.getvalue()))
     assert exc.value.args[0] == (
-        "check-file reply echoed b'something-else' where b'check-file' was expected"
+        "check-file reply echoed b'something-else' where b'check-file' was expected; "
+        "draft-ietf-secsh-filexfer-extensions-00 3 sends the algorithm first and echoes no "
+        "name, so a server implementing that spelling arrives here, and this library "
+        "implements paramiko's, which echoes it"
     )
+
+
+def test_the_drafts_reply_shape_is_refused_and_the_message_names_it():
+    """The reply the *specification* describes, which is one field shorter than paramiko's.
+
+    `draft-ietf-secsh-filexfer-extensions-00` 3 is `string hash-algo-used` followed straight by
+    the digests -- no echoed extension name. Until D-118 this library's docstrings said the
+    extension had no specification at all, so this shape was not merely unimplemented, it was
+    not known to exist.
+
+    Refusing it is the decision (see `CheckFileReply`): telling the two apart is unambiguous,
+    but nothing the matrix can start implements the draft spelling, so the branch would ship
+    with a fake as its only witness. What is asserted here is that the refusal *says* that --
+    the failure a user hits is a working server meeting a client that implements the other
+    shape, and a bare "echoed b'sha256'" reads like a corrupt frame instead.
+
+    Written with real-looking digest bytes on purpose. The first draft of this test used a
+    two-field body and passed against a parser that read *both* strings before judging either
+    -- because with nothing after the algorithm the second read simply found the end. A whole
+    32-byte digest is what exposed the ordering: `b"\\xab\\xab\\xab\\xab"` is read as a length
+    of about two billion, so the parse died as "truncated before the algorithm name" and blamed
+    the frame for being short when it was exactly the length its own specification gives.
+    """
+    writer = WireWriter()
+    writer.write_string(b"sha256")  # the draft's first field is the algorithm
+    writer.write_bytes(b"\xab" * 32)
+    with pytest.raises(ProtocolError) as exc:
+        CheckFileReply.from_reply(ExtendedReply(3, writer.getvalue()))
+    assert exc.value.args[0].startswith(
+        "check-file reply echoed b'sha256' where b'check-file' was expected; "
+    )
+    assert "draft-ietf-secsh-filexfer-extensions-00 3" in exc.value.args[0]
+
+
+@pytest.mark.parametrize("digest_bytes", [b"", b"\x00" * 32, b"\xff" * 20, bytes(range(32))])
+def test_the_drafts_reply_is_refused_the_same_way_whatever_the_digests_are(digest_bytes: bytes):
+    # The point of checking the name before reading the algorithm: the diagnosis must not
+    # depend on whether the first four digest bytes happen to parse as a plausible length.
+    writer = WireWriter()
+    writer.write_string(b"sha1")
+    writer.write_bytes(digest_bytes)
+    with pytest.raises(ProtocolError) as exc:
+        CheckFileReply.from_reply(ExtendedReply(3, writer.getvalue()))
+    assert exc.value.args[0].startswith(
+        "check-file reply echoed b'sha1' where b'check-file' was expected; "
+    )
+
+
+def test_a_reply_truncated_before_the_extension_name_is_refused():
+    # An empty body cannot even name itself, which is a different failure from one that names
+    # itself and stops -- the message below is what tells them apart.
+    with pytest.raises(ProtocolError) as exc:
+        CheckFileReply.from_reply(ExtendedReply(3, b""))
+    assert exc.value.args[0] == "check-file reply is truncated before the extension name"
 
 
 def test_a_reply_truncated_before_the_algorithm_is_refused():

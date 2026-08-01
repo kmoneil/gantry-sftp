@@ -215,7 +215,12 @@ exists today:
 - wire primitives and an incremental frame splitter, so a payload is never copied on the way in
   and is copied exactly once on the way out — straight into the frame handed to the transport
 - the client state machine: handshake, deterministic request-id allocation, and
-  request/response correlation that survives out-of-order replies
+  request/response correlation that survives out-of-order replies. The handshake **refuses any
+  negotiated version but 3**, in both directions and with a different message for each: a server
+  answering below 3 is obeying `draft-ietf-secsh-filexfer-02` §4 and simply cannot be spoken to,
+  and one answering above 3 is violating it. v4 ATTRS puts a `byte type` ahead of every optional
+  field, so a v3 decoder reads a v4 reply as a shifted version of a different packet — which is
+  the silent-corruption shape, and is why this fails at the handshake rather than later
 - transports: `ssh -s sftp` as a subprocess, and `sftp-server` on a bare pipe
 - **one call to connect**: `connect(host, ...)` opens the `ssh` connection and a session over
   it, and `from gantry_sftp import ...` reaches every entry point and value type, so no
@@ -1485,7 +1490,9 @@ If you call `check_file()` yourself, leave `block_size` alone. It defaults to
 `CHECK_FILE_BLOCK_SIZE` (64 KiB) because that is the largest block paramiko answers correctly:
 above it the digests cover the wrong bytes and the server thread ends up in a loop it never
 leaves, and `block_size=0`, meaning "one digest over the whole range", is that same loop for any
-file over 64 KiB, and a `FAILURE` for any range under 256 bytes. Measured, not inferred.
+file over 64 KiB, and a `FAILURE` for any range under 256 bytes. Measured, not inferred — except
+the 256, which is the draft's own rule and therefore holds against every server, not just this
+one.
 
 Rung 3 is not free of decisions, so here is what it actually does:
 
@@ -1529,10 +1536,24 @@ with something else. The digest *count* is nowhere on the wire; it follows from 
 and the width of the chosen algorithm, so a payload that does not divide evenly is a
 `ProtocolError` rather than a set of silently misaligned digests.
 
-`check-file` is in no published SFTP draft: 05, 09 and 13 were each checked. The layout here
-was read off paramiko's implementation and off a captured frame, and it is committed as a
-golden fixture in both directions with a live test that re-runs the capture, because there is
-no document to notice a disagreement against.
+`check-file` **is** specified, in `draft-ietf-secsh-filexfer-extensions-00` §3 — a separate
+draft from the filexfer series, which is why searching filexfer 05, 09 and 13 for the name finds
+nothing. This paragraph used to say the extension had no document at all. It is the same draft
+OpenSSH's `PROTOCOL` links from §4.10 and §4.11 for `copy-data` and `home-directory`.
+
+The *request* here matches that draft field for field, and so does paramiko's. The **reply does
+not**: the draft sends `string hash-algo-used` and then the digests, while paramiko echoes
+`check-file` in front of the algorithm, and this library implements paramiko's — the only
+implementation of this extension it can actually reach. A server sending the draft's reply is
+refused with a message naming both shapes, rather than parsed on a guess. Both directions are
+committed as golden fixtures with a live test that re-runs the capture.
+
+Two more things the draft settles that this README previously credited to paramiko. The 256-byte
+floor under `block_size` is the specification's (`MUST NOT be smaller than 256 bytes`), so every
+implementation refuses below it. And the draft defines a second request, `check-file-name`, that
+takes a **path** instead of a handle — which is what would remove the extra `OPEN` that verifying
+an upload costs, since the handle a `put` holds is write-only and cannot be hashed. Nothing this
+project can reach implements it, so it is named here and not built.
 
 `examples/server_capabilities.py` runs this with no arguments, and shows the path you will
 almost certainly take: OpenSSH answers `OP_UNSUPPORTED`, and the example falls to the size

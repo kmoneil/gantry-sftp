@@ -1,15 +1,21 @@
-"""The codec is pure, and this is what makes that true rather than aspirational.
+"""Invariants asserted by parsing the shipped source, rather than by importing it.
 
-CLAUDE.md states the invariant: ``codec/`` imports nothing async, no sockets, no
-subprocess, no clock, no randomness. Bytes in, events out. Convention is not enforcement,
-so the invariant is asserted here by parsing the source rather than by importing it -- an
-import-based check would pass for a module that imports ``time`` lazily inside a function,
-which is exactly the shape this rule exists to catch.
+Mostly the codec's purity, which is what this file was built for. CLAUDE.md states that
+invariant: ``codec/`` imports nothing async, no sockets, no subprocess, no clock, no
+randomness. Bytes in, events out. Convention is not enforcement, so it is asserted here by
+parsing rather than importing -- an import-based check would pass for a module that imports
+``time`` lazily inside a function, which is exactly the shape the rule exists to catch.
+
+The last section is a different kind of rule with the same enforcement problem: a call that
+must always carry one keyword argument. Nothing about layering, and it lives here because
+parsing every shipped module is what both need and a second file to do it twice is worse than
+a docstring saying so.
 """
 
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -241,3 +247,98 @@ def imported_paths(module: Path) -> list[tuple[int, str]]:
         elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
             found.append((node.lineno, node.module))
     return found
+
+
+# --- one keyword that has to be on every call (D-118) -------------------------------------------
+
+
+def hashlib_calls(module: Path) -> list[tuple[int, str, bool]]:
+    """Every ``hashlib.<constructor>(...)`` call, with whether it passed the keyword.
+
+    Attribute calls on the ``hashlib`` name only, which is how all of them are spelled here.
+    ``from hashlib import new`` would slip past, so the test below refuses that import outright
+    rather than growing a second matcher for a spelling nothing uses.
+    """
+    tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+    found: list[tuple[int, str, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)):
+            continue
+        if func.value.id != "hashlib":
+            continue
+        opted_out = any(
+            keyword.arg == "usedforsecurity"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is False
+            for keyword in node.keywords
+        )
+        found.append((node.lineno, f"hashlib.{func.attr}", opted_out))
+    return found
+
+
+@pytest.mark.skipif(
+    "MUTANT_UNDER_TEST" in os.environ,
+    reason="mutmut mutates the keyword this asserts on, in a shadow tree this then reads",
+)
+@pytest.mark.parametrize("module", package_modules(), ids=lambda p: str(p.name))
+def test_every_hashlib_constructor_opts_out_of_the_security_policy(module: Path) -> None:
+    """``usedforsecurity=False`` on every one, and the site that lacked it is why (D-118).
+
+    A FIPS-enabled build refuses ``hashlib.new("md5")`` outright, and paramiko -- the only
+    server implementing ``check-file`` that this project can reach -- offers md5 and sha1 and
+    nothing else. So the flag is what makes rung 1 reachable at all on such a build.
+
+    **The failure it caused was a wrong diagnosis rather than a missing feature**, which is why
+    a rule beats a fix. Three of the four call sites had the keyword; the fourth sized the
+    digest the server named, inside a ``try`` that turns any ``ValueError`` into "server hashed
+    with b'md5', which this Python cannot size". That sentence blames the algorithm for a
+    policy, and it is the shape CLAUDE.md's "error messages name what failed" exists to stop.
+
+    It is also true on the merits at every site: these digests check that a transfer arrived
+    intact, which is not an authentication use and was never claimed to be.
+
+    **Skipped under mutmut, and it is the assertion rather than the rule that cannot run
+    there.** ``PACKAGE_ROOT`` resolves into ``mutants/``, which holds a *mutated* copy of every
+    module -- one variant per mutation, so ``_session.py`` grows past 36,000 lines -- and
+    flipping ``usedforsecurity=False`` to ``True`` is an ordinary keyword mutation mutmut
+    generates. So this reads real mutations of a fake tree and reports them as offenders,
+    against source nobody ships. Without the skip the lane cannot start at all: stats collection
+    stops on the first failure, which is the same symptom ``test_sync_facade.py`` has and the
+    same one ``test_argv.py``'s ``stacklevel`` assertion has, both recorded in ``pyproject.toml``.
+    Skipping kills nothing -- mutmut mutates function *bodies*, and this asserts on source text.
+    """
+    offenders = [(line, name) for line, name, opted_out in hashlib_calls(module) if not opted_out]
+    assert not offenders, (
+        f"{module.name} calls a hashlib constructor without usedforsecurity=False, which a "
+        f"FIPS build refuses for md5 and sha1: "
+        + ", ".join(f"{name} (line {line})" for line, name in offenders)
+    )
+
+
+def test_no_shipped_module_imports_a_hashlib_constructor_by_name() -> None:
+    """The matcher above reads ``hashlib.x(...)``, so a bare ``new(...)`` would be invisible.
+
+    Refused rather than matched: one spelling is what makes the rule checkable, and nothing in
+    the package wants the other.
+    """
+    offenders: list[str] = []
+    for module in package_modules():
+        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+        offenders += [
+            f"{module.name}:{node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "hashlib"
+        ]
+    assert not offenders, (
+        "import hashlib and call hashlib.new(...); a name imported from it escapes the "
+        "usedforsecurity check above: " + ", ".join(offenders)
+    )
+
+
+def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
+    """Guards the guard. A moved call would otherwise make every assertion above vacuous."""
+    total = sum(len(hashlib_calls(module)) for module in package_modules())
+    assert total >= 3, f"expected the verification ladder's hashlib calls, found {total}"

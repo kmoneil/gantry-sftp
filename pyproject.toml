@@ -451,6 +451,16 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # glob matches nothing, so the allowlist looks stale and the *inverse* test passes
 # vacuously. Worth naming rather than just ignoring: a test that resolves the repo root
 # does not merely fail here, it can also pass for the wrong reason.
+# `tests/test_layer_discipline.py` needs no ignore but carries one `skipif` for the same
+# family, added with D-118. Its hashlib rule parses every shipped module and asserts each
+# `hashlib.<constructor>` call passes `usedforsecurity=False`; under mutmut `PACKAGE_ROOT`
+# resolves into `mutants/`, which holds a mutated copy of every module — one variant per
+# mutation, so `_session.py` runs past 36,000 lines — and flipping that keyword to `True` is an
+# ordinary mutation mutmut generates. So the rule reads real mutations of a fake tree and
+# reports them as offenders against source nobody ships, and stats collection stops on the
+# first one. The file's other rows stay in the lane: mutations do not add forbidden imports or
+# `async def`, so they pass, and none of them can kill a mutant either — every assertion here
+# is on source text rather than behaviour.
 # `tests/test_argv.py` needs no ignore but does carry one `skipif`, and the reason belongs
 # with this list because the cause is the same family: mutmut wraps every mutated function in
 # a trampoline, so the *call stack* is one frame deeper than it is outside the lane. A test

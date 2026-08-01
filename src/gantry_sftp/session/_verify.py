@@ -39,7 +39,11 @@ range over 64 KiB, and a ``FAILURE`` for any range under 256 bytes. Both were me
 both come out of ``SFTPServer._check_file``:
 
 * it turns ``block_size=0`` into ``block_size=length``, then refuses anything below 256 with
-  ``"Block size too small"``. So a 100-byte prefix is unhashable in that spelling.
+  ``"Block size too small"``. So a 100-byte prefix is unhashable in that spelling. **That
+  floor is the specification's**, not paramiko's -- ``draft-ietf-secsh-filexfer-extensions-00``
+  3 says the block size "MUST NOT be smaller than 256 bytes" -- so every server implementing
+  this extension refuses it and the ``0`` spelling is unusable for a short range anywhere
+  (D-118).
 * its inner read loop is ``count += len(data)`` followed by ``offset += count`` -- cumulative,
   where it means ``offset += len(data)``. While a block fits in one read the two are equal, and
   ``chunklen`` is capped at 64 KiB, so **64 KiB is exactly the boundary where the two stop

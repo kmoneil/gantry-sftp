@@ -61,10 +61,17 @@ class StateError(SFTPError):
 
 
 class ProtocolError(SFTPError):
-    """The peer sent bytes that are not valid filexfer v3.
+    """The peer sent bytes this client cannot go on reading as filexfer v3.
 
-    This is always the *server's* fault or a transport corruption -- a well-formed request
+    Almost always the *server's* fault or a transport corruption -- a well-formed request
     cannot provoke it. It is not retryable.
+
+    **One case is nobody's fault**, and it is worth naming rather than filing under the
+    sentence above: a server that speaks only filexfer v2 answers the handshake with ``2``,
+    which ``draft-ietf-secsh-filexfer-02`` 4 requires of it. That server is correct and this
+    client still cannot use it, so the refusal arrives here -- the stream after it is not v3
+    and reading on would mean guessing at a layout. The message says which of the two happened;
+    see :func:`gantry_sftp.codec._codec._version_refusal`.
 
     Attributes:
         packet_type: Numeric packet type, if the frame got far enough to have one.

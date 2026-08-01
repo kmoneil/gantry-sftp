@@ -63,6 +63,10 @@ UNVERIFIABLE: dict[str, str] = {
     "SparseServer": "omits the permission bits",
     "SparseAndRefusing": "omits the permission bits and refuses the stat that would settle it",
     "TerseServer": "answers a listing without the attributes a real server includes",
+    "FakeServer": (
+        "negotiates a version it was told to and can fall silent after VERSION; a real server "
+        "implements the versions it implements and cannot be asked for another"
+    ),
     "Recipe": "a script of failures for the retry ladder, not a server",
     "Wire": "a transport-level fake, below the protocol entirely",
     "Rendezvous": "a barrier proving two requests overlapped; it models no server",

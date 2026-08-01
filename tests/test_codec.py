@@ -100,6 +100,66 @@ def test_a_second_version_is_refused():
     assert exc.value.args[0] == "server sent VERSION while READY; the handshake happens once"
 
 
+def test_a_version_below_ours_is_refused():
+    # The *legal* case, and the one that went unnoticed: draft 4 has the server answer with the
+    # lower of the two versions, so a v2-only server answering 2 is behaving correctly. Nothing
+    # checked this before 0.12, and the codec went to READY and spoke v3 at it.
+    codec = Codec()
+    codec.initiate()
+    with pytest.raises(ProtocolError) as exc:
+        codec.receive(encode(Version(2)))
+    assert exc.value.args[0] == (
+        "server negotiated filexfer v2 and this client implements only v3; "
+        "draft-ietf-secsh-filexfer-02 4 has the server answer with the lower of its own "
+        "version and ours, so this server is behaving correctly and simply cannot speak v3 -- "
+        "10.1 lists READLINK, SYMLINK and EXTENDED as v3 additions, and nothing tells a v3 "
+        "client which of its requests this server knows"
+    )
+
+
+def test_a_version_above_ours_is_refused():
+    # The violation. v4 ATTRS puts a `byte type` before every optional field, so a v3 decoder
+    # reads the type byte as the first byte of the size and every field after it is shifted.
+    codec = Codec()
+    codec.initiate()
+    with pytest.raises(ProtocolError) as exc:
+        codec.receive(encode(Version(4)))
+    assert exc.value.args[0] == (
+        "server negotiated filexfer v4, above the v3 this client implements; "
+        "draft-ietf-secsh-filexfer-02 4 requires the answer to be the lower of the two "
+        "versions, so a version above ours is a protocol violation -- and v4 ATTRS puts a "
+        "'byte type' ahead of every optional field (draft-04 5), which a v3 decoder reads as "
+        "the leading byte of whatever comes next"
+    )
+
+
+@pytest.mark.parametrize("version", [0, 1, 2, 4, 6, 0xFFFFFFFF])
+def test_a_refused_version_is_terminal(version: int):
+    # Not merely reported: the stream after it is not v3, so reading on would mean guessing at
+    # a layout. The latch is what stops the next `receive` carrying on.
+    codec = Codec()
+    codec.initiate()
+    with pytest.raises(ProtocolError):
+        codec.receive(encode(Version(version)))
+
+    assert codec.state is CodecState.FAILED
+    assert codec.server_version is None
+    assert codec.extensions == {}
+    with pytest.raises(ProtocolError) as exc:
+        codec.receive(encode(Version(3)))
+    assert exc.value.args[0] == "codec is in a failed state; the connection is not recoverable"
+
+
+def test_a_refused_version_does_not_adopt_the_extensions_it_advertised():
+    # The advertisement arrives on the same frame as the version. Recording it would leave
+    # `supports()` answering about a server we have just refused to speak to.
+    codec = Codec()
+    codec.initiate()
+    with pytest.raises(ProtocolError):
+        codec.receive(encode(Version(4, ((b"posix-rename@openssh.com", b"1"),))))
+    assert codec.extensions == {}
+
+
 def test_a_response_before_version_is_refused():
     codec = Codec()
     codec.initiate()

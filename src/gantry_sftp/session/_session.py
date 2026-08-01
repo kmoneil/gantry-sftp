@@ -842,7 +842,12 @@ class Session:
 
     @property
     def server_version(self) -> int | None:
-        """Protocol version negotiated."""
+        """Protocol version negotiated, which on a session that opened is always 3.
+
+        A constant, and reported anyway, because it is the *negotiated* value rather than a
+        library fact: what makes it constant is the handshake refusing anything else, and the
+        two are worth being able to tell apart when a connection did not open.
+        """
         return self._codec.server_version
 
     @property
@@ -2464,6 +2469,9 @@ class Session:
         it, so a WRITE-only handle -- the one an upload is holding -- answers ``FAILURE``
         with ``"Unable to hash file"``. Verifying something being uploaded therefore costs a
         second ``OPEN``, and cannot reuse the handle the bytes are going through.
+        ``draft-ietf-secsh-filexfer-extensions-00`` 3 defines a ``check-file-name`` taking a
+        *path* that would remove that second ``OPEN``; nothing this project can reach
+        implements it, so it is named rather than built (D-118).
 
         The digest count is not on the wire: the server sends one digest per block,
         concatenated, and how many that is follows from ``block_size`` and the digest size of
@@ -2528,7 +2536,16 @@ class Session:
 
         parsed = CheckFileReply.from_reply(reply)
         try:
-            digest_size = hashlib.new(parsed.algorithm.decode("ascii")).digest_size
+            # `usedforsecurity=False` for the reason every other hashlib call in this package
+            # carries it, and this was the one site that did not: a FIPS-enabled build refuses
+            # `hashlib.new("md5")` outright, and paramiko -- the only server implementing this
+            # extension -- offers nothing but md5 and sha1. Without the flag, rung 1 against it
+            # failed on such a build with "which this Python cannot size", which names the
+            # algorithm as the problem when the problem is the policy. It is also true on its
+            # own terms: this digest is a transfer check, not an authentication one.
+            digest_size = hashlib.new(
+                parsed.algorithm.decode("ascii"), usedforsecurity=False
+            ).digest_size
         except (ValueError, UnicodeDecodeError) as unknown:
             raise ProtocolError(
                 f"server hashed with {parsed.algorithm!r}, which this Python cannot size, "
@@ -5858,6 +5875,12 @@ async def open_session(
         TransferTimeoutError: If the handshake does not complete within ``request_timeout`` --
             either half of it, since the message names which one stalled.
         ConnectError: If the transport fails, carrying the child's stderr.
+        ProtocolError: If the server negotiates a filexfer version other than 3. Both
+            directions of that are refused and the message says which happened: a server
+            answering *below* 3 is obeying ``draft-ietf-secsh-filexfer-02`` 4 and is simply not
+            usable by this client, and one answering *above* 3 is violating it. Neither can be
+            spoken to with a v3 decoder, so the connection ends here rather than at whichever
+            later packet the layout difference happened to corrupt.
     """
     codec = Codec()
     # Inside the handshake deadline rather than before it. INIT is nine bytes and cannot fill a
@@ -5931,6 +5954,13 @@ async def _negotiate(transport: Transport, codec: Codec, deadline: float | None)
     The deadline spans the handshake rather than each chunk of it: per-chunk would let a
     server dribble one byte at a time indefinitely and never trip, which is a hang wearing a
     timeout's clothes.
+
+    **The version itself is the codec's to judge, not this function's**, and it is judged --
+    :meth:`~gantry_sftp.codec.Codec.receive` refuses anything but 3. It belongs there because
+    that is the layer that would misparse: a v4 ATTRS carries a ``byte type`` this decoder has
+    no place for. What this function has to get right is only that the refusal travels as the
+    ``ProtocolError`` it is, rather than being swallowed into the ``TimeoutError`` handler
+    below and reported as a server that went quiet.
     """
     if deadline is None:
         await transport.send(codec.initiate())

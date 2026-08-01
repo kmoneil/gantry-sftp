@@ -183,7 +183,10 @@ class ServerDiagnosis:
         server: The identified implementation's label.
         server_description: What the quirks profile says it is.
         server_version: The vendor's own version string, where it sends one.
-        protocol_version: What the handshake settled on.
+        protocol_version: What the handshake settled on, which is 3 whenever ``reached`` is
+            true -- the handshake refuses any other version. A server that negotiates another
+            one shows up as ``reached=False`` with the refusal in ``error``, which is the
+            report a ``doctor`` run against such a server is for.
         extensions: Every advertised name, in the order the server sent them.
         implemented: Which of those this library can actually send.
         unimplemented: Advertised names nothing here uses.

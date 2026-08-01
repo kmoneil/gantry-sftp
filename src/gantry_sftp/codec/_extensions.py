@@ -7,10 +7,16 @@ tables, the decode registry and the event union stay untouched. That is delibera
 per-extension packet type would put the completeness sweep in DESIGN.md's way for every new
 extension, and the wire has exactly one type byte here.
 
-Every layout in this module was read off a real ``sftp-server`` (OpenSSH 10.0p2) on
+Every OpenSSH layout in this module was read off a real ``sftp-server`` (OpenSSH 10.0p2) on
 2026-07-26, not recalled and not taken from documentation alone. ``SYMLINK`` is why: its
 field order contradicts the draft, and a layout written from memory passes every unit test
 while corrupting every real operation. The probe output is in DESIGN.md 13.
+
+``check-file`` is the exception and is qualified where it is defined: OpenSSH does not
+implement it, so there was no ``sftp-server`` to read it off. Its request comes from
+``draft-ietf-secsh-filexfer-extensions-00`` 3 and from paramiko, which agree; its *reply* is
+paramiko's, which the draft does not describe. This sentence used to be missing and the
+docstring below claimed the extension had no specification at all -- see D-118.
 
 Measured, and each one changed the code above this layer:
 
@@ -279,19 +285,26 @@ class CheckFile:
     spellings answer ``OP_UNSUPPORTED``, measured -- so every use of this degrades to a size
     check or a full re-read.
 
-    **Sourced from paramiko's ``SFTPServer._check_file``**, which is the implementation this
-    library has actually spoken to, and from the frames that exchange produced. It is in no
-    secsh draft: ``draft-ietf-secsh-filexfer-05``, ``-09`` and ``-13`` were each fetched and
-    searched, and the string does not appear in any of them. Paramiko's own comment says it
-    "comes from v6 protocol"; whatever document that refers to, it is not one of those three,
-    so the layout below cites code rather than a specification.
+    **It does have a specification, and this docstring said it did not** (D-118). The document
+    is ``draft-ietf-secsh-filexfer-extensions-00`` 3, *File Hashing* -- a separate draft from
+    the filexfer series, which is why searching ``-05``, ``-09`` and ``-13`` for the string
+    found nothing and the absence was read as the extension having no source at all. It is the
+    same draft OpenSSH's ``PROTOCOL`` links from 4.10 and 4.11 for ``copy-data`` and
+    ``home-directory``, both of which this package already carries constants for, so it was one
+    hyperlink from a file this project validates against. Paramiko's own comment guesses "comes
+    from v6 protocol"; the guess was wrong and repeating it here was worse than saying nothing.
 
-    Two spellings exist in the wild and this is the paramiko one. The extension it advertises
-    is ``check-file``, unsuffixed, taking a **handle**; other documents describe separate
-    ``check-file-handle`` and ``check-file-name`` requests. A server advertising those needs
-    its own type, not a flag on this one.
+    **The request below matches that draft field for field.** What the draft calls the request
+    is ``check-file-handle``, with a sibling ``check-file-name`` taking a *path* instead, and
+    ``check-file`` is the name both are advertised under. Paramiko implements one request
+    called ``check-file`` that takes a handle, which is the shape here.
 
-    Body layout::
+    The path-taking sibling is worth knowing about rather than merely noting: it is the answer
+    to verifying an upload without a second ``OPEN``, since the handle a ``put`` is holding is
+    write-only and cannot be hashed. Nothing implements it that this project can reach, so it
+    is not built -- see :class:`CheckFileReply` for the rule that decides that.
+
+    Body layout, from that draft and from the frames paramiko produced::
 
         string  "check-file"
         string  handle
@@ -310,8 +323,10 @@ class CheckFile:
         start_offset: First byte to hash.
         length: Bytes to hash, or ``0`` for the rest of the file.
         block_size: Bytes per digest, or ``0`` for a single digest over the whole range.
-            Paramiko refuses anything below 256 with ``FAILURE``, so this is not a free
-            parameter -- it is 0 or at least 256.
+            Not a free parameter: **the draft requires at least 256** ("The block-size MUST
+            NOT be smaller than 256 bytes"), and paramiko enforces it with ``FAILURE``. This
+            docstring credited that floor to paramiko until D-118, which made a rule of the
+            protocol read as one implementation's fussiness.
     """
 
     extension_name: ClassVar[bytes] = CHECK_FILE_NAME
@@ -353,9 +368,10 @@ class CheckFile:
 
 @dataclass(frozen=True, slots=True)
 class CheckFileReply:
-    """The ``EXTENDED_REPLY`` to a :class:`CheckFile`, and its last field is the trap.
+    """The ``EXTENDED_REPLY`` to a :class:`CheckFile`, and the two shapes it comes in.
 
-    Body layout, after the ``uint32`` request id the packet already carries::
+    Body layout **as paramiko sends it**, which is what this parses, after the ``uint32``
+    request id the packet already carries::
 
         string  "check-file"    -- the extension name, echoed back
         string  algorithm       -- which one the server chose
@@ -368,8 +384,23 @@ class CheckFileReply:
     of the frame. Reading it as a ``string`` consumes four bytes of the first digest as a
     length and then overruns.
 
+    **The draft's reply has no echoed name** (D-118). ``draft-ietf-secsh-filexfer-extensions-00``
+    3 specifies ``string hash-algo-used`` followed straight by the digests, so a server written
+    to the specification sends one field fewer than this reads, and :meth:`from_reply` refuses
+    it -- loudly, naming both shapes, rather than parsing the algorithm as a name and four bytes
+    of the first digest as a length.
+
+    **Accepting both was considered and declined**, and the reason is the Definition of Done's
+    rather than a judgement about difficulty: telling them apart is trivial and unambiguous --
+    no hash algorithm is called ``check-file`` -- but there is no server behind the second
+    branch. Nothing in ``live-tests/matrix.py`` implements this extension except paramiko, so a
+    draft-shaped parser would ship with a fake as its only witness, which is the thing D-114
+    exists to say is not evidence. If an implementation of the draft spelling turns up, the
+    branch is four lines and the fixture is what unlocks it.
+
     One digest per block, concatenated, so the count follows from the request's ``block_size``
-    and the digest size of the chosen algorithm rather than being stated anywhere.
+    and the digest size of the chosen algorithm rather than being stated anywhere. Both shapes
+    agree on that part.
 
     Attributes:
         request_id: The request this answers.
@@ -385,13 +416,41 @@ class CheckFileReply:
     def from_reply(cls, reply: ExtendedReply) -> Self:
         """Parse an ``EXTENDED_REPLY`` body as a check-file answer.
 
+        **The name is checked before the algorithm is read, and the order is the fix rather
+        than a tidy-up** (D-118). Reading both first and judging afterwards meant a
+        draft-shaped reply almost never reached the name check: its first field really is a
+        string, so that read succeeds, and the *second* read then takes the leading four bytes
+        of a raw digest as a length. For a sha256 digest that is a number around two billion,
+        so the parse died as "truncated before the algorithm name" -- which blames the frame
+        for being short when it is exactly as long as its own specification says. Checking the
+        name first makes the diagnosis independent of what the digest bytes happen to be.
+
         Raises:
-            ProtocolError: If the echoed name is not ``check-file``, or the body is truncated
-                before the algorithm.
+            ProtocolError: If the body is truncated before the name, if the name is not
+                ``check-file``, or if it is truncated before the algorithm. The middle one is
+                most likely a server implementing the draft's reply rather than paramiko's, so
+                the message says so -- it is the one refusal here that names a *working* server
+                rather than a broken one.
         """
         reader = WireReader(reply.data)
         try:
             name = bytes(reader.read_string())
+        except ProtocolError as truncated:
+            raise ProtocolError(
+                "check-file reply is truncated before the extension name",
+                request_id=reply.request_id,
+                raw_frame=reply.data,
+            ) from truncated
+        if name != CHECK_FILE_NAME:
+            raise ProtocolError(
+                f"check-file reply echoed {name!r} where {CHECK_FILE_NAME!r} was expected; "
+                f"draft-ietf-secsh-filexfer-extensions-00 3 sends the algorithm first and "
+                f"echoes no name, so a server implementing that spelling arrives here, and "
+                f"this library implements paramiko's, which echoes it",
+                request_id=reply.request_id,
+                raw_frame=reply.data,
+            )
+        try:
             algorithm = bytes(reader.read_string())
         except ProtocolError as truncated:
             raise ProtocolError(
@@ -399,12 +458,6 @@ class CheckFileReply:
                 request_id=reply.request_id,
                 raw_frame=reply.data,
             ) from truncated
-        if name != CHECK_FILE_NAME:
-            raise ProtocolError(
-                f"check-file reply echoed {name!r} where {CHECK_FILE_NAME!r} was expected",
-                request_id=reply.request_id,
-                raw_frame=reply.data,
-            )
         return cls(
             request_id=reply.request_id,
             algorithm=algorithm,

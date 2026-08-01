@@ -425,7 +425,12 @@ class SyncSession:
 
     @property
     def server_version(self) -> int | None:
-        """The protocol version in force."""
+        """The protocol version in force, which is always 3 on a session that opened.
+
+        Kept rather than dropped for being a constant: it is the *negotiated* value, and the
+        handshake refusing anything else is what makes it one. A caller reading it is asking
+        what was agreed, and the honest answer is the agreed number.
+        """
         return self._session.server_version
 
     @property

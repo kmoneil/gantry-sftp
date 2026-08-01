@@ -103,6 +103,8 @@ async def connect(
         AuthenticationError: If the server rejected every credential offered.
         HostKeyError: If the host key is unknown or has changed.
         ConnectError: For any other failure to connect, carrying OpenSSH's stderr verbatim.
+        ProtocolError: If the server negotiates a filexfer version other than 3 -- see
+            :func:`~gantry_sftp.session.open_session`, which is where the handshake happens.
     """
     async with (
         open_ssh_transport(

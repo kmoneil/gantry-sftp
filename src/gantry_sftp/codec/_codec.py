@@ -36,6 +36,7 @@ from enum import Enum, auto
 from types import MappingProxyType
 from typing import override
 
+from gantry_sftp.codec._constants import PROTOCOL_VERSION
 from gantry_sftp.codec._framing import DEFAULT_MAX_FRAME_LENGTH, FrameSplitter
 from gantry_sftp.codec._packets import (
     Init,
@@ -161,11 +162,15 @@ class Codec:
 
     # --- sending -------------------------------------------------------------------------
 
-    def initiate(self, version: int = 3) -> bytes:
+    def initiate(self, version: int = PROTOCOL_VERSION) -> bytes:
         """Encode the INIT that opens the connection.
 
         Args:
-            version: Protocol version to request.
+            version: Protocol version to request. Any value may be *asked* for, but the only
+                one this codec can decode is :data:`~gantry_sftp.codec.PROTOCOL_VERSION`, so
+                :meth:`receive` refuses a VERSION that negotiates anything else -- see
+                :func:`_version_refusal` for the two ways that happens and why neither can be
+                spoken to with a v3 decoder.
 
         Returns:
             Bytes to write to the transport.
@@ -299,6 +304,8 @@ class Codec:
             raise self._fail(
                 f"server sent VERSION while {self._state.name}; the handshake happens once"
             )
+        if packet.version != PROTOCOL_VERSION:
+            raise self._fail(_version_refusal(packet.version))
         self._state = CodecState.READY
         self._version = packet.version
         # Last wins, matching how a dict of advertised pairs would be built anywhere else.
@@ -355,3 +362,40 @@ class Codec:
         reachable path could tell the two apart.
         """
         return ProtocolError(message, request_id=request_id)
+
+
+def _version_refusal(version: int) -> str:
+    """Why a negotiated version that is not ours cannot be spoken to. Two cases, two messages.
+
+    **Nothing checked this until 0.12**, and the gap was not that a violation went unreported
+    -- it was that the *legal* case went unreported. ``draft-ietf-secsh-filexfer-02`` 4 has the
+    server answer with the lower of its own version and the client's, so a server that speaks
+    only v2 answering ``2`` is behaving correctly and this client then spoke v3 at it anyway.
+
+    The two cases are kept apart because the remedies are opposite: below is a server doing the
+    right thing that this client cannot use, above is a server violating the handshake. Both
+    are terminal -- :meth:`Codec.receive` latches :attr:`CodecState.FAILED` on the
+    :class:`~gantry_sftp.exceptions.ProtocolError` this builds -- because a stream whose ATTRS
+    layout we have guessed wrong is not one to keep reading.
+
+    Args:
+        version: What the server put in its VERSION reply.
+
+    Returns:
+        The message, naming the version, the rule it broke or kept, and what goes wrong next.
+    """
+    if version < PROTOCOL_VERSION:
+        return (
+            f"server negotiated filexfer v{version} and this client implements only "
+            f"v{PROTOCOL_VERSION}; draft-ietf-secsh-filexfer-02 4 has the server answer with "
+            f"the lower of its own version and ours, so this server is behaving correctly and "
+            f"simply cannot speak v3 -- 10.1 lists READLINK, SYMLINK and EXTENDED as v3 "
+            f"additions, and nothing tells a v3 client which of its requests this server knows"
+        )
+    return (
+        f"server negotiated filexfer v{version}, above the v{PROTOCOL_VERSION} this client "
+        f"implements; draft-ietf-secsh-filexfer-02 4 requires the answer to be the lower of "
+        f"the two versions, so a version above ours is a protocol violation -- and v4 ATTRS "
+        f"puts a 'byte type' ahead of every optional field (draft-04 5), which a v3 decoder "
+        f"reads as the leading byte of whatever comes next"
+    )

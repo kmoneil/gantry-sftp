@@ -164,6 +164,12 @@ EXTENSION_CHECK_FILE = "check-file"
 all three spellings, measured. Paramiko's server advertises exactly this, unsuffixed, with a
 value of ``md5,sha1``; ProFTPD's ``mod_sftp`` implements the same idea as ``checkFile``.
 
+Specified in ``draft-ietf-secsh-filexfer-extensions-00`` 3, which is a different document from
+the filexfer series and is where ``copy-data`` and ``home-directory`` above come from too --
+OpenSSH's ``PROTOCOL`` links it for both. This is the *advertised* name; the draft's two
+requests are ``check-file-handle`` and ``check-file-name``, and paramiko implements one
+handle-taking request under the advertised name. See :class:`~gantry_sftp.codec.CheckFile`.
+
 It is rung 1 of DESIGN.md 6's verification ladder and the only rung that verifies *content*
 without moving the bytes again."""
 

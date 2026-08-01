@@ -81,12 +81,17 @@ class FakeServer:
         content: bytes = b"",
         silent_after_version: bool = False,
         never_version: bool = False,
+        version: int = 3,
     ) -> None:
         self.extensions = extensions
         self.limits = limits
         self.content = content
         self.silent_after_version = silent_after_version
         self.never_version = never_version
+        self.version = version
+        """What to answer INIT with. Not 3 only for the handshake-refusal tests -- a real
+        server cannot be asked to negotiate a version it does not implement, which is why
+        this one is exempt from the contract suite by name."""
         self.seen: list[object] = []
         self._splitter = FrameSplitter()
         self._outbox = bytearray()
@@ -104,7 +109,7 @@ class FakeServer:
         self.seen.append(packet)
         if isinstance(packet, Init):
             if not self.never_version:
-                self._reply(Version(3, self.extensions))
+                self._reply(Version(self.version, self.extensions))
             return
         if self.silent_after_version:
             return
@@ -158,6 +163,45 @@ async def test_a_session_negotiates_and_reads_limits():
         assert sftp.server_version == 3
         assert sftp.limits.max_read_length == 261120
         assert LIMITS_EXTENSION in sftp.extensions
+
+
+@pytest.mark.parametrize(
+    ("version", "marker"),
+    [
+        (2, "this server is behaving correctly and simply cannot speak v3"),
+        (4, "a version above ours is a protocol violation"),
+    ],
+)
+async def test_a_server_that_negotiates_another_version_is_refused_at_the_handshake(
+    version: int, marker: str
+):
+    """The codec's refusal has to reach the caller, and `_negotiate` is where it could be lost.
+
+    That method wraps the handshake in `fail_after` and catches `TimeoutError`, so the failure
+    travelling as a `ProtocolError` is what keeps it flat and typed rather than surfacing as a
+    timeout at the end of `request_timeout`. Asserted here rather than only in the codec
+    because the two halves are in different modules and only this one is what a user sees.
+    """
+    server = FakeServer(version=version)
+    with pytest.raises(ProtocolError) as exc:
+        async with open_session(server):  # type: ignore[arg-type]
+            pytest.fail("the handshake must not complete against another version")
+    assert marker in exc.value.args[0]
+    assert f"filexfer v{version}" in exc.value.args[0]
+
+
+async def test_a_refused_handshake_never_probes_limits():
+    """The limits probe is the first thing after the handshake and it must not be reached.
+
+    It sends an `EXTENDED`, which is a v3 addition (draft 10.1) -- exactly the packet a v2
+    server would not understand. A refusal that still sent one would be the bug wearing the
+    fix's clothes.
+    """
+    server = FakeServer(version=2)
+    with pytest.raises(ProtocolError):
+        async with open_session(server):  # type: ignore[arg-type]
+            pytest.fail("unreachable")
+    assert [type(packet).__name__ for packet in server.seen] == ["Init"]
 
 
 async def test_a_server_that_does_not_advertise_limits_is_not_asked():

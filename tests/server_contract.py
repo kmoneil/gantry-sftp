@@ -150,6 +150,26 @@ def guarantee(
     return register
 
 
+# --- handshake -----------------------------------------------------------------------------
+
+
+@guarantee()
+async def the_handshake_settles_on_filexfer_v3(sftp, root: bytes) -> None:
+    """Every server here answers INIT with 3, which is what makes refusing anything else safe.
+
+    Since 0.12 the codec **refuses** a negotiated version that is not 3 -- v4 ATTRS puts a
+    `byte type` ahead of every optional field, so a v3 decoder cannot read one, and a v2 server
+    has no READLINK, SYMLINK or EXTENDED to answer with. That refusal is only correct if real
+    servers do in fact settle on 3, and a fake asserting it against itself proves nothing: the
+    fake is where the number is chosen. asyncssh implements up to v6 and paramiko v3, so this
+    is a genuine question of the matrix rather than a formality.
+
+    Needs no capability: the answer is established before the session exists.
+    """
+    del root
+    assert sftp.server_version == 3
+
+
 # --- listing -------------------------------------------------------------------------------
 
 
