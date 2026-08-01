@@ -338,6 +338,46 @@ async def test_put_tree_and_get_tree_preserve_files_and_the_directories_they_cre
             )
 
 
+async def test_by_default_neither_tree_preserves_timestamps(tmp_path: Path):
+    """The tree half of the default, which only the single-file half had (D-105, twelfth slice).
+
+    `preserve_times=False` on `get_tree` and `put_tree` was held in place by exactly one thing:
+    `test_sync_facade.py` comparing the async signature against the sync twin. That is agreement
+    between two surfaces rather than a statement about the value, so changing both would have
+    gone unnoticed -- and mutmut cannot see that file at all, which is how a documented public
+    default came to have no lane-visible test.
+
+    The consequence is the one `test_by_default_a_transfer_stamps_the_destination_with_now`
+    states for a single file, multiplied by a tree: a landing zone whose consumer collects
+    "modified since X" never picks up a file wearing last year's date.
+    """
+    needs_real_server()
+    source = tmp_path / "src"
+    build_tree(source)
+    uploaded = tmp_path / "up"
+    downloaded = tmp_path / "down"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        await sftp.put_tree(source, str(uploaded).encode())
+        # **Downloaded from the stamped source, not from what the upload just landed.** The
+        # first version of this read `uploaded`, which `put_tree` had already re-stamped with
+        # now -- so a `get_tree` that preserved would have copied *that*, and "not the known
+        # time" was true either way. The mutation survived and the test could not have failed.
+        await sftp.get_tree(str(source).encode(), downloaded)
+
+    for base in (uploaded, downloaded):
+        for relative in ("a.txt", "sub/b.txt"):
+            assert int((base / relative).stat().st_mtime) != KNOWN_MTIME, (
+                f"{base.name}/{relative} was stamped with the source's time without being asked"
+            )
+    # And the sources are untouched, so this is a fact about the copies rather than about
+    # something the walk did on the way past.
+    assert int((source / "a.txt").stat().st_mtime) == KNOWN_MTIME
+
+
 async def test_neither_tree_stamps_the_root_the_caller_named(tmp_path: Path):
     # Restamping a directory the caller already had is a side effect on something they did
     # not ask to have modified. Stated as a test because "we only touch what we create" is

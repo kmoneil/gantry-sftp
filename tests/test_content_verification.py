@@ -49,6 +49,7 @@ from gantry_sftp.codec import (
     Init,
     LStat,
     Open,
+    OpenFlag,
     Read,
     Stat,
     Status,
@@ -59,7 +60,7 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.exceptions import TransferError
+from gantry_sftp.exceptions import ProtocolError, TransferError, UnsupportedError
 from gantry_sftp.session import (
     CHECK_FILE_BLOCK_SIZE,
     ContentCheck,
@@ -943,3 +944,181 @@ async def test_a_real_server_resume_degrades_and_still_finishes_the_file(tmp_pat
     assert result.resume_check is ResumeCheck.UNAVAILABLE
     assert result.transferred == len(content) - 70_000, "only the remainder should have moved"
     assert partial.read_bytes() == content
+
+
+# --- what `check_file` puts on the wire, and what it says when the answer is wrong ------------
+#
+# D-105's twelfth slice. `Session.check_file` carried 30 survivors, and they are this register's
+# established theme for the fifth time: the *arguments* and the *carried state* of the errors,
+# where the messages were already pinned. Two of them are the sharpest kind -- the offered
+# algorithm name-list could be uppercased or emptied and nothing looked, and a server that
+# supports none of what we offer answers FAILURE, which this library degrades to
+# `ContentCheck.UNAVAILABLE`. So a mutation there turns rung 1 off everywhere while every test
+# still passes, which is the silent downgrade DESIGN.md 6 exists to make impossible.
+
+
+class ChoosesTheAlgorithm(HashingServer):
+    """Answers `check-file` with an algorithm and digests of our choosing.
+
+    `HashingServer` always answers `sha1` over the bytes it holds, which is what makes it a
+    *conformant* fake. The two failures below are ones a conformant server cannot be asked for:
+    an algorithm this Python cannot size, and a digest run that does not divide by the size of
+    the algorithm the server named.
+    """
+
+    def __init__(self, *, holds: bytes, algorithm: bytes, digests: bytes) -> None:
+        super().__init__(holds=holds)
+        self.algorithm = algorithm
+        self.digests = digests
+
+    def _check_file(self, packet: Extended) -> None:
+        request = CheckFile.from_extended(packet)
+        self.checks.append(request)
+        writer = WireWriter()
+        writer.write_string(CHECK_FILE)
+        writer.write_string(self.algorithm)
+        writer.write_bytes(self.digests)
+        self._reply(ExtendedReply(request.request_id, writer.getvalue()))
+
+
+class AnswersWithTheWrongPacket(HashingServer):
+    """Answers `check-file` with a STATUS of OK -- well-formed, and not an `EXTENDED_REPLY`."""
+
+    def _check_file(self, packet: Extended) -> None:
+        self.checks.append(CheckFile.from_extended(packet))
+        self._reply(Status(packet.request_id, StatusCode.OK))
+
+
+async def test_check_file_offers_the_algorithms_this_library_actually_supports():
+    """The name-list on the wire, pinned as a value rather than as "some list".
+
+    Uppercasing it is a legal string and an illegal name-list: the server matches the names it
+    knows, finds none, and answers `FAILURE` -- which this library reports as
+    `ContentCheck.UNAVAILABLE`, the same answer a server with no `check-file` at all gives. So
+    rung 1 would stop running everywhere and every existing test would still pass.
+
+    The three defaults beside it are pinned in the same call because they are what the
+    *extension* means: `0` length is "to the end of the file" and `0` offset is "from the
+    start", and either one becoming `1` silently hashes a different range than the caller asked
+    about -- which a digest comparison then reports as corruption.
+    """
+    payload = b"payload " * 64
+    server = HashingServer(holds=payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        _ = await sftp.check_file(handle)
+
+    assert len(server.checks) == 1
+    asked = server.checks[0]
+    assert asked.algorithms == b"sha256,sha1,md5", "the offered name-list is a wire value"
+    assert asked.start_offset == 0
+    assert asked.length == 0, "0 is the wire spelling of 'to the end of the file'"
+    assert asked.block_size == CHECK_FILE_BLOCK_SIZE
+
+
+async def test_check_file_forwards_every_argument_it_was_given():
+    """Each argument proven to *arrive*, which is not what pinning the defaults proves.
+
+    `CheckFile` carries the same defaults this method does, so dropping any one of these from
+    the request would send the right value anyway whenever the caller wanted the default. It is
+    the caller who asked for something else that loses -- the fifth time this card has found a
+    forwarded argument nobody proved arrives, after `_retry`'s tunables and `put_tree`'s
+    `max_depth`. Four distinct values, so a *shift* onto the neighbouring field cannot pass
+    either.
+    """
+    payload = b"payload " * 64
+    server = HashingServer(holds=payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        _ = await sftp.check_file(
+            handle, algorithms=b"sha1", start_offset=8, length=256, block_size=512
+        )
+
+    asked = server.checks[0]
+    assert asked.algorithms == b"sha1"
+    assert asked.start_offset == 8
+    assert asked.length == 256
+    assert asked.block_size == 512
+
+
+async def test_a_settled_unsupported_refuses_the_next_call_without_asking_again():
+    """The cache, asserted on the exception it raises rather than only on the round trip saved.
+
+    `test_a_refused_check_file_is_asked_once_for_the_whole_session` already pins the round trip.
+    What nothing pinned is what the caller is handed the second time: the message, and the
+    `code` that makes `except UnsupportedError` mean `OP_UNSUPPORTED` rather than "some
+    refusal". Both could be nulled or deleted with the round-trip assertion still passing.
+    """
+    server = HashingServer(holds=b"payload", advertises=True, implements=False)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        with pytest.raises(UnsupportedError) as first:
+            _ = await sftp.check_file(handle)
+        with pytest.raises(UnsupportedError) as second:
+            _ = await sftp.check_file(handle)
+
+    assert len(server.checks) == 1, "the second call re-asked a settled question"
+    assert second.value.args[0] == (
+        "this server has already answered OP_UNSUPPORTED for check-file"
+    )
+    assert second.value.code == StatusCode.OP_UNSUPPORTED
+    # The first came from the server's own STATUS and the second from the cache, so they are
+    # different code paths reaching the same class -- and only the second is this method's own.
+    assert first.value.code == StatusCode.OP_UNSUPPORTED
+
+
+async def test_a_check_file_answered_with_the_wrong_packet_names_what_was_expected():
+    payload = b"payload " * 64
+    server = AnswersWithTheWrongPacket(holds=payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.check_file(handle)
+
+    assert exc.value.args[0] == ("server answered with STATUS OK where EXTENDED_REPLY was expected")
+
+
+async def test_an_algorithm_this_python_cannot_size_is_reported_with_the_frame_it_came_on():
+    """The reply names an algorithm `hashlib` does not know, so the digests cannot be split.
+
+    A `ProtocolError` rather than a `ServerError`: the server answered, and what it said cannot
+    be read. The state matters more than the sentence -- `request_id` is what ties this to a
+    frame in a dump, and it could be nulled with the message still reading perfectly.
+    """
+    server = ChoosesTheAlgorithm(holds=b"payload " * 64, algorithm=b"whirlpool9", digests=b"x" * 8)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.check_file(handle)
+
+    assert exc.value.args[0] == (
+        "server hashed with b'whirlpool9', which this Python cannot size, so its 8 digest "
+        "bytes cannot be split"
+    )
+    assert exc.value.request_id == server.checks[0].request_id
+
+
+async def test_digests_that_do_not_divide_by_the_algorithm_carry_the_frame_that_proves_it():
+    """sha1 is 20 bytes; 30 is not a whole number of them, so the reply is malformed.
+
+    `raw_frame` is the field that makes this reportable to whoever wrote the server, and it is
+    the one most easily dropped: the message is complete without it and nothing else looks.
+    """
+    server = ChoosesTheAlgorithm(holds=b"payload " * 64, algorithm=b"sha1", digests=b"z" * 30)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.check_file(handle)
+
+    assert exc.value.args[0] == (
+        "30 digest bytes do not divide into 20-byte digests, so this is not b'sha1' output"
+    )
+    assert exc.value.request_id == server.checks[0].request_id
+    assert exc.value.raw_frame is not None
+    assert exc.value.raw_frame.endswith(b"z" * 30)
