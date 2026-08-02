@@ -897,6 +897,16 @@ async def test_an_upload_records_the_publish_mechanism(
     assert len(finished) == 1
     assert "bytes=512" in finished[0]
     assert "mechanism=" in finished[0]
+    # And as *data*, which is what D-98 was for and what the substring above cannot see: a
+    # `mechanism` of `None` renders as `mechanism=None` and still contains "mechanism=". The
+    # two identifying fields go the same way -- an upload's record names both ends or a
+    # reader has one line per transfer and no way to tell which transfer.
+    record = next(r for r in caplog.records if r.getMessage().startswith("put ok "))
+    fields = record_fields(record)
+    assert fields["operation"] == "put"
+    assert fields["local"] == str(source)
+    assert fields["remote"] == str(tmp_path / "published.csv")
+    assert fields["mechanism"] == "POSIX_RENAME"
 
 
 async def test_a_tree_download_records_its_counts(caplog: pytest.LogCaptureFixture, tmp_path: Path):

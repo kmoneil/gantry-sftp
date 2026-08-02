@@ -533,11 +533,44 @@ async def test_in_place_over_an_existing_file_sets_the_mode_before_the_first_wri
         await sftp.put(source, b"/target.bin", publish=Publish(atomic=False), mode=PRIVATE)
 
     first_write = index_of_first(server, lambda packet: isinstance(packet, Write))
+    narrowing = [
+        packet
+        for packet in server.seen
+        if isinstance(packet, FSetStat) and packet.attrs.permissions is not None
+    ]
     narrowed_at = index_of_first(
         server,
         lambda packet: isinstance(packet, FSetStat) and packet.attrs.permissions is not None,
     )
     assert narrowed_at < first_write
+    # **The value, not just the timing.** The narrowing sends `mode & CREATE_BITS`, and `&`
+    # is one character from `|` -- which widens it to 0o777 for the whole write and is then
+    # tidied up by the final pass, so the end state below is identical and the window this
+    # test exists for is wide open in the middle of it.
+    assert narrowing[0].attrs.permissions == PRIVATE
+    assert server.modes[b"/target.bin"] == PRIVATE
+
+
+async def test_an_in_place_upload_creates_a_new_destination_with_the_mode_asked_for(
+    tmp_path: Path,
+):
+    """The creating OPEN carries the mode on this path too, and its result reports it.
+
+    The atomic path's creating `OPEN` is asserted above; in place it is a second construction
+    site and was held to nothing, so the mode could have been dropped from it entirely -- which
+    is D-56a's original bug, surviving on the one path where `open(2)` is the only thing that
+    can close the window for a file that does not exist yet.
+    """
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    server = ModeServer()
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, b"/target.bin", publish=Publish(atomic=False), mode=PRIVATE)
+
+    opens = [packet for packet in server.seen if isinstance(packet, Open)]
+    assert [packet.attrs.permissions for packet in opens] == [PRIVATE]
+    assert result.mode == PRIVATE
     assert server.modes[b"/target.bin"] == PRIVATE
 
 
@@ -933,3 +966,24 @@ async def test_chmod_follows_a_symlink_which_is_what_chmod_does(tmp_path: Path):
         await sftp.chmod(str(link).encode(), PRIVATE)
 
     assert bits(target) == PRIVATE
+
+
+async def test_a_refused_narrowing_names_the_destination_it_was_narrowing(tmp_path: Path):
+    """The in-place path's early `_set_mode` is a second call site with its own `path=`.
+
+    The atomic path's is asserted above; this one runs *before* the first write, against the
+    destination rather than a staging name, and could stop naming its file with nothing
+    failing. It is also the site where knowing the name matters most -- the file already
+    existed, it still holds the caller's old bytes, and the refusal is what stops it being
+    filled with new ones under the old permissions.
+    """
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    server = ModeServer(files={b"/target.bin": b"old content"}, refuse_fsetstat=True)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as refusal:
+            await sftp.put(source, b"/target.bin", publish=Publish(atomic=False), mode=PRIVATE)
+
+    assert refusal.value.path == b"/target.bin"
+    assert not any(isinstance(packet, Write) for packet in server.seen), "bytes went out anyway"

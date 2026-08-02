@@ -4516,7 +4516,7 @@ class Session:
         )
 
     async def _fill_and_close(
-        self, upload: _Upload, handle: bytes, path: bytes, *, start_offset: int = 0
+        self, upload: _Upload, handle: bytes, path: bytes, *, start_offset: int
     ) -> tuple[int, Durability, TimePreservation, int | None]:
         """Push the file through an open handle, set its metadata, flush it, and close it.
 

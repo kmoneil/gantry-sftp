@@ -1584,3 +1584,28 @@ async def test_the_first_byte_of_a_downloaded_file_is_inside_a_reread_too(tmp_pa
 
     assert refusal.value.offset == 0
     assert refusal.value.transferred == 16
+
+
+@pytest.mark.parametrize("atomic", [True, False], ids=["atomic", "in-place"])
+async def test_the_resume_gate_runs_the_rung_the_upload_asked_for(tmp_path: Path, atomic: bool):
+    """`verify=` reaches the gate from both publish paths, and each builds the call itself.
+
+    A gate handed nothing falls through to rung 1, which is absent from nearly every endpoint
+    -- so an upload that asked for `REREAD`, the rung that works everywhere, would report the
+    adopted prefix as `UNAVAILABLE` and complete on the size match alone. That is the exact
+    failure the gate exists to prevent, arrived at by dropping one argument, and the two paths
+    are separate construction sites: proving one proves nothing about the other.
+    """
+    payload = b"correct " * 16
+    server = HashingServer(holds=payload[:64], advertises=False, implements=False)
+    source = tmp_path / "right.bin"
+    source.write_bytes(payload)
+    policy = Publish(atomic=atomic, staging_name=b".staged") if atomic else Publish(atomic=False)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(
+            source, b"/incoming/file.bin", publish=policy, resume=True, verify=Verify.REREAD
+        )
+
+    assert result.resume_check is ResumeCheck.MATCHED
+    assert server.checks == [], "rung 2 was asked for and rung 1 was attempted"

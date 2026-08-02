@@ -8,7 +8,9 @@ are run against a real server, and neither substitutes for the other.
 
 from __future__ import annotations
 
+import errno
 import os
+import stat
 from contextlib import aclosing
 from pathlib import Path
 
@@ -1233,6 +1235,10 @@ COLLIDING_TREE = {
 COLLIDING_FILES = {b"/root/README.md": b"AAA", b"/root/readme.md": b"bbbbb"}
 
 
+def bits(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
 def fold_case(path: Path) -> tuple[int, int]:
     """Stand in for a case-folding filesystem, for the cases a hard link cannot reach.
 
@@ -1455,3 +1461,92 @@ async def test_a_relative_upload_tree_on_a_rootless_server_is_refused(tmp_path: 
     assert caught.value.feature == "uploading a tree"
     # MKDIR of the parents is the first thing put_tree would have sent, and it did not.
     assert not [packet for packet in server.seen if isinstance(packet, MkDir)]
+
+
+async def test_two_collisions_are_reported_in_the_plural(tmp_path: Path):
+    """The message inflects, and only the singular had ever been produced.
+
+    Not a typo hunt: one refused name and several are different situations for whoever reads
+    the error -- a single case-fold clash is a filename to fix, and a tree full of them is the
+    wrong destination filesystem. The plural branch is also where the count comes from, so a
+    message that says "1 remote path" for four of them is actively misleading.
+    """
+    destination = tmp_path / "out"
+    destination.mkdir()
+    for lower, upper in ((b"readme.md", b"README.md"), (b"notes.txt", b"NOTES.txt")):
+        first = destination / upper.decode()
+        first.write_text("placeholder")
+        os.link(first, destination / lower.decode())
+
+    tree = {
+        b"/root": (
+            named(b"README.md", REGULAR, 3),
+            named(b"readme.md", REGULAR, 5),
+            named(b"NOTES.txt", REGULAR, 3),
+            named(b"notes.txt", REGULAR, 5),
+        ),
+    }
+    files = {
+        b"/root/README.md": b"AAA",
+        b"/root/readme.md": b"bbbbb",
+        b"/root/NOTES.txt": b"CCC",
+        b"/root/notes.txt": b"ddddd",
+    }
+    server = TreeServer(tree=tree, files=files)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    assert caught.value.args[0] == (
+        "2 remote paths resolved onto a local file this download had already written, "
+        "and were refused rather than overwriting it"
+    )
+    assert len(caught.value.collisions) == 2
+
+
+async def test_a_tree_download_creates_its_files_private(tmp_path: Path):
+    """The same default `get` has, on the path that creates the file somewhere else.
+
+    A tree's destination file is created by the claim -- before the collision check, which is
+    what makes that check mean anything -- so its mode is decided there and *not* by the
+    transfer's own open, which finds the file already present and has its mode argument
+    ignored. That makes this the only thing standing between a downloaded tree and
+    `0o666 & ~umask`, and it is a different line of code from the one the single-file test
+    covers.
+    """
+    destination = tmp_path / "out"
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await sftp.get_tree(b"/root", destination)
+
+    assert bits(destination / "README.md") == 0o600
+    assert bits(destination / "readme.md") == 0o600
+
+
+async def test_a_symlink_in_the_destination_is_refused_rather_than_written_through(
+    tmp_path: Path,
+):
+    """`O_NOFOLLOW` on the claim, and what it catches that the transfer's own open does not.
+
+    A link pointing out of the destination is refused earlier, by the containment check that
+    resolves it, and a link onto an existing sibling is refused twice over -- here and again
+    when the transfer opens the file. The case that belongs to *this* open is the **dangling**
+    one: the claim runs `O_CREAT` before the transfer exists, so without the flag it creates
+    the link's target, an empty file at a name the server never sent, and only then does the
+    transfer refuse. The refusal is identical either way; the litter is what says which open
+    made it.
+    """
+    destination = tmp_path / "out"
+    destination.mkdir()
+    planted = destination / "never-sent.txt"
+    (destination / "README.md").symlink_to(planted)
+
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(OSError) as refused:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    assert refused.value.errno == errno.ELOOP
+    assert not planted.exists(), "the claim created a file through the link"

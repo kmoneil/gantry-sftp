@@ -61,6 +61,7 @@ from gantry_sftp.session import (
     Durability,
     Publish,
     PublishMechanism,
+    ResumeCheck,
     SizeCheck,
     UploadResult,
     open_session,
@@ -962,6 +963,12 @@ async def test_require_atomic_refuses_a_target_that_appears_during_the_transfer(
         "leaving a window with no file at all"
     )
     assert isinstance(exc.value.__cause__, ServerError), "the refusal that triggered it is kept"
+    # The structured half, which the pre-flight refusal above asserts and this one did not --
+    # and this is the site a caller is more likely to branch on, because it fires after the
+    # bytes have moved and a retry loop has to tell it from a transient failure.
+    assert exc.value.feature == "atomic publish"
+    assert exc.value.missing == (EXTENSION_POSIX_RENAME,)
+    assert exc.value.path == TARGET
     assert bytes(server.files[TARGET]) == b"somebody else got there first"
     assert STAGED not in server.files, "the staging file was left behind"
 
@@ -1098,6 +1105,12 @@ async def test_require_fsync_probes_before_the_bytes_and_refuses_on_the_answer(s
     )
     assert exc.value.feature == "durable upload"
     assert exc.value.missing == (EXTENSION_FSYNC,)
+    # It names the *staging* file, which is the one that was opened and probed. Asserted as
+    # "present and not the destination" because the staging name carries fresh randomness --
+    # pinning the literal would need a fixed `staging_name=`, and what matters here is that the
+    # field is filled with the file the probe actually touched.
+    assert exc.value.path is not None
+    assert exc.value.path != TARGET
     assert "Write" not in server.kinds(), "bytes were moved before the refusal"
     assert not server.files, "the staging file was left behind"
 
@@ -1132,6 +1145,9 @@ async def test_a_known_refusal_makes_require_fsync_refuse_before_anything(
         "require_fsync=True and this server has already answered OP_UNSUPPORTED for "
         "fsync@openssh.com, so nothing can promise the bytes reached stable storage"
     )
+    assert exc.value.feature == "durable upload"
+    assert exc.value.missing == (EXTENSION_FSYNC,)
+    assert exc.value.path == b"/home/user/second.csv"
     assert len(server.kinds()) == sent, "the refusal cost a round trip it did not need"
 
 
@@ -1152,6 +1168,12 @@ async def test_in_place_require_fsync_refuses_after_the_bytes_and_says_so(source
         "require_fsync=True and this server did not perform fsync@openssh.com, so nothing can "
         "promise the bytes reached stable storage"
     )
+    assert exc.value.feature == "durable upload"
+    assert exc.value.missing == (EXTENSION_FSYNC,)
+    # And **no path**, which is the answer rather than an omission: this refusal comes from the
+    # flush, which holds a handle and not a name. The other two `durable upload` sites name the
+    # file they opened; asserting the absence here is what stops one being copied to the other.
+    assert exc.value.path is None
     assert bytes(server.files[TARGET]) == b"id,total\n1,42\n", "the bytes were written"
 
 
@@ -1636,3 +1658,131 @@ async def test_put_tree_refuses_a_staging_name_rather_than_colliding_every_file(
         "would all stage under one name and overwrite each other. Leave it unset to get a "
         "generated hidden sibling per file."
     )
+
+
+# --- what `put` forwards, and what its result reports -------------------------------------------
+#
+# D-105's fifteenth slice. Three shapes, all of them arguments this method's job is to pass on:
+# its own name into the errors two shared helpers build, the caller's `depth=` into the
+# scheduler, and the fields of the `UploadResult` the in-place path assembles by position.
+
+
+async def test_put_names_itself_in_the_arguments_it_refuses(source: Path):
+    """Both refusals are built by shared helpers that take the caller's name as data.
+
+    `resolve_mode` and `publish_from_legacy` are called by four transfer methods each, so the
+    name in the message is the only thing telling a reader which call was wrong -- and each
+    caller passes its own as a literal. They are unit-tested with the name spelled out by the
+    test, which proves the helper and not the wiring: every caller could pass `get()`, or
+    `None`, and only a call through the real method would notice.
+    """
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TypeError) as bad_mode:
+            _ = await sftp.put(source, TARGET, mode=True)
+        with pytest.raises(TypeError) as both_spellings:
+            _ = await sftp.put(source, TARGET, publish=Publish(atomic=True), atomic=False)
+
+    assert bad_mode.value.args[0].startswith("put() mode= must be ")
+    assert both_spellings.value.args[0].startswith("put() got both publish= and the legacy ")
+    assert not server.files, "a refused argument moved bytes"
+
+
+async def test_put_forwards_its_own_depth_rather_than_the_session_s(source: Path):
+    """`depth=` on the call is per-transfer, and dropping it silently restores the session's.
+
+    The two are different numbers on purpose -- a session sets the default for everything on
+    the connection and a call tunes one transfer -- so an upload that quietly ignored the
+    argument would report success while running at a depth the caller had overridden, which is
+    a memory bound (D-101) as much as a rate. Proven with a depth the scheduler refuses,
+    because an invalid value is the cheapest thing that separates "the call's depth arrived"
+    from "the session's did".
+    """
+    server = PublishingServer()
+    async with open_session(server, depth=8) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as refusal:
+            _ = await sftp.put(source, TARGET, depth=0)
+
+    assert refusal.value.args[0] == "depth must be at least 1, got 0"
+
+
+async def test_an_advertised_fsync_is_taken_at_its_word_rather_than_probed(source: Path):
+    """The probe exists for the server that did *not* advertise, and costs a round trip.
+
+    `_probe_durability` returns immediately when the extension is in the server's list, so a
+    `require_fsync=True` upload against a server that advertises it flushes once -- at the end,
+    where the flush belongs. Skipping that check sends a second `fsync`, on an empty staging
+    file, on every durable upload. Nothing looked at the count, so the saving was free to
+    disappear.
+    """
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(
+            source, TARGET, publish=Publish(staging_name=STAGED, require_fsync=True)
+        )
+
+    assert result.durability is Durability.FSYNCED
+    assert server.fsynced == [STAGED], "the advertised extension was probed as well as used"
+
+
+async def test_an_in_place_result_reports_the_destination_it_wrote(source: Path):
+    """The in-place `UploadResult` is assembled positionally, and three of its fields are free.
+
+    `remote_path` and `size_check` can each be nulled with every other assertion in this file
+    still passing -- the atomic path's result is asserted in several places and this one's was
+    not, so the two constructions had drifted apart in what they were held to. A result that
+    reports `None` for the file it just wrote is worse than useless to a caller logging one
+    line per transfer. (`mode` is the third, and it needs a server that takes an `FSETSTAT`:
+    `test_modes.py` asserts it where the rest of that field's behaviour lives.)
+    """
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(source, TARGET, publish=Publish(atomic=False))
+
+    assert result.remote_path == TARGET
+    assert result.size_check is SizeCheck.MATCHED
+    assert result.mechanism is PublishMechanism.IN_PLACE
+
+
+async def test_an_atomic_result_reports_the_resume_gate_it_ran(source: Path, tmp_path: Path):
+    """The gate's answer is a positional field, and dropping it defaults to `SKIPPED`.
+
+    `SKIPPED` is the honest answer for an upload that adopted nothing, which is what every
+    other test here does -- so the field reads correctly in all of them while carrying nothing.
+    A resume that *did* adopt a prefix and could not prove it must say `UNAVAILABLE`, because
+    the whole point of the value is telling "there was nothing to check" apart from "there was
+    and we could not".
+    """
+    payload = b"id,total\n1,42\n"
+    partial = tmp_path / "partial.csv"
+    _ = partial.write_bytes(payload)
+    server = PublishingServer(extensions=(POSIX_RENAME_NAME,), files={STAGED: payload[:5]})
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(partial, TARGET, publish=Publish(staging_name=STAGED), resume=True)
+
+    assert result.resume_check is ResumeCheck.UNAVAILABLE
+    assert bytes(server.files[TARGET]) == payload
+
+
+async def test_a_stalled_upload_is_bounded_by_the_session_s_idle_timeout(source: Path):
+    """The session's watchdog reaches the upload scheduler, which is where a stall happens.
+
+    `test_upload.py` proves the scheduler honours an idle timeout when it is handed one; this
+    proves `put` hands it the session's. Without it a server that accepts the OPEN and then
+    stops answering leaves the call outstanding for the shipped default of 60 s -- or forever,
+    if the session was opened with no timeout at all, which is a supported spelling.
+    """
+
+    class StopsAfterTheOpen(PublishingServer):
+        def _on_write(self, packet: Write) -> None:
+            return
+
+    server = StopsAfterTheOpen()
+    async with open_session(server, idle_timeout=0.05) as sftp:  # type: ignore[arg-type]
+        # The outer deadline is the assertion, not a safety net: an upload that fell back to
+        # the 60 s default would still raise the same error, eventually, and a test with no
+        # ceiling could not tell the two apart -- it would just be slow.
+        with anyio.fail_after(5):
+            with pytest.raises(TransferTimeoutError):
+                _ = await sftp.put(source, TARGET, publish=Publish(staging_name=STAGED))
