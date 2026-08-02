@@ -148,10 +148,24 @@ class _Uploader:
         self._exchange = exchange
         self._handle = handle
         self._source = source
-        self._span = span
-        """Where this run starts and where the local file ends. A non-zero start is a resume,
-        and the bytes below it are assumed to be on the server already -- a claim the session
-        makes and this layer cannot check."""
+
+        if span.end is None:
+            raise ValueError("an upload span must have an end; a sender knows its own length")
+        self._start = span.start
+        """Where this run starts. A non-zero start is a resume, and the bytes below it are
+        assumed to be on the server already -- a claim the session makes and this layer
+        cannot check."""
+
+        self._end = span.end
+        """Where the payload ends.
+
+        :class:`Span` is shared with the download side, where this is ``None`` for a server
+        that would not report a size and the run reads until EOF. **That shape does not exist
+        in this direction**: a sender knows how many bytes it is sending, from ``os.fstat`` in
+        :func:`upload_handle` and from ``len(payload)`` in :func:`write_range_from`. So it is
+        refused above rather than carried into the request loop as three branches no caller
+        can take -- which is what it was, and the mutation lane could not tell the difference.
+        """
 
         self._write_length = write_length
         self._idle_timeout = idle_timeout
@@ -170,13 +184,18 @@ class _Uploader:
             self._finished.set()
 
     async def _send_all(self) -> None:
-        offset = self._span.start
-        while self._span.end is None or offset < self._span.end:
-            length = self._write_length
-            if self._span.end is not None:
-                length = min(length, self._span.end - offset)
+        offset = self._start
+        while offset < self._end:
+            # Clamped, so a source that has *grown* since it was measured cannot push bytes
+            # past the end this run promised -- `os.pread` answers with whatever the file
+            # holds now, not with what `os.fstat` saw when the transfer started.
+            length = min(self._write_length, self._end - offset)
             payload = await self._source.read_at(offset, length)
             if not payload:
+                # And the other direction: a source that has *shrunk* runs out before the span
+                # does. What was acknowledged is what arrived, and `run` returns it. `break`
+                # rather than `return`, because the two lines below are what let `run` finish
+                # at all -- leaving without them parks it on an event nothing will set.
                 break
 
             await self._window.acquire()
@@ -199,7 +218,7 @@ class _Uploader:
             if self._progress is not None:
                 # Absolute, not per-run: "4.5 GB of 9 GB" is what a caller displays, and
                 # "0.5 GB of 9 GB" after a resume is a lie about how much is left.
-                self._progress(self._span.start + self._acknowledged, self._span.end)
+                self._progress(self._start + self._acknowledged, self._end)
 
     async def _next_reply(self) -> Completed:
         if self._idle_timeout is None:
@@ -251,8 +270,8 @@ class _Uploader:
             the span starts at 0. Progress, by contrast, is reported absolutely.
         """
         if self._progress is not None:
-            self._progress(self._span.start, self._span.end)
-        if self._span.end is not None and self._span.start >= self._span.end:
+            self._progress(self._start, self._end)
+        if self._start >= self._end:
             # Nothing left: an empty file, or a resume of one already fully uploaded. Both
             # are successes that move no bytes, and neither may open a task group to find out.
             return 0
@@ -267,7 +286,7 @@ class _Uploader:
             raise _flatten_exception_group(group) from None
 
         if self._progress is not None:
-            self._progress(self._span.start + self._acknowledged, self._span.end)
+            self._progress(self._start + self._acknowledged, self._end)
         return self._acknowledged
 
 

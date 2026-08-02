@@ -29,6 +29,8 @@ from gantry_sftp.session import (
     open_session,
     upload_handle,
 )
+from gantry_sftp.session._download import Span
+from gantry_sftp.session._upload import Source, _Uploader
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -377,6 +379,174 @@ async def test_a_start_offset_at_the_end_writes_nothing_at_all(tmp_path: Path):
     server = WritableServer()
     assert await push(server, source, write_length=64, start_offset=64) == 0
     assert server.writes == []
+
+
+# --- the span and the source can disagree, because a local file is not frozen -------------------
+#
+# Both entry points measure the source once -- `os.fstat` in `upload_handle`, `len(payload)` in
+# `write_range_from` -- and then read it again, request by request, for as long as the transfer
+# runs. A local file may change size in between, and the sender has one guard for each direction:
+# the clamp for a file that grew, the `break` for one that shrank. Neither had a test, because
+# every test above drives a source whose extent *is* the span's end -- which is precisely the
+# case where neither guard does anything.
+
+
+class ScriptedSource:
+    """A `Source` whose extent is set independently of the span it is driven with.
+
+    Which is the point of it: a `DescriptorSource` over a file the same test stat'd cannot
+    disagree with its own span, so no test written against one can reach either guard.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.reads: list[tuple[int, int]] = []
+
+    async def read_at(self, offset: int, length: int) -> bytes:
+        self.reads.append((offset, length))
+        return self.data[offset : offset + length]
+
+
+async def drive(server: WritableServer, source: Source, *, span: Span, **kwargs) -> int:
+    """Run one `_Uploader` over a source of the test's choosing.
+
+    `push` cannot serve: it goes through `upload_handle`, which derives the span from the file
+    it is about to read, so the two can never disagree there.
+    """
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+        with dispatcher.exchange() as exchange:
+            uploader = _Uploader(
+                dispatcher.codec,
+                exchange,
+                HANDLE,
+                source,
+                span=span,
+                write_length=kwargs.pop("write_length", 64),
+                depth=kwargs.pop("depth", 4),
+                idle_timeout=kwargs.pop("idle_timeout", 5.0),
+                progress=kwargs.pop("progress", None),
+                remote_path=kwargs.pop("remote_path", None),
+            )
+            return await uploader.run()
+
+
+async def test_a_source_that_ran_out_early_stops_rather_than_waiting_for_ever():
+    # A local file truncated after it was stat'd. The sender must stop and report what was
+    # acknowledged -- and it must stop by *breaking*, since the two statements after the loop
+    # are what release `run` from the event it is waiting on. Leaving the loop any other way
+    # is not a wrong answer, it is no answer: the upload hangs until the caller gives up.
+    server = WritableServer()
+    source = ScriptedSource(b"x" * 100)
+
+    with anyio.fail_after(5):
+        sent = await drive(server, source, span=Span(0, 400), write_length=64)
+
+    assert sent == 100
+    assert server.writes == [(0, 64), (64, 36)]
+    assert bytes(server.stored) == b"x" * 100
+
+
+async def test_a_source_that_grew_after_it_was_measured_is_not_sent_past_the_span():
+    # The other direction, and the one that would corrupt rather than hang: `os.pread` answers
+    # with what the file holds *now*, so without the clamp a file that gained bytes mid-transfer
+    # would push them past the end this run promised -- writing more than it returns, at offsets
+    # the caller was never told about.
+    server = WritableServer()
+    source = ScriptedSource(b"y" * 500)
+
+    sent = await drive(server, source, span=Span(0, 100), write_length=64)
+
+    assert sent == 100
+    assert server.writes == [(0, 64), (64, 36)]
+    assert len(server.stored) == 100
+
+
+async def test_the_sender_stops_at_the_end_rather_than_reading_a_zero_length_chunk():
+    # The bound is `<` and not `<=`, which nothing could see from the outside: one extra
+    # iteration asks for `min(write_length, 0)` bytes, gets the empty answer that ends the loop
+    # anyway, and produces an identical transfer. It is one worker-thread hop per file, and the
+    # only place it is visible is the read log.
+    server = WritableServer()
+    source = ScriptedSource(b"z" * 128)
+
+    sent = await drive(server, source, span=Span(0, 128), write_length=64)
+
+    assert sent == 128
+    assert source.reads == [(0, 64), (64, 64)]
+
+
+@pytest.mark.parametrize(("start", "end"), [(0, 0), (100, 100)], ids=["empty", "resumed-at-end"])
+async def test_an_upload_with_nothing_to_do_reports_progress_once_and_reads_nothing(
+    start: int, end: int
+):
+    # The early return is not an optimisation with the same observable answer: without it the
+    # run opens a task group, falls straight back out, and calls the progress callback a second
+    # time with the numbers it already reported. A caller rendering a bar sees the same position
+    # twice for a file that never moved.
+    server = WritableServer()
+    source = ScriptedSource(b"q" * end)
+    seen: list[tuple[int, int | None]] = []
+
+    sent = await drive(
+        server,
+        source,
+        span=Span(start, end),
+        progress=lambda transferred, total: seen.append((transferred, total)),
+    )
+
+    assert sent == 0
+    assert seen == [(start, end)]
+    assert source.reads == []
+    assert server.writes == []
+
+
+async def test_an_upload_span_with_no_end_is_refused_rather_than_read_until_eof():
+    # `Span` is shared with the download side, where `end is None` means "the server would not
+    # say how big it is, read until EOF". A sender has no such case, and the three branches that
+    # used to carry the shape through this module were unreachable from either entry point --
+    # which is why the lane could mutate all three without a test noticing.
+    server = WritableServer()
+
+    with pytest.raises(ValueError) as excinfo:
+        _ = await drive(server, ScriptedSource(b"q" * 10), span=Span(0, None))
+
+    assert excinfo.value.args[0] == "an upload span must have an end; a sender knows its own length"
+
+
+class TruncatingServer(WritableServer):
+    """Shrinks the local file the moment the first write arrives.
+
+    The same shape as `ScriptedSource`'s, driven through `upload_handle` against a real file and
+    a real `os.pread` -- because a fake source proves the sender handles a short read, and only
+    the filesystem can prove a short read is what a truncated file gives it.
+    """
+
+    def __init__(self, path: Path, *, keep: int) -> None:
+        super().__init__()
+        self._path = path
+        self._keep = keep
+
+    def _on_write(self, packet: Write) -> None:
+        if not self.writes:
+            os.truncate(self._path, self._keep)
+        super()._on_write(packet)
+
+
+async def test_a_real_file_truncated_mid_transfer_stops_at_what_is_left(tmp_path: Path):
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"w" * 400)
+    server = TruncatingServer(source, keep=100)
+
+    with anyio.fail_after(5):
+        sent = await push(server, source, write_length=64)
+
+    # The first request was read and sent before the truncation landed, so what survives is
+    # everything up to the new end -- and the transfer *completes*, reporting the smaller
+    # number, rather than failing or stalling.
+    assert sent == 100
+    assert bytes(server.stored) == b"w" * 100
+    assert sum(length for _, length in server.writes) == 100
 
 
 # --- progress ---------------------------------------------------------------------------------
