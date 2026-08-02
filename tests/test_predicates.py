@@ -603,3 +603,47 @@ def test_a_denied_predicate_arrives_flat_on_the_blocking_surface(tmp_path: Path)
             assert denied.value.args[0] == "server returned PERMISSION_DENIED: Permission denied"
     finally:
         closed.chmod(0o755)
+
+
+async def test_makedirs_walks_up_to_the_ancestor_it_actually_needs(tmp_path: Path):
+    """The walk strips a trailing separator and nothing else, which a name can be mistaken for.
+
+    `parent.rstrip(b"/")` takes a *set* of characters, so widening it by one letter silently
+    truncates any ancestor whose name ends in that letter -- and the failure is a second
+    `MKDIR` of the original path against a parent that still is not there. A directory called
+    `dataX` is not a contrived name; the point is that the strip is about the separator and
+    must not be about the name.
+    """
+    needs_real_server()
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        await sftp.makedirs(remote(tmp_path / "dataX" / "inner"))
+
+    assert (tmp_path / "dataX" / "inner").is_dir()
+    assert not (tmp_path / "data").exists(), "the ancestor's name was truncated"
+
+
+async def test_makedirs_stops_at_the_root_rather_than_walking_past_it(tmp_path: Path):
+    """The recursion's terminating condition, and the one that is not about `exist_ok`.
+
+    A refusal one level under `/` leaves nothing to recurse into: the parent strips to the
+    empty string, and the guard re-raises the server's own answer. Getting the condition wrong
+    turns a clean `PERMISSION_DENIED` into a walk toward an empty path -- an error about a name
+    the caller never used, or no termination at all.
+    """
+    needs_real_server()
+    if os.geteuid() == 0:
+        pytest.skip("running as root, where creating a directory at / succeeds")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(ServerError) as refused:
+            await sftp.makedirs(b"/gantry-sftp-should-not-be-able-to-create-this")
+
+    assert refused.value.code == int(StatusCode.PERMISSION_DENIED)
+    assert refused.value.path == b"/gantry-sftp-should-not-be-able-to-create-this"

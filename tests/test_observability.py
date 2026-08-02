@@ -929,6 +929,13 @@ async def test_a_tree_download_records_its_counts(caplog: pytest.LogCaptureFixtu
     assert "directories=1" in finished[0]
     assert "bytes=3" in finished[0]
     assert "skipped=0" in finished[0]
+    # And the two identifying fields, which the counts above say nothing about: a record that
+    # names neither end is one line per tree with no way to tell which tree.
+    fields = record_fields(
+        next(r for r in caplog.records if r.getMessage().startswith("get_tree ok "))
+    )
+    assert fields["remote"] == str(source)
+    assert fields["local"] == str(tmp_path / "copy")
 
 
 # --- the credential, through every surface at once ----------------------------------------
@@ -1090,3 +1097,70 @@ async def test_a_reconnect_is_the_one_thing_this_library_warns_about(
     assert isinstance(fields["attempt"], int)
     assert isinstance(fields["attempts"], int)
     assert isinstance(fields["delay"], float)
+
+
+async def test_a_tree_upload_records_its_counts_as_data(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+):
+    """`put_tree` had no record test at all, and `get_tree`'s only read the message.
+
+    Four counters, each of which is a *key* as well as a value -- and a mutated key still
+    renders into the sentence, so a substring assertion on "files=2" cannot see `record["FILES"]`
+    while a field assertion can. These are the numbers an operator's dashboard groups by, which
+    is D-98's whole argument for the record carrying data rather than a formatted line.
+    """
+    requires_sftp_server()
+    source = tmp_path / "tree"
+    (source / "sub").mkdir(parents=True)
+    (source / "one.csv").write_bytes(b"a")
+    (source / "sub" / "two.csv").write_bytes(b"bb")
+
+    with caplog.at_level(logging.DEBUG, logger="gantry_sftp.session"):
+        async with (
+            open_local_server_transport(cwd=tmp_path) as transport,
+            open_session(transport) as sftp,
+        ):
+            _ = await sftp.put_tree(source, str(tmp_path / "uploaded").encode())
+
+    record = next(r for r in caplog.records if r.getMessage().startswith("put_tree ok "))
+    fields = record_fields(record)
+    assert fields["operation"] == "put_tree"
+    assert fields["files"] == 2
+    assert fields["directories"] == 1
+    assert fields["bytes"] == 3
+    assert fields["skipped"] == 0
+
+
+async def test_a_tree_removal_records_what_it_removed(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+):
+    """`rmtree` is the operation with the least to show for itself and the most to answer for.
+
+    It returns counts and deletes the evidence, so the record is the only durable account of
+    what a run took away -- and it had no test. The operation's own *name* is in the mutation
+    set too: `operation(logger, "rmtree", ...)` could be handed anything, and every message
+    assertion elsewhere is about some other operation.
+    """
+    requires_sftp_server()
+    victim = tmp_path / "doomed"
+    (victim / "sub").mkdir(parents=True)
+    (victim / "one.csv").write_bytes(b"a")
+    (victim / "sub" / "two.csv").write_bytes(b"bb")
+
+    with caplog.at_level(logging.DEBUG, logger="gantry_sftp.session"):
+        async with (
+            open_local_server_transport(cwd=tmp_path) as transport,
+            open_session(transport) as sftp,
+        ):
+            result = await sftp.rmtree(str(victim).encode())
+
+    assert not victim.exists()
+    # The empty tuple is the answer rather than an absence: `rmtree` reports what it passed
+    # over, and "nothing" is what a caller checks before believing the tree is gone.
+    assert result.skipped == ()
+    record = next(r for r in caplog.records if r.getMessage().startswith("rmtree ok "))
+    fields = record_fields(record)
+    assert fields["operation"] == "rmtree"
+    assert fields["remote"] == str(victim)
+    assert fields["files"] == 2
+    assert fields["directories"] == 2

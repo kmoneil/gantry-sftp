@@ -1550,3 +1550,178 @@ async def test_a_symlink_in_the_destination_is_refused_rather_than_written_throu
 
     assert refused.value.errno == errno.ELOOP
     assert not planted.exists(), "the claim created a file through the link"
+
+
+# --- what the tree methods forward, and what they call themselves -------------------------------
+#
+# D-105's seventeenth slice. Both trees hand their own name to two shared helpers, forward four
+# arguments to the layers under them, and report four counters -- and the wiring of each was
+# invisible from every existing test, because a name only shows up in a message nobody asserted
+# and a forwarded argument only shows up when it is *not* the default.
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        (lambda sftp, src, dst: sftp.get_tree(src, dst, mode=True), "get_tree() mode= must be "),
+        (lambda sftp, src, dst: sftp.put_tree(dst, src, mode=True), "put_tree() mode= must be "),
+    ],
+    ids=["get_tree", "put_tree"],
+)
+async def test_a_tree_names_itself_in_the_mode_it_refuses(tmp_path: Path, call, expected: str):
+    """`resolve_mode` is shared by four transfer methods and takes the caller's name as data.
+
+    It is unit-tested with the name spelled out by the test, which proves the helper rather than
+    the wiring: every caller could pass `put()`, or `None`, and only a call through the real
+    method would notice. `mode=True` is the refusal that reaches it earliest -- a `bool` is an
+    `int`, so without the check it would upload `0o1`.
+    """
+    local = tmp_path / "local"
+    local.mkdir()
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TypeError) as refusal:
+            _ = await call(sftp, b"/root", local)
+
+    assert refusal.value.args[0].startswith(expected)
+
+
+async def test_put_tree_names_itself_when_both_publish_spellings_arrive(tmp_path: Path):
+    """The other shared helper, and the other caller name `put_tree` passes as a literal."""
+    source = tmp_path / "src"
+    source.mkdir()
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TypeError) as refusal:
+            _ = await sftp.put_tree(source, b"/dst", publish=Publish(atomic=True), atomic=False)
+
+    assert refusal.value.args[0].startswith("put_tree() got both publish= and the legacy ")
+
+
+async def test_put_tree_refuses_progress_with_more_than_one_worker(tmp_path: Path):
+    """`concurrency=2` and a progress callback cannot both mean what the caller wants.
+
+    The callback is `(transferred, total)` and carries no file identity, so several workers
+    interleave several files' counters into one stream with nothing to tell them apart. Two is
+    the boundary -- one worker is a sequence a reporter can follow -- and the refusal is
+    `put_tree`'s own call into the shared check, which had never been driven through the method.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"a")
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as refusal:
+            _ = await sftp.put_tree(source, b"/dst", concurrency=2, progress=lambda *_: None)
+
+    assert "put_tree" in refusal.value.args[0]
+
+
+async def test_a_tree_download_creates_the_intermediate_directories_of_its_destination(
+    tmp_path: Path,
+):
+    """`parents=True` on the destination, which is the difference between a usable call and a
+    `FileNotFoundError` for anyone naming a path two levels deep.
+
+    A tree download creates the destination; creating only its last component would refuse
+    `get_tree(remote, base / "runs" / "2026-08-02")`, which is the shape every scheduled job
+    uses. Nothing had asked for more than one missing level.
+    """
+    destination = tmp_path / "runs" / "2026-08-02" / "out"
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get_tree(b"/root", destination)
+
+    assert destination.is_dir()
+    assert result.files == 2
+
+
+async def test_a_bounded_tree_download_does_not_descend_past_its_limit(tmp_path: Path):
+    """`max_depth` is forwarded to the walk, and nothing proved it arrived on this side.
+
+    The upload half of this was found by an earlier slice -- a `max_depth` that never reached
+    `walk_local`, so a bounded recursive upload sent the whole tree. This is the same argument
+    in the other direction: the bound is a defence against a server-controlled tree, so a
+    forwarded argument that goes missing turns a bounded download into an unbounded one.
+    """
+    tree = {
+        b"/root": (named(b"top.txt", REGULAR, 3), named(b"sub", DIRECTORY, 0)),
+        b"/root/sub": (named(b"deep.txt", REGULAR, 5),),
+    }
+    files = {b"/root/top.txt": b"AAA", b"/root/sub/deep.txt": b"bbbbb"}
+    destination = tmp_path / "out"
+    server = TreeServer(tree=tree, files=files)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get_tree(b"/root", destination, max_depth=0)
+
+    assert result.files == 1
+    assert (destination / "top.txt").read_bytes() == b"AAA"
+    assert not (destination / "sub" / "deep.txt").exists()
+
+
+async def test_a_tree_upload_hands_each_file_the_progress_callback(tmp_path: Path):
+    """`progress=` is forwarded per file, and `concurrency=1` is the only shape it is legal in.
+
+    A tree calls the callback per file, so `total` resets at each one -- that is documented and
+    is why more than one worker refuses it. What nothing checked is that a single worker
+    forwards it at all: a `put_tree(progress=...)` that dropped the argument would report
+    nothing and raise nothing, which is the failure mode a progress bar cannot tell apart from
+    a slow server.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"a" * 10)
+    (source / "b.txt").write_bytes(b"b" * 20)
+    seen: list[tuple[int, int | None]] = []
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        _ = await sftp.put_tree(
+            source,
+            str(tmp_path / "dst").encode(),
+            progress=lambda moved, total: seen.append((moved, total)),
+        )
+
+    assert seen, "the callback was never called"
+    assert {total for _, total in seen} == {10, 20}, "one total per file, not one for the tree"
+
+
+async def test_a_directory_the_server_lists_twice_is_refused_rather_than_merged(tmp_path: Path):
+    """The collision check applies to directories, and its `PathCollision` is a second site.
+
+    A file collision is the headline case; a directory one reaches the same ledger by a
+    different route and builds its own `PathCollision`, whose fields nothing read. Staged with
+    a **duplicate name in one listing** -- which is a hostile server rather than a folding
+    filesystem, and is the only way to reach this branch on ext4, where two directory names
+    cannot share an inode. The consequence it prevents is quieter than a file's: no single file
+    is lost, and the *structure* is wrong, because two remote directories' contents merge.
+    """
+    destination = tmp_path / "out"
+    tree = {
+        b"/root": (named(b"docs", DIRECTORY, 0), named(b"docs", DIRECTORY, 0)),
+        b"/root/docs": (named(b"a.txt", REGULAR, 3),),
+    }
+    files = {b"/root/docs/a.txt": b"AAA"}
+    server = TreeServer(tree=tree, files=files)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    # Two collisions from one duplicate: the directory itself, and the file inside it that the
+    # second visit tried to claim again. The directory's is the one built at the second site.
+    directory_collisions = [
+        item for item in caught.value.collisions if item.local == str(destination / "docs")
+    ]
+    assert [item.remote for item in directory_collisions] == [b"/root/docs"]
+    assert directory_collisions[0].first == b"/root/docs"
