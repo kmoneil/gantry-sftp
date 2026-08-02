@@ -11,7 +11,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from gantry_sftp.codec import WireWriter
+from gantry_sftp.codec import Read, WireWriter, Write, encode
 from gantry_sftp.exceptions import ProtocolError
 from gantry_sftp.session import (
     DEFAULT_MAX_PACKET_LENGTH,
@@ -208,3 +208,84 @@ def test_a_read_never_exceeds_what_the_server_said_it_would_accept(
     # all -- in which case the minimum-progress floor is what we deliberately chose.
     encoded = read_request_overhead(handle) + sizes.read_length
     assert encoded <= packet or sizes.read_length == 1
+
+
+# --- the overhead, measured rather than restated ------------------------------------------------
+#
+# D-105's nineteenth slice. Every test above computes the encoded size *with the same function
+# it is testing*, so the two sides move together: `1 + 4 + (4 + handle) + 8 + 4` could become any
+# other sum and every assertion here would still hold. That is the golden-frame argument applied
+# to arithmetic -- an encoder checked against itself is checked against nothing -- and the fix is
+# an independent oracle, which is the codec that has to put the bytes on the wire.
+
+
+def test_the_read_overhead_is_what_a_real_empty_read_frame_measures():
+    """The oracle is the encoder, because it is the thing the server actually counts.
+
+    A zero-length READ *is* its own overhead, so encoding one and measuring it settles the sum
+    without restating it. The four-byte length prefix comes off because it is framing: OpenSSH
+    counts `max-packet-length` against the body, which is why its `max-read-length` sits 1024
+    below its `max-packet-length` rather than at it.
+    """
+    handle = b"\x00" * OPENSSH_HANDLE_LENGTH
+    frame = encode(Read(1, handle, offset=0, length=0))
+    assert len(frame) - 4 == read_request_overhead(OPENSSH_HANDLE_LENGTH)
+
+
+def test_the_write_overhead_is_what_a_real_empty_write_frame_measures():
+    """The same oracle for the other direction, whose payload is in the *request*.
+
+    A WRITE's data string carries its own four-byte length prefix inside the body, which is the
+    term that makes this sum equal the read's by coincidence rather than by construction -- so
+    the two are measured separately.
+    """
+    handle = b"\x00" * OPENSSH_HANDLE_LENGTH
+    frame = encode(Write(1, handle, offset=0, data=b""))
+    assert len(frame) - 4 == write_request_overhead(OPENSSH_HANDLE_LENGTH)
+
+
+@pytest.mark.parametrize("handle_length", [0, 4, 64, 255], ids=["empty", "openssh", "long", "255"])
+def test_the_overhead_tracks_the_handle_at_every_length(handle_length: int):
+    """The handle is the only variable term, and it is the one another server can change.
+
+    OpenSSH's handles are four bytes; nothing says another server's are, and a formula that
+    dropped the handle entirely would still pass every fixed-handle test above.
+    """
+    handle = b"\x00" * handle_length
+    assert len(encode(Read(1, handle, offset=0, length=0))) - 4 == read_request_overhead(
+        handle_length
+    )
+    assert len(encode(Write(1, handle, offset=0, data=b""))) - 4 == write_request_overhead(
+        handle_length
+    )
+
+
+def test_a_negotiated_request_fills_the_packet_ceiling_without_exceeding_it():
+    """The property the arithmetic exists for, asserted on the bytes rather than on the sum.
+
+    OpenSSH's real numbers, and a real frame at the negotiated size: the encoded body must fit
+    `max-packet-length`, because the consequence of exceeding it is not an error but a clamp --
+    on every request, forever, which is the failure this whole module is here to avoid.
+    """
+    limits = ServerLimits.from_extended_reply(limits_reply(262144, 261120, 261120, 1048571))
+    sizes = negotiate_transfer_sizes(limits, handle_length=OPENSSH_HANDLE_LENGTH)
+    handle = b"\x00" * OPENSSH_HANDLE_LENGTH
+
+    read_frame = encode(Read(1, handle, offset=0, length=sizes.read_length))
+    write_frame = encode(Write(2, handle, offset=0, data=b"\x00" * sizes.write_length))
+
+    assert len(read_frame) - 4 <= limits.effective_max_packet_length
+    assert len(write_frame) - 4 <= limits.effective_max_packet_length
+
+
+def test_the_packet_ceiling_wins_for_a_write_as_well_as_a_read():
+    """The read half of this is asserted above; the write budget is a separate subtraction.
+
+    Spelled as a literal rather than as `4096 - write_request_overhead(4)`, because computing
+    the expectation from the function under test is what let every term of it drift. The
+    overhead is 25 bytes with a four-byte handle: a type byte, a request id, a string handle
+    (four of length and four of handle), a `uint64` offset and a `uint32` length.
+    """
+    limits = ServerLimits(max_packet_length=4096)
+    sizes = negotiate_transfer_sizes(limits, handle_length=4, preferred_write=1 << 30)
+    assert sizes.write_length == 4096 - 25

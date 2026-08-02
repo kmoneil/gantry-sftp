@@ -183,3 +183,16 @@ async def test_the_remote_only_operations_keep_working_without_offset_io(
         assert await sftp.realpath(b".") == b"/canonical"
         handle = await sftp.open(b"/remote/file.bin")
         await sftp.close(handle)
+
+
+def test_a_python_without_fchmod_reports_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The third probe, and the only one whose name is spelled out rather than derived.
+
+    The two offset primitives come from a list comprehension over `_OFFSET_IO`, so their names
+    are the list's; `os.fchmod` is appended as a literal and nothing had removed it to see what
+    the refusal says. It is the primitive `mode=` needs on the download side -- without it a
+    delivered file cannot be given the permissions the caller asked for, which is D-56a's whole
+    subject on the local half.
+    """
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    assert missing_local_io() == ("os.fchmod",)

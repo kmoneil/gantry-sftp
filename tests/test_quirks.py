@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from gantry_sftp.session import PROFILES, UNKNOWN, ServerProfile, identify, parse_vendor_id
+from gantry_sftp.session._quirks import _from_vendor_id
 
 
 def vendor_id(vendor: bytes, product: bytes, version: bytes, build: int = 0) -> bytes:
@@ -107,6 +108,21 @@ def test_a_vendor_id_that_is_not_utf8_still_decodes():
     assert parsed[1].startswith("Weird")
 
 
+def test_a_stray_byte_in_the_version_does_not_discard_the_whole_identity():
+    """Each of the three strings is decoded separately, and each needs the lenient handler.
+
+    The product's is asserted above; the version's was not, and the failure it hides is worse
+    than a wrong string. A strict decode raises `UnicodeDecodeError`, the broad `except` here
+    catches it, and the *entire* vendor-id is discarded -- so a server with one bad byte in its
+    version goes from identified to unknown, and every profile decision made from its name
+    silently stops happening.
+    """
+    parsed = parse_vendor_id(vendor_id(b"Acme", b"Widget", b"2.1\xff"))
+    assert parsed is not None
+    assert parsed[1] == "Widget"
+    assert parsed[2].startswith("2.1")
+
+
 # --- matching ----------------------------------------------------------------------------------
 
 
@@ -119,6 +135,25 @@ def test_asyncssh_is_recognised_from_its_vendor_id_and_carries_the_version():
     assert profile.name == "asyncssh"
     assert profile.version == "2.24.0"
     assert profile.label == "asyncssh/2.24.0"
+
+
+@pytest.mark.parametrize(
+    "product", [b"asyncssh", b"AsyncSSH", b"ASYNCSSH"], ids=["lower", "mixed", "upper"]
+)
+def test_a_known_product_is_matched_whatever_case_it_announces_itself_in(product: bytes):
+    """The lookup folds the product name, and the table's keys are lowercase.
+
+    A server chooses how to spell its own name and can change that spelling between releases,
+    so matching it exactly would make the profile table depend on a cosmetic decision made at
+    the other end. Asserted across three spellings because the fold is one method call: `.get`
+    on the raw name misses the mixed case, and folding the *wrong* way misses all three.
+    """
+    profile = _from_vendor_id(vendor_id(b"asyncssh", product, b"2.24.0"))
+    assert profile is not None
+    assert profile is not UNKNOWN
+    assert profile.name == "asyncssh"
+    assert profile.description == PROFILES["asyncssh"].description
+    assert profile.version == "2.24.0"
 
 
 def test_paramiko_is_recognised_from_check_file():
