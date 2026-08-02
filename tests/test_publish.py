@@ -1595,6 +1595,22 @@ def test_both_spellings_at_once_is_refused_rather_than_merged():
     )
 
 
+def test_the_both_spellings_refusal_lists_every_legacy_name_it_found():
+    """The same one-element blind spot as the misspelling message, on the other refusal.
+
+    This is the message a caller reads while deciding which spelling to delete, so listing
+    one of the two names they used sends them to fix half of it and hit the same error again.
+    Reversed against the expected order for the same reason as above.
+    """
+    with pytest.raises(TypeError) as exc:
+        publish_from_legacy(Publish(atomic=True), {"fsync": False, "atomic": False}, caller="put")
+    assert exc.value.args[0] == (
+        "put() got both publish= and the legacy argument(s) atomic, fsync; use one spelling "
+        "or the other, because there is no correct way to merge them -- either would silently "
+        "override something you wrote"
+    )
+
+
 def test_a_misspelled_argument_is_refused_and_the_message_lists_the_real_ones():
     # The regression that absorbing these into **legacy would otherwise introduce: Python no
     # longer rejects a typo for us, and `atmoic=False` would publish atomically while the
@@ -1604,6 +1620,24 @@ def test_a_misspelled_argument_is_refused_and_the_message_lists_the_real_ones():
     assert exc.value.args[0] == (
         "put() got unexpected keyword argument(s) atmoic; publish policy is now a Publish "
         "object passed as publish=, and the accepted legacy names are atomic, fsync, "
+        "require_atomic, require_fsync, staging_name"
+    )
+
+
+def test_two_misspellings_are_listed_together_and_in_a_stable_order():
+    """A one-element join renders no separator, so the one above proves nothing about it.
+
+    `', '.join(unknown)` could be spelled with any separator, or none, while the single-name
+    case still read exactly right -- the two names are what put anything between anything.
+    The input is reversed against the expected output so the `sorted` is observable too: a
+    caller who mistyped twice gets both names in an order that does not move with the
+    insertion order of a `**kwargs` dict.
+    """
+    with pytest.raises(TypeError) as exc:
+        publish_from_legacy(None, {"fsnyc": True, "atmoic": False}, caller="put")
+    assert exc.value.args[0] == (
+        "put() got unexpected keyword argument(s) atmoic, fsnyc; publish policy is now a "
+        "Publish object passed as publish=, and the accepted legacy names are atomic, fsync, "
         "require_atomic, require_fsync, staging_name"
     )
 
@@ -1640,6 +1674,40 @@ async def test_the_old_spelling_still_publishes_the_way_it_used_to(source: Path)
         new = await sftp.put(source, TARGET, publish=Publish(atomic=False))
     assert new.mechanism is PublishMechanism.IN_PLACE
     assert old.transferred == new.transferred
+
+
+@pytest.mark.skipif(
+    "MUTANT_UNDER_TEST" in os.environ,
+    reason="mutmut's trampoline adds a frame, so stack depth is not what it is outside it",
+)
+async def test_the_deprecation_names_the_line_that_used_the_old_spelling(source: Path):
+    """`stacklevel` decides whose file the warning blames, and nothing was reading it.
+
+    A deprecation is only actionable if it points at the call that has to change, and this one
+    is three frames down -- `publish_from_legacy`, `put`, the caller -- so it is the only value
+    that names the user's line. Dropped it becomes 1 and blames `_publish.py`, which is a
+    library file the reader cannot edit; raised to 4 it blames whatever called *them*. Both
+    render an identical sentence, so every message assertion above passes either way, and a
+    `filterwarnings` entry keyed on the caller's module stops matching in both.
+
+    Only reachable through the real method: the pure-function tests call
+    `publish_from_legacy` directly, where three frames up is pytest rather than the caller.
+
+    **Skipped under mutmut for the reason `test_argv.py`'s stacklevel assertion is** -- every
+    mutated function is wrapped in a trampoline, so the chain gains frames and 3 lands inside
+    `mutmut/mutation/trampoline.py`. The instrumentation changes the exact thing this measures,
+    so both `stacklevel` mutants survive the lane permanently and neither is an untested line.
+    """
+    server = PublishingServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.warns(DeprecationWarning) as record:
+            _ = await sftp.put(source, TARGET, atomic=False)
+
+    deprecations = [caught for caught in record if caught.category is DeprecationWarning]
+    assert len(deprecations) == 1
+    assert deprecations[0].filename == __file__, (
+        "the deprecation blamed a frame that is not the caller's"
+    )
 
 
 async def test_put_tree_refuses_a_staging_name_rather_than_colliding_every_file(tmp_path: Path):
