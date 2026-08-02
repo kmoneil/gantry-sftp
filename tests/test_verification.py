@@ -326,6 +326,11 @@ async def test_a_truncated_upload_is_refused_before_it_can_be_published(tmp_path
         "the transfer was truncated or the file changed underneath it"
     )
     assert exc.value.remote_path == b"/incoming/.staged"
+    # The state, and it is the *server's* count on both fields rather than what was sent: the
+    # message already says how many bytes went out, and what a caller needs from the fields is
+    # where the file actually ends. Neither was asserted anywhere, so both could be nulled.
+    assert exc.value.transferred == 9
+    assert exc.value.offset == 9
     assert "posix-rename@openssh.com" not in server.kinds, "a short upload was published"
     assert "Rename" not in server.kinds
     # The staging file goes, because on this path the destination was never touched and the

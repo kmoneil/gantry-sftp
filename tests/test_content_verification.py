@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 from pathlib import Path
 
 import anyio
@@ -60,7 +61,12 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.exceptions import ProtocolError, TransferError, UnsupportedError
+from gantry_sftp.exceptions import (
+    ProtocolError,
+    TransferError,
+    TransferTimeoutError,
+    UnsupportedError,
+)
 from gantry_sftp.session import (
     CHECK_FILE_BLOCK_SIZE,
     ContentCheck,
@@ -1122,3 +1128,459 @@ async def test_digests_that_do_not_divide_by_the_algorithm_carry_the_frame_that_
     assert exc.value.request_id == server.checks[0].request_id
     assert exc.value.raw_frame is not None
     assert exc.value.raw_frame.endswith(b"z" * 30)
+
+
+# --- the arithmetic's edges, and what the rungs forward ------------------------------------------
+#
+# D-105's thirteenth slice found the carried state of every refusal untested; this is the same
+# question asked of the verification ladder, and the answer came back in three parts. The state
+# again (an offset and a path nothing read), the *forwarded arguments* -- a range, a depth, an
+# idle timeout and a size, each handed to something else by a method whose whole job is to hand
+# them over -- and three edges of the block arithmetic that only a degenerate size reaches.
+
+
+def test_block_bounds_accepts_the_smallest_legal_block():
+    """`block_size=1` is the boundary the guard names, and nothing had ever passed it.
+
+    `if block_size < 1` is one character from `<= 1`, and a suite that only ever passes 0 (the
+    refusal, tested above) and 1024 (the ordinary case) cannot separate the two. One byte per
+    block is what a caller reaches for to localise a corruption, and the guard exists to refuse
+    only the value that would not terminate.
+    """
+    assert block_bounds(0, 3, 1) == [0, 1, 2]
+    assert block_bounds(7, 2, 1) == [7, 8]
+
+
+async def test_local_block_digests_refuse_a_non_ascii_algorithm_as_an_algorithm(tmp_path: Path):
+    """The algorithm name is the *server's* bytes, so the decode has to survive hostile ones.
+
+    `check-file`'s reply names the algorithm it hashed with and this library hashes with
+    whatever it says -- so those bytes are attacker-controlled, and the decode is deliberately
+    lenient (`errors="replace"`) so the refusal that follows is about the **algorithm**, raised
+    by `hashlib`, rather than about the decode. Strict decoding reports the wrong failure for
+    the same input, and an unknown error-handler name raises `LookupError` from inside the codec
+    machinery, which is neither.
+
+    The type is asserted exactly rather than through `pytest.raises(ValueError)`, because
+    `UnicodeDecodeError` **is** a `ValueError` -- the assertion that looks sufficient passes for
+    precisely the failure this test exists to tell apart.
+    """
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"x" * 16)
+
+    with pytest.raises(ValueError) as refusal:
+        _ = await local_block_digests(source, b"sha1\xff", start=0, length=16)
+
+    assert type(refusal.value) is ValueError
+    assert "sha1�" in refusal.value.args[0]
+
+
+async def test_local_block_digests_hash_what_is_there_when_the_file_ends_early(tmp_path: Path):
+    """A short read means the local file shrank, and the digest covers what was found.
+
+    `_digest_block` breaks out of its read loop on the first empty `pread`; it does not retry
+    and it does not abandon the block. The difference is what the caller sees: a digest over the
+    bytes that *are* there fails the comparison, which is the correct answer to "the file
+    changed underneath us", while returning nothing for the block is a `TypeError` in the
+    comparison instead of a mismatch.
+    """
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"short")
+
+    assert await local_block_digests(source, b"sha1", start=0, length=64) == (sha1(b"short"),)
+
+
+async def test_local_block_digests_hash_a_final_block_of_one_byte(tmp_path: Path):
+    """The one-byte tail, which `while remaining > 0` is one character from never hashing.
+
+    Every ordinary block survives `> 1`, because a full `pread` takes `remaining` from the
+    block's length straight to zero in one pass. Only a block of exactly one byte enters the
+    loop already at its last byte, so a range whose final block is a single byte is the only
+    input that separates the two.
+    """
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"abc")
+
+    assert await local_block_digests(source, b"sha1", start=0, length=3, block_size=2) == (
+        sha1(b"ab"),
+        sha1(b"c"),
+    )
+
+
+async def test_ranges_equal_sizes_its_last_block_to_the_range_and_not_past_it(tmp_path: Path):
+    """Two blocks, a short second one, and a difference beyond the range being compared.
+
+    The existing test above cannot see this: with a single block starting at zero the
+    short-final-block arithmetic and its mutations agree. A second block is what makes the
+    remainder visible, and the difference *past* the range is what turns an overrun into a wrong
+    answer -- which is not hypothetical, because the resume gate compares exactly the adopted
+    prefix and nothing else. Reading past it fails a resume that should have proceeded.
+    """
+    left = tmp_path / "left.bin"
+    right = tmp_path / "right.bin"
+    shared = b"a" * 1500
+    left.write_bytes(shared + b"L" * 548)
+    right.write_bytes(shared + b"R" * 548)
+
+    fd = os.open(left, os.O_RDONLY)
+    try:
+        assert await ranges_equal(fd, right, start=0, length=1500, block_size=1024) is True
+    finally:
+        os.close(fd)
+
+
+# --- the rungs' own edges ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rung", [Verify.HASH, Verify.REREAD], ids=["hash", "reread"])
+async def test_an_empty_file_is_verified_without_asking_the_server_anything(
+    tmp_path: Path, rung: Verify
+):
+    """`length=0` short-circuits, and that is a wire fact rather than an optimisation.
+
+    `length=0` in a `check-file` request means "to the end of the file" -- the opposite of
+    "nothing" -- so sending one would hash the whole file and compare it against no local blocks
+    at all. The early return answers **True**: an empty file matches an empty file, and
+    answering anything else refuses every zero-byte upload, which is a real thing to send.
+    """
+    server = HashingServer(holds=b"")
+    source = tmp_path / "empty.bin"
+    source.write_bytes(b"")
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(
+            source, b"/incoming/empty.bin", publish=Publish(atomic=False), verify=rung
+        )
+
+    expected = ContentCheck.HASHED if rung is Verify.HASH else ContentCheck.REREAD
+    assert result.content_check is expected
+    assert server.checks == []
+    assert "Read" not in server.kinds
+
+
+@pytest.mark.parametrize("rung", [Verify.HASH, Verify.REREAD], ids=["hash", "reread"])
+async def test_a_one_byte_file_is_compared_rather_than_waved_through(tmp_path: Path, rung: Verify):
+    """One byte is not zero bytes, and the short-circuit is one character from saying it is.
+
+    `if length == 0` mutates to `== 1`, which passes every single-byte file unverified. A
+    one-byte upload is not a curiosity -- a sentinel, a flag file, a marker a downstream job
+    polls for -- and the whole point of a content check is that the file is the *right* byte.
+    """
+    server = HashingServer(holds=b"X", corrupts=True)
+    source = tmp_path / "one.bin"
+    source.write_bytes(b"Y")
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as refusal:
+            _ = await sftp.put(
+                source, b"/incoming/one.bin", publish=Publish(atomic=False), verify=rung
+            )
+
+    assert refusal.value.transferred == 1
+    assert refusal.value.offset == 0
+
+
+@pytest.mark.parametrize("rung", [Verify.HASH, Verify.REREAD], ids=["hash", "reread"])
+async def test_the_first_byte_of_an_upload_is_inside_the_verified_range(
+    tmp_path: Path, rung: Verify
+):
+    """The range starts at 0, and `start=0` is one character from `start=1`.
+
+    A verification that begins at the second byte reads correctly, reports the rung it reached,
+    and cannot see a corruption in the first byte -- which is where a truncated header, a
+    byte-order mark eaten by a middlebox, or an off-by-one in a reassembler puts it. Every other
+    content test here corrupts the whole payload, so all of them pass with the first byte
+    excluded.
+    """
+    server = HashingServer(holds=b"B" + b"x" * 15, corrupts=True)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"A" + b"x" * 15)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as refusal:
+            _ = await sftp.put(
+                source, b"/incoming/file.bin", publish=Publish(atomic=False), verify=rung
+            )
+
+    assert refusal.value.offset == 0
+    assert refusal.value.local_path == str(source)
+
+
+async def test_the_first_byte_of_a_download_is_inside_the_verified_range(tmp_path: Path):
+    """The same off-by-one on the other side, where only rung 1 can see it at all.
+
+    Rung 2 on a download compares the file against a second read of the same remote bytes, so a
+    server serving something other than what it hashes is invisible to it -- which is why this
+    is the hash rung and why the docstring for `Verify.REREAD` says what it proves on each side.
+    """
+    server = HashingServer(holds=b"A" + b"x" * 15, serves=b"B" + b"x" * 15)
+    local = tmp_path / "downloaded.bin"
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as refusal:
+            _ = await sftp.get(b"/remote.bin", local, verify=Verify.HASH)
+
+    assert refusal.value.offset == 0
+    assert local.read_bytes() == b"B" + b"x" * 15
+
+
+# --- what the two rungs hand to the layers under them ----------------------------------------
+
+
+async def test_a_settled_refusal_saves_the_open_and_the_close_as_well_as_the_question(
+    tmp_path: Path,
+):
+    """The cache is checked *before* the OPEN, and the OPEN is two of the three round trips.
+
+    The test above this one counts `check-file` requests, which is the question itself. It
+    cannot see the other two: rung 1 opens the file to ask, because `check-file` hashes through
+    a handle and an upload's is WRITE-only. A cache consulted after the open would save one trip
+    of three and the count of questions would still read as one.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload, advertises=False, implements=False)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        for name in (b"/incoming/one.bin", b"/incoming/two.bin"):
+            result = await sftp.put(source, name, publish=Publish(atomic=False), verify=Verify.HASH)
+            assert result.content_check is ContentCheck.UNAVAILABLE
+
+    assert len(server.checks) == 1
+    # Two uploads, three opens: each destination, plus the one file rung 1 opened to ask about.
+    assert len(server.opened) == 3
+
+
+async def test_hashing_a_range_asks_the_server_about_the_range_it_was_given(tmp_path: Path):
+    """`start_offset` is forwarded, and both public callers pass zero, so nothing proved it.
+
+    An argument that is only ever handed the value it defaults to is invisible from the API --
+    and this one is the method's whole contract, which is documented as "rung 1 over one range".
+    A resume gate hashing from zero on the server while this side hashed from the offset would
+    report every partial as a mismatch and refuse every resume the gate exists to allow.
+    """
+    payload = b"".join(bytes([n]) * 32 for n in range(8))
+    server = HashingServer(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        agreed = await sftp._hashes_agree(b"/remote.bin", source, start=64, length=64)  # noqa: SLF001
+
+    assert agreed is True
+    assert server.checks[0].start_offset == 64
+    assert server.checks[0].length == 64
+
+
+async def test_a_reread_asks_for_the_range_and_does_not_read_on_to_find_the_end(tmp_path: Path):
+    """`size=` is what lets the re-read stop without a trailing round trip to see EOF.
+
+    `download_handle` documents it: `None` reads until EOF and costs one extra request at the
+    end. Rung 2 already knows how long the range is, so passing it is the difference between one
+    READ and two -- per verified file, which on a `put_tree` is per file in the tree, and on the
+    200 ms profile the netem lane measures is the whole cost of the rung on small files.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        result = await sftp.put(
+            source, b"/incoming/file.bin", publish=Publish(atomic=False), verify=Verify.REREAD
+        )
+
+    assert result.content_check is ContentCheck.REREAD
+    assert server.kinds.count("Read") == 1
+
+
+async def test_a_reread_that_is_refused_names_the_file_it_was_reading(tmp_path: Path):
+    """The re-read is a download, and a download's errors carry the remote path they were given.
+
+    Rung 2 hands `remote_path` to the scheduler, which has a handle and no name -- so an error
+    raised in there says `None` unless this call site passes it. The upload has already
+    succeeded at this point, which is exactly when a nameless error is hardest to place: the
+    bytes are on the server and the failure is in the verification of a file the message does
+    not identify.
+    """
+
+    class RefusesTheReread(HashingServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read):
+                self._reply(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"no"))
+                return
+            super()._handle(packet)
+
+    payload = b"payload " * 16
+    server = RefusesTheReread(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as refusal:
+            _ = await sftp.put(
+                source, b"/incoming/file.bin", publish=Publish(atomic=False), verify=Verify.REREAD
+            )
+
+    assert refusal.value.remote_path == b"/incoming/file.bin"
+    assert refusal.value.local_path == str(source)
+
+
+async def test_a_reread_runs_at_the_session_s_pipeline_depth(tmp_path: Path):
+    """The depth is forwarded, and what it bounds is memory rather than speed.
+
+    D-101 states the cost of a transfer as `concurrent transfers x depth x request size`, so a
+    re-read that quietly ran at the default depth would break that arithmetic for anybody who
+    turned the depth down to fit it. Proven with a depth the scheduler refuses: an invalid value
+    is the cheapest thing that tells "the session's depth arrived" apart from "the default did",
+    and the refusal is the scheduler's own.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server, depth=0) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as refusal:
+            _ = await sftp._reread_agrees(b"/remote.bin", source, start=0, length=len(payload))  # noqa: SLF001
+
+    assert refusal.value.args[0] == "depth must be at least 1, got 0"
+
+
+async def test_a_stalled_reread_is_bounded_by_the_session_s_idle_timeout(tmp_path: Path):
+    """A server that answers the OPEN and then stops is the case the idle timeout is for.
+
+    The forwarded `idle_timeout` is the only thing between a hung verification and a transfer
+    that never returns -- and the upload has already completed, so the caller is blocked on a
+    check rather than on the work. Set short here; the shipped default is 60 s, which is the
+    difference between this test taking a moment and taking a minute.
+    """
+
+    class StopsAfterTheOpen(HashingServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read):
+                return
+            super()._handle(packet)
+
+    payload = b"payload " * 16
+    server = StopsAfterTheOpen(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server, idle_timeout=0.05) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferTimeoutError):
+            _ = await sftp._reread_agrees(b"/remote.bin", source, start=0, length=len(payload))  # noqa: SLF001
+
+
+async def test_the_scratch_file_a_reread_writes_is_named_after_this_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The prefix is what makes a leaked temporary attributable, and nothing read it.
+
+    Rung 2's cost is temporary local disk equal to the range, in `$TMPDIR` -- which on a busy
+    host holds files from everything running on it. A stray `gantry-verify-*` names both the
+    library and the operation that left it; an unnamed one is somebody else's problem to
+    diagnose. Same argument D-107 recorded for the askpass helper's directory prefix, and the
+    same reason it needs an assertion: a prefix nothing reads can be renamed or dropped without
+    anything noticing.
+    """
+    prefixes: list[object] = []
+    real = tempfile.NamedTemporaryFile
+
+    def recording(*args: object, **kwargs: object):
+        prefixes.append(kwargs.get("prefix"))
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", recording)
+
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await sftp.put(
+            source, b"/incoming/file.bin", publish=Publish(atomic=False), verify=Verify.REREAD
+        )
+
+    assert prefixes == ["gantry-verify-"]
+
+
+@pytest.mark.parametrize("rung", [Verify.HASH, Verify.REREAD], ids=["hash", "reread"])
+async def test_a_verification_closes_the_handle_it_opened(tmp_path: Path, rung: Verify):
+    """Both rungs open the file a second time to ask their question, and both must close it.
+
+    A handle leaked by the *verification* is invisible from this side and counts against the
+    server's open-handle limit exactly like a leaked transfer handle -- and it is leaked on the
+    success path, so nothing anywhere is failing when it happens. `_close_quietly` swallows
+    every exception by design, which is what makes this untestable by any route except counting
+    what reached the server.
+    """
+    payload = b"payload " * 16
+    server = HashingServer(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        _ = await sftp.put(
+            source, b"/incoming/file.bin", publish=Publish(atomic=False), verify=rung
+        )
+
+    assert server.kinds.count("Open") == 2, "the destination, and the file the rung re-opened"
+    assert server.kinds.count("Close") == server.kinds.count("Open")
+
+
+async def test_a_reread_reads_back_the_range_and_not_the_file_under_it(tmp_path: Path):
+    """`start_offset` is rung 2's other forwarded argument, and dropping it is silently correct.
+
+    A re-read that started at zero would still answer correctly -- it would fetch the bytes
+    below the range, ignore them, and compare the right ones -- so the only visible difference
+    is what crossed the link. That difference is the rung's entire cost argument: gating a
+    resume on rung 2 is worth it when reading back is cheaper than sending again, and a gate
+    that re-read the whole file every time would be the bandwidth cost resume exists to avoid.
+    """
+
+    class RecordsReads(HashingServer):
+        reads: list[tuple[int, int]] = []  # noqa: RUF012
+
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read):
+                self.reads = [*self.reads, (packet.offset, packet.length)]
+            super()._handle(packet)
+
+    payload = b"".join(bytes([n]) * 32 for n in range(8))
+    server = RecordsReads(holds=payload)
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        agreed = await sftp._reread_agrees(b"/remote.bin", source, start=64, length=64)  # noqa: SLF001
+
+    assert agreed is True
+    assert server.reads, "the rung read nothing at all"
+    assert min(offset for offset, _ in server.reads) == 64
+
+
+async def test_the_first_byte_of_a_downloaded_file_is_inside_a_reread_too(tmp_path: Path):
+    """The mirror of the upload's first-byte test, on the rung the public path cannot stage.
+
+    Rung 2 on a download compares the local file against a second read of the same remote
+    bytes, so an honest server makes the two agree by construction and no `get` can produce a
+    disagreement to test with. What *can* differ is a local file that changed after it
+    arrived -- a concurrent writer, a half-restored backup -- which is what this stages by
+    calling the check against a file the server never sent.
+    """
+    served = b"B" + b"x" * 15
+    server = HashingServer(holds=served)
+    local = tmp_path / "downloaded.bin"
+    local.write_bytes(b"A" + b"x" * 15)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as refusal:
+            _ = await sftp._verify_downloaded_content(  # noqa: SLF001
+                b"/remote.bin", local, len(served), Verify.REREAD
+            )
+
+    assert refusal.value.offset == 0
+    assert refusal.value.transferred == 16
