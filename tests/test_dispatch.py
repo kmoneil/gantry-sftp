@@ -13,6 +13,7 @@ and a hang in a suite with no timeout plugin is a CI job that runs until someone
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import anyio
@@ -374,6 +375,83 @@ async def test_retiring_an_exchange_leaves_no_route_behind():
 
     assert "routes=0" in repr(dispatcher)
     assert "exchanges=0" in repr(dispatcher)
+
+
+# --- what the counters count ----------------------------------------------------------------
+
+
+async def yielded_during(work: Callable[[], Awaitable[None]]) -> bool:
+    """Whether ``work`` handed the event loop to another task even once.
+
+    A task started with ``start_soon`` cannot run until the task that started it reaches a
+    checkpoint, so "did it run" is an exact reading of "was there a checkpoint". Counting
+    scheduler turns instead reads differently on the two backends -- trio does not hand two
+    ready tasks the loop in the order asyncio does -- and the count is not the claim anyway.
+    """
+    ran = False
+
+    async def competitor() -> None:
+        nonlocal ran
+        ran = True
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(competitor)
+        await work()
+        observed = ran
+        group.cancel_scope.cancel()
+    return observed
+
+
+async def send_several(dispatcher: Dispatcher, codec: Codec, count: int) -> None:
+    with dispatcher.exchange() as exchange:
+        for _ in range(count):
+            await exchange.send(Stat(codec.allocate_request_id(), b"/p"))
+
+
+async def test_the_send_lock_does_not_yield_the_loop_to_take_an_uncontended_permit():
+    # `Wire.send` contains no await of its own, so the lock's acquire is the only checkpoint on
+    # this path -- which turns "did another task get to run" into an exact reading of it. The
+    # docstring on `_send_lock` claims the plain spelling costs an event-loop round trip per
+    # request, on a path that issues one per 255 KiB of a transfer, and nothing measured it.
+    codec = ready_codec()
+    dispatcher = Dispatcher(Wire(), codec)  # type: ignore[arg-type]
+
+    assert await yielded_during(lambda: send_several(dispatcher, codec, 16)) is False
+
+    # The control, and it is load-bearing rather than decoration: the assertion above is only
+    # about *our* spelling while anyio's default still checkpoints. If that ever changed, this
+    # line fails and says so, instead of the one above passing for a dispatcher that had lost
+    # `fast_acquire` altogether.
+    plain_codec = ready_codec()
+    plain = Dispatcher(Wire(), plain_codec)  # type: ignore[arg-type]
+    plain._send_lock = anyio.Lock()  # noqa: SLF001
+    assert await yielded_during(lambda: send_several(plain, plain_codec, 16)) is True
+
+
+async def test_the_byte_counter_totals_what_the_transport_was_actually_handed():
+    # The oracle is the transport's own tally rather than a size this test computes: `bytes_sent`
+    # is meant to be what went out, so what went out is the thing to compare it against.
+    codec = ready_codec()
+    wire = Wire()
+    dispatcher = Dispatcher(wire, codec)  # type: ignore[arg-type]
+
+    assert dispatcher.bytes_sent == 0
+    assert "sent=0/0B" in repr(dispatcher)
+
+    with dispatcher.exchange() as exchange:
+        await exchange.send(Stat(codec.allocate_request_id(), b"/one"))
+        after_one = dispatcher.bytes_sent
+        assert after_one == len(wire.sent)
+
+        # A second request, of a deliberately different length. A counter that *assigns* agrees
+        # with one that accumulates for exactly as long as only one request is ever sent -- and
+        # one request is what every other test in this file sends.
+        await exchange.send(Stat(codec.allocate_request_id(), b"/a-considerably-longer-name"))
+
+    assert dispatcher.bytes_sent == len(wire.sent)
+    assert dispatcher.bytes_sent > after_one
+    assert dispatcher.requests_sent == 2
+    assert f"sent=2/{len(wire.sent)}B" in repr(dispatcher)
 
 
 # --- the reader's lifetime ----------------------------------------------------------------
