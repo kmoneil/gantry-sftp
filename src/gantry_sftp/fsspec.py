@@ -135,8 +135,76 @@ world-readable file, and no later ``chmod`` closes the window between the two.
 
 _QUERY_FLOATS: Final = frozenset({"request_timeout", "idle_timeout"})
 _QUERY_INTS: Final = frozenset({"port", "depth"})
-_QUERY_STRINGS: Final = frozenset({"user", "identity_file", "config_file", "ssh_executable", "cwd"})
+_QUERY_STRINGS: Final = frozenset({"user", "cwd"})
 _SESSION_KEYS: Final = frozenset({"request_timeout", "idle_timeout", "depth"})
+
+_NAMES_A_LOCAL_PATH: Final = (
+    "it names a local path, and a URL is untrusted input in a way a constructor call is not"
+)
+_RUNS_A_PROGRAM: Final = (
+    "several ssh options run a program of their own -- ProxyCommand, LocalCommand, "
+    "KnownHostsCommand and Match exec among them -- and one loads a shared library"
+)
+
+_REFUSED_IN_URL: Final[Mapping[str, str]] = {
+    "identity_file": _NAMES_A_LOCAL_PATH,
+    "config_file": _NAMES_A_LOCAL_PATH,
+    "ssh_executable": _NAMES_A_LOCAL_PATH,
+    "options": _RUNS_A_PROGRAM,
+}
+"""Constructor arguments a URL may **not** set, mapped to why. Each is still an argument.
+
+D-120. The first three were accepted as query parameters until 0.11, and two of them were
+remote code execution from a URL string -- measured, not reasoned about:
+
+- ``ssh_executable`` is ``argv[0]``. A URL naming it chooses the program this library spawns.
+- ``config_file`` is ``-F``. An ``ssh_config`` is allowed a ``ProxyCommand``, which runs a
+  program to obtain the connection, and a ``Match exec``, which runs one during config
+  *parsing* before any connection is attempted. Neither is neutralised by any option in
+  :data:`~gantry_sftp.transport._argv.DEFAULT_SSH_OPTIONS` -- ``PermitLocalCommand=no`` and
+  ``ClearAllForwardings=yes`` do not reach either of them, which ``transport/_argv.py`` has
+  said in a comment since 0.9. So a URL plus one attacker-writable file anywhere on disk was
+  arbitrary command execution.
+- ``identity_file`` is ``-i``, which is not execution but is still a URL choosing which local
+  file gets read, and it tells the caller whether that file exists.
+
+**The asymmetry is the point, and it is why this is not simply a smaller feature.** A
+constructor argument is written by the author of the program; a URL arrives from a job
+config, a notebook parameter, a database row or an API request, which is exactly the
+population this adapter serves -- ``pd.read_parquet`` of a URL somebody else chose. Its own
+docstring calls the incumbent's blanket host-key acceptance "the bug class this library
+cannot have"; accepting these three from a URL was a worse one.
+
+``options`` is the fourth and it was **never** accepted -- it is here because until now that
+was true by omission rather than by a rule, and it is the most dangerous of the four. ``-o
+ProxyCommand=…`` is the argument-injection payload ``transport/_argv.py``'s own module
+docstring demonstrates, and ``-o StrictHostKeyChecking=no`` silently removes the defence that
+makes an attacker-chosen destination survivable.
+
+**A safe-subset allowlist was considered and refused**, and the reason is recorded so it is
+not re-proposed: the directives that execute or load code are neither a short nor a stable
+list -- ``ProxyCommand``, ``LocalCommand``, ``KnownHostsCommand`` and ``Match exec`` run
+programs, ``PKCS11Provider`` loads a shared library, ``Include`` pulls in another config file
+whole -- and a new OpenSSH release can add another, with arbitrary execution as the cost of
+missing it. That is D-121's denylist trap in a second costume.
+
+All four remain available as constructor arguments, so ``storage_options`` still carries them
+and nothing an author writes in their own source is restricted.
+"""
+
+_AUTHORITY_ONLY: Final = frozenset({"password"})
+"""Arguments a URL carries somewhere other than the query string.
+
+Not a security boundary -- ``?password=`` grants no authority the ``user:password@host`` form
+does not already grant, so this set never protects anything. It is here because the
+unknown-parameter message would be **false**: ``password`` is a constructor argument *and* a
+real part of the URL, just not of this part of it, and a caller told it was "unknown" would go
+looking for a spelling that already works.
+
+The message names ``storage_options`` first anyway, because that is the one place a password
+travels in neither the URL string nor the instance cache token -- see
+``_strip_tokenize_options``.
+"""
 _NONE_SPELLINGS: Final = frozenset({"none", "null", ""})
 _UNBOUNDED: Final = 1 << 40
 """Length to ask for when the server would not say how big a file is.
@@ -318,6 +386,11 @@ def _parse_query(query: str) -> dict[str, Any]:
     silently does nothing is a connection that fails for a reason the message will not name,
     and a URL is exactly where a typo lives.
 
+    The three names in :data:`_REFUSED_IN_URL` get their own message rather than falling into
+    the unknown-parameter one (D-120). They *are* constructor arguments, so "unknown" would be
+    false, and a caller who reads it as a typo would go looking for the correct spelling of a
+    parameter that is spelled correctly and refused on purpose.
+
     Args:
         query: The raw query string, which fsspec hands back unparsed.
 
@@ -325,12 +398,25 @@ def _parse_query(query: str) -> dict[str, Any]:
         Keyword arguments for :class:`GantrySFTPFileSystem`.
 
     Raises:
-        ValueError: If a parameter is not one this adapter accepts, or does not parse.
+        ValueError: If a parameter names a local path, is not one this adapter accepts, or
+            does not parse.
     """
     accepted = _QUERY_STRINGS | _QUERY_INTS | _QUERY_FLOATS
     session: dict[str, Any] = {}
     kwargs: dict[str, Any] = {}
     for key, raw in parse_qsl(query, keep_blank_values=True):
+        if key in _REFUSED_IN_URL:
+            raise ValueError(
+                f"query parameter {key!r} may not be set from a {PROTOCOL} URL because "
+                f"{_REFUSED_IN_URL[key]}; pass {key}=... to the filesystem instead, through "
+                f"storage_options"
+            )
+        if key in _AUTHORITY_ONLY:
+            raise ValueError(
+                f"query parameter {key!r} is not how a {PROTOCOL} URL carries a password; put "
+                f"it in the authority as user:password@host, or pass password=... through "
+                f"storage_options, which keeps it out of the URL string altogether"
+            )
         if key not in accepted:
             raise ValueError(
                 f"unknown query parameter {key!r} in a {PROTOCOL} URL; this adapter accepts "
@@ -368,16 +454,22 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
     :meth:`gantry_sftp.Session.exists` is the one that distinguishes "no such file" from "I was
     not allowed to look"; reach for the session when that difference matters.
 
+    **Three arguments cannot come from a URL** and are constructor-only: ``identity_file``,
+    ``config_file`` and ``ssh_executable``, each of which names a local path. Two of them were
+    remote code execution from a URL string until 0.11 -- see :data:`_REFUSED_IN_URL` for what
+    was measured. Pass them here, or in ``storage_options``, where the author of the program
+    is the one writing them.
+
     Args:
         host: Hostname, or anything ``ssh`` would accept. Never interpreted as a flag.
         user: Remote user. ``ssh`` resolves it from its config when this is ``None``.
         port: Remote port.
-        identity_file: Private key to offer.
+        identity_file: Private key to offer. Not settable from a URL.
         password: Sent through ``SSH_ASKPASS``, never argv, never a log line, and never stored
             in ``storage_options``.
-        config_file: An ``ssh_config`` to read instead of the default.
-        options: Extra ``-o`` options for ``ssh``.
-        ssh_executable: Which ``ssh`` to spawn.
+        config_file: An ``ssh_config`` to read instead of the default. Not settable from a URL.
+        options: Extra ``-o`` options for ``ssh``. Never settable from a URL.
+        ssh_executable: Which ``ssh`` to spawn. Not settable from a URL.
         cwd: A remote working directory relative paths resolve against. A URL path is always
             absolute, so this is how a relative root gets expressed.
         session: Scheduling tunables.
@@ -525,8 +617,9 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
 
         fsspec parses neither: ``infer_storage_options`` returns host, port, username and
         password, and hands the query back as an unparsed ``url_query``. So the URL form and
-        every parameter in it is this adapter's decision, and the ones accepted are the
-        arguments :func:`gantry_sftp.connect` already takes.
+        every parameter in it is this adapter's decision, and the ones accepted are a *subset*
+        of the arguments :func:`gantry_sftp.connect` takes -- the three that name a local path
+        are refused here and constructor-only, for the reason in :data:`_REFUSED_IN_URL`.
 
         The argument is named ``path`` because the base class names it that and calls it
         positionally *and* by keyword; ``urlpath`` read better and was a Liskov violation the

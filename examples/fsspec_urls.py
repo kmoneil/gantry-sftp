@@ -30,6 +30,16 @@ that answers `isfile() == False` is a file nothing will open.
 and `storage_options` is what `__reduce__` pickles -- a dask scheduler ships it to every
 worker -- and what `to_json()` serialises, whose `include_password` argument defaults to
 `True`. The last section prints both and finds nothing.
+
+**A URL may not set what runs on this machine** (D-120). `identity_file`, `config_file`,
+`ssh_executable` and `options` are constructor arguments and are *refused* as query
+parameters, because two of them were arbitrary code execution from a URL string:
+`?ssh_executable=` is `argv[0]`, and `?config_file=` is `ssh -F`, whose `ProxyCommand` runs a
+program to obtain the connection. `options` would be a third -- `-o ProxyCommand=...` is the
+same payload. The asymmetry is the whole of it: a constructor argument is written by the
+author of the program, and a URL arrives from a job config, a notebook parameter or an API
+request, which is exactly what this adapter is for. The fourth section below shows each
+refusal and then passes the same argument the way that works.
 """
 
 from __future__ import annotations
@@ -156,6 +166,47 @@ def show_the_credential() -> None:
     print("    -- and none of those four carries it, so a pickle to a dask worker cannot")
 
 
+def show_what_a_url_may_not_set() -> None:
+    """The four arguments that are constructor-only, and why (D-120).
+
+    Nothing is spawned here. The refusal happens while the URL is being resolved, which is the
+    point -- by the time a connection exists, an argument like ``ssh_executable`` has already
+    decided what got run.
+    """
+    print("\nfour arguments a URL may not set, because each decides what runs on this machine:")
+    for parameter, value in (
+        # An uploads directory is the realistic vector: the attacker needs somewhere to write,
+        # not a planted binary. `/tmp` would say the same thing and trips ruff's S108.
+        ("ssh_executable", "/srv/uploads/attacker"),
+        ("config_file", "/srv/uploads/attacker.conf"),
+        ("identity_file", "/srv/uploads/attacker.key"),
+        ("options", "ProxyCommand=/srv/uploads/attacker"),
+    ):
+        url = f"{PROTOCOL}://example.com/incoming/events.parquet?{parameter}={value}"
+        try:
+            GantrySFTPFileSystem._get_kwargs_from_urls(url)  # noqa: SLF001
+        except ValueError as refusal:
+            print(f"    ?{parameter}=  ->  {refusal}")
+        else:  # pragma: no cover -- the refusal is the feature
+            raise AssertionError(f"a URL set {parameter}")
+
+    # Not a security boundary: `?password=` grants nothing `user:password@host` does not. The
+    # refusal exists because calling `password` "unknown" would be false.
+    try:
+        GantrySFTPFileSystem._get_kwargs_from_urls(  # noqa: SLF001
+            f"{PROTOCOL}://example.com/x?password=hunter2"
+        )
+    except ValueError as refusal:
+        print(f"\n    ?password=     ->  {refusal}")
+
+    # The same argument, passed the way that works: by the author of the program.
+    filesystem = GantrySFTPFileSystem(
+        "example.com", config_file=os.devnull, skip_instance_cache=True
+    )
+    print(f"\n    ...and as a constructor argument it is unchanged: {filesystem.config_file!r}")
+    print("    (storage_options is the fsspec spelling: pd.read_parquet(url, storage_options=...))")
+
+
 def main() -> None:
     destination = sys.argv[1] if len(sys.argv) > 1 else None
     remote_dir = sys.argv[2] if len(sys.argv) > 2 else None
@@ -185,6 +236,7 @@ def main() -> None:
             read_bytes(filesystem, directory)
 
     show_the_credential()
+    show_what_a_url_may_not_set()
 
     print(
         "\nWith a real host, the same thing through pandas is one line:\n"

@@ -21,6 +21,7 @@ shipped one. The `ssh` path itself is `live-tests/test_fsspec_live.py`.
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -40,6 +41,12 @@ from fsspec.registry import (
 
 from gantry_sftp.exceptions import CapabilityError
 from gantry_sftp.fsspec import (
+    _AUTHORITY_ONLY,
+    _QUERY_FLOATS,
+    _QUERY_INTS,
+    _QUERY_STRINGS,
+    _REFUSED_IN_URL,
+    _SESSION_KEYS,
     PROTOCOL,
     GantrySFTPFile,
     GantrySFTPFileSystem,
@@ -382,13 +389,13 @@ def test_a_url_strips_to_a_remote_path(url: str, expected: str):
 def test_the_url_carries_the_connection_arguments():
     kwargs = GantrySFTPFileSystem._get_kwargs_from_urls(  # noqa: SLF001
         "gantry-sftp://bob:hunter2@example.com:2222/incoming"
-        "?identity_file=/keys/id_ed25519&depth=8&request_timeout=30"
+        "?cwd=/incoming&depth=8&request_timeout=30"
     )
     assert kwargs["host"] == "example.com"
     assert kwargs["port"] == 2222
     assert kwargs["user"] == "bob"
     assert kwargs["password"] == "hunter2"
-    assert kwargs["identity_file"] == "/keys/id_ed25519"
+    assert kwargs["cwd"] == "/incoming"
     assert kwargs["session"].depth == 8
     assert kwargs["session"].request_timeout == 30.0
 
@@ -409,8 +416,7 @@ def test_an_unknown_query_parameter_is_refused_rather_than_ignored():
         )
     assert exc.value.args[0] == (
         "unknown query parameter 'identiy_file' in a gantry-sftp URL; this adapter accepts "
-        "config_file, cwd, depth, identity_file, idle_timeout, port, request_timeout, "
-        "ssh_executable, user"
+        "cwd, depth, idle_timeout, port, request_timeout, user"
     )
 
 
@@ -420,6 +426,172 @@ def test_a_query_parameter_that_does_not_parse_names_itself(key: str, raw: str):
         _ = GantrySFTPFileSystem._get_kwargs_from_urls(f"gantry-sftp://h/x?{key}={raw}")  # noqa: SLF001
     assert key in exc.value.args[0]
     assert raw in exc.value.args[0]
+
+
+# --- D-120: a URL may not name a local path -----------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["identity_file", "config_file", "ssh_executable"])
+def test_a_url_may_not_name_a_local_path(key: str):
+    """D-120. All three are constructor arguments, so the message may not say "unknown".
+
+    A caller who reads "unknown query parameter 'config_file'" goes looking for the correct
+    spelling of a parameter that is spelled correctly and refused on purpose.
+    """
+    with pytest.raises(ValueError) as exc:
+        _ = GantrySFTPFileSystem._get_kwargs_from_urls(f"gantry-sftp://h/x?{key}=/tmp/anything")  # noqa: SLF001
+    assert exc.value.args[0] == (
+        f"query parameter {key!r} may not be set from a gantry-sftp URL because it names a "
+        f"local path, and a URL is untrusted input in a way a constructor call is not; pass "
+        f"{key}=... to the filesystem instead, through storage_options"
+    )
+
+
+def test_a_url_naming_an_ssh_executable_does_not_run_it(tmp_path: Path):
+    """D-120, named for the bug: ``?ssh_executable=`` was argv[0] and it was spawned.
+
+    Measured before the fix -- the marker file below was written, with the real argv in it.
+    The refusal has to happen while resolving the URL, before anything is spawned, which is
+    why the assertion is on the marker and not only on the exception.
+    """
+    register()
+    marker = tmp_path / "EXECUTED"
+    fake_ssh = tmp_path / "fake-ssh"
+    fake_ssh.write_text(f'#!/bin/sh\necho "argv: $*" > {marker}\nexit 1\n')
+    fake_ssh.chmod(0o700)
+
+    with pytest.raises(ValueError) as exc:
+        _ = fsspec.open(f"gantry-sftp://user@example.com/x.parquet?ssh_executable={fake_ssh}")
+    assert exc.value.args[0].startswith("query parameter 'ssh_executable' may not be set")
+    assert not marker.exists(), f"the URL spawned {fake_ssh}"
+
+
+def test_a_url_naming_a_config_file_does_not_run_its_proxycommand(tmp_path: Path):
+    """D-120, named for the bug: ``?config_file=`` was ``-F`` and its ``ProxyCommand`` ran.
+
+    The nastier of the two, because it needs no planted executable -- only a file the attacker
+    can write anywhere on disk, which an uploads directory or ``/tmp`` supplies. Measured
+    before the fix: the marker below was written by ``ssh`` itself while obtaining the
+    connection. No option in ``DEFAULT_SSH_OPTIONS`` prevents it; ``PermitLocalCommand=no``
+    governs ``LocalCommand`` and reaches neither ``ProxyCommand`` nor ``Match exec``.
+    """
+    register()
+    marker = tmp_path / "PROXIED"
+    config = tmp_path / "evil.conf"
+    config.write_text(f'Host *\n  ProxyCommand /bin/sh -c "echo ran > {marker}; exit 1"\n')
+
+    with pytest.raises(ValueError) as exc:
+        _ = fsspec.open(f"gantry-sftp://user@example.com/x.parquet?config_file={config}")
+    assert exc.value.args[0].startswith("query parameter 'config_file' may not be set")
+    assert not marker.exists(), f"the URL ran the ProxyCommand in {config}"
+
+
+def test_a_url_may_not_set_ssh_options():
+    """D-120. ``options`` was never accepted, and until 0.11 that was true by omission.
+
+    It is the most dangerous of the four: ``-o ProxyCommand=…`` is the payload
+    ``transport/_argv.py``'s module docstring demonstrates, and ``-o StrictHostKeyChecking=no``
+    removes the defence that makes an attacker-chosen destination survivable.
+    """
+    with pytest.raises(ValueError) as exc:
+        _ = GantrySFTPFileSystem._get_kwargs_from_urls(  # noqa: SLF001
+            "gantry-sftp://h/x?options=ProxyCommand%3Dtouch+/tmp/pwned"
+        )
+    assert exc.value.args[0] == (
+        "query parameter 'options' may not be set from a gantry-sftp URL because several ssh "
+        "options run a program of their own -- ProxyCommand, LocalCommand, KnownHostsCommand "
+        "and Match exec among them -- and one loads a shared library; pass options=... to the "
+        "filesystem instead, through storage_options"
+    )
+
+
+def test_a_password_query_parameter_names_the_spelling_that_works():
+    """Not a security boundary -- ``?password=`` grants nothing the authority does not.
+
+    The refusal exists because "unknown query parameter 'password'" would be false, and a
+    caller who read it as one would hunt for a spelling that already works.
+    """
+    with pytest.raises(ValueError) as exc:
+        _ = GantrySFTPFileSystem._get_kwargs_from_urls("gantry-sftp://h/x?password=hunter2")  # noqa: SLF001
+    assert exc.value.args[0] == (
+        "query parameter 'password' is not how a gantry-sftp URL carries a password; put it "
+        "in the authority as user:password@host, or pass password=... through storage_options, "
+        "which keeps it out of the URL string altogether"
+    )
+    # And the spelling the message names does work.
+    kwargs = GantrySFTPFileSystem._get_kwargs_from_urls("gantry-sftp://bob:hunter2@h/x")  # noqa: SLF001
+    assert kwargs["password"] == "hunter2"
+
+
+def test_every_constructor_argument_is_classified_for_the_url():
+    """The rule, enforced rather than remembered: a new argument must be sorted before it ships.
+
+    ``options`` was safe only because nobody had added it to ``_QUERY_STRINGS`` — an absence,
+    which no test can fail on. This is the test that fails: it reads ``__init__``'s signature
+    and requires every argument to appear in exactly one bucket, so the next argument added to
+    the adapter cannot reach a release without somebody deciding whether a URL may set it.
+
+    The question to answer when this fails is **not** "which set silences it" but the one
+    D-120 turned on: does this name something on the *client* machine, or does it carry
+    authority the URL's sender should not have? If either, it belongs in ``_REFUSED_IN_URL``.
+    """
+    accepted = _QUERY_STRINGS | _QUERY_INTS | _QUERY_FLOATS
+    refused = frozenset(_REFUSED_IN_URL)
+    # `host` is the URL's own; `user` and `port` are in the authority *and* accepted as query
+    # parameters, which is deliberate and is why membership below is "at least one" rather
+    # than "exactly one". `password` is authority-only.
+    from_authority = frozenset({"host", "user", "port"}) | _AUTHORITY_ONLY
+    expanded_into_session = frozenset({"session"})
+    buckets = {
+        "accepted": accepted,
+        "refused": refused,
+        "from the authority": from_authority,
+        "expanded into session": expanded_into_session,
+    }
+
+    signature = inspect.signature(GantrySFTPFileSystem.__init__)
+    arguments = {
+        name
+        for name, parameter in signature.parameters.items()
+        if name != "self" and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+    }
+
+    unclassified = sorted(
+        argument
+        for argument in arguments
+        if not any(argument in bucket for bucket in buckets.values())
+    )
+    assert not unclassified, (
+        f"{unclassified} are constructor arguments of GantrySFTPFileSystem and no set in "
+        f"fsspec.py says whether a URL may set them; classify each one -- see _REFUSED_IN_URL"
+    )
+
+    # A parameter cannot be both allowed and refused, and a refused one must not be reachable
+    # through the authority either -- that would be the same hole with a different spelling.
+    assert not accepted & refused
+    assert not refused & from_authority
+
+    # Every name the query sets mention is either a constructor argument or a session tunable,
+    # so a set cannot name something that quietly does nothing.
+    assert (accepted | refused) - arguments == _SESSION_KEYS
+
+
+def test_the_refused_parameters_are_still_constructor_arguments(tmp_path: Path):
+    """The break is deliberate and bounded: refused from a URL, unchanged everywhere else.
+
+    Nothing an author writes in their own source is restricted by D-120, and
+    ``storage_options`` is that spelling for an fsspec caller.
+    """
+    filesystem = GantrySFTPFileSystem(
+        "example.com",
+        identity_file=str(tmp_path / "id_ed25519"),
+        config_file=str(tmp_path / "ssh_config"),
+        ssh_executable=str(tmp_path / "ssh"),
+        skip_instance_cache=True,
+    )
+    assert filesystem.identity_file == str(tmp_path / "id_ed25519")
+    assert filesystem.config_file == str(tmp_path / "ssh_config")
+    assert filesystem.ssh_executable == str(tmp_path / "ssh")
 
 
 # --- listing --------------------------------------------------------------------------------

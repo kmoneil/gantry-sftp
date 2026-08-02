@@ -549,13 +549,62 @@ unparsed**, so these parameters are this library's own, and they are the argumen
 
 | | |
 | --- | --- |
-| `user`, `identity_file`, `config_file`, `ssh_executable` | as on `connect()` |
+| `user` | as on `connect()` |
 | `port` | as on `connect()`, and also expressible as `host:port` |
 | `cwd` | a remote working directory relative paths resolve against |
 | `depth`, `request_timeout`, `idle_timeout` | the [tunables](#tunables-and-what-they-default-to). `request_timeout=none` means "wait forever" |
 
 An unknown parameter **raises** rather than being ignored: a misspelled `identiy_file` that
-silently does nothing is a connection that fails for a reason the message will not name.
+silently does nothing is a connection that fails for a reason the message will not name. And
+`?password=` raises too, naming the two spellings that work — the authority form
+`user:password@host`, or `storage_options`, which keeps it out of the URL string altogether.
+That one is not a security boundary; a query spelling would grant nothing the authority does
+not already grant. It is there because calling `password` "unknown" would be false.
+
+**Four arguments `connect()` takes cannot come from a URL**, and this is a security boundary
+rather than an omission. `identity_file`, `config_file` and `ssh_executable` each name a
+**local** path, and until 0.11 all three were accepted as query parameters. Two of them were
+remote code execution from a URL string:
+
+- `?ssh_executable=` is `argv[0]`. The URL chose which program this library spawned.
+- `?config_file=` is `ssh -F`. An `ssh_config` may carry a `ProxyCommand`, which runs a program
+  to obtain the connection, and a `Match exec`, which runs one during config *parsing* before
+  any connection is attempted. No `-o` default neutralises either. So a URL plus one
+  attacker-writable file anywhere on disk — an uploads directory, `/tmp` — was arbitrary
+  command execution.
+
+Both were measured against OpenSSH 10.0p2, not reasoned about, and
+`tests/test_fsspec.py` carries the proof for each. The asymmetry is the whole of the argument:
+a constructor argument is written by the author of the program, while a URL arrives from a job
+config, a notebook parameter, a database row or an API request — which is precisely the
+population this adapter exists to serve, since `pd.read_parquet` of a URL somebody else chose
+is the reason it is here at all.
+
+`options` is the fourth and it was never accepted — it is named here because until 0.11 that
+was true only because nobody had added it, which is not a rule and cannot fail a test. It is
+also the most dangerous of the four: `-o ProxyCommand=…` is the same execution payload, and
+`-o StrictHostKeyChecking=no` silently removes the defence that makes an attacker-chosen
+destination survivable. **A safe-subset allowlist was considered and refused**: the directives
+that execute or load code are neither short nor stable — `ProxyCommand`, `LocalCommand`,
+`KnownHostsCommand` and `Match exec` run programs, `PKCS11Provider` loads a shared library,
+`Include` pulls in another config file whole — and a new OpenSSH release can add one more, with
+arbitrary execution as the price of missing it.
+
+A test reads the constructor's signature and requires every argument to be classified as
+URL-settable or not, so the next one added cannot reach a release without that decision being
+made.
+
+Pass them to the filesystem instead, where they are unchanged:
+
+```python
+fs = fsspec.filesystem("gantry-sftp", host="example.com", identity_file="~/.ssh/id_ed25519")
+
+# or, through storage_options
+pd.read_parquet(
+    "gantry-sftp://example.com/incoming/events.parquet",
+    storage_options={"config_file": "/etc/gantry/ssh_config"},
+)
+```
 
 ### Two things about fsspec's own design to know before you deploy this
 
