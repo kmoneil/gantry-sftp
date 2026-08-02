@@ -26,11 +26,22 @@ from gantry_sftp.codec import (
     EXTENSION_LSETSTAT,
     MAX_V3_TIMESTAMP,
     Attrs,
+    FSetStat,
+    Handle,
     LSetStat,
+    Name,
+    NameEntry,
+    OpenFlag,
     Owner,
+    Status,
     StatusCode,
 )
-from gantry_sftp.exceptions import CapabilityError, ServerError
+from gantry_sftp.exceptions import (
+    CapabilityError,
+    NoSuchFileError,
+    ProtocolError,
+    ServerError,
+)
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
@@ -38,6 +49,22 @@ pytestmark = pytest.mark.anyio
 
 KNOWN_MTIME = 1_600_000_000
 KNOWN_ATIME = 1_600_000_007
+
+LCHMOD_NOTE = (
+    "the server may be refusing because it cannot do this at all: Linux has no lchmod, so "
+    "fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP and OpenSSH maps that to a contentless "
+    "FAILURE. A symlink's own permission bits are ignored by the Linux kernel and are always "
+    "0o777, so there is nothing to set. The times and owner of a symlink can be set there; the "
+    "mode cannot. Pass follow_symlinks=True to change what the link points at, if that is what "
+    "you meant."
+)
+"""Spelled out here rather than imported, which is the only version of this that proves anything.
+
+A test importing the string it asserts on agrees with whatever the source says, including with a
+mutation of it. This is the one place in the suite where a `chmod(follow_symlinks=False)` refusal
+gets its whole explanation checked, and that explanation is the entire diagnosis: OpenSSH's
+`FAILURE` carries no message, so a caller who does not read this note is told nothing at all.
+"""
 
 
 def needs_real_server() -> None:
@@ -118,6 +145,11 @@ async def test_readlink_of_a_plain_file_is_bad_message(tmp_path: Path):
     `ENAMETOOLONG` onto it, so it is also how `readlink` says "that is not a link" -- which
     makes it a *filesystem* answer about the caller's path rather than a protocol complaint
     about ours. Pinned because the natural reaction to seeing it is to go looking in the codec.
+
+    The path is asserted as well as the code, and that is not decoration: `readlink` reaches
+    this refusal through `_unexpected`, which forwards `path=` into `raise_for_status` only on
+    the STATUS branch. Nothing else in this file drives that branch, so without this line the
+    argument could be dropped and every remaining test would still pass.
     """
     needs_real_server()
     plain = tmp_path / "plain.txt"
@@ -131,6 +163,7 @@ async def test_readlink_of_a_plain_file_is_bad_message(tmp_path: Path):
             _ = await sftp.readlink(str(plain).encode())
 
     assert refusal.value.code == int(StatusCode.BAD_MESSAGE)
+    assert refusal.value.path == str(plain).encode()
 
 
 async def test_a_dangling_target_is_created_without_complaint(tmp_path: Path):
@@ -374,7 +407,8 @@ async def test_chmod_of_a_symlink_is_impossible_on_a_linux_server(tmp_path: Path
             await sftp.chmod(str(link).encode(), 0o600, follow_symlinks=False)
 
     assert refusal.value.code == int(StatusCode.FAILURE)
-    assert any("Linux has no lchmod" in note for note in refusal.value.__notes__)
+    assert refusal.value.__notes__ == [LCHMOD_NOTE]
+    assert refusal.value.path == str(link).encode()
     assert bits(target) == 0o644
 
 
@@ -507,3 +541,306 @@ async def test_each_mutation_sends_exactly_one_attribute_flag(
         if getattr(attrs, name) is not None
     ]
     assert present == [expected_flag]
+
+
+# --- what a refusal carries, which is the half that was not asserted ------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda sftp, path: sftp.chmod(path, 0o600),
+        lambda sftp, path: sftp.chown(path, os.getuid(), os.getgid()),
+        lambda sftp, path: sftp.utime(path, KNOWN_ATIME, KNOWN_MTIME),
+        lambda sftp, path: sftp.truncate(path, 0),
+    ],
+    ids=["chmod", "chown", "utime", "truncate"],
+)
+async def test_a_refusal_names_the_path_it_concerned(tmp_path: Path, call):
+    """The state rather than the sentence, on every method that raises one.
+
+    `ServerError.path` is what makes a refusal answerable -- a `put_tree` fanning out over a
+    thousand names produces a `NO_SUCH_FILE` that means nothing without it. Every method here
+    passed it and nothing looked, so dropping the argument left a message that still read
+    correctly and an error that no longer said which file. That is the shape D-105 has found in
+    five consecutive slices: the prose half tested, the carried half not, and the half that was
+    done making the other look finished.
+    """
+    needs_real_server()
+    missing = tmp_path / "not-here.bin"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(NoSuchFileError) as refusal:
+            await call(sftp, str(missing).encode())
+
+    assert refusal.value.path == str(missing).encode()
+
+
+async def test_a_refused_symlink_names_the_link_it_did_not_create(tmp_path: Path):
+    """And it names the *link*, not the target, which is the argument this method reverses.
+
+    `symlink(target, link_path)` takes the arguments in `os.symlink`'s order and sends them in
+    the opposite one, so "which of the two paths does the error name" is a question this method
+    has a real chance of getting wrong. The link is the right answer: the target is a string
+    being stored, and the path the server refused is the name it would not create.
+    """
+    needs_real_server()
+    link = tmp_path / "no-such-directory" / "alias.txt"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(NoSuchFileError) as refusal:
+            await sftp.symlink(b"/wherever", str(link).encode())
+
+    assert refusal.value.path == str(link).encode()
+
+
+@pytest.mark.parametrize(
+    ("call", "operation"),
+    [
+        (lambda sftp, path: sftp.chmod(path, 0o600, follow_symlinks=False), "chmod"),
+        (
+            lambda sftp, path: sftp.chown(path, os.getuid(), os.getgid(), follow_symlinks=False),
+            "chown",
+        ),
+        (lambda sftp, path: sftp.utime(path, 1, 2, follow_symlinks=False), "utime"),
+    ],
+    ids=["chmod", "chown", "utime"],
+)
+async def test_the_capability_refusal_names_the_operation_the_caller_asked_for(
+    tmp_path: Path, call, operation: str
+):
+    """One helper serves three methods, and each passes its own name into the message.
+
+    `_set_one_attribute` builds the `CapabilityError` and takes `operation=` from the caller,
+    so the sentence a `chown` produces is assembled from a string `chown` alone supplies. Only
+    the `chmod` spelling had ever been checked, which left the other two forwarding a value
+    nothing read -- they could have passed each other's name, or none.
+
+    The structured fields are asserted beside the message for the reason the message exists:
+    `feature` and `path` are what a caller branches on, and neither was pinned anywhere.
+    """
+    needs_real_server()
+    target = tmp_path / "real.txt"
+    target.write_bytes(b"payload")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+    encoded = str(link).encode()
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        # The same cache poisoning `test_a_server_without_lsetstat_...` uses: the shape a
+        # server without the extension produces, without needing one.
+        sftp._unsupported.add(EXTENSION_LSETSTAT.encode("ascii"))  # noqa: SLF001
+        with pytest.raises(CapabilityError) as refusal:
+            await call(sftp, encoded)
+
+    assert refusal.value.args[0] == (
+        f"follow_symlinks=False needs {EXTENSION_LSETSTAT}, which this server will not perform, "
+        f"and filexfer v3 has no other way to {operation} a symlink without following it. "
+        f"Passing follow_symlinks=True would {operation} whatever {encoded!r} points at, which "
+        f"is a different operation"
+    )
+    assert refusal.value.feature == f"{operation} without following a symlink"
+    assert refusal.value.path == encoded
+    assert refusal.value.missing == (EXTENSION_LSETSTAT,)
+
+
+async def test_the_non_following_refusal_also_names_the_path(tmp_path: Path):
+    """The other branch of the same helper, and it needs its own test.
+
+    `_set_one_attribute` sends `SETSTAT` or `LSETSTAT` depending on `follow_symlinks`, and each
+    passes `path=` separately. A test that only ever follows proves one of the two, so the
+    non-following branch could stop naming the path with nothing failing -- on the branch where
+    the caller is being careful about *which* file is touched, which is where knowing the name
+    matters most.
+    """
+    needs_real_server()
+    target = tmp_path / "real.txt"
+    target.write_bytes(b"payload")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(ServerError) as refusal:
+            await sftp.chmod(str(link).encode(), 0o600, follow_symlinks=False)
+
+    assert refusal.value.path == str(link).encode()
+
+
+# --- ftruncate's boundary -------------------------------------------------------------------------
+
+
+async def test_ftruncate_to_zero_empties_the_open_file(tmp_path: Path):
+    """Zero is the common call and it was the untested one.
+
+    `if size < 0` is one character from `if size <= 0`, and a suite that only truncates to a
+    positive length cannot tell the two apart -- while "empty this file" is what a caller
+    holding a write handle asks for most often. The refusal it would produce arrives as a
+    `ValueError` about a negative size for a size that is not negative.
+    """
+    needs_real_server()
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"payload")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(target).encode(), OpenFlag.WRITE)
+        try:
+            await sftp.ftruncate(handle, 0)
+        finally:
+            await sftp.close(handle)
+
+    assert target.read_bytes() == b""
+
+
+async def test_ftruncate_refuses_a_negative_size_before_sending_anything(tmp_path: Path):
+    """Local, and the message carries the value -- a bare "must not be negative" is unfixable.
+
+    Refused here rather than by the server because `SIZE` is a `uint64` on the wire: a negative
+    length has no encoding, so this cannot become a refusal we forward. The server never sees a
+    frame, which is asserted rather than assumed.
+    """
+    needs_real_server()
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"payload")
+    sent: list[object] = []
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(target).encode(), OpenFlag.WRITE)
+        original = sftp.request
+
+        async def recording(request):
+            sent.append(request)
+            return await original(request)
+
+        sftp.request = recording  # type: ignore[method-assign]
+        try:
+            with pytest.raises(ValueError) as refusal:
+                await sftp.ftruncate(handle, -1)
+        finally:
+            sftp.request = original  # type: ignore[method-assign]
+            await sftp.close(handle)
+
+    assert refusal.value.args[0] == "size must not be negative, got -1"
+    assert not [packet for packet in sent if isinstance(packet, FSetStat)]
+    assert target.read_bytes() == b"payload"
+
+
+# --- a reply of the wrong shape ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        (lambda sftp, path, handle: sftp.stat(path), "ATTRS"),
+        (lambda sftp, path, handle: sftp.lstat(path), "ATTRS"),
+        (lambda sftp, path, handle: sftp.fstat(handle), "ATTRS"),
+        (lambda sftp, path, handle: sftp.readlink(path), "NAME"),
+    ],
+    ids=["stat", "lstat", "fstat", "readlink"],
+)
+@pytest.mark.parametrize("shape", ["handle", "status"])
+async def test_a_reply_of_the_wrong_shape_names_what_was_expected(
+    tmp_path: Path, call, expected: str, shape: str
+):
+    """Four methods, one helper, and the name of the packet they wanted is per-method data.
+
+    A server answering a `STAT` with a `HANDLE` is not refusing, it is unintelligible, and the
+    error has to say what was due or a reader cannot tell which end is wrong. Every one of these
+    four passes that string as a literal and none of them was checked, so all four could have
+    said the same thing, or nothing.
+
+    **Both shapes, because `_unexpected` has two branches.** A `STATUS OK` where a result was due
+    is a server claiming success while withholding the answer; any other packet is a server we
+    cannot parse. They produce different sentences and both carry the request id, which is the
+    only handle an operator has on *which* exchange went wrong when several are in flight.
+
+    Driven by replacing `request` on a session talking to a real server, rather than by a fake:
+    everything up to the reply is the shipped path, and a server that answers the wrong packet
+    type on demand is not a server anybody can be asked for.
+    """
+    needs_real_server()
+    plain = tmp_path / "plain.txt"
+    plain.write_bytes(b"payload")
+    seen_ids: list[int] = []
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(plain).encode())
+        original = sftp.request
+
+        async def wrong_shape(request):
+            seen_ids.append(request.request_id)
+            if shape == "handle":
+                return Handle(request.request_id, b"nonsense")
+            return Status(request.request_id, StatusCode.OK)
+
+        sftp.request = wrong_shape  # type: ignore[method-assign]
+        try:
+            with pytest.raises(ProtocolError) as confusion:
+                await call(sftp, str(plain).encode(), handle)
+        finally:
+            sftp.request = original  # type: ignore[method-assign]
+            await sftp.close(handle)
+
+    rendered = "Handle" if shape == "handle" else "STATUS OK"
+    assert confusion.value.args[0] == (
+        f"server answered with {rendered} where {expected} was expected"
+    )
+    assert confusion.value.request_id == seen_ids[-1]
+
+
+async def test_readlink_refuses_a_name_carrying_any_count_but_one(tmp_path: Path):
+    """A link has exactly one target, so a count that is not one is a server we do not understand.
+
+    The same strictness `realpath` applies, and for the same reason: `send_names` sends one, and
+    where the draft and the reference implementation agree there is nothing to be lenient
+    towards. Taking `entries[0]` from a two-name reply would be picking one of the server's
+    answers and calling it the target.
+    """
+    needs_real_server()
+    link = tmp_path / "alias.txt"
+    link.symlink_to(tmp_path / "real.txt")
+    encoded = str(link).encode()
+    seen_ids: list[int] = []
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        original = sftp.request
+
+        async def two_names(request):
+            seen_ids.append(request.request_id)
+            entry = NameEntry(filename=b"first", longname=b"first", attrs=Attrs())
+            return Name(request.request_id, (entry, entry))
+
+        sftp.request = two_names  # type: ignore[method-assign]
+        try:
+            with pytest.raises(ProtocolError) as confusion:
+                _ = await sftp.readlink(encoded)
+        finally:
+            sftp.request = original  # type: ignore[method-assign]
+
+    assert confusion.value.args[0] == (
+        f"READLINK of {encoded!r} answered with 2 names, and a link has exactly one target"
+    )
+    assert confusion.value.request_id == seen_ids[-1]

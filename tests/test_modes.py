@@ -595,6 +595,13 @@ async def test_a_refused_mode_fails_the_upload_and_does_not_publish(tmp_path: Pa
     assert not any(isinstance(packet, Rename) for packet in server.seen)
     # And the staging file it wrote is cleaned up rather than left behind.
     assert [packet for packet in server.seen if isinstance(packet, Remove)]
+    # The error names the file the mode was refused on, which on this path is the staging name
+    # rather than the destination: nothing was ever published under `/target.bin`, so an error
+    # pointing at it would name a file that does not exist. `_set_mode` is handed that path
+    # explicitly for this reason and nothing had checked it arrived.
+    staged = [packet.filename for packet in server.seen if isinstance(packet, Open)]
+    assert refusal.value.path == staged[0]
+    assert refusal.value.path != b"/target.bin"
 
 
 async def test_a_refused_timestamp_still_does_not_fail_the_upload(tmp_path: Path):

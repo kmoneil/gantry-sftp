@@ -35,6 +35,7 @@ from gantry_sftp.codec import (
     LStat,
     Open,
     Read,
+    SetStat,
     Stat,
     Status,
     StatusCode,
@@ -397,6 +398,53 @@ async def test_neither_tree_stamps_the_root_the_caller_named(tmp_path: Path):
 
     assert int(uploaded.stat().st_mtime) != KNOWN_MTIME
     assert int(downloaded.stat().st_mtime) != KNOWN_MTIME
+
+
+async def test_a_refused_directory_timestamp_does_not_fail_the_tree(tmp_path: Path):
+    """The trade `_set_directory_times` makes, and it was made in a `suppress` nothing entered.
+
+    The tree's files are the payload and they are already written by the time the directory
+    pass runs, so failing a completed upload because a server would not restamp a directory
+    would be the wrong answer. Same trade `_set_times` makes for a file, and the same one
+    `_set_directory_modes` makes -- which had a test, while this one did not: removing the
+    `suppress` here broke nothing in the suite.
+
+    The refusal is injected rather than provoked, because no unprivileged test can make a real
+    `sftp-server` decline a `utimes` on a directory it owns. Everything either side of the
+    reply is the shipped path, and the error the code catches is a real `ServerError` built by
+    `raise_for_status` from a real STATUS.
+    """
+    needs_real_server()
+    source = tmp_path / "src"
+    build_tree(source)
+    uploaded = tmp_path / "up"
+    refused: list[bytes] = []
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        original = sftp.request
+
+        async def refuse_directory_times(request):
+            # Only the directory pass: a file's times go by FSETSTAT on its open handle.
+            if isinstance(request, SetStat) and request.attrs.times is not None:
+                refused.append(request.path)
+                return Status(request.request_id, StatusCode.PERMISSION_DENIED, b"no")
+            return await original(request)
+
+        sftp.request = refuse_directory_times  # type: ignore[method-assign]
+        try:
+            result = await sftp.put_tree(source, str(uploaded).encode(), preserve_times=True)
+        finally:
+            sftp.request = original  # type: ignore[method-assign]
+
+    assert result.files == 2
+    # The refusal was reached -- otherwise this passes by never running the code it is about.
+    assert refused == [str(uploaded / "sub").encode()]
+    # And the files, which are what the caller was transferring, kept their times.
+    assert int((uploaded / "a.txt").stat().st_mtime) == KNOWN_MTIME
+    assert int((uploaded / "sub" / "b.txt").stat().st_mtime) == KNOWN_MTIME
 
 
 # --- absent is not epoch ---------------------------------------------------------------------
