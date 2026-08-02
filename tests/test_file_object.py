@@ -51,7 +51,13 @@ from gantry_sftp.codec import (
 from gantry_sftp.codec import (
     FrameSplitter as Splitter,
 )
-from gantry_sftp.exceptions import ProtocolError, ServerError, StateError, TransferError
+from gantry_sftp.exceptions import (
+    ProtocolError,
+    ServerError,
+    StateError,
+    TransferError,
+    TransferTimeoutError,
+)
 from gantry_sftp.session import open_session, read_range_into, write_range_from
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
@@ -256,6 +262,9 @@ async def test_a_data_longer_than_its_request_is_refused():
         "server answered a 64-byte READ at offset 0 with 65 bytes; "
         "a DATA may be short but never long"
     )
+    # The frame it came on, which is the half a reader needs to report this upstream and the
+    # half the sentence reads perfectly without.
+    assert exc.value.request_id is not None
 
 
 async def test_the_unfilled_tail_of_a_buffer_is_left_alone():
@@ -679,3 +688,169 @@ async def test_the_file_object_repr_says_where_it_is(tmp_path: Path):
             await remote.read(4)
             assert repr(remote) == f"<RemoteFile {path!r} open at 4>"
         assert repr(remote) == f"<RemoteFile {path!r} closed at 4>"
+
+
+# --- the range functions' own guards, and what they forward ------------------------------------
+#
+# D-105's sixteenth slice. Both take the same three guards as the whole-file schedulers and had
+# none of their messages asserted -- and neither had ever been passed the smallest value its
+# guard admits, so `< 1` could become `<= 1` with every existing test still green.
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"depth": 0}, "depth must be at least 1, got 0"),
+        ({"write_length": 0}, "write_length must be at least 1, got 0"),
+    ],
+    ids=["depth", "write-length"],
+)
+async def test_a_range_write_refuses_a_setting_that_cannot_make_progress(
+    kwargs: dict[str, int], message: str
+):
+    server = RangeServer(b"")
+    with pytest.raises(ValueError) as refusal:
+        _ = await write_range(server, 0, b"payload", **{"write_length": 64, **kwargs})
+    assert refusal.value.args[0] == message
+
+
+async def test_a_range_write_refuses_a_negative_offset():
+    server = RangeServer(b"")
+    with pytest.raises(ValueError) as refusal:
+        _ = await write_range(server, -1, b"payload")
+    assert refusal.value.args[0] == "offset must not be negative, got -1"
+
+
+async def test_a_range_read_refuses_a_negative_offset():
+    server = RangeServer(b"0123456789")
+    with pytest.raises(ValueError) as refusal:
+        _ = await read_range(server, -1, 4)
+    assert refusal.value.args[0] == "offset must not be negative, got -1"
+
+
+@pytest.mark.parametrize("depth", [0, -1], ids=["zero", "negative"])
+async def test_a_range_read_refuses_a_depth_that_cannot_make_progress(depth: int):
+    server = RangeServer(b"0123456789")
+    with pytest.raises(ValueError) as refusal:
+        _ = await read_range(server, 0, 4, depth=depth)
+    assert refusal.value.args[0] == f"depth must be at least 1, got {depth}"
+
+
+async def test_the_smallest_legal_settings_still_move_a_range():
+    """`depth=1` and one byte per request: the value each guard is written to admit.
+
+    Every other test of those guards passes 0 or -1, which cannot separate `< 1` from `<= 1`.
+    A caller reaches for this shape to find out which byte a broken endpoint mangles, so it has
+    to work rather than merely not be refused.
+    """
+    server = RangeServer(b"0123456789")
+    assert await read_range(server, 2, 4, depth=1, read_length=1) == b"2345"
+    assert server.reads == [(2, 1), (3, 1), (4, 1), (5, 1)]
+
+
+async def test_an_empty_range_read_moves_nothing_and_reports_zero():
+    """Zero is the answer, and it is one character from being one.
+
+    An empty buffer is what a caller passes at EOF, and a range read that reported `1` for it
+    would have the caller advance an offset past a byte nothing wrote -- silently, since there
+    is no request on the wire to disagree with.
+    """
+    server = RangeServer(b"0123456789")
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+        # The returned count is the assertion, not the buffer: `bytes(buffer[:1])` of an empty
+        # buffer is still empty, so reading through the helper cannot see a wrong answer here.
+        filled = await read_range_into(
+            dispatcher, HANDLE, memoryview(bytearray(0)), offset=4, read_length=64
+        )
+
+    assert filled == 0
+    assert server.reads == []
+
+
+async def test_a_refused_range_write_names_the_file_it_was_writing():
+    """`remote_path` is forwarded to the scheduler, which holds a handle and no name.
+
+    A byte-range write is what a file object does on `flush`, so the caller is several frames
+    away from the path by the time this fails -- and the error is all they get.
+    """
+
+    class RefusesWrites(RangeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Write):
+                self._queue(encode(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"no")))
+                return
+            super()._handle(packet)
+
+    server = RefusesWrites(b"")
+    with pytest.raises(TransferError) as refusal:
+        _ = await write_range(server, 0, b"payload", remote_path=b"/incoming/report.csv")
+
+    assert refusal.value.remote_path == b"/incoming/report.csv"
+
+
+async def test_a_stalled_range_read_is_bounded_by_the_idle_timeout_it_was_given():
+    """The forwarded watchdog, and the outer deadline is the assertion.
+
+    A dropped `idle_timeout=` falls back to the shipped 60 s default, which raises the same
+    error a minute later -- so a test with no ceiling of its own cannot tell the two apart and
+    is merely slow.
+    """
+
+    class NeverAnswersARead(RangeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read):
+                return
+            super()._handle(packet)
+
+    server = NeverAnswersARead(b"0123456789")
+    with anyio.fail_after(5):
+        with pytest.raises(TransferTimeoutError):
+            _ = await read_range(server, 0, 4, idle_timeout=0.05)
+
+
+async def test_the_smallest_legal_settings_still_write_a_range():
+    """`depth=1` on the sending side, which its own guard admits and nothing had passed."""
+    server = RangeServer(b"")
+    assert await write_range(server, 0, b"payload", depth=1, write_length=1) == 7
+    assert server.writes == [(offset, 1) for offset in range(7)]
+
+
+async def test_a_refused_range_read_names_the_file_it_was_reading():
+    """The read side's `remote_path`, forwarded to a scheduler that holds a handle and no name.
+
+    Asserted separately from the write side's because they are separate call sites: the two
+    functions each build their own scheduler and each pass this argument themselves.
+    """
+
+    class RefusesReads(RangeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read):
+                self._queue(encode(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"no")))
+                return
+            super()._handle(packet)
+
+    server = RefusesReads(b"0123456789")
+    with pytest.raises(TransferError) as refusal:
+        _ = await read_range(server, 0, 4, remote_path=b"/incoming/report.csv")
+
+    assert refusal.value.remote_path == b"/incoming/report.csv"
+
+
+async def test_a_stalled_range_write_is_bounded_by_the_idle_timeout_it_was_given():
+    """The write side's watchdog, with the same outer ceiling as the read side's.
+
+    Separate call sites again, and the failure mode is worse here: a `flush` that never
+    returns holds bytes the caller believes are on their way.
+    """
+
+    class NeverAnswersAWrite(RangeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Write):
+                return
+            super()._handle(packet)
+
+    server = NeverAnswersAWrite(b"")
+    with anyio.fail_after(5):
+        with pytest.raises(TransferTimeoutError):
+            _ = await write_range(server, 0, b"payload", idle_timeout=0.05)

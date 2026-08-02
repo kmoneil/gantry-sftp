@@ -456,3 +456,105 @@ async def test_uploading_over_a_real_server_uses_the_derived_write_size(tmp_path
     # The derived size is the server's real ceiling, not a round number that gets clamped.
     assert expected == 261120
     assert sftp.limits != ServerLimits.unknown()
+
+
+# --- the smallest legal settings, and what a refusal renders ------------------------------------
+#
+# D-105's sixteenth slice. The guards below all read `< 1`, and every test that exercised them
+# passed 0 or -1 -- so `<= 1` and `< 2` survived, and the smallest value the guard is written to
+# *allow* had never been through the scheduler at all.
+
+
+async def test_a_depth_and_a_write_length_of_one_still_transfer(tmp_path: Path):
+    """One request in flight, one byte at a time: legal, and the boundary the guards name.
+
+    `depth=1` is the spelling for a server that cannot pipeline, and `write_length=1` is what a
+    caller reaches for to isolate which byte a broken endpoint mangles. Both are the value the
+    guard admits, and a mutation to `<= 1` or `< 2` refuses them while every existing test --
+    all of which pass 0 or -1 -- keeps passing.
+    """
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"abc")
+    server = WritableServer()
+
+    assert await push(server, source, depth=1, write_length=1) == 3
+    assert bytes(server.stored) == b"abc"
+    assert server.writes == [(0, 1), (1, 1), (2, 1)]
+    assert server.max_in_flight == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"depth": 0}, "depth must be at least 1, got 0"),
+        ({"depth": -1}, "depth must be at least 1, got -1"),
+        ({"write_length": 0}, "write_length must be at least 1, got 0"),
+    ],
+    ids=["depth-zero", "depth-negative", "write-length-zero"],
+)
+async def test_a_setting_that_cannot_make_progress_names_itself_and_its_value(
+    tmp_path: Path, kwargs: dict[str, int], message: str
+):
+    """The value is in the message because the caller usually computed it.
+
+    A `write_length` here comes from `negotiate_transfer_sizes` and a `depth` from a session
+    tunable, so "must be at least 1" without the number sends somebody looking at a constant
+    rather than at the arithmetic that produced a zero.
+    """
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"x")
+    with pytest.raises(ValueError) as refusal:
+        await push(WritableServer(), source, **{"write_length": 64, **kwargs})
+    assert refusal.value.args[0] == message
+
+
+async def test_a_refusal_renders_the_server_s_own_words_without_trusting_them(tmp_path: Path):
+    """The message on a STATUS is attacker-controlled bytes, and it goes into our error text.
+
+    Three properties in one assertion, each of which a mutation removes on its own: it is
+    decoded leniently, because a server may send anything and a `UnicodeDecodeError` from
+    inside an error path replaces the diagnosis with a crash; the trailing whitespace real
+    servers pad with is stripped from the *right*, so the sentence ends where it should; and
+    the offset is the chunk's rather than the transfer's.
+    """
+
+    class RefusesRudely(WritableServer):
+        def _on_write(self, packet: Write) -> None:
+            self._reply(Status(packet.request_id, StatusCode.FAILURE, b"caf\xe9 quota  \n"))
+
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"x" * 128)
+    with pytest.raises(TransferError) as refusal:
+        await push(RefusesRudely(), source, write_length=64, depth=1)
+
+    assert refusal.value.args[0] == "server refused a write at offset 0: FAILURE caf� quota"
+
+
+async def test_a_stall_part_way_through_reports_what_was_acknowledged(tmp_path: Path):
+    """`transferred` on a timeout, and zero is the one value that cannot prove it is carried.
+
+    The silent-server test above asserts `transferred == 0` -- which is also what the field
+    reads if it is never passed, so it cannot tell a plumbed value from a default. A stall
+    *after* some writes have been acknowledged is the case a caller resumes from, and the
+    count is the whole reason to prefer resuming to restarting.
+    """
+
+    class GoesQuietAfter(WritableServer):
+        def __init__(self, *, after: int) -> None:
+            super().__init__()
+            self.after = after
+
+        def _on_write(self, packet: Write) -> None:
+            if packet.offset >= self.after:
+                self._in_flight += 1
+                self.writes.append((packet.offset, len(packet.data)))
+                return
+            super()._on_write(packet)
+
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"x" * 192)
+
+    with pytest.raises(TransferTimeoutError) as timed_out:
+        await push(GoesQuietAfter(after=128), source, write_length=64, depth=1, idle_timeout=0.05)
+
+    assert timed_out.value.transferred == 128

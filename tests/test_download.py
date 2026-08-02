@@ -35,7 +35,7 @@ from gantry_sftp.codec import (
 from gantry_sftp.codec import (
     FrameSplitter as Splitter,
 )
-from gantry_sftp.exceptions import TransferError, TransferTimeoutError
+from gantry_sftp.exceptions import ProtocolError, TransferError, TransferTimeoutError
 from gantry_sftp.session import (
     DEFAULT_PIPELINE_DEPTH,
     ServerLimits,
@@ -626,3 +626,106 @@ async def test_downloading_from_a_real_sftp_server(tmp_path: Path):
 
     assert written == len(content)
     assert destination.read_bytes() == content
+
+
+# --- the smallest legal settings, and what a refusal renders ------------------------------------
+#
+# D-105's sixteenth slice, the download half. Same finding as the upload's: every test of these
+# guards passes 0 or -1, so `<= 1` and `< 2` survive and the value the guard is written to admit
+# had never been through the scheduler.
+
+
+async def test_a_depth_and_a_read_length_of_one_still_transfer(tmp_path: Path):
+    """One request in flight, one byte per request -- legal, and the boundary the guards name.
+
+    `read_length=1` is not a serious tuning choice; it is what a caller reaches for when a
+    server mangles a particular byte and they want one request per byte to find it. It has to
+    work, and a mutation to `<= 1` refuses it while every existing guard test keeps passing.
+    """
+    server = ScriptedServer(b"abc")
+    destination = tmp_path / "out"
+
+    assert await fetch(server, destination, depth=1, read_length=1) == 3
+    assert destination.read_bytes() == b"abc"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"depth": 0}, "depth must be at least 1, got 0"),
+        ({"depth": -1}, "depth must be at least 1, got -1"),
+        ({"read_length": 0}, "read_length must be at least 1, got 0"),
+    ],
+    ids=["depth-zero", "depth-negative", "read-length-zero"],
+)
+async def test_a_setting_that_cannot_make_progress_names_itself_and_its_value(
+    tmp_path: Path, kwargs: dict[str, int], message: str
+):
+    """The value belongs in the message because the caller usually computed it rather than
+    typing it -- a `read_length` comes from the negotiated limits and a depth from a tunable."""
+    server = ScriptedServer(b"x")
+    with pytest.raises(ValueError) as refusal:
+        await fetch(server, tmp_path / "out", **{"read_length": 64, **kwargs})
+    assert refusal.value.args[0] == message
+
+
+async def test_a_refusal_renders_the_server_s_own_words_without_trusting_them(tmp_path: Path):
+    """The mirror of the upload's, and the same three properties in one sentence.
+
+    A STATUS message is bytes the far end chose. Decoding it strictly would turn a refusal into
+    a `UnicodeDecodeError` raised from inside the error path, which replaces the diagnosis with
+    a crash; and the padding real servers add is stripped from the right, so the sentence ends
+    where the server's words do.
+    """
+    server = RefusingFrom(bytes(256), after=64, message=b"caf\xe9 quota  \n")
+    with pytest.raises(TransferError) as refusal:
+        await fetch(server, tmp_path / "out", read_length=64, depth=1)
+
+    assert (
+        refusal.value.args[0] == "server refused a read at offset 64: PERMISSION_DENIED caf� quota"
+    )
+
+
+async def test_a_reply_of_the_wrong_shape_to_a_read_names_the_frame_it_came_on(tmp_path: Path):
+    """A READ is answered with DATA or STATUS. Anything else is a server we cannot follow.
+
+    The `request_id` is what ties this to a line in the frame dump, and it is the half most
+    easily dropped: the sentence reads perfectly without it, and a caller reporting an
+    unintelligible server upstream has nothing else to quote.
+    """
+
+    class AnswersWithAHandle(ScriptedServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read):
+                self._queue(encode(Handle(packet.request_id, HANDLE)))
+                return
+            super()._handle(packet)
+
+    server = AnswersWithAHandle(bytes(64))
+    with pytest.raises(ProtocolError) as confusion:
+        await fetch(server, tmp_path / "out", read_length=64, depth=1)
+
+    assert confusion.value.args[0] == "server answered a READ with Handle"
+    assert confusion.value.request_id is not None
+
+
+async def test_a_stall_part_way_through_reports_what_had_arrived(tmp_path: Path):
+    """`transferred` on a timeout, and zero is the one value that cannot prove it is carried.
+
+    The silent-server test above asserts nothing about the count because nothing had arrived;
+    a field that is never passed reads the same way. A stall after some ranges have landed is
+    the case a caller resumes from, and the count is what the resume starts at.
+    """
+
+    class GoesQuietAfter(ScriptedServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Read) and packet.offset >= 64:
+                self.reads.append((packet.offset, packet.length))
+                return
+            super()._handle(packet)
+
+    server = GoesQuietAfter(bytes(192))
+    with pytest.raises(TransferTimeoutError) as timed_out:
+        await fetch(server, tmp_path / "out", read_length=64, depth=1, idle_timeout=0.05)
+
+    assert timed_out.value.transferred == 64
