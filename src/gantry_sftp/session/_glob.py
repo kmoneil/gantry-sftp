@@ -210,6 +210,16 @@ def split_pattern(
     this argument means "match the names case-insensitively", not "resolve the whole path
     case-insensitively", and the public docstring says so in those words.
 
+    **Whether the pattern is absolute is read from the pattern itself, not from what survives
+    trimming its trailing separators.** ``//`` and ``///`` are nothing but separator, so a
+    version that asked after trimming asked an empty string and was told "relative" --
+    ``glob("/")`` answered ``/`` and ``glob("//")`` answered *nothing*, having resolved the
+    root of the server against the working directory and then stat'd ``b""``. Both spellings
+    name the root to the server itself, measured against OpenSSH 10.0p2: POSIX leaves two
+    leading separators implementation-defined and collapses three or more, and either way the
+    path is absolute. Trailing separators need no trimming here in any case, since splitting on
+    ``/`` yields empty components and those are dropped.
+
     Args:
         pattern: The whole pattern, absolute or relative.
         case_sensitive: What the caller asked for; see above.
@@ -222,9 +232,8 @@ def split_pattern(
         in a shell.
     """
     directories_only = pattern.endswith(b"/") and pattern != b"/"
-    trimmed = pattern.rstrip(b"/") if directories_only else pattern
-    absolute = trimmed.startswith(b"/")
-    parts = [part for part in trimmed.split(b"/") if part]
+    absolute = pattern.startswith(b"/")
+    parts = [part for part in pattern.split(b"/") if part]
 
     index = next(
         (i for i, part in enumerate(parts) if has_magic(part) or part == RECURSIVE),
@@ -233,8 +242,7 @@ def split_pattern(
     if not case_sensitive and parts:
         index = min(index, len(parts) - 1)
     joined = b"/".join(parts[:index])
-    base = b"/" + joined if absolute else joined
-    return base or (b"/" if absolute else b""), tuple(parts[index:]), directories_only
+    return (b"/" + joined if absolute else joined), tuple(parts[index:]), directories_only
 
 
 def match_component(pattern: bytes, name: bytes, *, case_sensitive: bool = True) -> bool:

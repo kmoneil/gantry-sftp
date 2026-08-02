@@ -535,10 +535,17 @@ def test_a_range_that_folds_backwards_is_still_matched_as_written(name: bytes):
         (b"/*", (b"/", (b"*",), False)),
         (b"/incoming//sub/*", (b"/incoming/sub", (b"*",), False)),
         (b"/incoming/*/", (b"/incoming", (b"*",), True)),
-        # A trailing slash strips *slashes* and nothing else. The final `X` is there because a
-        # strip set is a set of bytes rather than a suffix, so a strip written with any other
-        # byte in it eats part of the name it was meant to leave alone.
+        # A trailing slash contributes an empty component and nothing else. The final `X` is
+        # there because a trailing separator used to be removed with `rstrip(b"/")`, and a
+        # strip set is a set of bytes rather than a suffix -- so a strip written with any other
+        # byte in it ate part of the name it was meant to leave alone.
         (b"/logX/", (b"/logX", (), True)),
+        # A pattern that is nothing but separator is still absolute, and the server agrees: it
+        # answers `lstat("//")` with the root directory. Deciding this after the trailing
+        # separators were trimmed decided it about `b""`, which is relative -- so `glob("//")`
+        # resolved the root against the working directory and then matched nothing at all.
+        (b"//", (b"/", (), True)),
+        (b"///", (b"/", (), True)),
     ],
     ids=[
         "literal-prefix",
@@ -552,6 +559,8 @@ def test_a_range_that_folds_backwards_is_still_matched_as_written(name: bytes):
         "empty-components-collapse",
         "trailing-slash-with-magic",
         "trailing-slash-strips-only-slashes",
+        "two-separators-are-absolute",
+        "three-separators-are-absolute",
     ],
 )
 def test_the_literal_prefix_is_split_off_so_no_directory_is_listed_needlessly(
@@ -570,8 +579,18 @@ def test_the_literal_prefix_is_split_off_so_no_directory_is_listed_needlessly(
         (b"/a/b/c", (b"/a/b", (b"c",), False)),
         (b"report.csv", (b"", (b"report.csv",), False)),
         (b"/", (b"/", (), False)),
+        # No component to hold back, so the "never fold the last one into the prefix" rule has
+        # nothing to do here and must not turn an empty split into a negative index.
+        (b"//", (b"/", (), True)),
     ],
-    ids=["literal-file", "magic-is-unchanged", "literal-path", "relative-literal", "root"],
+    ids=[
+        "literal-file",
+        "magic-is-unchanged",
+        "literal-path",
+        "relative-literal",
+        "root",
+        "two-separators-are-absolute",
+    ],
 )
 def test_case_insensitive_matching_never_folds_the_last_component_into_the_prefix(
     pattern: bytes, expected: tuple[bytes, tuple[bytes, ...], bool]
@@ -1191,6 +1210,36 @@ async def test_globbing_a_real_server(tmp_path: Path):
     # what this proves is our folding against a real listing, which is the half we own. The
     # server-side half is the argument for `case_sensitive` being a parameter at all.
     assert folded == [prefix + b"/REPORT.CSV"]
+
+
+async def test_a_pattern_that_is_all_separator_names_the_root_the_way_the_server_does(
+    tmp_path: Path,
+):
+    # The bug the mutation lane's `rstrip(b"/")` -> `rstrip(None)` survivor pointed at, and it
+    # needed a real server to be worth anything: the claim is that `//` and `///` name the same
+    # directory to `sftp-server` as `/` does, which no fake of ours can establish. Absoluteness
+    # used to be decided about the pattern *after* its trailing separators were trimmed, so a
+    # pattern that is nothing but separator trimmed down to `b""`, was called relative, and was
+    # resolved against the working directory -- `glob("/")` answered the root and `glob("//")`
+    # answered nothing, which is this module's own "no matches when I mean I could not look"
+    # in the one place it was not looking for it.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        # The server's own answer first, so the assertions below are pinned to what it holds
+        # rather than to what this file believes about POSIX pathname resolution.
+        root = await sftp.lstat(b"/")
+        assert (await sftp.lstat(b"//")).permissions == root.permissions
+        assert (await sftp.lstat(b"///")).permissions == root.permissions
+
+        assert await matches(sftp, b"/") == [b"/"]
+        assert await matches(sftp, b"//") == [b"/"]
+        assert await matches(sftp, b"///") == [b"/"]
+        assert await matches(sftp, b"//", case_sensitive=False) == [b"/"]
 
 
 async def test_a_real_server_listing_feeds_get_without_the_caller_joining_anything(
