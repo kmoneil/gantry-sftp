@@ -3169,7 +3169,7 @@ class Session:
         progress: ProgressCallback | None,
         remote_path: bytes,
         no_follow: bool,
-        start_offset: int = 0,
+        start_offset: int,
         times: Times | None = None,
         mode: int | None = None,
     ) -> int:

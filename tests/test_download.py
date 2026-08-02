@@ -18,6 +18,8 @@ import pytest
 from tests.conftest import negotiate, running_dispatcher
 
 from gantry_sftp.codec import (
+    Attrs,
+    AttrsReply,
     Close,
     Codec,
     Data,
@@ -26,6 +28,7 @@ from gantry_sftp.codec import (
     Open,
     OpenFlag,
     Read,
+    Stat,
     Status,
     StatusCode,
     Version,
@@ -35,10 +38,16 @@ from gantry_sftp.codec import (
 from gantry_sftp.codec import (
     FrameSplitter as Splitter,
 )
-from gantry_sftp.exceptions import ProtocolError, TransferError, TransferTimeoutError
+from gantry_sftp.exceptions import (
+    ProtocolError,
+    ServerError,
+    TransferError,
+    TransferTimeoutError,
+)
 from gantry_sftp.session import (
     DEFAULT_PIPELINE_DEPTH,
     ServerLimits,
+    Session,
     download_handle,
     negotiate_transfer_sizes,
 )
@@ -729,3 +738,96 @@ async def test_a_stall_part_way_through_reports_what_had_arrived(tmp_path: Path)
         await fetch(server, tmp_path / "out", read_length=64, depth=1, idle_timeout=0.05)
 
     assert timed_out.value.transferred == 64
+
+
+# --- what `get` forwards, and the handle it must not leak ---------------------------------------
+
+
+async def test_a_stat_refused_after_the_open_still_closes_the_handle(tmp_path: Path):
+    """The concurrent STAT-and-OPEN pair, and the case where only one of them fails.
+
+    Both go out together on the non-resume path (D-110), so either can fail while the other
+    succeeded -- and a STAT that fails after the OPEN has already returned a handle leaves that
+    handle open on the server unless this path closes it. Nothing had exercised the failing
+    half: every other test here refuses the READ, by which point the handle is owned by the
+    transfer and closed by it.
+    """
+
+    class RefusesTheStat(ScriptedServer):
+        def __init__(self, content: bytes) -> None:
+            super().__init__(content)
+            self.closed: list[bytes] = []
+
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Stat):
+                self._queue(encode(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"no")))
+                return
+            if isinstance(packet, Open):
+                self._queue(encode(Handle(packet.request_id, HANDLE)))
+                return
+            if isinstance(packet, Close):
+                self.closed.append(packet.handle)
+                self._queue(encode(Status(packet.request_id, StatusCode.OK)))
+                return
+            super()._handle(packet)
+
+    server = RefusesTheStat(bytes(64))
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+        session = Session(dispatcher, ServerLimits.unknown())
+        with pytest.raises(ServerError):
+            _ = await session.get(b"/remote.bin", tmp_path / "out")
+
+    assert server.closed == [HANDLE], "the handle the OPEN returned was left on the server"
+
+
+async def test_get_forwards_its_own_depth_rather_than_the_session_s(tmp_path: Path):
+    """`depth=` on the call is per-transfer, and dropping it silently restores the session's.
+
+    The upload half of this was proven in an earlier slice; the download reaches its scheduler
+    through `_download_into`, which resolves `None` to the session's value -- so a call that
+    quietly ignored the argument would run at a depth the caller had overridden, and D-101
+    states a transfer's memory as `concurrency x depth x request size`. Proven with a depth the
+    scheduler refuses, because an invalid value is the cheapest thing that separates "the
+    call's depth arrived" from "the session's did".
+    """
+
+    class Openable(ScriptedServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Stat):
+                self._queue(encode(AttrsReply(packet.request_id, Attrs(size=len(self.content)))))
+                return
+            if isinstance(packet, Open):
+                self._queue(encode(Handle(packet.request_id, HANDLE)))
+                return
+            if isinstance(packet, Close):
+                self._queue(encode(Status(packet.request_id, StatusCode.OK)))
+                return
+            super()._handle(packet)
+
+    server = Openable(bytes(64))
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+        session = Session(dispatcher, ServerLimits.unknown(), depth=8)
+        with pytest.raises(ValueError) as refusal:
+            _ = await session.get(b"/remote.bin", tmp_path / "out", depth=0)
+
+    assert refusal.value.args[0] == "depth must be at least 1, got 0"
+
+
+async def test_get_names_itself_in_the_mode_it_refuses(tmp_path: Path):
+    """`resolve_mode` is shared by four transfer methods and takes the caller's name as data.
+
+    The trees and `put` each got this in earlier slices; `get` is the fourth caller and the
+    last one whose wiring nothing drove. `mode=True` is the refusal that reaches it earliest --
+    a `bool` is an `int`, so without the check a download would land `0o1`.
+    """
+    server = ScriptedServer(bytes(64))
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+        session = Session(dispatcher, ServerLimits.unknown())
+        with pytest.raises(TypeError) as refusal:
+            _ = await session.get(b"/remote.bin", tmp_path / "out", mode=True)
+
+    assert refusal.value.args[0].startswith("get() mode= must be ")
+    assert server.reads == [], "a refused argument reached the wire"

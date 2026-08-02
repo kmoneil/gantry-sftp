@@ -27,6 +27,7 @@ the argument exists to prevent, reported as success.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -84,6 +85,9 @@ POSIX_RENAME_NAME = b"posix-rename@openssh.com"
 # Distinctive and asymmetric on purpose: 0o640 differs from every default a server or this
 # library would otherwise produce (0o666 & ~umask, and 0o600), so a test asserting it cannot
 # pass by accident on a machine whose umask happens to agree.
+KNOWN_MTIME = 1_600_000_000
+KNOWN_ATIME = 1_600_000_007
+
 PRIVATE = 0o600
 GROUP_READABLE = 0o640
 
@@ -172,11 +176,15 @@ async def test_a_download_is_private_by_default_and_takes_an_explicit_mode(tmp_p
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        await sftp.get(str(source).encode(), private)
-        await sftp.get(str(source).encode(), shared, mode=GROUP_READABLE)
+        default_result = await sftp.get(str(source).encode(), private)
+        widened = await sftp.get(str(source).encode(), shared, mode=GROUP_READABLE)
 
     assert bits(private) == PRIVATE
     assert bits(shared) == GROUP_READABLE
+    # And the result says what it did, which is the field a caller logs rather than re-stating
+    # the mode they asked for. `None` is the honest answer for the default: nothing was set.
+    assert default_result.mode is None
+    assert widened.mode == GROUP_READABLE
 
 
 # --- PRESERVE, both directions --------------------------------------------------------------
@@ -687,6 +695,11 @@ async def test_preserving_a_mode_the_server_never_sent_is_an_error(tmp_path: Pat
         "b'/source.bin', so there is nothing to preserve; pass an explicit mode= or "
         "leave it unset to keep the 0o600 a download creates"
     )
+    # Both counters are zero and both are the answer rather than a default: the refusal comes
+    # before the first READ, so nothing moved and there is no offset to resume from. A caller's
+    # retry loop reads these to decide, and "unset" and "zero" are different decisions.
+    assert refusal.value.transferred == 0
+    assert refusal.value.offset == 0
     assert not any(isinstance(packet, Read) for packet in server.seen)
 
 
@@ -987,3 +1000,96 @@ async def test_a_refused_narrowing_names_the_destination_it_was_narrowing(tmp_pa
 
     assert refusal.value.path == b"/target.bin"
     assert not any(isinstance(packet, Write) for packet in server.seen), "bytes went out anyway"
+
+
+async def test_the_metadata_of_an_already_complete_resume_does_not_follow_a_link(tmp_path: Path):
+    """`no_follow` is forwarded to both metadata calls on the path that opens nothing else.
+
+    The early return applies the mode and the times to the destination by name, on a fresh
+    descriptor, and it is handed the caller's `no_follow` for the reason the docstring gives:
+    the containment check is old by the time this runs. Both forwards were invisible -- a
+    dropped one degrades to *following* the link, which is the failure the argument exists to
+    prevent, and the file at the end of the link is not the file the caller named.
+    """
+    needs_real_server()
+    payload = b"payload"
+    remote = tmp_path / "source.bin"
+    remote.write_bytes(payload)
+    target = tmp_path / "elsewhere.bin"
+    target.write_bytes(payload)
+    link = tmp_path / "done.bin"
+    link.symlink_to(target)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(OSError) as refused:
+            await sftp.get(str(remote), link, resume=True, no_follow=True, mode=PRIVATE)
+
+    assert refused.value.errno == errno.ELOOP
+    assert bits(target) != PRIVATE, "the mode was applied through the link"
+
+
+async def test_the_times_of_an_already_complete_resume_do_not_follow_a_link_either(
+    tmp_path: Path,
+):
+    """The other metadata call on that path, and it needs its own test.
+
+    `_chmod_local` runs first, so a test that passes `mode=` never reaches `_stamp_local` --
+    the mode raises on the link and the times are never attempted. Preserving times *without*
+    a mode is what drives the second forward, and it is the more likely spelling: a resumed
+    download that carries the source's dates is the ordinary use of `resume=True`.
+    """
+    needs_real_server()
+    payload = b"payload"
+    remote = tmp_path / "source.bin"
+    remote.write_bytes(payload)
+    os.utime(remote, (KNOWN_ATIME, KNOWN_MTIME))
+    target = tmp_path / "elsewhere.bin"
+    target.write_bytes(payload)
+    before = target.stat().st_mtime_ns
+    link = tmp_path / "done.bin"
+    link.symlink_to(target)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(OSError) as refused:
+            await sftp.get(str(remote), link, resume=True, no_follow=True, preserve_times=True)
+
+    assert refused.value.errno == errno.ELOOP
+    assert target.stat().st_mtime_ns == before, "the times were applied through the link"
+
+
+async def test_by_default_a_resumed_download_does_follow_the_link_it_was_pointed_at(
+    tmp_path: Path,
+):
+    """The characterisation of the default, and the other half of the two tests above.
+
+    `get`'s `no_follow` is **False** by default, matching `open(2)`: the caller named a path and
+    a symlink at that path is a legitimate way to say "write over there". Pinning it is what
+    makes the two refusals above mean something -- without it the forwarded argument could be
+    hard-wired to `True` and every one of those tests would still pass, while a caller who
+    deliberately pointed a download at a link found it refused.
+    """
+    needs_real_server()
+    payload = b"payload"
+    remote = tmp_path / "source.bin"
+    remote.write_bytes(payload)
+    os.utime(remote, (KNOWN_ATIME, KNOWN_MTIME))
+    target = tmp_path / "elsewhere.bin"
+    target.write_bytes(payload)
+    link = tmp_path / "done.bin"
+    link.symlink_to(target)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.get(str(remote), link, resume=True, preserve_times=True)
+
+    assert result.transferred == 0
+    assert int(target.stat().st_mtime) == KNOWN_MTIME, "the times did not reach the target"
+    assert link.is_symlink(), "the link was replaced rather than written through"

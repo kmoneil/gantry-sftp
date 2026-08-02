@@ -1164,3 +1164,41 @@ async def test_a_tree_removal_records_what_it_removed(
     assert fields["remote"] == str(victim)
     assert fields["files"] == 2
     assert fields["directories"] == 2
+
+
+async def test_a_download_records_both_ends_and_a_resumed_one_records_what_it_adopted(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+):
+    """`get` names both files, and the already-complete resume writes its own two counters.
+
+    D-105's eighteenth slice. The counts a plain `get` reports are asserted elsewhere; the two
+    *identifying* fields were not, and a record naming neither end is one line per transfer with
+    no way to tell which transfer. The resumed-and-already-complete path is a second record
+    site: it returns without opening anything, so it sets `bytes` and `adopted` by hand -- and
+    `adopted` is the only thing distinguishing "nothing to do" from "nothing happened".
+    """
+    requires_sftp_server()
+    source = tmp_path / "data.csv"
+    source.write_bytes(b"z" * 512)
+    destination = tmp_path / "out.csv"
+
+    with caplog.at_level(logging.DEBUG, logger="gantry_sftp.session"):
+        async with (
+            open_local_server_transport(cwd=tmp_path) as transport,
+            open_session(transport) as sftp,
+        ):
+            _ = await sftp.get(str(source), destination)
+            _ = await sftp.get(str(source), destination, resume=True)
+
+    finished = [r for r in caplog.records if r.getMessage().startswith("get ok ")]
+    assert len(finished) == 2
+
+    first = record_fields(finished[0])
+    assert first["operation"] == "get"
+    assert first["remote"] == str(source)
+    assert first["local"] == str(destination)
+    assert first["bytes"] == 512
+
+    resumed = record_fields(finished[1])
+    assert resumed["bytes"] == 0, "the second call moved nothing"
+    assert resumed["adopted"] == 512

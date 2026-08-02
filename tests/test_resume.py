@@ -35,7 +35,13 @@ from gantry_sftp.codec import (
     encode,
 )
 from gantry_sftp.exceptions import TransferError
-from gantry_sftp.session import Publish, PublishMechanism, ResumeCheck, open_session
+from gantry_sftp.session import (
+    Publish,
+    PublishMechanism,
+    ResumeCheck,
+    SizeCheck,
+    open_session,
+)
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -117,6 +123,12 @@ async def test_a_resumed_download_of_an_already_complete_file_moves_nothing(tmp_
     assert result.transferred == 0
     assert result.adopted == len(CONTENT)
     assert result.size == len(CONTENT)
+    # The rest of the result, which this path builds at its own construction site: it returns
+    # without opening anything, so every field is assembled here rather than by the scheduler,
+    # and each one could be nulled with the three counts above still reading correctly.
+    assert result.remote_path == str(remote).encode()
+    assert result.local_path == local
+    assert result.size_check is SizeCheck.MATCHED
 
     assert local.read_bytes() == CONTENT
     assert local.stat().st_mtime_ns == before, "the file was rewritten to transfer nothing"

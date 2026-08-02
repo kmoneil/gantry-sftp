@@ -1273,6 +1273,10 @@ async def test_a_second_name_for_one_local_file_is_refused_not_overwritten(tmp_p
     assert [(item.remote, item.first) for item in caught.value.collisions] == [
         (b"/root/readme.md", b"/root/README.md")
     ]
+    # The local path it refused, which is the one an operator goes and looks at -- and the
+    # third field of a `PathCollision`, built at a site whose other two were asserted here
+    # from the day it was written.
+    assert [item.local for item in caught.value.collisions] == [str(destination / "readme.md")]
     assert caught.value.destination == str(destination)
 
 
