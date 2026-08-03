@@ -644,6 +644,31 @@ def askpass_directories() -> set[Path]:
 
 
 @pytest.fixture
+def private_temp_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Give this test its own temp directory, so a leak check sees only its own leaks.
+
+    :func:`askpass_directories` globs the *process-global* temp directory, which makes "did this
+    connection leave anything behind" a question about the whole machine. Under one pytest
+    process that is invisible; under the mutation lane, which runs mutants in parallel processes
+    that share ``/tmp``, another worker's live askpass directory appears between the two samples
+    and the leak check fails on somebody else's correct behaviour.
+
+    Found by the first `session/_glob` run after D-128. **Isolation rather than a ``skipif``**,
+    which is what the four other mutmut-hostile tests here needed: those read something mutmut
+    genuinely rewrote, and this one only reads shared state it never had to share. The Definition
+    of Done asks for the environment a test depends on to be controlled, and a global temp
+    directory is part of that environment.
+
+    ``tempfile.tempdir`` rather than ``TMPDIR``: :func:`tempfile.gettempdir` caches its answer on
+    first use, so setting the variable mid-process may change nothing, while the module global is
+    what both it and :func:`tempfile.mkdtemp` actually read.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    assert Path(tempfile.gettempdir()) == tmp_path
+    return tmp_path
+
+
+@pytest.fixture
 def no_askpass_in_the_environment(monkeypatch):
     """Unset everything that would arm an askpass helper, and prove it is unset.
 
@@ -688,7 +713,7 @@ async def test_the_password_path_relaxes_batchmode_in_the_command_it_actually_ru
         assert "BatchMode=yes" not in transport.argv
 
 
-async def test_the_helper_does_not_outlive_the_connection(fake_ssh: Path):
+async def test_the_helper_does_not_outlive_the_connection(fake_ssh: Path, private_temp_root: Path):
     # A credential-adjacent temporary file surviving a failed connection is the leak this
     # design exists to avoid, and the failure path is the one nobody watches.
     before = askpass_directories()
@@ -700,7 +725,9 @@ async def test_the_helper_does_not_outlive_the_connection(fake_ssh: Path):
     assert askpass_directories() == before
 
 
-async def test_a_password_that_could_answer_two_prompts_is_refused_before_spawning():
+async def test_a_password_that_could_answer_two_prompts_is_refused_before_spawning(
+    private_temp_root: Path,
+):
     # Validation happens before any process exists, so a rejected password cannot leave a
     # child, a helper or a directory behind.
     before = askpass_directories()

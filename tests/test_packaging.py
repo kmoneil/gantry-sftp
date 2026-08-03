@@ -19,8 +19,10 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tomllib
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 import pytest
 
@@ -86,18 +88,49 @@ def test_the_changelog_states_the_limitations_rather_than_only_the_features():
         )
 
 
-def test_the_project_urls_point_at_something_a_reader_can_reach():
+def test_the_project_urls_are_declared_absolute_and_share_one_host():
     """They were absent until 0.1.0 and the reason was written into `pyproject.toml`.
 
     METADATA advertising a Homepage that 404s is the same defect as a docstring pointing at a
     gitignored file, so the field came back with the repository rather than before it. Asserted
     now so it cannot quietly go missing in a build config edit -- PyPI renders each of these as a
     link on the project page, and a release with none is one a reader cannot get behind.
+
+    **This test used to be called ``..._point_at_something_a_reader_can_reach`` and checked that
+    four keys appeared in the file.** It could not have failed for a URL that 404s, was a typo,
+    or pointed at ``example.com`` -- the exact defect its own docstring says it exists to
+    prevent, which is the shape this repository keeps finding: a guard named for a claim it
+    does not make. The name now says what it checks.
+
+    **Reachability is deliberately not asserted, and cannot be here**: a test that fetched these
+    would need the network, which this suite does not use, and would then fail on an outage
+    rather than on a defect. What is checkable offline is checked -- that each field exists,
+    that each is an absolute ``https`` URL rather than a path or a placeholder, that all four
+    name one host so a typo in any single one stands out against its siblings, and that the
+    ``Changelog`` link names a file this repository actually has. That last one is the only
+    end-of-link that lives in the tree, so it is the only one whose target can be proven.
     """
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert "[project.urls]" in pyproject
-    for field in ("Homepage", "Source", "Issues", "Changelog"):
-        assert f"{field} = " in pyproject, f"[project.urls] lost {field}"
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    urls = pyproject["project"].get("urls", {})
+
+    wanted = ("Homepage", "Source", "Issues", "Changelog")
+    missing = [field for field in wanted if field not in urls]
+    assert not missing, f"[project.urls] lost {missing}"
+
+    hosts = set()
+    for field, url in urls.items():
+        parsed = urlparse(url)
+        assert parsed.scheme == "https", f"{field} is not https: {url!r}"
+        assert parsed.netloc, f"{field} names no host, so it is not an absolute URL: {url!r}"
+        hosts.add(parsed.netloc)
+    assert len(hosts) == 1, f"[project.urls] spans several hosts, which is usually a typo: {hosts}"
+
+    # The one link whose far end is in this tree. A renamed changelog leaves the URL pointing at
+    # a file that stopped existing, and nothing else here would notice.
+    changelog = PurePosixPath(urlparse(urls["Changelog"]).path).name
+    assert (ROOT / changelog).is_file(), (
+        f"[project.urls] Changelog points at {changelog!r}, which this repository does not have"
+    )
 
 
 def test_pyproject_declares_the_licence_file():

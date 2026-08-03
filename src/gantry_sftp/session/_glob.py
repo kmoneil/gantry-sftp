@@ -82,7 +82,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
-from dataclasses import dataclass
 from types import TracebackType
 from typing import Protocol
 
@@ -648,9 +647,25 @@ def _strip_dot_prefix(path: bytes) -> bytes:
     return path[2:] if path.startswith(b"./") else path
 
 
-@dataclass(frozen=True, slots=True)
 class GlobRunner:
     """The traversal half of :meth:`Session.glob`, holding no session and no state.
+
+    **A plain class with a written-out ``__init__``, and not a dataclass** -- which looks like a
+    step backwards and is the opposite (D-128, found by the first run of the lane after the
+    extraction). mutmut does not instrument the methods of a **decorated class**, for the same
+    reason it declines a decorated function: building the trampoline means re-running the
+    decorator, and ``@dataclass(slots=True)`` does not merely add methods, it returns a *new
+    class object*. Measured in the shadow tree rather than reasoned about — as a dataclass this
+    class produced **zero** mutants while the module-level matcher above it produced 48, so the
+    six methods below moved out of `Session`, which is instrumented, into a class which is not.
+    The extraction would have silently traded the traversal's mutation coverage for tidier
+    construction.
+
+    So the five fields are assigned by hand. `frozen` and `slots` bought a defensive guarantee
+    and a micro-optimisation on an object built once per `glob()` call; the lane's view of six
+    methods full of comparisons, slices and `or` defaults is worth more than both. This is
+    CLAUDE.md's D-107 rule applied to a class rather than to a function: decide by reading the
+    body for something mutable, and these bodies are almost entirely that.
 
     **Built from bound methods rather than from a session**, and that is a layering decision
     rather than a style one (D-128). Three of the five things a glob needs are private members
@@ -670,11 +685,20 @@ class GlobRunner:
     the move changed no behaviour.
     """
 
-    attrs_or_absent: _AttrsOrAbsent
-    scandir: _Scandir
-    walk: _Walk
-    settle_kind: _SettleKind
-    unclassifiable: _Unclassifiable
+    def __init__(
+        self,
+        *,
+        attrs_or_absent: _AttrsOrAbsent,
+        scandir: _Scandir,
+        walk: _Walk,
+        settle_kind: _SettleKind,
+        unclassifiable: _Unclassifiable,
+    ) -> None:
+        self.attrs_or_absent = attrs_or_absent
+        self.scandir = scandir
+        self.walk = walk
+        self.settle_kind = settle_kind
+        self.unclassifiable = unclassifiable
 
     async def literal(self, path: bytes, *, directories_only: bool) -> GlobMatch | None:
         """Resolve a pattern that turned out to have no magic in it.

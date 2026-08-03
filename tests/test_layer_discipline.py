@@ -399,6 +399,25 @@ def _class_named(module: Path, name: str) -> ast.ClassDef:
     pytest.fail(f"{name} is not defined in {module.name}")
 
 
+_SHADOW_TREE = pytest.mark.skipif(
+    "MUTANT_UNDER_TEST" in os.environ,
+    reason="mutmut rewrites Session into one trampoline per mutant, in a shadow tree this reads",
+)
+"""Both ceilings count methods on the *shipped* class, and under the lane they would not.
+
+mutmut copies `source_paths` into `mutants/` and rewrites each function into a trampoline plus
+one variant per mutation, so `Session` measures in the thousands there -- and `PACKAGE_ROOT` is
+derived from `__file__`, which under the lane is inside that copy. Without this the ceiling
+fails on arrival, `--exitfirst` stops the run, and mutmut reports "failed to collect stats"
+rather than anything about the ceiling.
+
+Found by the first `session/_glob` run after D-128, which is the fourth entry in this
+repository's list of tests that read what mutmut rewrote. A per-test `skipif` rather than an
+`--ignore`, because every *other* test in this module is a real kill under the lane.
+"""
+
+
+@_SHADOW_TREE
 def test_the_session_class_does_not_grow() -> None:
     """The one structural claim this repository had no mechanical statement for (D-128).
 
@@ -422,6 +441,7 @@ def test_the_session_class_does_not_grow() -> None:
     )
 
 
+@_SHADOW_TREE
 def test_the_session_ceiling_is_not_slack() -> None:
     """A ratchet that drifts above what it measures has stopped being one.
 
