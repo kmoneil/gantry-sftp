@@ -32,7 +32,7 @@ from gantry_sftp.exceptions import (
     ServerError,
     UnsafePathError,
 )
-from gantry_sftp.session import open_session
+from gantry_sftp.session import EntryKind, entry_kind, open_session
 from gantry_sftp.session._glob import (
     _NAMED_CLASSES,
     RECURSIVE,
@@ -1056,6 +1056,56 @@ async def test_a_pattern_with_no_magic_is_a_path_and_answers_at_most_once():
         assert await matches(sftp, b"/root/sub/") == [b"/root/sub"]
 
 
+async def test_a_literal_pattern_synthesises_an_entry_with_no_longname():
+    """There was no listing to take one from, and `DirEntry.longname` is `bytes` (D-105 s28).
+
+    `None` would be a type the rest of the surface does not expect, and any other placeholder
+    would look like something the server said. The wildcard half carries the server's real
+    `longname`, which is what makes the two distinguishable at all.
+    """
+    server = TreeServer(tree=GLOB_TREE, files={b"/root/a.csv": b"aaa"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        async with aclosing(sftp.glob(b"/root/a.csv")) as found:
+            literal = [match async for match in found]
+        async with aclosing(sftp.glob(b"/root/*.csv")) as found:
+            listed = [match async for match in found]
+
+    assert [match.entry.longname for match in literal] == [b""]
+    assert [match.entry.filename for match in literal] == [b"a.csv"]
+    # The same file through the matching path does carry one, so `b""` is a decision here
+    # rather than what this server happens to send.
+    assert listed[0].entry.longname != b""
+
+
+async def test_a_literal_pattern_reports_a_symlink_as_a_symlink(tmp_path: Path):
+    """The literal path uses `LSTAT`, matching what every other component does.
+
+    Following it would make a link answer as whatever it points at, so the two halves of
+    `glob` would disagree about what a link is -- decided by whether the caller's pattern
+    happened to contain a `*`. That is the divergence D-102 was filed for, one field over.
+
+    Against the real server because the scripted one answers `LSTAT` for entries it holds
+    rather than for every name it listed, so the literal route cannot reach a link there.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    target = tmp_path / "data.csv"
+    target.write_bytes(b"aaa")
+    (tmp_path / "alias").symlink_to(target)
+    prefix = os.fsencode(str(tmp_path))
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+        aclosing(sftp.glob(prefix + b"/alias")) as found,
+    ):
+        got = [match async for match in found]
+
+    assert [match.path for match in got] == [prefix + b"/alias"]
+    assert entry_kind(got[0].entry.attrs) is EntryKind.SYMLINK
+
+
 async def test_a_match_carries_the_entry_so_the_kind_costs_no_extra_round_trip():
     server = TreeServer(tree=GLOB_TREE, files={b"/root/a.csv": b"aaa"})
     async with (
@@ -1178,6 +1228,37 @@ async def test_max_depth_survives_a_descent_before_the_recursive_component():
         assert await matches(sftp, b"/root/*/**/*.csv", max_depth=1) == [
             b"/root/sub/a.csv",
             b"/root/sub/deeper/b.csv",
+        ]
+
+
+async def test_the_bound_reaches_a_second_recursive_component():
+    """`_glob_recursive` consumes `max_depth` in its own `walk` *and* forwards it (D-105 s28).
+
+    The forwarded copy only matters when what is left contains another `**`, so a pattern with
+    two of them is the only shape that can see it. Dropped, the inner one descends without
+    limit while the outer one is bounded -- which is the bound not holding, in the one pattern
+    where a hostile server has two chances to be infinite.
+
+    The duplicates are real and are pinned rather than glossed: two recursive components each
+    expand, so a path reachable both ways is reported both ways. Observed, not fixed -- `**/**`
+    is a pathological spelling of `**` and no caller has asked for it.
+    """
+    tree = {
+        b"/root": (named(b"a.csv", REGULAR, 3), named(b"sub", DIRECTORY)),
+        b"/root/sub": (named(b"b.csv", REGULAR, 3), named(b"deeper", DIRECTORY)),
+        b"/root/sub/deeper": (named(b"c.csv", REGULAR, 3), named(b"deepest", DIRECTORY)),
+        b"/root/sub/deeper/deepest": (named(b"d.csv", REGULAR, 3),),
+    }
+    server = TreeServer(tree=tree)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert await matches(sftp, b"/root/**/**/*.csv", max_depth=0) == [b"/root/a.csv"]
+        # One level from the root for the outer `**`, and one more from each place it reached
+        # for the inner one -- so `deeper/c.csv` appears and `deepest/d.csv` does not.
+        assert await matches(sftp, b"/root/**/**/*.csv", max_depth=1) == [
+            b"/root/a.csv",
+            b"/root/sub/b.csv",
+            b"/root/sub/b.csv",
+            b"/root/sub/deeper/c.csv",
         ]
 
 

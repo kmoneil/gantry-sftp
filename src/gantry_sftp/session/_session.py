@@ -5322,7 +5322,7 @@ def _check_publish_flags(
     fsync: bool,
     require_atomic: bool,
     require_fsync: bool,
-    resume: bool = False,
+    resume: bool,
     staging_name: bytes | str | None = None,
 ) -> None:
     """Refuse a combination of flags that contradict each other.
