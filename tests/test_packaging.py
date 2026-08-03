@@ -29,6 +29,7 @@ from gantry_sftp.session import (
     DEFAULT_PIPELINE_DEPTH,
     PREFERRED_READ_LENGTH,
     PREFERRED_WRITE_LENGTH,
+    Session,
 )
 from gantry_sftp.transport import missing_executable_hint
 
@@ -209,6 +210,38 @@ def test_the_lowered_depth_example_still_arrives_at_the_number_it_claims():
     lowered = 8
     assert f"SessionOptions(depth={lowered})" in readme
     assert f"about {round(lowered * PREFERRED_READ_LENGTH / 2**20)} MiB" in readme
+
+
+def test_the_readme_says_who_owns_the_total_concurrency_and_the_tree_methods_point_at_it():
+    """D-116. Two layers bound the concurrency and the caller owns the product.
+
+    A fact stated in four places is four places to update, so the README section is the anchor
+    and the two `concurrency=` docstrings defer to it rather than restate it. That arrangement
+    is only safe if something notices when a pointer stops pointing anywhere -- a docstring
+    naming a README section that has been renamed is worse than one that said nothing, because
+    it reads as a citation.
+
+    The measurement behind it is in DESIGN 5.2 and is deliberately not asserted here: it is a
+    throughput result, it belongs to the machine it was taken on, and `benchmarks/` is the only
+    place figures live (D-94).
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    # The code span is spelled with one backtick in Markdown and two in the docstrings' RST, so
+    # the assertion is on the words. Asserting the punctuation would fail on a correct citation.
+    anchor = "bounds one call, and you own the product"
+    assert f"### `concurrency=` {anchor}" in readme
+    # The memory section states the same product for a different cost, and the two halves
+    # drifting apart is exactly what D-101 and this card each fixed one side of.
+    assert "#concurrency-bounds-one-call-and-you-own-the-product" in readme
+
+    downloads = Session.get_tree.__doc__
+    uploads = Session.put_tree.__doc__
+    assert downloads is not None
+    assert uploads is not None
+    assert anchor in " ".join(downloads.split())
+    # `put_tree` defers to `get_tree` for the whole of what `concurrency=` means, so what it owes
+    # is the referral, not the sentence.
+    assert "the total across several calls is the caller's" in " ".join(uploads.split())
 
 
 # --- No shipped document states a throughput figure (D-88) ----------------------------------

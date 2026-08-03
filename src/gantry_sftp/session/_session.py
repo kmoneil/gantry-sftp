@@ -3815,6 +3815,12 @@ class Session:
                 that argument -- and above 1 the order files are transferred in is not the
                 walk's, so a failure part-way leaves an unpredictable subset transferred.
 
+                **This bounds one call and nothing adds the calls up.** M of them in your task
+                group is M x this number in flight, and the total is the caller's to own -- it
+                is close to free on one session and it is the session count that costs. The
+                README's *"``concurrency=`` bounds one call, and you own the product"* is where
+                that lives and DESIGN.md §5.2 has the measurement (D-116).
+
         Returns:
             Counts, bytes, and every entry that was skipped with the reason it was.
 
@@ -4961,7 +4967,8 @@ class Session:
                 directory can see a partial file while it happens.
             concurrency: Files uploaded at once. ``1`` -- the default -- keeps the exact
                 sequential path this method has always had. See :meth:`get_tree` for what
-                concurrency buys, what it cannot lift, and what it costs in ordering.
+                concurrency buys, what it cannot lift, what it costs in ordering, and why the
+                total across several calls is the caller's and not this argument's.
             **legacy: The publish arguments under their pre-:class:`Publish` names, as
                 :meth:`put` accepts them and for the same reason.
 

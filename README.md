@@ -780,6 +780,31 @@ Two things it will not do, both deliberate:
   `1` the transfer order is not the walk's, so a failure part-way leaves an unpredictable
   subset transferred.
 
+### `concurrency=` bounds one call, and you own the product
+
+`concurrency=` is the bound for *that call*. It does not compose, and nothing anywhere adds the
+calls up for you: three `get_tree(concurrency=8)` running in your task group is twenty-four
+transfers in flight, not eight. **The total is yours to own**, in the same way and for the same
+reason the concurrent-`get` fan-out above is.
+
+Two things follow, and only the second is a surprise:
+
+- **On one session the total is close to free.** Measured over a real server, how the product
+  is split makes no difference, and raising it well past the point where the link is busy
+  changes nothing either. Extra workers queue behind one channel, one reader task and one
+  window — there is one of everything to contend over, so there is nothing to thrash.
+- **Across sessions it is not free, and the number that costs is the session count.** A second
+  connection is the only route past the 2 MiB ceiling, and a second one measured faster than
+  one. The third and the fourth give the gain back: each `ssh` child is another channel we have
+  to frame, decode and place bytes for, and all of that is one Python process on one GIL. On a
+  tree of small files a second session buys nothing at all. So if you are reaching for a
+  connection pool, keep the number very small and measure it on your own machine — where it
+  stops paying is a property of your CPU, not of your link.
+
+To bound the work this library does across a whole program, bound the thing that actually costs:
+**how many sessions you open**. A limiter over transfers would bound the number that was already
+free.
+
 ## Byte ranges, and a file object
 
 `get` and `put` move a whole file between a remote path and a local path. When that is not the
@@ -2605,7 +2630,10 @@ is the part nobody guesses when sizing a container.
 **What multiplies it is concurrency, and you own that number.** One transfer is one `depth`
 worth of buffers. `get_tree(concurrency=8)` is eight. Your own task group over `get` is however
 many you started — `asyncio.gather` over a hundred files is a hundred, which is where a
-comfortable limit stops being comfortable.
+comfortable limit stops being comfortable. Two `get_tree(concurrency=8)` calls at once is
+sixteen, because the argument bounds one call and not the program: see
+[`concurrency=` bounds one call](#concurrency-bounds-one-call-and-you-own-the-product) for what
+that costs in throughput, which is a different answer from what it costs in memory.
 
 The bound is the same in both directions and the reason differs, which matters if you are
 reading the code to check us: **uploading**, the codec holds each `WRITE` — payload included —

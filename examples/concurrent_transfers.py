@@ -10,6 +10,12 @@ choose -- an `anyio` task group -- rather than something the library decides for
 *tree*, `get_tree(concurrency=)` does it for you, and the last section here shows why that is
 a separate thing rather than the same thing with a loop around it.
 
+That argument bounds **one call** and nothing adds the calls up, so the total across a program
+is the caller's either way: three `get_tree(concurrency=8)` in your task group is twenty-four
+transfers in flight. The README section *"`concurrency=` bounds one call, and you own the
+product"* is what that costs, and the short version is that it is close to free on one session
+and the thing that actually costs is how many sessions you open.
+
 Two reasons to want it, and they are different:
 
 * **Round trips.** A thousand small files cost `OPEN`/`READ`/`CLOSE` each. Sequentially that
