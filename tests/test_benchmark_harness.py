@@ -41,6 +41,7 @@ for _extra in (_BENCHMARKS, _ROOT / "live-tests"):
         # path resolves it just as well and cannot shadow.
         sys.path.append(str(_extra))
 
+import _harness  # noqa: E402  -- imported as a module so the clock can be monkeypatched
 from _harness import (  # noqa: E402
     Comparison,
     CpuCeiling,
@@ -333,17 +334,56 @@ async def test_a_sweep_rung_runs_on_one_connection_and_times_neither_warmup(monk
 
 
 @pytest.mark.anyio
-async def test_cpu_is_measured_per_sample_rather_than_cumulatively():
+async def test_cpu_is_measured_per_sample_rather_than_cumulatively(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Each sample carries its own run's cost, not the total so far.
+
+    A cumulative counter is how a benchmark reports a fictional slowdown: every sample looks
+    worse than the one before it, and the last one looks catastrophic.
+
+    **The clock is stubbed, and that is the fix for a real flake.** This used to burn CPU in a
+    child twice and assert the second sample came in under 1.8x the first. It failed once in a
+    full-suite run and the cause is not scheduling noise, which was measured and does not reach
+    the bound -- ratios over 15 quiet runs spanned 0.85 to 1.19.
+
+    The cause is that :func:`~benchmarks._harness.cpu_seconds` is own CPU **plus**
+    ``RUSAGE_CHILDREN``, and ``RUSAGE_CHILDREN`` is *process-wide*: it accumulates every child
+    this process reaps, whoever spawned it. A child belonging to something else, reaped inside
+    the second sample's window, is charged to that sample. Measured: with one stray child in
+    the window the ratio ran 1.07 to 2.56 and the old assertion failed 8 times in 10.
+
+    That also rules out the obvious repair. Making the second run do a twentieth of the work,
+    so the two hypotheses differ in sign rather than by a ratio, was tried and is **worse** --
+    the noise is *additive*, so shrinking the honest second sample lets a stray child dominate
+    it, and that version failed 9 times in 10 under the same conditions.
+
+    So the timing comes out entirely. The claim here is arithmetic -- that the sampler records
+    a difference rather than a reading -- and a stubbed monotonic clock pins it exactly, with
+    the second sample deliberately *smaller* than the first, which no running total can do.
+    The claim that the real counter sees a real child's CPU is a different one and is proved
+    against the real clock by
+    :func:`test_cpu_seconds_counts_a_reaped_childs_time`; splitting them is what lets each be
+    tested with the instrument it needs.
+    """
+    # Monotonic, like the real counter, with known steps. The second interval is smaller than
+    # the first: a cumulative implementation cannot produce that, because a running total
+    # cannot decrease.
+    combined = iter([10.0, 10.5, 10.5, 10.75])
+    own = iter([1.0, 1.1, 1.1, 1.3])
+    monkeypatch.setattr(_harness, "cpu_seconds", lambda: next(combined))
+    monkeypatch.setattr(_harness, "own_cpu_seconds", lambda: next(own))
+
     async def run_once() -> tuple[float, int]:
-        await anyio.to_thread.run_sync(burn_in_a_child)
         return 1.0, 1
 
     result = await take_samples(run_once, scenario="s", client="c", repeats=2, warmups=0)
-    # Each sample carries its own run's cost. A cumulative counter would make the second
-    # sample roughly twice the first, which is how a benchmark reports a fictional slowdown.
+
     first, second = result.samples
-    assert first.cpu_seconds > 0.01
-    assert second.cpu_seconds < first.cpu_seconds * 1.8
+    assert first.cpu_seconds == pytest.approx(0.5)
+    assert second.cpu_seconds == pytest.approx(0.25)
+    assert first.own_cpu_seconds == pytest.approx(0.1)
+    assert second.own_cpu_seconds == pytest.approx(0.2)
 
 
 # --- the second ceiling (D-113) -------------------------------------------------------------
