@@ -13,6 +13,7 @@ python examples/atomic_publish.py                 # put(), and what "atomic" act
 python examples/listing.py                        # listdir() and scandir(), and what a listing can't know
 python examples/working_directory.py              # chdir() as a prefix, and what a reconnect does to it
 python examples/predicates.py                     # exists()/isdir()/..., and the answer that is neither yes nor no
+python examples/paths.py                          # SFTPPath: the algebra, and the two things `/` refuses
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/destination_collision.py          # two remote names, one local file, and the refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
@@ -39,6 +40,7 @@ python examples/atomic_publish.py user@host /remote/incoming
 python examples/listing.py user@host /remote/dir
 python examples/working_directory.py user@host /remote/dir
 python examples/predicates.py user@host /remote/dir
+python examples/paths.py user@host /remote/dir
 python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
 python examples/resume.py user@host /remote/dir
@@ -72,6 +74,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `listing.py`              | `listdir()` vs streaming `scandir()`, attributes that arrive with the listing, and `EntryKind.UNKNOWN` |
 | `working_directory.py`    | `chdir()` / `getcwd()`: a prefix this library prepends because v3 has no working directory, why absolute paths are never touched, why `symlink`'s target is not either, and the reconnect that silently starts you somewhere else |
 | `predicates.py`           | `exists()` / `isdir()` / `isfile()` / `islink()` / `getsize()` / `getmtime()` / `makedirs()`, the third state a predicate has — a refusal is not `False` — and the two questions a broken symlink separates |
+| `paths.py`                | `SFTPPath`: `pathlib`-shaped arithmetic over a name that stays bytes, the joining check that refuses a server-supplied `../..` while the constructor accepts the one you wrote, and why the session binding is explicit |
 | `doctor.py`               | `python -m gantry_sftp doctor` as data: `local_diagnosis()` for a container health check with no network, `server_diagnosis()` for the handshake a transfer would make, and the exit codes that let a Dockerfile tell "no ssh" from "host unreachable" |
 | `glob_patterns.py`        | `glob()`: the `glob(3)` dialect and where it differs from `fnmatch`, the dotfile rule, `**`, a trailing `/`, POSIX character classes (`log.[[:digit:]]`, ASCII-only) and what a **misspelled** class name does, and a match whose path goes straight to `get()` — then the same job with a **regex**, which no pattern can express, over `check_listed_name` / `join_remote` / `local_child` |
 | `allowed_hosts.py`       | `allowed_hosts()` and `GANTRY_SFTP_ALLOWED_HOSTS`: restricting where a connection may go when the hostname came from somebody else — why layers only narrow, why the *effective* host is what is checked rather than the name you passed, and the three things it deliberately does not do |

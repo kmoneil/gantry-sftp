@@ -289,6 +289,11 @@ exists today:
   that was listed and then gone, and one whose `stat` was refused are three different facts and
   are reported as three, in `Skipped.reason`. `walk` records all three and carries on, because it
   has somewhere to put them; `glob` raises on the refusal, because it has not
+- **a path object**: `SFTPPath` gives a remote name `pathlib`'s shape — `/`, `.parent`,
+  `.suffix`, `glob`, and then `download` on what it found — over a payload that stays `bytes`,
+  with an explicit session binding and a `/` that validates one component rather than
+  concatenating. It is not a `str` subclass and not `os.PathLike`, both for the same reason:
+  either one would let a caller rebuild the path arithmetic the joining check exists to own
 - **an fsspec filesystem**: `gantry_sftp.fsspec` makes `pd.read_parquet("gantry-sftp://…")`
   work, over the blocking surface rather than a second concurrency runtime. It registers
   **nothing** on import, because `sftp://` is already claimed inside fsspec by an
@@ -363,17 +368,16 @@ over a new connection.
 **There is a blocking surface, and it is a facade rather than a generated twin**; see
 [No event loop](#no-event-loop). There is an **fsspec filesystem**; see
 [pandas, dask and anything else that speaks fsspec](#pandas-dask-and-anything-else-that-speaks-fsspec).
-Not yet: `SFTPPath`. `put_many()` from DESIGN.md's §8 sketch does not exist. Concurrency is
-spelled with your own task group, or with `get_tree(concurrency=)`, rather than a
-`concurrency=` argument on a `*_many` call.
+And there is a **path object**; see
+[`SFTPPath`](#sftppath-which-is-the-remote-side-with-the-arithmetic-attached). `put_many()` from
+DESIGN.md's §8 sketch does not exist. Concurrency is spelled with your own task group, or with
+`get_tree(concurrency=)`, rather than a `concurrency=` argument on a `*_many` call.
 
-**What is still missing.** `SFTPPath` does not exist — `Path.open` / `read_bytes` /
-`write_bytes` are most of what a path is for, and the byte-range surface they needed landed in
-0.11 ([Byte ranges, and a file object](#byte-ranges-and-a-file-object)), so what remains is the
-path algebra rather than a missing primitive. The other things it was waiting on have all
-landed: the predicates ([Is it there?](#is-it-there)), relative paths with `chdir` / `getcwd`
-([A working directory](#a-working-directory-which-this-protocol-does-not-have)), and the
-blocking surface.
+**One thing the §8 sketch promised is not what shipped.** `SFTPPath("sftp://host/incoming")`
+constructs nothing: a URL cannot name a connection without a module-level default client, and
+there is not one. The binding is `SFTPPath(path, session=sftp)`, which is the same decision as
+the fsspec adapter registering nothing on import — a library that reaches for ambient state is a
+library whose behaviour depends on what else got imported.
 
 Against **asyncssh** specifically, this library is still behind on surface, with no `statvfs`,
 no `hardlink` and no `copy-data`, and its transfers work on Windows where ours refuse.
@@ -414,6 +418,7 @@ Everything keeps its shape, including the parts that could not survive the bound
 | `async with sftp.scandir(p) as entries` | `with sftp.scandir(p) as entries`, still a context manager, because it still holds a directory handle |
 | `async with sftp.open_file(p) as f` | `with sftp.open_file(p) as f`, the same, for the same reason: it holds a file handle |
 | `except NoSuchFileError` | `except NoSuchFileError`, arriving flat rather than in an `ExceptionGroup` |
+| `SFTPPath(p, session=sftp)` | `SyncSFTPPath(p, session=sftp)`, whose `iterdir` / `glob` / `rglob` are ordinary iterators |
 
 Breaking out of a `walk`, a `glob`, a `scandir` or an `open_file` closes the handle **on the
 server**, not
@@ -984,6 +989,69 @@ straight back. A **local** path is a `Path` or a `str`, because it is opened by 
 So the refusal is a `TypeError` naming the rule, not an `os.fsencode` that looks like a
 convenience. Pass `str(path)` when the path really is posix-shaped, or the bytes the server gave
 you.
+
+## `SFTPPath`, which is the remote side with the arithmetic attached
+
+`pathlib`'s shape over a remote name, bound to a session:
+
+```python
+from gantry_sftp import SFTPPath, connect
+
+async with connect("example.com", user="bob") as sftp:
+    incoming = SFTPPath("/incoming", session=sftp)
+
+    async for csv in incoming.glob("2026/*.csv"):
+        await csv.download(local_dir / os.fsdecode(csv.name))
+
+    receipt = incoming / "receipt.txt"          # one validated component
+    await receipt.write_text("done\n")          # created 0600, not 0666
+```
+
+`name` / `parent` / `parts` / `stem` / `suffix` / `suffixes` / `parents`, `/` and `joinpath`,
+`with_name` / `with_stem` / `with_suffix`, `relative_to` / `is_relative_to`, `match`,
+`is_absolute` — none of which need a connection — and then `stat` / `lstat`, `exists` / `is_dir` /
+`is_file` / `is_symlink`, `size` / `mtime`, `iterdir` / `glob` / `rglob`, `mkdir` / `rmdir` /
+`rmtree` / `unlink`, `rename` / `replace`, `resolve` / `readlink` / `symlink_to` / `chmod`,
+`open` / `read_bytes` / `write_bytes` / `read_text` / `write_text`, and `download` / `upload` /
+`download_tree` / `upload_tree`. `gantry_sftp.sync.SyncSFTPPath` is the same thing without the
+`await`s.
+
+Four decisions in it are worth knowing before you use it, because each one could have gone the
+other way.
+
+**Strings go in, bytes come out.** `path.name` is `bytes`, like `DirEntry.filename` and
+`realpath` and everything else here, because a remote name is bytes whose encoding the protocol
+never states. `str(path)` is a view — it decodes with `surrogateescape`, so re-encoding it gives
+back `bytes(path)` for any name at all — and `bytes(path)` is the value. Nothing is ever
+normalised: a trailing slash stays, `//` stays, and a backslash is a character in a name rather
+than a separator.
+
+**`/` takes one component and checks it; the constructor does not.** The right-hand side of a
+join is almost always `entry.filename`, which the *server* chose, so `path / name` refuses a
+separator, a NUL, an empty name, `.` and `..` with `UnsafePathError` — the same predicate `glob`
+and the recursive operations use. Go up with `.parent`, which needs no string. The constructor
+takes `SFTPPath("/a/../b")` without complaint, because that argument was written by you and
+`sftp.stat("/a/../b")` accepts it too. Trust comes from who wrote it.
+
+**The binding is explicit, and there is no URL constructor.** `SFTPPath("/incoming")` is pure
+arithmetic and raises `StateError` — naming `session=` and `.bind()` — if you ask it to touch the
+wire. A path derived from a bound one stays bound. `SFTPPath("sftp://host/incoming")` would need
+a module-level default client, and this library does not have one.
+
+**It is not a `str` subclass and not `os.PathLike`.** A `str` subclass inherits `+`, `%` and
+`.replace()`, none of which route through the joining check — a type that lets you rebuild the
+hazard with `path + name` is the defence with a hole in it. And defining `__fspath__` would admit
+a *remote* name into `open()`, `os.stat()` and every other stdlib function that takes a path, all
+of which would then operate on the local filesystem.
+
+Two things it deliberately does not do. It never folds case: two paths differing in case are two
+paths, and the collision that actually bites is a case-folding *local* disk, which
+[`get_tree` already checks](#two-remote-names-one-local-file) by asking `lstat` after the write.
+And `glob` / `iterdir` yield paths rather than entries, so where you need the size or the type
+the listing already carried, `sftp.scandir` and `sftp.glob` hand you the whole `DirEntry` and
+cost no extra round trip.
+
+`examples/paths.py` runs all of it.
 
 ## Listing
 

@@ -28,11 +28,13 @@ connection. :mod:`gantry_sftp.codec` is the sans-I/O protocol layer
 underneath, public because a frame dumper and a fuzz harness need it. Typed errors are
 re-exported here; every one carries state rather than a string.
 
-Two surfaces sit beside the session rather than under it. :mod:`gantry_sftp.sync` is the same
+Three surfaces sit beside the session rather than under it. :mod:`gantry_sftp.sync` is the same
 API without an event loop -- a facade over the async code, not a second implementation.
-:mod:`gantry_sftp.fsspec` is an fsspec filesystem, so pandas, pyarrow and dask reach a remote
-file through a URL; it needs the ``fsspec`` extra and **registers nothing on import**, because
-``sftp://`` already belongs to somebody else.
+:class:`~gantry_sftp.SFTPPath` is a ``pathlib``-shaped object bound to a session, made of bytes
+because remote names are, and with a joining operator that validates every component rather than
+concatenating. :mod:`gantry_sftp.fsspec` is an fsspec filesystem, so pandas, pyarrow and dask
+reach a remote file through a URL; it needs the ``fsspec`` extra and **registers nothing on
+import**, because ``sftp://`` already belongs to somebody else.
 
 **Names a server sent are attacker-controlled, and building a path out of one is not the
 caller's problem to solve from scratch.** ``glob`` and the recursive operations do it
@@ -73,6 +75,7 @@ from gantry_sftp.exceptions import (
     UnsafePathError,
     UnsupportedError,
 )
+from gantry_sftp.path import SFTPPath
 from gantry_sftp.session import (
     DirEntry,
     DownloadResult,
@@ -122,6 +125,7 @@ __all__ = [
     "Publish",
     "RemoteFile",
     "SFTPError",
+    "SFTPPath",
     "SFTPWarning",
     "ServerError",
     "Session",

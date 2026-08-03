@@ -41,6 +41,7 @@ from gantry_sftp import (
     OpenFlag,
     Session,
     SessionOptions,
+    SFTPPath,
     StateError,
 )
 from gantry_sftp import (
@@ -53,6 +54,7 @@ from gantry_sftp.sync import (
     SyncDirectoryScan,
     SyncRemoteFile,
     SyncSession,
+    SyncSFTPPath,
     SyncTransport,
     connect,
     open_local_server_transport,
@@ -241,11 +243,158 @@ def test_the_blocking_file_object_mirrors_the_async_one():
         assert parameters(ours[name]) == parameters(member), f"{name} changed its arguments"
 
 
-# --- the entry points ----------------------------------------------------------------------
-
-
 def parameters(function: Any) -> list[inspect.Parameter]:
     return list(inspect.signature(function).parameters.values())
+
+
+# --- the path type, whose translation is a rule rather than a table (D-61) -------------------
+
+PATH_MEMBERS = public_members(SFTPPath)
+SYNC_PATH_MEMBERS = public_members(SyncSFTPPath)
+
+BLOCKING_TYPES = {
+    "SFTPPath": "SyncSFTPPath",
+    "RemoteFile": "SyncRemoteFile",
+    "Session": "SyncSession",
+}
+"""What a type name becomes on the blocking side, applied to annotations as a substitution.
+
+`SyncSession`'s table above is a table because four members of `Session` translate and forty
+do not. Here nearly every member translates -- a path type is closed under its own operations,
+so `parent`, `/`, `with_suffix`, `resolve` and `rename` all hand back another one -- and a
+listing of them would be a second copy of the class. So the rule is the substitution itself,
+and `test_the_path_translation_is_not_vacuous` is what stops it passing by matching nothing.
+
+Order matters and is safe in this order only: each replacement's *output* contains an earlier
+key (`SyncSFTPPath` contains `SFTPPath`) and never a later one, so one pass per entry cannot
+compound.
+"""
+
+
+def blocking_annotation(text: str) -> str:
+    """The blocking spelling of one async annotation.
+
+    Two kinds of change, and the second is the one that also applies to `Session`: a type that
+    has a blocking twin is renamed, and an async generator becomes an ordinary iterator because
+    that is what the portal can hand back.
+    """
+    for async_name, blocking_name in BLOCKING_TYPES.items():
+        text = text.replace(async_name, blocking_name)
+    return text.replace("AsyncGenerator[", "Iterator[")
+
+
+def translated(function: Any) -> list[inspect.Parameter]:
+    """Every parameter of an async member, spelled the way the blocking one must spell it."""
+    return [
+        parameter.replace(annotation=blocking_annotation(parameter.annotation))
+        if isinstance(parameter.annotation, str)
+        else parameter
+        for parameter in parameters(function)
+    ]
+
+
+def getter(member: Any) -> Any:
+    """The function to compare, which for a property is the one that computes it."""
+    return member.fget if isinstance(member, property) else member
+
+
+def test_the_path_derivation_is_not_vacuous():
+    # Guards the guards below, all of which are loops over this dict.
+    assert len(PATH_MEMBERS) > 20
+    assert sum(inspect.iscoroutinefunction(getter(m)) for m in PATH_MEMBERS.values()) > 10
+
+
+def test_every_path_member_has_a_blocking_form():
+    missing = sorted(set(PATH_MEMBERS) - set(SYNC_PATH_MEMBERS))
+    assert missing == [], f"SFTPPath members with no blocking form: {missing}"
+
+
+def test_the_blocking_path_invents_nothing_of_its_own():
+    extra = sorted(set(SYNC_PATH_MEMBERS) - set(PATH_MEMBERS))
+    assert extra == [], f"SyncSFTPPath has public members SFTPPath does not: {extra}"
+
+
+@pytest.mark.parametrize(
+    "name", sorted(n for n, m in PATH_MEMBERS.items() if isinstance(m, property))
+)
+def test_a_path_property_stays_a_property(name: str):
+    """`path.parent` must not become `path.parent()` on the way across the thread."""
+    assert isinstance(SYNC_PATH_MEMBERS[name], property), f"{name} is a property on SFTPPath only"
+
+
+@pytest.mark.parametrize("name", sorted(PATH_MEMBERS))
+def test_a_path_member_keeps_its_signature(name: str):
+    """Every parameter, in order, with its annotation translated and its default unchanged."""
+    assert name in SYNC_PATH_MEMBERS, f"{name} has no blocking form at all"
+    theirs = translated(getter(PATH_MEMBERS[name]))
+    ours = parameters(getter(SYNC_PATH_MEMBERS[name]))
+    assert ours == theirs
+
+
+@pytest.mark.parametrize("name", sorted(PATH_MEMBERS))
+def test_a_path_member_returns_the_translated_type(name: str):
+    """Awaiting is the portal's job, so only the type names and the generators change."""
+    theirs = inspect.signature(getter(PATH_MEMBERS[name])).return_annotation
+    ours = inspect.signature(getter(SYNC_PATH_MEMBERS[name])).return_annotation
+    assert ours == blocking_annotation(theirs)
+
+
+def test_the_path_translation_is_not_vacuous():
+    """A substitution that never fires would make every assertion above compare two equal strings.
+
+    Three separate things have to translate or the rule is not being exercised: a return type
+    that is the path class itself, an argument that accepts one, and an async generator.
+    """
+    returns = {
+        name
+        for name in PATH_MEMBERS
+        if inspect.signature(getter(PATH_MEMBERS[name])).return_annotation != "None"
+        and "SyncSFTPPath"
+        in blocking_annotation(inspect.signature(getter(PATH_MEMBERS[name])).return_annotation)
+    }
+    accepts = {
+        name
+        for name in PATH_MEMBERS
+        if any("SFTPPath" in str(p.annotation) for p in parameters(getter(PATH_MEMBERS[name])))
+    }
+    generators = {name for name in PATH_MEMBERS if inspect.isasyncgenfunction(PATH_MEMBERS[name])}
+    assert len(returns) > 10, sorted(returns)
+    assert accepts == {"relative_to", "is_relative_to", "rename", "replace", "symlink_to"}
+    assert generators == {"glob", "iterdir", "rglob"}
+
+
+def test_the_operators_cross_the_boundary_too():
+    """`dir()` skips dunders, so the parity sweep above cannot see `/`, `==` or `bytes()`.
+
+    Derived from `SFTPPath`'s own `__dict__` rather than listed, so an operator added there and
+    forgotten here fails by name -- which is the whole reason the sweep is derived at all.
+    """
+    theirs = {name for name in vars(SFTPPath) if name.startswith("__") and name != "__slots__"}
+    ours = {name for name in vars(SyncSFTPPath) if name.startswith("__") and name != "__slots__"}
+    assert sorted(theirs - ours) == [], f"operators with no blocking form: {sorted(theirs - ours)}"
+
+
+def test_the_blocking_path_never_hands_back_an_async_one():
+    """The wrapper has to be closed under its own operations or it leaks the async type.
+
+    Cheap to get wrong -- one `return self._path.parent` instead of `self._wrap(...)` -- and
+    invisible to the signature tests, which read annotations rather than values.
+    """
+    path = SyncSFTPPath(b"/incoming/2026/report.tar.gz")
+    derived = [
+        path.parent,
+        *path.parents,
+        path / b"child",
+        path.joinpath(b"a", b"b"),
+        path.with_name(b"other"),
+        path.with_stem(b"other"),
+        path.with_suffix(b".zip"),
+        path.relative_to(b"/incoming"),
+    ]
+    assert all(isinstance(found, SyncSFTPPath) for found in derived)
+
+
+# --- the entry points ----------------------------------------------------------------------
 
 
 def test_connect_takes_exactly_the_async_arguments():

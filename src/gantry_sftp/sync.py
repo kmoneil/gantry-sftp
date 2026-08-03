@@ -86,6 +86,7 @@ from anyio.from_thread import BlockingPortal, start_blocking_portal
 from gantry_sftp._connect import connect as _async_connect
 from gantry_sftp.codec import Attrs, OpenFlag, Request, Response
 from gantry_sftp.exceptions import StateError
+from gantry_sftp.path import DEFAULT_WRITE_MODE, SFTPPath
 from gantry_sftp.session import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
@@ -118,6 +119,7 @@ __all__ = [
     "BoundPortal",
     "SyncDirectoryScan",
     "SyncRemoteFile",
+    "SyncSFTPPath",
     "SyncSession",
     "SyncTransport",
     "connect",
@@ -822,6 +824,476 @@ class SyncSession:
                 **legacy,
             )
         )
+
+
+class SyncSFTPPath:
+    """A remote path with the algebra and the operations, from a thread with no event loop.
+
+    The blocking form of :class:`~gantry_sftp.path.SFTPPath`, and a facade over it rather than a
+    second copy of the algebra::
+
+        with connect("example.com", user="bob") as sftp:
+            incoming = SyncSFTPPath("/incoming", session=sftp)
+            for csv in incoming.glob("*.csv"):
+                csv.download(local_dir / os.fsdecode(csv.name))
+
+    Every member is the identically-named async one, so the type rule (strings go in, bytes come
+    out), the joining check, the trust split between the constructor and ``/``, and every
+    exception are documented there and are not restated. The differences are the two this
+    boundary forces: methods return values rather than awaitables, and :meth:`iterdir`,
+    :meth:`glob` and :meth:`rglob` come back as ordinary Python iterators.
+
+    ``tests/test_sync_facade.py`` derives this class's names and signatures from
+    :class:`~gantry_sftp.path.SFTPPath`, with the translation applied as a substitution rule
+    rather than a list -- so a method added there and forgotten here fails by name.
+
+    Args:
+        path: The path. ``bytes``, ``str``, or another :class:`SyncSFTPPath` to copy.
+        session: The session this path operates through, or ``None`` for a pure path.
+    """
+
+    __slots__ = ("_facade", "_path")
+
+    def __init__(
+        self, path: bytes | str | SyncSFTPPath, *, session: SyncSession | None = None
+    ) -> None:
+        inherited = path.session if isinstance(path, SyncSFTPPath) else None
+        facade = session if session is not None else inherited
+        self._facade: SyncSession | None = facade
+        self._path = SFTPPath(
+            bytes(path) if isinstance(path, SyncSFTPPath) else path,
+            session=None if facade is None else _wrapped_session(facade),
+        )
+
+    # --- what it is ------------------------------------------------------------------------
+
+    def __bytes__(self) -> bytes:
+        """The path exactly as it will go on the wire."""
+        return bytes(self._path)
+
+    @override
+    def __str__(self) -> str:
+        """The path decoded for display, reversibly."""
+        return str(self._path)
+
+    @override
+    def __repr__(self) -> str:
+        """Name the path and say whether it can reach a server."""
+        return f"SyncSFTPPath({bytes(self._path)!r}, {'bound' if self._facade else 'unbound'})"
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        """Byte equality of the path. The session takes no part."""
+        return isinstance(other, SyncSFTPPath) and self._path == other._path
+
+    @override
+    def __hash__(self) -> int:
+        """Hash the bytes, matching :meth:`__eq__`."""
+        return hash(self._path)
+
+    def __lt__(self, other: SyncSFTPPath) -> bool:
+        """Order by bytes, so a list of paths sorts. Undefined across types."""
+        if not isinstance(other, SyncSFTPPath):
+            return NotImplemented
+        return self._path < other._path
+
+    def __le__(self, other: SyncSFTPPath) -> bool:
+        """Order by bytes; see :meth:`__lt__`."""
+        if not isinstance(other, SyncSFTPPath):
+            return NotImplemented
+        return self._path <= other._path
+
+    def __gt__(self, other: SyncSFTPPath) -> bool:
+        """Order by bytes; see :meth:`__lt__`."""
+        if not isinstance(other, SyncSFTPPath):
+            return NotImplemented
+        return self._path > other._path
+
+    def __ge__(self, other: SyncSFTPPath) -> bool:
+        """Order by bytes; see :meth:`__lt__`."""
+        if not isinstance(other, SyncSFTPPath):
+            return NotImplemented
+        return self._path >= other._path
+
+    # --- the machinery -----------------------------------------------------------------------
+
+    def _wrap(self, path: SFTPPath) -> SyncSFTPPath:
+        """A derived path of this class, carrying this one's session."""
+        return SyncSFTPPath(bytes(path), session=self._facade)
+
+    def _required(self) -> SyncSession:
+        """The blocking session, or a refusal naming how to get one.
+
+        Raises:
+            StateError: If this path was constructed without a session.
+        """
+        if self._facade is None:
+            raise StateError(
+                f"SyncSFTPPath({bytes(self._path)!r}) has no session, so it can do path "
+                f"arithmetic and nothing else -- construct it with "
+                f"SyncSFTPPath(path, session=...) or call .bind(session)"
+            )
+        return self._facade
+
+    def _call[T](self, call: Callable[[], Awaitable[T]]) -> T:
+        """Run one of the async path's coroutines on the portal's thread."""
+        return _portal_of(self._required()).call(call)
+
+    def _stream(self, factory: Callable[[], AsyncGenerator[SFTPPath]]) -> Iterator[SyncSFTPPath]:
+        """Drive one of the async path's generators, wrapping each path it yields."""
+        for found in _driven(self._required(), factory):
+            yield self._wrap(found)
+
+    # --- pure algebra ----------------------------------------------------------------------
+
+    @property
+    def session(self) -> SyncSession | None:
+        """The session this path operates through, or ``None`` for a pure path."""
+        return self._facade
+
+    @property
+    def name(self) -> bytes:
+        """The last component, or ``b""``."""
+        return self._path.name
+
+    @property
+    def parts(self) -> tuple[bytes, ...]:
+        """The components, with ``b"/"`` first when the path is absolute."""
+        return self._path.parts
+
+    @property
+    def parent(self) -> SyncSFTPPath:
+        """The directory holding this path, keeping the binding."""
+        return self._wrap(self._path.parent)
+
+    @property
+    def parents(self) -> tuple[SyncSFTPPath, ...]:
+        """Every ancestor, nearest first."""
+        return tuple(self._wrap(found) for found in self._path.parents)
+
+    @property
+    def stem(self) -> bytes:
+        """:attr:`name` without its final suffix."""
+        return self._path.stem
+
+    @property
+    def suffix(self) -> bytes:
+        """The final extension of :attr:`name`, including its dot, or ``b""``."""
+        return self._path.suffix
+
+    @property
+    def suffixes(self) -> tuple[bytes, ...]:
+        """Every extension of :attr:`name`."""
+        return self._path.suffixes
+
+    def is_absolute(self) -> bool:
+        """Whether the path starts at the server's root."""
+        return self._path.is_absolute()
+
+    def joinpath(self, *names: bytes | str) -> SyncSFTPPath:
+        """Append one or more validated components."""
+        return self._wrap(self._path.joinpath(*names))
+
+    def __truediv__(self, name: bytes | str) -> SyncSFTPPath:
+        """``path / name`` -- one validated component. See :meth:`joinpath`."""
+        return self._wrap(self._path / name)
+
+    def with_name(self, name: bytes | str) -> SyncSFTPPath:
+        """Replace the last component."""
+        return self._wrap(self._path.with_name(name))
+
+    def with_stem(self, stem: bytes | str) -> SyncSFTPPath:
+        """Replace the last component's stem, keeping its suffix."""
+        return self._wrap(self._path.with_stem(stem))
+
+    def with_suffix(self, suffix: bytes | str) -> SyncSFTPPath:
+        """Replace the last component's final suffix."""
+        return self._wrap(self._path.with_suffix(suffix))
+
+    def relative_to(self, other: bytes | str | SyncSFTPPath) -> SyncSFTPPath:
+        """This path expressed below ``other``."""
+        return self._wrap(self._path.relative_to(_inner(other)))
+
+    def is_relative_to(self, other: bytes | str | SyncSFTPPath) -> bool:
+        """Whether :meth:`relative_to` would answer rather than raise."""
+        return self._path.is_relative_to(_inner(other))
+
+    def match(self, pattern: bytes | str, *, case_sensitive: bool = True) -> bool:
+        """Whether this path matches a pattern, without asking the server anything."""
+        return self._path.match(pattern, case_sensitive=case_sensitive)
+
+    def bind(self, session: SyncSession) -> SyncSFTPPath:
+        """The same path, operating through ``session``."""
+        return SyncSFTPPath(bytes(self._path), session=session)
+
+    # --- asking the server -----------------------------------------------------------------
+
+    def stat(self) -> Attrs:
+        """Attributes of the file, following symlinks."""
+        return self._call(self._path.stat)
+
+    def lstat(self) -> Attrs:
+        """Attributes of the file, not following a final symlink."""
+        return self._call(self._path.lstat)
+
+    def exists(self, *, follow_symlinks: bool = True) -> bool:
+        """Whether the path is there."""
+        return self._call(partial(self._path.exists, follow_symlinks=follow_symlinks))
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        """Whether it is a directory."""
+        return self._call(partial(self._path.is_dir, follow_symlinks=follow_symlinks))
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        """Whether it is a regular file."""
+        return self._call(partial(self._path.is_file, follow_symlinks=follow_symlinks))
+
+    def is_symlink(self) -> bool:
+        """Whether it is a symbolic link."""
+        return self._call(self._path.is_symlink)
+
+    def size(self) -> int | None:
+        """The size in bytes, or ``None`` if the server reported none."""
+        return self._call(self._path.size)
+
+    def mtime(self) -> datetime | None:
+        """Last modification as an aware UTC :class:`~datetime.datetime`, or ``None``."""
+        return self._call(self._path.mtime)
+
+    def resolve(self) -> SyncSFTPPath:
+        """The canonical path, with ``..`` and symlinks resolved by the server."""
+        return self._wrap(self._call(self._path.resolve))
+
+    def readlink(self) -> SyncSFTPPath:
+        """Where this symlink points, as the server stored it."""
+        return self._wrap(self._call(self._path.readlink))
+
+    def symlink_to(self, target: bytes | str | SyncSFTPPath) -> None:
+        """Create this path as a symlink pointing at ``target``."""
+        return self._call(partial(self._path.symlink_to, _inner(target)))
+
+    def chmod(self, mode: int, *, follow_symlinks: bool = True) -> None:
+        """Set permission bits."""
+        return self._call(partial(self._path.chmod, mode, follow_symlinks=follow_symlinks))
+
+    # --- directories -----------------------------------------------------------------------
+
+    def iterdir(self) -> Iterator[SyncSFTPPath]:
+        """Yield each entry of this directory as a path, streaming."""
+        return self._stream(self._path.iterdir)
+
+    def glob(
+        self, pattern: bytes | str, *, max_depth: int | None = None, case_sensitive: bool = True
+    ) -> Iterator[SyncSFTPPath]:
+        """Match a pattern below this path, streaming each match as it is found."""
+        return self._stream(
+            partial(self._path.glob, pattern, max_depth=max_depth, case_sensitive=case_sensitive)
+        )
+
+    def rglob(
+        self, pattern: bytes | str, *, max_depth: int | None = None, case_sensitive: bool = True
+    ) -> Iterator[SyncSFTPPath]:
+        """:meth:`glob`, applied at every level below this path."""
+        return self._stream(
+            partial(self._path.rglob, pattern, max_depth=max_depth, case_sensitive=case_sensitive)
+        )
+
+    def mkdir(self, *, parents: bool = False, exist_ok: bool = False) -> None:
+        """Create this directory."""
+        return self._call(partial(self._path.mkdir, parents=parents, exist_ok=exist_ok))
+
+    def rmdir(self) -> None:
+        """Remove this directory, which must be empty."""
+        return self._call(self._path.rmdir)
+
+    def rmtree(self) -> TreeResult:
+        """Remove this directory and everything below it."""
+        return self._call(self._path.rmtree)
+
+    def unlink(self, *, missing_ok: bool = False) -> None:
+        """Remove this file."""
+        return self._call(partial(self._path.unlink, missing_ok=missing_ok))
+
+    def rename(self, target: bytes | str | SyncSFTPPath) -> SyncSFTPPath:
+        """Rename to ``target``, which must not already exist."""
+        return self._wrap(self._call(partial(self._path.rename, _inner(target))))
+
+    def replace(self, target: bytes | str | SyncSFTPPath) -> SyncSFTPPath:
+        """Rename to ``target``, replacing it atomically if it exists."""
+        return self._wrap(self._call(partial(self._path.replace, _inner(target))))
+
+    # --- bytes ------------------------------------------------------------------------------
+
+    def open(self, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None) -> SyncRemoteFile:
+        """Open this file as a cursor-bearing object, for ranges and streaming."""
+        portal = _portal_of(self._required())
+        return SyncRemoteFile(portal, self._path.open(pflags, mode=mode))
+
+    def read_bytes(self) -> bytes:
+        """The whole file."""
+        return self._call(self._path.read_bytes)
+
+    def write_bytes(self, data: bytes | memoryview, *, mode: int = DEFAULT_WRITE_MODE) -> int:
+        """Replace the file's contents with ``data``. This is not an atomic publish."""
+        return self._call(partial(self._path.write_bytes, data, mode=mode))
+
+    def read_text(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        """The whole file, decoded."""
+        return self._call(partial(self._path.read_text, encoding, errors))
+
+    def write_text(
+        self,
+        data: str,
+        encoding: str = "utf-8",
+        errors: str = "strict",
+        *,
+        mode: int = DEFAULT_WRITE_MODE,
+    ) -> int:
+        """Encode ``data`` and write it. See :meth:`write_bytes` for what this is not."""
+        return self._call(partial(self._path.write_text, data, encoding, errors, mode=mode))
+
+    # --- transfers ---------------------------------------------------------------------------
+
+    def download(
+        self,
+        local_path: Path | str,
+        *,
+        progress: ProgressCallback | None = None,
+        depth: int | None = None,
+        no_follow: bool = False,
+        resume: bool = False,
+        verify_size: bool = True,
+        verify: Verify = Verify.SIZE,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+    ) -> DownloadResult:
+        """Download this file to ``local_path``."""
+        return self._call(
+            partial(
+                self._path.download,
+                local_path,
+                progress=progress,
+                depth=depth,
+                no_follow=no_follow,
+                resume=resume,
+                verify_size=verify_size,
+                verify=verify,
+                preserve_times=preserve_times,
+                mode=mode,
+            )
+        )
+
+    def upload(
+        self,
+        local_path: Path | str,
+        *,
+        publish: Publish | None = None,
+        resume: bool = False,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        verify: Verify = Verify.SIZE,
+        progress: ProgressCallback | None = None,
+        depth: int | None = None,
+    ) -> UploadResult:
+        """Upload ``local_path`` to this path, publishing it atomically by default."""
+        return self._call(
+            partial(
+                self._path.upload,
+                local_path,
+                publish=publish,
+                resume=resume,
+                preserve_times=preserve_times,
+                mode=mode,
+                verify=verify,
+                progress=progress,
+                depth=depth,
+            )
+        )
+
+    def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = None,
+        progress: ProgressCallback | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
+    ) -> TreeResult:
+        """Download this directory into ``local_path``, refusing to escape it."""
+        return self._call(
+            partial(
+                self._path.download_tree,
+                local_path,
+                max_depth=max_depth,
+                progress=progress,
+                preserve_times=preserve_times,
+                mode=mode,
+                resume=resume,
+                concurrency=concurrency,
+            )
+        )
+
+    def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = None,
+        publish: Publish | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        progress: ProgressCallback | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
+    ) -> TreeResult:
+        """Upload the local tree at ``local_path`` into this directory."""
+        return self._call(
+            partial(
+                self._path.upload_tree,
+                local_path,
+                max_depth=max_depth,
+                publish=publish,
+                preserve_times=preserve_times,
+                mode=mode,
+                progress=progress,
+                resume=resume,
+                concurrency=concurrency,
+            )
+        )
+
+
+def _inner(path: bytes | str | SyncSFTPPath) -> bytes | str:
+    """Unwrap a blocking path so the async one below never sees this class."""
+    return bytes(path) if isinstance(path, SyncSFTPPath) else path
+
+
+# --- the seam between the two halves of the facade ------------------------------------------
+#
+# `SyncSFTPPath` and `SyncSession` are one facade split across two classes in one module, and
+# the three functions below are where the split shows. Each reaches for machinery `SyncSession`
+# already owns -- the live portal, the async session it drives, and the generator driver that
+# finalises on the portal's thread -- rather than reimplementing it, which is the second
+# implementation D-8 exists to forbid. Making them public members of `SyncSession` is not the
+# alternative: `tests/test_sync_facade.py::test_the_facade_invents_nothing_of_its_own` asserts
+# that class has no public member `Session` does not, so a public `portal` would fail that test
+# rather than satisfy this lint. Named here, in one place, so the reach is three lines rather
+# than scattered through thirty methods.
+
+
+def _wrapped_session(facade: SyncSession) -> Session:
+    """The async session a blocking one drives."""
+    return facade._session  # noqa: SLF001 -- one facade, two classes; see above
+
+
+def _portal_of(facade: SyncSession) -> BlockingPortal:
+    """The live portal, refusing a session whose ``with`` block has ended."""
+    return facade._ready()  # noqa: SLF001 -- one facade, two classes; see above
+
+
+def _driven[T](facade: SyncSession, factory: Callable[[], AsyncGenerator[T]]) -> Iterator[T]:
+    """One async generator, driven from this thread and finalised on the portal's."""
+    return facade._iterate(factory)  # noqa: SLF001 -- one facade, two classes; see above
 
 
 class BoundPortal:

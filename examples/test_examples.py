@@ -199,3 +199,32 @@ def test_the_verification_example_shows_corruption_slipping_past_the_size_check(
     assert "matches the source: False" in stdout
     # And rung 2 refusing the same prefix on a server that cannot hash anything.
     assert "cannot resume:" in stdout
+
+
+def test_the_paths_example_demonstrates_both_refusals_and_the_awkward_name():
+    """Three claims, and each is a decision the class could have made the other way.
+
+    An example of a `pathlib`-shaped API is a tour of an API unless it shows what the shape
+    costs and buys. So what is pinned is the joining refusal on a name a *server* chose, the
+    constructor accepting the same characters because a caller wrote them, and a name that is
+    not valid UTF-8 surviving to the output -- a directory of tidy ASCII would prove nothing a
+    docstring could not claim.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "paths.py")
+    assert returncode == 0
+    # The zip-slip join, refused, with the reason and the alternative in the message.
+    assert "refusing to join b'../../etc/cron.d/x'" in stdout
+    assert "use .parent to go up" in stdout
+    # The other side of the same line: the constructor is a path the caller wrote.
+    assert "the constructor takes what the join refuses: b'/a/../b'" in stdout
+    # A path with no session does arithmetic and nothing else.
+    assert "has no session, so it can do path arithmetic and nothing else" in stdout
+    # The name that breaks clients which decode strictly, listed and then downloaded.
+    assert r"caf\xe9.csv" in stdout
+    # `glob(3)`'s leading-dot rule, which is what keeps a sweep off half-written files.
+    assert "and .staging.csv was not matched" in stdout
+    # And the mode a file created through a path arrives with, which is not the server's.
+    assert "mode 600" in stdout

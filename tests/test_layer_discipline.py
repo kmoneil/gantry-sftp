@@ -191,13 +191,27 @@ def test_codec_imports_only_itself_and_the_exception_module() -> None:
 
 # --- the top of the stack, which is a layer too (D-90) ------------------------------------------
 
-ERGONOMICS = ("gantry_sftp.doctor", "gantry_sftp.__main__")
+ERGONOMICS = (
+    "gantry_sftp.doctor",
+    "gantry_sftp.__main__",
+    "gantry_sftp.path",
+    "gantry_sftp.sync",
+    "gantry_sftp.fsspec",
+)
 """Modules that sit *above* session and transport, and are imported by nothing below them.
 
 The command line and the diagnostic are the top of the dependency order — they may reach down
 through the whole library, and nothing in the library may reach up to them. Stated as a list
-because there are two of them; the assertion below is what keeps the list from becoming a
+because there are five of them; the assertion below is what keeps the list from becoming a
 description of what happened rather than a rule.
+
+**The last three were added by D-61 and the first of them is the one with teeth.** CLAUDE.md's
+layout puts `path.py` beside the fsspec adapter at the ergonomics level, and the tempting
+spelling of its entry point — `session.path("/incoming")` — inverts that: `session/` would
+import the path type, which imports `Session`, and the direction stops being one-way. So the
+binding is `SFTPPath(path, session=...)` and this list is why. `sync` and `fsspec` came with it
+rather than as scope: `sync` has to import `path` for `SyncSFTPPath`, and `fsspec` imports
+`sync`, so leaving either out would report a legitimate downward import as a violation.
 """
 
 
@@ -210,10 +224,17 @@ def test_nothing_below_the_ergonomics_layer_imports_it() -> None:
     assertion, in the same file and for the same reason the codec's purity is asserted rather
     than documented.
     """
+    # The package root is the top of the stack by definition -- re-exporting the public API is
+    # what it is for, and `from gantry_sftp import SFTPPath` is the spelling every doc uses. It
+    # is excluded by *path* rather than by stem, because `session/__init__.py` and its two
+    # siblings have the same stem and are emphatically not exempt.
+    root = PACKAGE_ROOT / "__init__.py"
     below = [
         module
         for module in package_modules()
-        if f"gantry_sftp.{module.stem}" not in ERGONOMICS and module.stem != "__main__"
+        if f"gantry_sftp.{module.stem}" not in ERGONOMICS
+        and module.stem != "__main__"
+        and module != root
     ]
     offenders = [
         f"{module.name}:{line} imports {name}"
