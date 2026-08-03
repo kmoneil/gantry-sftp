@@ -141,24 +141,31 @@ def write_request_overhead(handle_length: int) -> int:
     return 1 + 4 + (4 + handle_length) + 8 + 4
 
 
-@dataclass(frozen=True, slots=True)
 class TransferSizes:
     """How many payload bytes to ask for per request, in each direction.
 
     Derived, never defaulted. Both values are guaranteed to be at least
     :data:`_MINIMUM_USEFUL_LENGTH`, so no caller can be handed a request size that makes no
     progress.
+
+    **Not a dataclass, and the validation is in ``__init__`` rather than ``__post_init__``**
+    (D-129). mutmut does not instrument the methods of a decorated class, so both guards below
+    generated no mutants -- and a `< 1` guard is the exact shape D-105's sixteenth slice found
+    survivors in on both schedulers, because every test passes a value the guard *rejects* and
+    none passes the smallest it admits. Nothing compares these, so dataclass equality was
+    buying nothing here either.
     """
 
-    read_length: int
-    write_length: int
+    __slots__ = ("read_length", "write_length")
 
-    def __post_init__(self) -> None:
+    def __init__(self, read_length: int, write_length: int) -> None:
         """Refuse to exist in a state that cannot make progress."""
-        if self.read_length < _MINIMUM_USEFUL_LENGTH:
-            raise ValueError(f"read_length must be at least 1, got {self.read_length}")
-        if self.write_length < _MINIMUM_USEFUL_LENGTH:
-            raise ValueError(f"write_length must be at least 1, got {self.write_length}")
+        if read_length < _MINIMUM_USEFUL_LENGTH:
+            raise ValueError(f"read_length must be at least 1, got {read_length}")
+        if write_length < _MINIMUM_USEFUL_LENGTH:
+            raise ValueError(f"write_length must be at least 1, got {write_length}")
+        self.read_length = read_length
+        self.write_length = write_length
 
 
 def negotiate_transfer_sizes(

@@ -51,6 +51,7 @@ from gantry_sftp.session import (
     download_handle,
     negotiate_transfer_sizes,
 )
+from gantry_sftp.session._download import DescriptorSink
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -831,3 +832,52 @@ async def test_get_names_itself_in_the_mode_it_refuses(tmp_path: Path):
 
     assert refusal.value.args[0].startswith("get() mode= must be ")
     assert server.reads == [], "a refused argument reached the wire"
+
+
+# --- the short-write loop, which nothing exercised until D-129 made it visible ---------------
+
+
+def test_a_short_pwrite_is_looped_until_the_whole_payload_lands(tmp_path: Path, monkeypatch):
+    """`os.pwrite` may write fewer bytes than asked, and this is the only thing that handles it.
+
+    `DescriptorSink.write_at`'s own docstring names the hazard -- *"a version of this that
+    ignored that would silently drop the tail of a payload"* -- and **nothing exercised the
+    loop's second iteration**, because a local file write never comes up short in practice. So
+    the accumulation and the offset arithmetic were both untested, and the Definition of Done
+    names this exact category: a surviving mutant in offset arithmetic is a missing test rather
+    than a curiosity.
+
+    Invisible until D-129, because `DescriptorSink` was a `@dataclass` and mutmut does not
+    instrument the methods of a decorated class -- so there was no mutant to survive. With the
+    decorator gone, `written +=` could become `written =` and `offset + written` could become
+    `offset - written` with the whole suite green.
+
+    The offsets are asserted as well as the bytes: writing the right content by luck at the
+    wrong offsets is precisely what `offset - written` does on the first iteration, where
+    `written` is still zero and the two spellings agree.
+    """
+    target = tmp_path / "sink.bin"
+    _ = target.write_bytes(b"\x00" * 32)
+    real_pwrite = os.pwrite
+    offsets: list[int] = []
+    budget = iter([2])  # the first write comes up short; the rest go in one go
+
+    def short_pwrite(fd: int, data, offset: int) -> int:
+        offsets.append(offset)
+        allowed = next(budget, len(data))
+        return real_pwrite(fd, bytes(data[:allowed]), offset)
+
+    monkeypatch.setattr(os, "pwrite", short_pwrite)
+
+    fd = os.open(target, os.O_WRONLY)
+    try:
+        DescriptorSink(fd).write_at(10, memoryview(b"abcdef"))
+    finally:
+        os.close(fd)
+
+    assert target.read_bytes()[10:16] == b"abcdef"
+    # Two calls, and the second resumes *after* what the first wrote rather than before it.
+    assert offsets == [10, 12]
+    # Nothing was written outside the range asked for.
+    assert target.read_bytes()[:10] == b"\x00" * 10
+    assert target.read_bytes()[16:] == b"\x00" * 16

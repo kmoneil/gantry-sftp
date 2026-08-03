@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -460,3 +461,159 @@ def test_the_session_ceiling_is_not_slack() -> None:
         f"{SESSION_METHOD_CEILING}. Lower SESSION_METHOD_CEILING to {len(methods)} in this same "
         f"change, so the next addition is measured against what the class actually is"
     )
+
+
+# --- what the mutation lane cannot see (D-129) ------------------------------------------------
+
+
+MUTATED_PACKAGES = ("codec", "session", "transport")
+"""The three packages `[tool.mutmut] only_mutate` covers. The rule below applies to those only."""
+
+_MUTABLE_NODES = (ast.BinOp, ast.Compare, ast.BoolOp, ast.UnaryOp, ast.Subscript, ast.IfExp)
+"""Node kinds that mean a body has something for mutmut to change.
+
+mutmut rewrites *expressions* -- an operator, a comparison, a slice, a literal. A body with none
+of these generates nothing whatever it is attached to, so a one-line delegation or a bare
+``return self.x`` is not a finding.
+"""
+
+
+def mutated_modules() -> list[Path]:
+    return sorted(
+        module for package in MUTATED_PACKAGES for module in (PACKAGE_ROOT / package).rglob("*.py")
+    )
+
+
+def walk_executable(node: ast.AST) -> Iterator[ast.AST]:
+    """Walk ``node``, skipping type annotations.
+
+    **The first draft of this rule walked the whole function and reported two false positives**,
+    both of them signatures rather than logic: ``-> tuple[bytes, ...]`` is a ``Subscript`` and
+    ``data: bytes | memoryview`` is a ``BinOp``. An annotation is not something mutmut changes
+    into different behaviour, so counting one as "a body worth mutating" would have flagged every
+    method with a generic return type -- a sweep failing in the direction that over-applies, which
+    is the half that gets the rule deleted rather than the half that gets it noticed.
+    """
+    skip: set[ast.AST] = set()
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        # A nested `def` inside a body brings its own signature with it.
+        skip = {node.args} | ({node.returns} if node.returns is not None else set())
+    elif isinstance(node, ast.Lambda):
+        skip = {node.args}
+    elif isinstance(node, ast.AnnAssign):
+        skip = {node.annotation}
+
+    for child in ast.iter_child_nodes(node):
+        if child in skip:
+            continue
+        yield child
+        yield from walk_executable(child)
+
+
+def method_body_nodes(member: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[ast.AST]:
+    """Every node in a method's body, with its signature and its annotations left out."""
+    for statement in member.body:
+        yield statement
+        yield from walk_executable(statement)
+
+
+def hidden_methods(module: Path) -> list[str]:
+    """Undecorated methods with mutable bodies that sit inside a decorated class.
+
+    Every clause is load-bearing. A method with its *own* decorator is already invisible for the
+    reason D-107 recorded and is not this rule's business; a method with nothing mutable in it
+    would generate no mutants anywhere; and only the *body* counts, never the signature -- see
+    :func:`walk_executable`.
+    """
+    tree = ast.parse(module.read_text(encoding="utf-8"))
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or not node.decorator_list:
+            continue
+        for member in node.body:
+            if not isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if member.decorator_list:
+                continue
+            if any(isinstance(inner, _MUTABLE_NODES) for inner in method_body_nodes(member)):
+                decorators = "+".join(ast.unparse(d).split("(")[0] for d in node.decorator_list)
+                found.append(f"{module.name}:{node.name}.{member.name} (@{decorators})")
+    return found
+
+
+@pytest.mark.parametrize("module", mutated_modules(), ids=lambda p: str(p.name))
+def test_no_decorated_class_hides_a_method_from_the_mutation_lane(module: Path) -> None:
+    """The statement that would have failed the day `GlobRunner` was written (D-129).
+
+    **mutmut declines to instrument the methods of a decorated class**, for the same reason it
+    declines a decorated function: building the trampoline re-runs the decorator, and
+    `@dataclass(slots=True)` does not merely add methods -- it returns a new class object. So a
+    `@dataclass` wrapped around a class whose methods carry logic silently removes all of them
+    from the lane.
+
+    **Nothing else can see it.** Such a class passes both type checkers, the complexity gate and
+    the whole suite, and `mutmut results` is silent too -- it lists survivors and timeouts, and a
+    function with *no* mutants appears in neither. D-128 found it only because the module-level
+    matcher in the same file produced 48 trampolines while the whole class produced 0, which is
+    legible only next to a healthy neighbour.
+
+    Six methods were hidden when this was written, and the Definition of Done names two of them
+    by category: `DescriptorSink.write_at` is the offset arithmetic of every download, and
+    `CheckFileReply.split` parses attacker-supplied bytes. *"A surviving mutant in frame parsing
+    or offset arithmetic is a missing test, not a curiosity"* -- and there was no mutant to
+    survive.
+
+    **Two ways to satisfy this**, and equality decides which. Drop the decorator and write
+    `__init__` by hand where nothing compares instances; keep it and move the body to a
+    module-level function where something does. `CheckFileReply` is the second case:
+    `tests/test_extensions.py` asserts `parsed == CheckFileReply(...)`, which is dataclass
+    equality doing golden-frame work.
+    """
+    hidden = hidden_methods(module)
+    assert not hidden, (
+        "these methods are invisible to the mutation lane because their class is decorated: "
+        + "; ".join(hidden)
+        + ". Either drop the class decorator and write __init__ by hand, or move the body to a "
+        "module-level function and delegate to it -- see D-129. If the body genuinely has "
+        "nothing worth mutating, it will not reach this rule."
+    )
+
+
+def test_the_hidden_method_scan_finds_the_shape_it_guards() -> None:
+    """The rule above passes when it finds nothing, which is also what a broken scan does.
+
+    D-116's lesson, applied here: a guard whose subject has been removed reports clean forever.
+    So the scanner is pointed at a decorated class with a comparison in an undecorated method
+    and has to see it.
+    """
+    sample = Path(__file__).parent / "_d129_sample.py"
+    sample.write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class Hidden:\n"
+        "    n: int\n"
+        "    def check(self) -> bool:\n"
+        "        return self.n < 1\n"
+        "    @property\n"
+        "    def already_invisible(self) -> bool:\n"
+        "        return self.n > 1\n"
+        "class Plain:\n"
+        "    def fine(self, n: int) -> bool:\n"
+        "        return n < 1\n"
+        "@dataclass\n"
+        "class SignatureOnly:\n"
+        "    n: int\n"
+        "    def annotated(self, data: bytes | memoryview) -> tuple[bytes, ...]:\n"
+        "        return helper(data)\n",
+        encoding="utf-8",
+    )
+    try:
+        found = hidden_methods(sample)
+    finally:
+        sample.unlink()
+    # `Hidden.check` only, and each exclusion is a case this scan got wrong at some point or
+    # would have: the property is out of scope (D-107 covers it), `Plain` is undecorated so its
+    # method is instrumented normally, and `SignatureOnly` carries a `|` and a `[...]` in its
+    # *annotations* with a one-line delegation for a body -- which is what the first draft of
+    # this rule reported as a finding, twice.
+    assert found == ["_d129_sample.py:Hidden.check (@dataclass)"]

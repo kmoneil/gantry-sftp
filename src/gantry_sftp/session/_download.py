@@ -161,16 +161,25 @@ class Sink(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
 class DescriptorSink:
     """Writes into an open local file at explicit offsets.
 
     ``pwrite`` needs no ordering and no seeking, which is what lets replies be handled in
     whatever order they arrive -- and it is why this sink is POSIX-only while
     :class:`BufferSink` is not. That split is the whole of the platform story for this layer.
+
+    **Not a dataclass, and the reason is the mutation lane** (D-129): mutmut declines to
+    instrument the methods of a *decorated class*, so :meth:`write_at` -- the offset arithmetic
+    of every download -- generated no mutants at all while this was one. The Definition of Done
+    names that case: a surviving mutant in offset arithmetic is a missing test rather than a
+    curiosity, and here there was no mutant to survive. Nothing compares these, so the free
+    ``__eq__`` was buying nothing.
     """
 
-    fd: int
+    __slots__ = ("fd",)
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
 
     def write_at(self, offset: int, payload: memoryview) -> None:
         """Write the whole payload, looping over short writes.
@@ -183,7 +192,6 @@ class DescriptorSink:
             written += os.pwrite(self.fd, payload[written:], offset + written)
 
 
-@dataclass(frozen=True, slots=True)
 class BufferSink:
     """Writes into a caller's buffer, which is what makes a byte-range read possible.
 
@@ -192,13 +200,19 @@ class BufferSink:
     copy of the payload into the caller's memory and nothing more -- no intermediate ``bytes``,
     no concatenation, and no per-payload allocation.
 
+    Not a dataclass, for the reason given on :class:`DescriptorSink` (D-129): its
+    :meth:`write_at` is two lines of offset arithmetic and both were invisible to the lane.
+
     Attributes:
         view: Writable view over the destination, exactly as long as the range being read.
         base: Absolute file offset of ``view[0]``.
     """
 
-    view: memoryview
-    base: int
+    __slots__ = ("base", "view")
+
+    def __init__(self, view: memoryview, base: int) -> None:
+        self.view = view
+        self.base = base
 
     def write_at(self, offset: int, payload: memoryview) -> None:
         start = offset - self.base

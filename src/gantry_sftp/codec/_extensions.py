@@ -60,6 +60,7 @@ __all__ = [
     "Fsync",
     "LSetStat",
     "PosixRename",
+    "split_digests",
 ]
 
 POSIX_RENAME_NAME = EXTENSION_POSIX_RENAME.encode("ascii")
@@ -475,15 +476,47 @@ class CheckFileReply:
                 A remainder means the algorithm we sized against is not the one that produced
                 these bytes, and splitting anyway would hand back digests that are silently
                 misaligned.
+
+        Note:
+            The body is :func:`split_digests` and **the split is for the mutation lane**
+            (D-129), not for structure. mutmut declines to instrument the methods of a
+            *decorated class*, so this parser of attacker-supplied bytes generated no mutants
+            while its body lived here -- and the Definition of Done names frame parsing as one
+            of the two places a survivor is a missing test rather than a curiosity. Unlike the
+            five classes converted with it, this one keeps ``@dataclass``: it is a decoded
+            packet type and ``tests/test_extensions.py`` asserts ``parsed == CheckFileReply(...)``,
+            which is dataclass equality doing golden-frame work. Dropping the decorator would
+            trade one gate for another, so the body moved instead. Do not fold it back.
         """
-        if digest_size < 1:
-            raise ValueError(f"digest_size must be at least 1, got {digest_size}")
-        if len(self.digests) % digest_size:
-            raise ValueError(
-                f"{len(self.digests)} digest bytes do not divide into {digest_size}-byte "
-                f"digests, so this is not {self.algorithm!r} output"
-            )
-        return tuple(
-            self.digests[start : start + digest_size]
-            for start in range(0, len(self.digests), digest_size)
+        return split_digests(self.digests, digest_size, algorithm=self.algorithm)
+
+
+def split_digests(digests: bytes, digest_size: int, *, algorithm: bytes) -> tuple[bytes, ...]:
+    """Split concatenated digest bytes into one digest per block.
+
+    The body of :meth:`CheckFileReply.split`, undecorated so the mutation lane can see it --
+    see that method's ``Note`` for why it is out here rather than in the class (D-129).
+
+    Args:
+        digests: The raw concatenated bytes, exactly as the server sent them.
+        digest_size: Width of one digest, from ``hashlib`` for the algorithm the server named.
+        algorithm: Only for the error message, which names what the bytes were sized against.
+
+    Returns:
+        One digest per block, in wire order.
+
+    Raises:
+        ValueError: If ``digest_size`` is not positive, or does not divide the payload. A
+            remainder means the algorithm we sized against is not the one that produced these
+            bytes, and splitting anyway would hand back digests that are silently misaligned.
+    """
+    if digest_size < 1:
+        raise ValueError(f"digest_size must be at least 1, got {digest_size}")
+    if len(digests) % digest_size:
+        raise ValueError(
+            f"{len(digests)} digest bytes do not divide into {digest_size}-byte "
+            f"digests, so this is not {algorithm!r} output"
         )
+    return tuple(
+        digests[start : start + digest_size] for start in range(0, len(digests), digest_size)
+    )

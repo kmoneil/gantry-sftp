@@ -346,6 +346,25 @@ def test_splitting_by_a_nonsense_digest_size_is_refused(digest_size: int):
     assert exc.value.args[0] == f"digest_size must be at least 1, got {digest_size}"
 
 
+def test_the_smallest_digest_size_the_guard_admits_actually_works():
+    """The other side of the boundary above, and D-129 is why it was missing.
+
+    That test passes 0 and -1 -- values the guard *rejects* -- so it pins that something is
+    refused without pinning **where**. `digest_size < 1` could become `<= 1` or `< 2` with it
+    green, and both would refuse a one-byte digest the contract allows.
+
+    Invisible until D-129: `split`'s body lived on a `@dataclass`, and mutmut does not
+    instrument the methods of a decorated class, so there was no mutant to survive. This is the
+    same shape D-105's sixteenth slice found on both schedulers -- every test passes a value the
+    guard turns away and none passes the smallest it lets through.
+
+    One byte is not hypothetical padding for a test: the digest size comes from `hashlib` for
+    whatever algorithm the *server* named, and nothing in the protocol constrains it.
+    """
+    parsed = CheckFileReply(3, b"crc32", b"abc")
+    assert parsed.split(1) == (b"a", b"b", b"c")
+
+
 def test_digests_that_do_not_divide_evenly_are_refused_rather_than_split():
     # A remainder means the algorithm we sized against is not the one that produced these
     # bytes. Splitting anyway hands back digests that are silently misaligned, which is the

@@ -83,7 +83,6 @@ class Source(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
 class DescriptorSource:
     """Reads the payload from an open local file.
 
@@ -92,20 +91,30 @@ class DescriptorSource:
     than reached as ``anyio.to_thread...``: that attribute only resolves because anyio happens
     to import the submodule eagerly today, which ty flags and which would break silently if it
     stopped.
+
+    Not a dataclass, for the reason given on
+    :class:`~gantry_sftp.session.DescriptorSink` (D-129). The body here is one call, and its
+    three arguments are exactly the kind mutmut reorders and nulls -- ``os.pread`` takes
+    ``(fd, length, offset)`` in that order, which is not the order this method receives them.
     """
 
-    fd: int
+    __slots__ = ("fd",)
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
 
     async def read_at(self, offset: int, length: int) -> bytes | memoryview:
         return await run_sync(os.pread, self.fd, length, offset)
 
 
-@dataclass(frozen=True, slots=True)
 class BufferSource:
     """Reads the payload from a buffer the caller already has.
 
     No thread and no copy: a ``memoryview`` slice is a view, so the payload handed to the
     codec is a window onto the caller's bytes right up to the point the frame is built.
+
+    Not a dataclass (D-129), for the reason given on
+    :class:`~gantry_sftp.session.DescriptorSink`.
 
     Attributes:
         view: The bytes to send.
@@ -113,8 +122,11 @@ class BufferSource:
             question a descriptor does.
     """
 
-    view: memoryview
-    base: int
+    __slots__ = ("base", "view")
+
+    def __init__(self, view: memoryview, base: int) -> None:
+        self.view = view
+        self.base = base
 
     async def read_at(self, offset: int, length: int) -> bytes | memoryview:
         start = offset - self.base
