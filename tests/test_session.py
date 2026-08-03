@@ -23,6 +23,7 @@ from gantry_sftp.codec import (
     Name,
     NameEntry,
     Open,
+    OpenDir,
     OpenFlag,
     Read,
     RealPath,
@@ -391,6 +392,30 @@ async def test_an_operation_whose_only_answer_is_a_status_refuses_another_shape(
             await sftp.remove("/data/whatever")
 
     assert exc.value.args[0] == "server answered with Handle where STATUS was expected"
+
+
+async def test_opendir_refuses_a_reply_that_is_not_a_handle():
+    """The third `_unexpected` call site, and the third with no test on the expected-type word.
+
+    `_realpath_raw` says NAME, `_expect_status` says STATUS, this says HANDLE -- and each is a
+    separate literal that could be emptied or case-mangled on its own. The word is the whole
+    diagnostic value of the message: without it the sentence says a server answered something,
+    which the reader already knew.
+    """
+
+    class WrongType(FakeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, OpenDir):
+                self._reply(Name(packet.request_id, ()))
+                return
+            super()._handle(packet)
+
+    server = WrongType()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.opendir(b"/somewhere")
+
+    assert exc.value.args[0] == "server answered with Name where HANDLE was expected"
 
 
 async def test_realpath_refuses_a_reply_that_is_not_a_name_at_all():

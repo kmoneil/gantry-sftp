@@ -32,7 +32,12 @@ from gantry_sftp.session import (
     unsafe_reason,
 )
 from gantry_sftp.session import _localpath as localpath
-from gantry_sftp.session._session import _chmod_local_directories, _stamp_local_directories
+from gantry_sftp.session._session import (
+    _chmod_local,
+    _chmod_local_directories,
+    _stamp_local,
+    _stamp_local_directories,
+)
 
 # --- names that must never become a filename ----------------------------------------------
 
@@ -390,6 +395,31 @@ def test_chmodding_a_directory_that_became_a_symlink_does_not_follow_it(tmp_path
     assert stat.S_IMODE(outside.stat().st_mode) == 0o755, (
         "chmod followed the link out of the destination"
     )
+
+
+def test_a_file_the_caller_may_not_write_is_still_stamped_and_chmodded(tmp_path: Path):
+    """`no_follow=False` must not quietly become a *write* open (D-105 slice 26).
+
+    Both helpers open read-only and act on the descriptor, and the flag they add for the
+    following case is `O_NOFOLLOW` -- which is `0` when it is not wanted. `0` mutates to `1`,
+    which is `os.O_WRONLY`, and every existing case passes a file this process can write, so
+    the two spell the same outcome. A read-only file is where they part: `O_RDONLY` opens it
+    and `O_WRONLY` raises `PermissionError`, from inside a metadata pass whose whole contract
+    is that it does not fail a completed download.
+
+    `no_follow=False` is `get`'s own default -- pointing a download at a link you made
+    yourself is legitimate -- so this is the ordinary path rather than an exotic one.
+    """
+    target = tmp_path / "readonly.csv"
+    target.write_bytes(b"done")
+    target.chmod(0o444)
+
+    _stamp_local(target, Times(atime=1_600_000_007, mtime=1_600_000_000), no_follow=False)
+    _chmod_local(target, 0o640, no_follow=False)
+
+    status = target.stat()
+    assert int(status.st_mtime) == 1_600_000_000
+    assert stat.S_IMODE(status.st_mode) == 0o640
 
 
 def test_an_ordinary_directory_is_still_stamped_and_chmodded(tmp_path: Path):

@@ -1101,6 +1101,122 @@ async def test_case_insensitivity_is_the_callers_decision_because_it_is_the_serv
         ]
 
 
+async def test_case_folding_survives_the_descent_into_a_subdirectory():
+    """Every option test above matches at the *top* level, which never forwards anything.
+
+    `_glob_in`, `_glob_descend` and `_glob_recursive` each hand the three options to the next
+    level down, and each forward could be dropped or nulled with every existing test green --
+    because a pattern with one component never gets there. `case_sensitive=None` is falsy, so
+    the mutation makes the *nested* level fold when the caller asked it not to (D-105 slice 26).
+    """
+    tree = {
+        b"/root": (named(b"SUB", DIRECTORY),),
+        b"/root/SUB": (named(b"REPORT.CSV", REGULAR, 3),),
+    }
+    server = TreeServer(tree=tree)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        # Both components matched against a listing, one level apart, and both folded.
+        assert await matches(sftp, b"/root/*/*.csv", case_sensitive=False) == [
+            b"/root/SUB/REPORT.CSV"
+        ]
+        # And the default reaches the nested level too, which is the half a dropped forward
+        # would silently satisfy: nothing here may match when the caller did not ask to fold.
+        assert await matches(sftp, b"/root/*/*.csv") == []
+
+        # Not a gap: `case_sensitive=False` folds the *names it matches*, and the literal
+        # directory prefix is used as typed -- `split_pattern` says so and the live test that
+        # found it is cited there. So a nested literal stays unfolded, deliberately.
+        assert await matches(sftp, b"/root/sub/*.csv", case_sensitive=False) == []
+        assert await matches(sftp, b"/root/SUB/*.csv", case_sensitive=False) == [
+            b"/root/SUB/REPORT.CSV"
+        ]
+
+
+async def test_a_directory_only_pattern_stays_directory_only_after_descending():
+    """The trailing `/` is decided once, at the top, and has to reach every level below it."""
+    tree = {
+        b"/root": (named(b"sub", DIRECTORY),),
+        b"/root/sub": (named(b"inner", DIRECTORY), named(b"c.csv", REGULAR, 5)),
+    }
+    server = TreeServer(tree=tree)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        # `inner` is a directory and `c.csv` is not, one level below where the flag was read.
+        assert await matches(sftp, b"/root/*/*/") == [b"/root/sub/inner"]
+        assert await matches(sftp, b"/root/*/*") == [b"/root/sub/inner", b"/root/sub/c.csv"]
+
+
+async def test_max_depth_survives_a_descent_before_the_recursive_component():
+    """`max_depth` is forwarded twice over and every existing case starts `**` at the root.
+
+    With the bound dropped on the way down, a pattern whose `**` begins *below* a literal
+    component descends without limit -- which is the hostile-server case the bound exists for,
+    reachable only after at least one descent.
+    """
+    tree = {
+        b"/root": (named(b"sub", DIRECTORY),),
+        b"/root/sub": (named(b"a.csv", REGULAR, 3), named(b"deeper", DIRECTORY)),
+        b"/root/sub/deeper": (named(b"b.csv", REGULAR, 3), named(b"deepest", DIRECTORY)),
+        b"/root/sub/deeper/deepest": (named(b"c.csv", REGULAR, 3),),
+    }
+    server = TreeServer(tree=tree)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert await matches(sftp, b"/root/sub/**/*.csv", max_depth=0) == [b"/root/sub/a.csv"]
+        assert await matches(sftp, b"/root/sub/**/*.csv", max_depth=1) == [
+            b"/root/sub/a.csv",
+            b"/root/sub/deeper/b.csv",
+        ]
+        assert await matches(sftp, b"/root/sub/**/*.csv") == [
+            b"/root/sub/a.csv",
+            b"/root/sub/deeper/b.csv",
+            b"/root/sub/deeper/deepest/c.csv",
+        ]
+
+        # And again with a *wildcard* before the `**`, which is a different route through the
+        # same forwards: a literal prefix enters `_glob_in` with `**` already at the head, so
+        # `_glob_descend` is never on the path and its own forward of the bound goes untested.
+        assert await matches(sftp, b"/root/*/**/*.csv", max_depth=0) == [b"/root/sub/a.csv"]
+        assert await matches(sftp, b"/root/*/**/*.csv", max_depth=1) == [
+            b"/root/sub/a.csv",
+            b"/root/sub/deeper/b.csv",
+        ]
+
+
+async def test_a_directory_only_pattern_stays_directory_only_through_a_recursive_component():
+    """The third route for the same flag, and the one `**` takes.
+
+    `_glob_in` hands `directories_only` to `_glob_recursive`, which hands it back to `_glob_in`
+    for the components below -- two more forwards, neither reachable by a pattern whose only
+    magic is a plain wildcard.
+    """
+    tree = {
+        b"/root": (named(b"sub", DIRECTORY),),
+        b"/root/sub": (named(b"a.csv", REGULAR, 3), named(b"deeper", DIRECTORY)),
+        b"/root/sub/deeper": (named(b"b.csv", REGULAR, 3), named(b"deepest", DIRECTORY)),
+        b"/root/sub/deeper/deepest": (named(b"c.csv", REGULAR, 3),),
+    }
+    server = TreeServer(tree=tree)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        # Directories at every level and no files anywhere, which is the whole difference.
+        assert await matches(sftp, b"/root/**/") == [
+            b"/root/sub",
+            b"/root/sub/deeper",
+            b"/root/sub/deeper/deepest",
+        ]
+        assert await matches(sftp, b"/root/**") == [
+            b"/root/sub",
+            b"/root/sub/a.csv",
+            b"/root/sub/deeper",
+            b"/root/sub/deeper/b.csv",
+            b"/root/sub/deeper/deepest",
+            b"/root/sub/deeper/deepest/c.csv",
+        ]
+        # Through a wildcard first, so the flag crosses `_glob_descend` as well.
+        assert await matches(sftp, b"/root/*/**/") == [
+            b"/root/sub/deeper",
+            b"/root/sub/deeper/deepest",
+        ]
+
+
 async def test_a_server_supplied_name_containing_a_separator_is_refused():
     # The whole reason to use `glob` rather than a hand-rolled listdir plus match: the join from
     # a name the server chose to a path the caller will feed to `get` happens once, here, and

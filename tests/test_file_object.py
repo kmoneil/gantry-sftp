@@ -992,6 +992,32 @@ async def test_a_range_write_refuses_a_negative_offset():
     assert refusal.value.args[0] == "offset must not be negative, got -1"
 
 
+async def test_readinto_at_hands_the_sessions_tunables_to_the_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The read side of the same forward `write_at` has, and it was untested for the same reason.
+
+    Every caller passes the callee's own defaults, so dropping `depth` or `idle_timeout` on the
+    way in restates what was going to happen anyway. A session opened with non-default values
+    is the only thing that can tell.
+    """
+    captured: dict[str, object] = {}
+
+    async def recording_read_range_into(*args: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 3
+
+    monkeypatch.setattr("gantry_sftp.session._session.read_range_into", recording_read_range_into)
+    server = CursorServer(b"0123456789")
+    async with open_session(server, depth=2, idle_timeout=9.5) as sftp:  # type: ignore[arg-type]
+        buffer = bytearray(4)
+        assert await sftp.readinto_at(HANDLE, buffer, 1) == 3
+
+    assert captured["depth"] == 2
+    assert captured["idle_timeout"] == 9.5
+    assert captured["offset"] == 1
+
+
 async def test_write_at_refuses_a_negative_offset_by_name():
     """The session-level guard, which is a different one from `write_range_from`'s.
 

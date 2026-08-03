@@ -502,6 +502,8 @@ async def test_an_entry_the_server_answers_without_type_bits_is_skipped_rather_t
     assert root.skipped[0].reason == (
         "the server reported no attributes, and a stat did not settle it"
     )
+    assert root.skipped[0].path == b"/root/mystery"
+    assert root.skipped[0].entry.filename == b"mystery"
 
 
 async def test_an_entry_listed_and_then_gone_is_reported_as_vanished_rather_than_unknown():
@@ -523,6 +525,9 @@ async def test_an_entry_listed_and_then_gone_is_reported_as_vanished_rather_than
     assert root.skipped[0].path == b"/root/mystery"
     assert root.skipped[0].reason == SkipReason.VANISHED
     assert root.skipped[0].reason == "listed, and then not there when it was stat'd"
+    # The entry itself, which is the third field and the one a caller needs to decide what to
+    # do about a skip -- the path and the reason were pinned and this was free (D-105 s26).
+    assert root.skipped[0].entry.filename == b"mystery"
 
 
 async def test_a_refused_settling_stat_is_reported_as_a_refusal_and_does_not_stop_the_walk():
@@ -544,6 +549,7 @@ async def test_a_refused_settling_stat_is_reported_as_a_refusal_and_does_not_sto
     assert root.skipped[0].reason == (
         "the server reported no attributes, and refused the stat that would settle it"
     )
+    assert root.skipped[0].entry.filename == b"mystery"
 
 
 async def test_max_depth_stops_the_descent_and_says_so():
@@ -554,6 +560,10 @@ async def test_max_depth_stops_the_descent_and_says_so():
 
     assert [entry.path for entry in visited] == [b"/root", b"/root/sub"]
     assert [skip.reason for skip in visited[1].skipped] == [SkipReason.TOO_DEEP]
+    # Both other fields of the record, neither of which any test read: the path names the
+    # directory that was not descended into, and the entry is what was listed there.
+    assert [skip.path for skip in visited[1].skipped] == [b"/root/sub/deeper"]
+    assert [skip.entry.filename for skip in visited[1].skipped] == [b"deeper"]
 
 
 async def test_max_depth_zero_lists_the_root_and_nothing_else():
@@ -1424,6 +1434,12 @@ async def test_the_refused_entry_is_reported_in_the_skip_list(tmp_path: Path):
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(DestinationCollisionError):
             _ = await sftp.get_tree(b"/root", destination)
+
+    # The `Skipped` record this path builds is deliberately not asserted here: a collision
+    # *raises* rather than returning the `TreeResult`, so those records never reach a caller
+    # and `DestinationCollisionError.collisions` carries the same three facts. Recorded in
+    # `deferred.md` since D-105's seventeenth slice; do not "fix" it with an assertion that
+    # cannot be written.
 
     # The reason string is the one a human reads in a report, so it is pinned like the rest.
     assert SkipReason.DESTINATION_COLLISION == (
