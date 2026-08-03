@@ -1,4 +1,13 @@
-"""Glob pattern matching over remote names -- pure, and deliberately not ``fnmatch``.
+"""Glob pattern matching over remote names, and the traversal that drives it.
+
+**Two halves, and the split between them is the point.** Everything above
+:class:`GlobRunner` is pure: bytes in, a verdict out, no I/O and no session. :class:`GlobRunner`
+is the traversal, and it reaches a server only through five callables it is handed, so it too
+runs with no transport and no server behind it. The matcher was always the easy half to test;
+D-128 moved the traversal here so it is the easy half as well, and so a change to globbing is
+made in the file that is only about globbing.
+
+The matcher is **deliberately not ``fnmatch``**.
 
 **The dialect is `glob(3)`, because that is what the reference client uses.** `sftp(1)` globs
 *client-side*: `sftp-glob.c` hands POSIX ``glob(3)`` its own ``opendir``/``readdir``/``lstat``
@@ -71,9 +80,21 @@ so does this, and the ``[`` is an ordinary member.
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Protocol
+
+from gantry_sftp.codec import Attrs
+from gantry_sftp.exceptions import CapabilityError, NoSuchFileError
+from gantry_sftp.session._listing import DirEntry, EntryKind, entry_kind
+from gantry_sftp.session._recursive import GlobMatch, WalkEntry, check_listed_name, join_remote
+
 __all__ = [
     "MAGIC_BYTES",
     "RECURSIVE",
+    "GlobRunner",
     "has_magic",
     "match_component",
     "split_pattern",
@@ -560,3 +581,305 @@ def _in_range(low: int, high: int, byte: int, *, case_sensitive: bool) -> bool:
     if case_sensitive:
         return low <= byte <= high
     return (low <= byte <= high) or (_fold(low) <= _fold(byte) <= _fold(high))
+
+
+# --- driving a session with the matcher above -------------------------------------------------
+
+
+class _AttrsOrAbsent(Protocol):
+    """``Session._attrs_or_absent``: attributes, or ``None`` when the path is not there."""
+
+    async def __call__(self, path: bytes, *, follow_symlinks: bool) -> Attrs | None: ...
+
+
+class _EntryScan(Protocol):
+    """As much of ``DirectoryScan`` as globbing uses.
+
+    Named structurally rather than imported: ``DirectoryScan`` lives in ``_session``, which
+    imports *this* module, so naming the class here would be the cycle the layering forbids.
+    """
+
+    async def __aenter__(self) -> AsyncIterator[DirEntry]: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+
+class _Scandir(Protocol):
+    """``Session.scandir``: one directory, streamed, with the handle held across the yield."""
+
+    def __call__(self, path: bytes | str) -> _EntryScan: ...
+
+
+class _Walk(Protocol):
+    """``Session.walk``: the bounded traversal, which owns the symlink and depth policy."""
+
+    def __call__(
+        self, path: bytes | str, *, max_depth: int | None = None
+    ) -> AsyncGenerator[WalkEntry]: ...
+
+
+class _SettleKind(Protocol):
+    """``Session._settle_kind``: the entry's kind, paying an ``LSTAT`` only when it must."""
+
+    async def __call__(self, path: bytes, entry: DirEntry) -> EntryKind | None: ...
+
+
+class _Unclassifiable(Protocol):
+    """``Session._unclassifiable``: the refusal shared with :meth:`Session.isdir`."""
+
+    def __call__(self, path: bytes, *, caller: str) -> CapabilityError: ...
+
+
+def _strip_dot_prefix(path: bytes) -> bytes:
+    """Drop the ``./`` a walk rooted at ``.`` prefixes onto every path below it.
+
+    Only the prefix a walk this library started is responsible for -- a server that genuinely
+    returns a name beginning with a dot keeps it, because ``.hidden`` is an ordinary filename
+    and ``..`` never reaches here (a listing excludes it and
+    :func:`~gantry_sftp.session.check_listed_name` refuses it).
+    """
+    if path == b".":
+        return b""
+    return path[2:] if path.startswith(b"./") else path
+
+
+@dataclass(frozen=True, slots=True)
+class GlobRunner:
+    """The traversal half of :meth:`Session.glob`, holding no session and no state.
+
+    **Built from bound methods rather than from a session**, and that is a layering decision
+    rather than a style one (D-128). Three of the five things a glob needs are private members
+    of ``Session``; reaching them from this module would be ``obj._private`` at seven call
+    sites, which ``SLF001`` refuses and which seven ``noqa``s would not fix so much as record.
+    Binding happens in :meth:`Session._glob_runner`, where ``self._settle_kind`` is an ordinary
+    attribute access, and this module never names a private member of anything.
+
+    What that buys beyond the lint: the traversal is exercisable with five callables and no
+    session, no transport and no server -- which is the property the extraction was for, and
+    the reason the pattern matcher above has always been the easy half to test.
+
+    The methods keep the names they had as ``Session`` methods. They are redundant here, where
+    everything is glob, and they are kept because ``tests/test_glob.py`` names them in its
+    docstrings when it explains which forwarding path a case covers: renaming them would make
+    that file's prose wrong, and an untouched test file passing over moved code is what proves
+    the move changed no behaviour.
+    """
+
+    attrs_or_absent: _AttrsOrAbsent
+    scandir: _Scandir
+    walk: _Walk
+    settle_kind: _SettleKind
+    unclassifiable: _Unclassifiable
+
+    async def literal(self, path: bytes, *, directories_only: bool) -> GlobMatch | None:
+        """Resolve a pattern that turned out to have no magic in it.
+
+        One ``LSTAT``. ``LSTAT`` rather than ``STAT`` so a symlink stays a symlink, matching
+        what the matching path does for every other component; and a missing path is ``None``
+        rather than an error, because a pattern matching nothing is the ordinary case and a
+        literal pattern is still a pattern.
+
+        **Through ``attrs_or_absent`` rather than round its own ``except``**, which is the
+        whole of the fix for D-102. This used to catch ``(NoSuchFileError, ServerError)`` -- and
+        ``NoSuchFileError`` *is* a ``ServerError``, so the second element swallowed every other
+        status too. A file the caller was not allowed to stat came back as "matches nothing",
+        and so did a name that was merely too long. That is the divergence from ``glob(3)``
+        that :meth:`listing` documents refusing, three methods below, for the wildcard
+        half of the same feature: a glob answering "no matches" when it means "I was not
+        allowed to look" is a partial success wearing a complete one's clothes. Whether the
+        caller's pattern happened to contain a ``*`` decided which answer they got.
+        """
+        attributes = await self.attrs_or_absent(path, follow_symlinks=False)
+        if attributes is None:
+            return None
+        entry = DirEntry(filename=path.rpartition(b"/")[2], longname=b"", attrs=attributes)
+        if directories_only and entry_kind(attributes) is not EntryKind.DIRECTORY:
+            return None
+        return GlobMatch(path, entry)
+
+    async def match_in(
+        self,
+        directory: bytes,
+        components: tuple[bytes, ...],
+        *,
+        max_depth: int | None,
+        case_sensitive: bool,
+        directories_only: bool,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Match ``components`` against the contents of one directory, descending as needed.
+
+        Recursive, and the recursion depth is the number of pattern components rather than the
+        depth of the tree -- so it is bounded by something the caller wrote, not by something
+        the server can answer with. One directory handle is open per level for the same reason.
+
+        **Every inner generator is wrapped in ``aclosing``, including this module's own.** An
+        ``async for`` does not close the generator it iterates, so a chain of them abandoned
+        part-way -- by a caller that stopped early, or by
+        :func:`~gantry_sftp.session.check_listed_name` refusing a name mid-listing -- leaves
+        each link to the garbage collector. trio does not finalise those, and it surfaces as
+        ``Exception ignored in: <async_generator object ...>`` at some unrelated later point.
+        This is the idiom :meth:`Session.walk` tells *callers* to use, applied to the callers
+        inside this class; it was not theoretical, and the test that refuses a hostile name is
+        what found it.
+        """
+        head, rest = components[0], components[1:]
+        if head == RECURSIVE:
+            async with aclosing(
+                self.recursive(
+                    directory,
+                    rest,
+                    max_depth=max_depth,
+                    case_sensitive=case_sensitive,
+                    directories_only=directories_only,
+                )
+            ) as found:
+                async for match in found:
+                    yield match
+            return
+
+        async with aclosing(self.listing(directory)) as entries:
+            async for entry in entries:
+                name = check_listed_name(entry.filename, directory=directory)
+                if not match_component(head, name, case_sensitive=case_sensitive):
+                    continue
+                path = join_remote(directory, name)
+                if rest:
+                    async with aclosing(
+                        self.descend(
+                            path,
+                            entry,
+                            rest,
+                            max_depth=max_depth,
+                            case_sensitive=case_sensitive,
+                            directories_only=directories_only,
+                        )
+                    ) as deeper:
+                        async for match in deeper:
+                            yield match
+                elif not directories_only or await self.is_directory(path, entry):
+                    yield GlobMatch(path, entry)
+
+    async def listing(self, directory: bytes) -> AsyncGenerator[DirEntry]:
+        """List one directory for a glob, where "not there" means "matches nothing".
+
+        A pattern naming a directory that does not exist matches nothing, exactly as a name
+        that does not match matches nothing -- ``/root/absent/*.csv`` is not an error, it is an
+        empty result. **And the same is true of a path component that exists and is not a
+        directory**, which falls out of the protocol rather than needing a second case:
+        ``OPENDIR`` on a plain file answers ``NO_SUCH_FILE`` because ``ENOTDIR`` is remapped.
+
+        Only that status is swallowed. ``PERMISSION_DENIED`` on a directory the pattern reached
+        is raised, because a glob that answers "no matches" when it means "I was not allowed to
+        look" is a partial success wearing a complete one's clothes -- which is the shape this
+        library refuses everywhere else, and is where it diverges from ``glob(3)``.
+
+        The ``NO_SUCH_FILE`` can only come from the ``OPENDIR`` this opens: a ``READDIR`` past
+        the end answers ``EOF``, which :meth:`Session.scandir` turns into the end of the
+        iteration.
+        """
+        try:
+            async with self.scandir(directory or b".") as entries:
+                async for entry in entries:
+                    yield entry
+        except NoSuchFileError:
+            return
+
+    async def descend(
+        self,
+        path: bytes,
+        entry: DirEntry,
+        rest: tuple[bytes, ...],
+        *,
+        max_depth: int | None,
+        case_sensitive: bool,
+        directories_only: bool,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Continue matching inside a matched entry, if it is a directory we may enter."""
+        if not await self.is_directory(path, entry):
+            return
+        async with aclosing(
+            self.match_in(
+                path,
+                rest,
+                max_depth=max_depth,
+                case_sensitive=case_sensitive,
+                directories_only=directories_only,
+            )
+        ) as found:
+            async for match in found:
+                yield match
+
+    async def recursive(
+        self,
+        directory: bytes,
+        rest: tuple[bytes, ...],
+        *,
+        max_depth: int | None,
+        case_sensitive: bool,
+        directories_only: bool,
+    ) -> AsyncGenerator[GlobMatch]:
+        """Match the components after a ``**`` at this directory and at every descendant.
+
+        Driven by :meth:`Session.walk`, which is where the bounded traversal, the symlink
+        policy and the ``max_depth`` refusal already live -- reimplementing the descent here
+        would be a second place for those three decisions to be made differently.
+
+        A trailing ``**`` is ``**/*``: it matches everything below its position, at every
+        level, which is what a shell with ``globstar`` does and what the alternative -- a
+        pattern that matches only directories, or only the root -- would surprise a caller
+        with.
+        """
+        remaining = rest or (b"*",)
+        async with aclosing(self.walk(directory or b".", max_depth=max_depth)) as walker:
+            async for visited in walker:
+                # `walk(b".")` reports `.` and `./sub`; a relative pattern's other components
+                # join onto `b""` and produce `sub`. Left alone, one pattern would answer in
+                # two spellings depending on whether it happened to contain `**`.
+                reached = visited.path if directory else _strip_dot_prefix(visited.path)
+                async with aclosing(
+                    self.match_in(
+                        reached,
+                        remaining,
+                        max_depth=max_depth,
+                        case_sensitive=case_sensitive,
+                        directories_only=directories_only,
+                    )
+                ) as found:
+                    async for match in found:
+                        yield match
+
+    async def is_directory(self, path: bytes, entry: DirEntry) -> bool:
+        """Whether a matched entry is a directory this glob may look inside.
+
+        ``settle_kind`` rather than a bare attribute read, so an entry the server sent no
+        permissions for costs one ``LSTAT`` instead of being guessed at -- and ``LSTAT`` is
+        what keeps a symlink a symlink, which is what makes "matched but never descended into"
+        true rather than aspirational.
+
+        **Absent is ``False``; a refusal and an answer with no type in it both raise, which is
+        D-103.** That is the same rule :meth:`listing` and :meth:`literal` state for
+        the other two ways a glob can be told nothing. An entry that is no longer there matches
+        nothing, exactly as a name that does not match matches nothing. But a server that
+        *refuses* the stat, or answers it without the permission bits v3 carries the file type
+        in, has said nothing about the kind -- and `glob` has no ``Skipped`` channel to record
+        that in, so answering "not a directory" would drop the entry, or everything beneath it,
+        into a result that looks complete.
+
+        **The second of those two is the likelier one in the field**, and it is why this method
+        does not stop at narrowing the ``except``: a server that omits permission bits from a
+        *listing* is a server that probably omits them from a ``STAT`` as well, so the entry
+        arrives here settled to ``UNKNOWN`` rather than refused. :meth:`Session._kind_is`
+        reached the same fork for :meth:`Session.isdir` and answered it the same way, and its
+        docstring names this exact consequence -- *"the reason recursive downloads silently
+        skip directories on some servers"*. Sharing ``unclassifiable`` is what keeps the two
+        refusals one decision instead of two wordings.
+        """
+        settled = await self.settle_kind(path, entry)
+        if settled is EntryKind.UNKNOWN:
+            raise self.unclassifiable(path, caller="glob")
+        return settled is EntryKind.DIRECTORY

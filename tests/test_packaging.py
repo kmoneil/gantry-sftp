@@ -504,6 +504,35 @@ def test_the_benchmark_lane_still_names_the_costs_it_measured():
     assert not missing, f"benchmarks/README.md stopped naming what this costs: {missing}"
 
 
+def test_the_adapter_page_still_names_the_cache_as_an_authentication_cost():
+    """D-126, pinned the same way and for the same reason as the admissions above.
+
+    Keeping ``password`` out of the fsspec cache token is right and stays -- it is what makes
+    the credential un-picklable. Its price is that the second caller's password is never checked
+    against anything, so a wrong one still connects on the first caller's session.
+
+    That was already documented, accurately, **as a caching cost**, and the wording is the whole
+    finding: a reader told they may get a stale connection budgets for a stale connection, while
+    a reader told a wrong password silently succeeds reaches for ``skip_instance_cache=True``.
+    So the consequence is pinned rather than the mechanism -- an edit may rewrite the sentence
+    and may not quietly demote it back to a caching note.
+
+    Note the spelling of the first phrase: the page emphasises *wrong* in that sentence, so a
+    pin reading "wrong for the account" is broken by the asterisks and fails against a page
+    that says exactly what it should. Pin a span with no markup inside it, or the test reports
+    a missing admission when what changed was the typography.
+    """
+    page = (ROOT / "docs" / "integrations.md").read_text(encoding="utf-8")
+    admissions = (
+        "for the account still gives a working session",
+        "skip_instance_cache=True",
+    )
+    missing = [phrase for phrase in admissions if phrase not in page]
+    assert not missing, (
+        f"docs/integrations.md stopped naming the cache's authentication cost: {missing}"
+    )
+
+
 def test_the_committed_tree_holds_no_benchmark_figures():
     """The other half of D-94: the numbers went to a generated report, not to a nicer table.
 

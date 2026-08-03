@@ -289,6 +289,33 @@ def test_the_probe_argv_replaces_the_subsystem_request_and_keeps_the_options():
     assert "ServerAliveInterval=30" in probe
 
 
+def test_an_argv_that_does_not_end_in_a_subsystem_request_names_the_coupling():
+    """D-127. The probe rebuilds argv by position, and the layout belongs to another module.
+
+    It already failed closed -- a malformed probe exits non-zero and `effective_host` refuses --
+    so this is about the *diagnosis*, not about a hole. Without the check the symptom is "the
+    allowlist refuses every host", which reads as a policy bug and sends the reader to the
+    patterns, the layers and the environment variable, none of which are where it is.
+    """
+    argv = [*argv_for("example.com"), "-o", "ProxyJump=bastion"]
+    with pytest.raises(ValueError) as exc:
+        _ = _probe_argv(argv, "example.com")
+    assert exc.value.args[0] == (
+        "cannot build an 'ssh -G' probe from this argv: it must end with "
+        "['-s', '--', 'example.com', <subsystem>] as build_ssh_argv writes it, and it ends "
+        "with ['example.com', 'sftp', '-o', 'ProxyJump=bastion']. The allowlist probe "
+        "reconstructs the connection's argv by position, so a change to that tail belongs in "
+        "transport/_argv.py and here together"
+    )
+
+
+def test_a_truncated_argv_is_refused_rather_than_silently_shortened():
+    """The other side of the same guard: too short must not slice into nothing and proceed."""
+    with pytest.raises(ValueError) as exc:
+        _ = _probe_argv(["ssh", "-s", "--"], "example.com")
+    assert exc.value.args[0].startswith("cannot build an 'ssh -G' probe from this argv")
+
+
 # --- the errored third state: a probe that cannot answer must refuse ------------------------
 
 

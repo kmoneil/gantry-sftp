@@ -445,8 +445,20 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
     **The password is deliberately absent from** ``storage_options``, so it cannot travel in a
     pickle or a ``to_json()``. The measured cost is the instance cache: two constructions
     differing *only* in password return the same instance, holding the first password, because
-    the password is not part of the cache token. Pass ``skip_instance_cache=True`` when that is
-    not what you want.
+    the password is not part of the cache token.
+
+    **Read that as an authentication consequence, not a caching one.** The second caller's
+    password is never checked against anything -- so a password that is *wrong* for the account
+    still yields a working session, authenticated by whoever constructed first. In a process
+    where one principal supplies credentials that is a stale connection; in a process where
+    several do -- a dask worker, a notebook server, a shared ETL job, which is the audience this
+    adapter exists for -- knowing a username is enough to inherit somebody else's session, and
+    nothing distinguishes it in a log because it *is* a legitimate connection. Pass
+    ``skip_instance_cache=True`` whenever more than one principal can reach this process.
+
+    Keeping the password out of the token is still the right trade and is not negotiable: it is
+    what makes the credential un-picklable. The cache collision is its price, and this is what
+    the price actually is.
 
     **The predicates here are fsspec's, not this library's.** ``exists`` / ``isdir`` /
     ``isfile`` come from ``AbstractFileSystem`` and swallow every exception, including a
@@ -466,7 +478,10 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         port: Remote port.
         identity_file: Private key to offer. Not settable from a URL.
         password: Sent through ``SSH_ASKPASS``, never argv, never a log line, and never stored
-            in ``storage_options``.
+            in ``storage_options``. Not part of the instance-cache token either, so a second
+            construction differing only in this argument reuses the first one's session and its
+            credential -- including when this one is wrong for the account. Pass
+            ``skip_instance_cache=True`` where more than one principal shares the process.
         config_file: An ``ssh_config`` to read instead of the default. Not settable from a URL.
         options: Extra ``-o`` options for ``ssh``. Never settable from a URL.
         ssh_executable: Which ``ssh`` to spawn. Not settable from a URL.

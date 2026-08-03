@@ -272,20 +272,37 @@ def test_the_repr_names_the_endpoint_and_the_state():
     assert repr(filesystem) == "<GantrySFTPFileSystem bob@example.com (not connected)>"
 
 
-def test_the_cost_of_keeping_the_password_out_of_the_token(tree: Path):
-    """Stated on the class, so it is asserted here rather than left as a surprise.
+def test_a_wrong_password_reuses_the_session_the_right_one_opened():
+    """D-126. The price of keeping the password out of the cache token, named as what it is.
 
-    The password is not part of the cache token, so two constructions differing only in it come
-    back as one instance holding the first password. ``skip_instance_cache=True`` is the
-    documented way out, and the test proves both halves.
+    The token omits ``password`` so the credential cannot travel in a pickle or a ``to_json()``,
+    and that stays -- but it means the second caller's password is **never checked against
+    anything**. A password that is wrong for the account still yields a working session,
+    authenticated by whoever constructed first.
+
+    Asserted as the security statement rather than as a caching one, because the two get read by
+    different people: this used to be named for the *cost* and a reader budgeting for a stale
+    connection does not reach for ``skip_instance_cache=True``, which is the control.
     """
-    first = GantrySFTPFileSystem("example.com", password="one")
-    second = GantrySFTPFileSystem("example.com", password="two")
-    assert first is second
-    assert first._password == "one"  # noqa: SLF001
-    apart = GantrySFTPFileSystem("example.com", password="two", skip_instance_cache=True)
-    assert apart is not first
-    assert apart._password == "two"  # noqa: SLF001
+    try:
+        right = GantrySFTPFileSystem("example.com", user="bob", password="correct-horse")
+        wrong = GantrySFTPFileSystem("example.com", user="bob", password="not-the-password")
+
+        assert wrong is right
+        # The whole finding in one line: what `wrong` will authenticate with is not what it
+        # was given.
+        assert wrong._password == "correct-horse"  # noqa: SLF001
+
+        apart = GantrySFTPFileSystem(
+            "example.com", user="bob", password="not-the-password", skip_instance_cache=True
+        )
+        assert apart is not right
+        assert apart._password == "not-the-password"  # noqa: SLF001
+    finally:
+        # Both cached constructions above are keyed on a token this test invented, and the
+        # cache is process-global. Leaving them behind would let this test decide what a later
+        # one resolves -- the failure `_restore_registry` exists for, one cache along.
+        GantrySFTPFileSystem._cache.clear()  # noqa: SLF001
 
 
 # --- the instance cache, which is the lifetime --------------------------------------------

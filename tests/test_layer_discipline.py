@@ -363,3 +363,80 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
     """Guards the guard. A moved call would otherwise make every assertion above vacuous."""
     total = sum(len(hashlib_calls(module)) for module in package_modules())
     assert total >= 3, f"expected the verification ladder's hashlib calls, found {total}"
+
+
+# --- how much may live in one class (D-128) ---------------------------------------------------
+
+
+SESSION_METHOD_CEILING = 109
+"""What `Session` measures today, which is the whole of the rule.
+
+**A ratchet, not a target, and not a round number.** D-128's finding was that `Session` holds the
+orchestration half of all seven responsibilities `session/` has a module for, while every gate
+this repository runs says nothing is wrong: each function passes complexipy and mccabe, both type
+checkers are clean, the suite is green. A class grows because absorbing the next orchestration is
+always the cheapest single edit, and every one of those edits is individually defensible.
+
+Set at the measurement of the day it lands so it cannot be met by doing nothing and cannot be
+raised without saying so out loud. A round number would either exempt the current state or fail on
+arrival, and both teach the next reader to edit the constant instead of the class.
+
+**The direction of travel is down.** Each further cut lowers this line; the glob cut that landed
+with D-128 took it from 114. If a change genuinely needs a new method here, the question the
+failure asks is whether the method belongs on `Session` at all -- six of the seven that left did
+not.
+
+The sync twin needs no ceiling of its own: `tests/test_sync_facade.py` derives `SyncSession` from
+`Session` by name, so a method that cannot be added here cannot appear there either.
+"""
+
+
+def _class_named(module: Path, name: str) -> ast.ClassDef:
+    tree = ast.parse(module.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    pytest.fail(f"{name} is not defined in {module.name}")
+
+
+def test_the_session_class_does_not_grow() -> None:
+    """The one structural claim this repository had no mechanical statement for (D-128).
+
+    Layering is proved by parsing the shipped source, the sync facade's parity is proved by
+    deriving it from `Session`, and every doc link is proved by resolving it. How much may live
+    in this class was held only by attention, which is what let it become both the largest class
+    in the library and the file with the most churn.
+    """
+    session = _class_named(PACKAGE_ROOT / "session" / "_session.py", "Session")
+    methods = [
+        node.name
+        for node in session.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    assert len(methods) <= SESSION_METHOD_CEILING, (
+        f"Session has grown to {len(methods)} methods, above the {SESSION_METHOD_CEILING} it "
+        f"measured when D-128 pinned this. Ask whether the new method belongs on Session at "
+        f"all: session/ has a module per responsibility and each holds that responsibility's "
+        f"pure half, so an orchestration usually belongs beside its own half. Raising this "
+        f"line is a decision to record, not a step in adding a method"
+    )
+
+
+def test_the_session_ceiling_is_not_slack() -> None:
+    """A ratchet that drifts above what it measures has stopped being one.
+
+    Without this, a cut that removes ten methods leaves the line ten too high and the next ten
+    additions pass unnoticed -- which is how a ceiling set once becomes a ceiling that never
+    fires. Failing here is the reminder to lower the constant in the same change as the cut.
+    """
+    session = _class_named(PACKAGE_ROOT / "session" / "_session.py", "Session")
+    methods = [
+        node.name
+        for node in session.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    assert len(methods) == SESSION_METHOD_CEILING, (
+        f"Session now has {len(methods)} methods and the ceiling still says "
+        f"{SESSION_METHOD_CEILING}. Lower SESSION_METHOD_CEILING to {len(methods)} in this same "
+        f"change, so the next addition is measured against what the class actually is"
+    )

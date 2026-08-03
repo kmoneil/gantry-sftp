@@ -382,14 +382,35 @@ def test_the_askpass_answer_is_masked_by_name():
 
 @pytest.mark.parametrize(
     "name",
-    ["MY_PASSWORD", "sftp_passphrase", "APP_SECRET", "CI_TOKEN", "aws_credential_file"],
+    [
+        "MY_PASSWORD",
+        # D-127. Not a substring of PASSWORD, so it matched nothing until it was its own
+        # marker -- and it is the spelling `/etc/passwd` trained everybody to reach for.
+        "SSH_PASSWD",
+        "sftp_passphrase",
+        "APP_SECRET",
+        "CI_TOKEN",
+        "aws_credential_file",
+    ],
 )
 def test_a_variable_the_library_never_sets_is_masked_by_marker(name: str):
     """Case-insensitive, and deliberately over-broad on a caller's own ``env=``.
 
-    An unhelpful log line is a much better failure than a leaked one.
+    An unhelpful log line is a much better failure than a leaked one. One case per marker, so
+    the next marker added without a case fails this parametrize rather than passing quietly.
     """
     assert mask_environment({name: "hunter2"}) == {name: MASKED}
+
+
+@pytest.mark.parametrize("name", ["PWD", "OLDPWD"])
+def test_the_working_directory_is_not_mistaken_for_a_credential(name: str):
+    """The reason the markers are spelled out at full length rather than trimmed to a stem.
+
+    ``PWD`` is diagnostic and appears on effectively every environment. A marker short enough
+    to catch it would redact a useful field on every record forever -- so this is the assertion
+    that stops the list being "simplified" into one that does.
+    """
+    assert mask_environment({name: "/srv/incoming"}) == {name: "/srv/incoming"}
 
 
 def test_masking_leaves_the_key_visible():

@@ -1154,8 +1154,9 @@ async def test_case_insensitivity_is_the_callers_decision_because_it_is_the_serv
 async def test_case_folding_survives_the_descent_into_a_subdirectory():
     """Every option test above matches at the *top* level, which never forwards anything.
 
-    `_glob_in`, `_glob_descend` and `_glob_recursive` each hand the three options to the next
-    level down, and each forward could be dropped or nulled with every existing test green --
+    `GlobRunner.match_in`, `GlobRunner.descend` and `GlobRunner.recursive` each hand the three
+    options to the next level down, and each forward could be dropped or nulled with every
+    existing test green --
     because a pattern with one component never gets there. `case_sensitive=None` is falsy, so
     the mutation makes the *nested* level fold when the caller asked it not to (D-105 slice 26).
     """
@@ -1222,8 +1223,9 @@ async def test_max_depth_survives_a_descent_before_the_recursive_component():
         ]
 
         # And again with a *wildcard* before the `**`, which is a different route through the
-        # same forwards: a literal prefix enters `_glob_in` with `**` already at the head, so
-        # `_glob_descend` is never on the path and its own forward of the bound goes untested.
+        # same forwards: a literal prefix enters `GlobRunner.match_in` with `**` already at
+        # the head, so `GlobRunner.descend` is never on the path and its own forward of the
+        # bound goes untested.
         assert await matches(sftp, b"/root/*/**/*.csv", max_depth=0) == [b"/root/sub/a.csv"]
         assert await matches(sftp, b"/root/*/**/*.csv", max_depth=1) == [
             b"/root/sub/a.csv",
@@ -1232,7 +1234,7 @@ async def test_max_depth_survives_a_descent_before_the_recursive_component():
 
 
 async def test_the_bound_reaches_a_second_recursive_component():
-    """`_glob_recursive` consumes `max_depth` in its own `walk` *and* forwards it (D-105 s28).
+    """`GlobRunner.recursive` consumes `max_depth` in its own `walk` *and* forwards it (D-105 s28).
 
     The forwarded copy only matters when what is left contains another `**`, so a pattern with
     two of them is the only shape that can see it. Dropped, the inner one descends without
@@ -1265,8 +1267,9 @@ async def test_the_bound_reaches_a_second_recursive_component():
 async def test_a_directory_only_pattern_stays_directory_only_through_a_recursive_component():
     """The third route for the same flag, and the one `**` takes.
 
-    `_glob_in` hands `directories_only` to `_glob_recursive`, which hands it back to `_glob_in`
-    for the components below -- two more forwards, neither reachable by a pattern whose only
+    `GlobRunner.match_in` hands `directories_only` to `GlobRunner.recursive`, which hands it
+    back to `GlobRunner.match_in` for the components below -- two more forwards, neither
+    reachable by a pattern whose only
     magic is a plain wildcard.
     """
     tree = {
@@ -1291,7 +1294,7 @@ async def test_a_directory_only_pattern_stays_directory_only_through_a_recursive
             b"/root/sub/deeper/deepest",
             b"/root/sub/deeper/deepest/c.csv",
         ]
-        # Through a wildcard first, so the flag crosses `_glob_descend` as well.
+        # Through a wildcard first, so the flag crosses `GlobRunner.descend` as well.
         assert await matches(sftp, b"/root/*/**/") == [
             b"/root/sub/deeper",
             b"/root/sub/deeper/deepest",
@@ -1481,11 +1484,11 @@ async def test_nothing_matching_is_an_empty_result_rather_than_an_error():
 
 # --- the third state, for the half of the feature that has no wildcard in it -------------------
 #
-# D-102. `_glob_literal` caught `(NoSuchFileError, ServerError)` -- and `NoSuchFileError` *is* a
-# `ServerError`, so the second element swallowed every other status. Both tests below passed
+# D-102. `GlobRunner.literal` caught `(NoSuchFileError, ServerError)` -- and `NoSuchFileError`
+# *is* a `ServerError`, so the second element swallowed every other status. Both tests below passed
 # vacuously before the fix, returning `[]`, and both fail against the code as it stood.
 #
-# The asymmetry that made it invisible: the wildcard branch (`_glob_listing`) has always been
+# The asymmetry that made it invisible: the wildcard branch (`GlobRunner.listing`) has always been
 # correct and documents refusing exactly this, so `glob("/closed/*.txt")` raised while
 # `glob("/closed/secret.txt")` answered "no matches". Whether the caller's pattern happened to
 # contain a `*` decided which answer they got, which is why both spellings are asserted here.
@@ -1600,7 +1603,7 @@ async def test_a_character_class_is_ascii_only_against_names_a_real_server_liste
 # documents the same rule: only `NO_SUCH_FILE` is swallowed, because a glob answering "no
 # matches" when it means "I was not allowed to look" is a partial success wearing a complete
 # one's clothes. The fourth is the `LSTAT` that settles an entry's *kind*, and it swallowed
-# every `ServerError` into `EntryKind.UNKNOWN`, which `_is_glob_directory` then read as "not a
+# every `ServerError` into `EntryKind.UNKNOWN`, which `GlobRunner.is_directory` then read as "not a
 # directory".
 #
 # Why no test caught it and no lane could: OpenSSH always sends permission bits, so a real

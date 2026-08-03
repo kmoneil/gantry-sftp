@@ -94,6 +94,14 @@ connection rather than hang it.
 
 _layers: ContextVar[tuple[tuple[str, ...], ...]] = ContextVar("gantry_sftp_allowed_hosts")
 
+_SUBSYSTEM_REQUEST_LENGTH: Final = 4
+"""How many trailing argv entries ``build_ssh_argv`` spends on the subsystem request.
+
+``["-s", "--", host, subsystem]``. Named rather than spelled as a literal at the one call site,
+because it is the length of somebody else's tuple and the reader has to be sent to the module
+that decides it.
+"""
+
 
 def normalize_host(host: str) -> str:
     """Fold a hostname to the form patterns are matched against.
@@ -245,8 +253,29 @@ def _probe_argv(argv: Sequence[str], host: str) -> list[str]:
     ``["-s", "--", host, subsystem]``; ``-s`` and the subsystem are the request to run one, and
     ``-G`` prints configuration instead of connecting, so those four are replaced rather than
     appended to.
+
+    **The tail is checked rather than assumed, and D-127 is about the difference.** That layout
+    belongs to ``_argv.py`` and the assumption lives here, so an option appended after the
+    subsystem -- a jump host, a second subsystem argument -- would silently make this probe
+    describe a different command. It already failed *closed*: a malformed probe exits non-zero
+    and :func:`effective_host` refuses, which is the errored-third-state rule doing its job. What
+    it did not do is say why. The symptom was "the allowlist refuses every host", which reads as
+    a policy bug, and every candidate for that is in another file.
+
+    Raises:
+        ValueError: If ``argv`` does not end the way ``build_ssh_argv`` ends. Not an
+            ``assert``: this guards a security control and ``python -O`` removes asserts.
     """
-    head = list(argv[: -len(["-s", "--", host, "subsystem"])])
+    tail = tuple(argv[-_SUBSYSTEM_REQUEST_LENGTH:])
+    if len(tail) != _SUBSYSTEM_REQUEST_LENGTH or tail[:3] != ("-s", "--", host):
+        raise ValueError(
+            f"cannot build an 'ssh -G' probe from this argv: it must end with "
+            f"['-s', '--', {host!r}, <subsystem>] as build_ssh_argv writes it, and it ends "
+            f"with {list(tail)!r}. The allowlist probe reconstructs the connection's argv by "
+            f"position, so a change to that tail belongs in transport/_argv.py and here "
+            f"together"
+        )
+    head = list(argv[:-_SUBSYSTEM_REQUEST_LENGTH])
     return [*head, "-G", "--", host]
 
 

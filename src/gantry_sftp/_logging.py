@@ -136,13 +136,22 @@ was named distinctly "so that a redaction key list has one unambiguous name to m
 that list.
 """
 
-SENSITIVE_KEY_MARKERS = ("PASSWORD", "PASSPHRASE", "SECRET", "TOKEN", "CREDENTIAL")
+SENSITIVE_KEY_MARKERS = ("PASSWORD", "PASSWD", "PASSPHRASE", "SECRET", "TOKEN", "CREDENTIAL")
 """Substrings that make *any* variable a credential as far as this masker is concerned.
 
 Matched case-insensitively and against variables this library never sets, on purpose: a caller
 who passes their own ``env=`` overlay through gets covered too, and the failure mode of an
 over-broad rule here is an unhelpful log line rather than a leaked secret. The exact-name list
 above is what we *know*; this is what we *assume*.
+
+``PASSWD`` is listed separately because it is **not** a substring of ``PASSWORD`` -- D-127, and
+the shape is worth keeping in mind for the next entry: a marker list reads as though it covers
+the spellings of a word and covers only the literal strings in it. ``SSH_PASSWD`` and
+``FTP_PASSWD`` matched nothing until it was added.
+
+``PWD`` is deliberately **not** here, which is why these are written out at their full length
+rather than trimmed to a shorter common stem: ``$PWD`` is the working directory, it is purely
+diagnostic, and masking it would redact a useful field on every record forever.
 """
 
 

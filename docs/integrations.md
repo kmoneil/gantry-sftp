@@ -149,6 +149,14 @@ Neither is a defect of this adapter, and both will surprise you if nobody says t
   **Not here**: the password reaches the constructor and is never stored on the instance, so
   none of those carry it. The cost is stated rather than hidden — the password is not part of
   the cache token either, so two filesystems differing only in password come back as one
-  instance holding the first. `skip_instance_cache=True` when that is not what you want.
+  instance holding the first.
+- **That cost is an authentication one.** The second caller's password is never checked against
+  anything, so a password that is *wrong* for the account still gives a working session,
+  authenticated by whoever constructed first. With one principal in the process that is a stale
+  connection. With several — a dask worker, a notebook server, a shared ETL job — knowing a
+  username is enough to inherit a colleague's session, and no log distinguishes it, because it
+  is a legitimate connection that simply is not theirs. **Pass `skip_instance_cache=True`
+  whenever more than one principal can reach the process.** Keeping the password out of the
+  token stays right regardless; this is what its price is.
 
 Runnable: `examples/fsspec_urls.py`.
