@@ -997,7 +997,12 @@ class Session:
         if isinstance(reply, Status):
             raise_for_status(reply, path=path)
             return
-        raise _unexpected(reply, expected="STATUS", path=path)
+        # No `path=` here, and its absence is the point: :func:`_unexpected` only reads it on
+        # its ``Status`` branch, and this line is reached only when the reply is *not* one --
+        # the branch above has already taken that case. Passing it looked like defence in
+        # depth and was dead by construction (D-105 slice 25). The call in ``_realpath_raw``
+        # does pass it, because a ``Status`` is one of the replies that is not a ``NAME``.
+        raise _unexpected(reply, expected="STATUS")
 
     # --- capabilities --------------------------------------------------------------------
 

@@ -37,8 +37,14 @@ from hypothesis import strategies as st
 from tests.conftest import negotiate, running_dispatcher
 
 from gantry_sftp.codec import (
+    Attrs,
+    AttrsReply,
+    Close,
     Data,
+    FStat,
+    Handle,
     Init,
+    Open,
     OpenFlag,
     Read,
     Status,
@@ -151,6 +157,89 @@ class RangeServer:
                 self._outbox += frame
         chunk = bytes(self._outbox[:max_bytes])
         del self._outbox[:max_bytes]
+        return chunk
+
+    async def aclose(self) -> None:
+        return
+
+
+class CursorServer:
+    """A whole session, for the two answers a real server will not give.
+
+    ``RangeServer`` above speaks only ``READ`` and ``WRITE``, which is right for the scheduler
+    and not enough for :class:`RemoteFile` -- the cursor object opens, fstats and closes. Two
+    behaviours here are the reason it exists at all and neither is reachable against
+    ``sftp-server``: **an ``ATTRS`` with no size in it**, which is legal (the size flag is
+    optional, ``draft-ietf-secsh-filexfer-02`` 5) and is what ``read()`` and ``seek(SEEK_END)``
+    refuse on, and **a ``CLOSE`` that fails**, which decides whether leaving the block reports
+    or stays quiet.
+
+    It also records every ``READ`` it is asked for, which is the only oracle for a length
+    computed one way rather than another: the *bytes* come back the same either way once EOF
+    clamps them, so the request is where the difference lives (D-105 slice 25).
+    """
+
+    def __init__(
+        self, content: bytes = b"", *, report_size: bool = True, close_fails: bool = False
+    ):
+        self.content = bytearray(content)
+        self.report_size = report_size
+        self.close_fails = close_fails
+        self.reads: list[tuple[int, int]] = []
+        self.writes: list[tuple[int, int]] = []
+        self.closes: list[bytes] = []
+        self._splitter = Splitter()
+        self._outbox = bytearray()
+        self._has_output = anyio.Event()
+
+    async def send(self, data: bytes | memoryview) -> None:
+        for frame in self._splitter.feed(data):
+            self._handle(decode(frame))
+
+    def _reply(self, packet: object) -> None:
+        self._outbox += encode(packet)  # type: ignore[arg-type]
+        self._has_output.set()
+
+    def _handle(self, packet: object) -> None:
+        if isinstance(packet, Init):
+            self._reply(Version(3))
+            return
+        rid = packet.request_id  # type: ignore[union-attr]
+        if isinstance(packet, Open):
+            self._reply(Handle(rid, HANDLE))
+        elif isinstance(packet, FStat):
+            size = len(self.content) if self.report_size else None
+            self._reply(AttrsReply(rid, Attrs(size=size)))
+        elif isinstance(packet, Read):
+            self.reads.append((packet.offset, packet.length))
+            chunk = bytes(self.content[packet.offset : packet.offset + packet.length])
+            if chunk:
+                self._reply(Data(rid, memoryview(chunk)))
+            else:
+                self._reply(Status(rid, StatusCode.EOF))
+        elif isinstance(packet, Write):
+            self.writes.append((packet.offset, len(packet.data)))
+            end = packet.offset + len(packet.data)
+            if len(self.content) < end:
+                self.content.extend(bytes(end - len(self.content)))
+            self.content[packet.offset : end] = bytes(packet.data)
+            self._reply(Status(rid, StatusCode.OK))
+        elif isinstance(packet, Close):
+            self.closes.append(packet.handle)
+            if self.close_fails:
+                self._reply(Status(rid, StatusCode.FAILURE, b"close refused"))
+            else:
+                self._reply(Status(rid, StatusCode.OK))
+        else:
+            self._reply(Status(rid, StatusCode.FAILURE, b"unscripted"))
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if not self._outbox:
+            await self._has_output.wait()
+        chunk = bytes(self._outbox[:max_bytes])
+        del self._outbox[:max_bytes]
+        if not self._outbox:
+            self._has_output = anyio.Event()
         return chunk
 
     async def aclose(self) -> None:
@@ -656,6 +745,188 @@ async def test_using_a_file_object_outside_its_block_is_refused(tmp_path: Path):
         )
 
 
+async def test_a_seek_to_exactly_the_start_is_allowed(tmp_path: Path):
+    """The value the guard exists to admit, which nothing had ever passed through it.
+
+    ``if target < 0`` reads as obviously right and becomes ``<= 0`` or ``< 1`` without any
+    test objecting: every existing case seeks to -1 (refused) or forward (never near the
+    boundary). Rewinding to the start is the ordinary thing a caller does, and it is exactly
+    the value the two mutations reject. Third instance of this shape after both schedulers.
+    """
+    needs_real_server()
+    (tmp_path / "data.bin").write_bytes(b"0123456789")
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+        sftp.open_file(str(tmp_path / "data.bin").encode()) as remote,
+    ):
+        assert await remote.seek(4) == 4
+        assert await remote.seek(0) == 0
+        assert remote.tell() == 0
+        assert await remote.read(2) == b"01"
+        # ...and by the other two routes to the same position, since each computes `target`
+        # with different arithmetic and only `SEEK_SET` passes the value through untouched.
+        assert await remote.seek(-2, os.SEEK_CUR) == 0
+        assert await remote.seek(-10, os.SEEK_END) == 0
+
+
+async def test_reading_the_rest_asks_for_what_remains_and_no_more(tmp_path: Path):
+    """The bytes cannot see this and the request can (D-105 slice 25).
+
+    ``length = max(0, attrs.size - self._position)`` returns the same *data* whether the
+    subtraction is a subtraction or an addition, because EOF clamps an over-long read to what
+    exists. What differs is what went on the wire -- an over-long request, or none at all.
+    """
+    server = CursorServer(b"0123456789")
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.open_file(b"/data.bin") as remote,
+    ):
+        _ = await remote.seek(4)
+        assert await remote.read() == b"456789"
+    # Six remaining, so six asked for. `size + position` would ask for fourteen and get the
+    # same six back; `max(1, ...)` would ask for one.
+    assert server.reads == [(4, 6)]
+
+
+async def test_reading_at_the_end_asks_the_server_nothing(tmp_path: Path):
+    """A zero-length range is answered locally, so the cursor at EOF costs one FSTAT and no READ.
+
+    `max(0, ...)` becoming `max(1, ...)` is invisible in the returned bytes -- a one-byte read
+    at EOF is `b""` as well -- and visible here as a round trip that should not have happened.
+    """
+    server = CursorServer(b"0123456789")
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.open_file(b"/data.bin") as remote,
+    ):
+        _ = await remote.seek(0, os.SEEK_END)
+        assert await remote.read() == b""
+    assert server.reads == []
+
+
+async def test_a_server_that_reports_no_size_is_refused_by_name(tmp_path: Path):
+    """Legal, unreachable against `sftp-server`, and the two refusals it produces.
+
+    The size flag is optional, so an ``ATTRS`` without one is a conformant answer that neither
+    ``read()`` with no length nor ``SEEK_END`` can work from. Both messages were unasserted, so
+    either could have been emptied or case-mangled.
+    """
+    server = CursorServer(b"0123456789", report_size=False)
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.open_file(b"/data.bin") as remote,
+    ):
+        with pytest.raises(ValueError) as read_refusal:
+            _ = await remote.read()
+        assert read_refusal.value.args[0] == (
+            "the server did not report a size, so read() cannot tell where the file "
+            "ends; pass a length"
+        )
+        with pytest.raises(ValueError) as seek_refusal:
+            _ = await remote.seek(0, os.SEEK_END)
+        assert seek_refusal.value.args[0] == (
+            "the server did not report a size, so SEEK_END has nothing to seek from"
+        )
+        # A read with an explicit length still works: only the "where does it end"
+        # question needs the size, and the refusal must not disable the rest.
+        assert await remote.read(4) == b"0123"
+
+
+async def test_the_cursor_advances_across_successive_readintos(tmp_path: Path):
+    """`self._position += filled` against `= filled`, which agree on the first call only."""
+    server = CursorServer(b"0123456789")
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.open_file(b"/data.bin") as remote,
+    ):
+        first = bytearray(4)
+        assert await remote.readinto(first) == 4
+        assert remote.tell() == 4
+        second = bytearray(4)
+        assert await remote.readinto(second) == 4
+        assert bytes(second) == b"4567"
+        # 8, not 4. Assignment would put the cursor back where the first call left it and
+        # re-read the same bytes for ever.
+        assert remote.tell() == 8
+
+
+async def test_a_close_that_fails_on_the_way_out_is_reported(tmp_path: Path):
+    """Leaving a clean block reports the failure; leaving a failing one must not replace it.
+
+    Both halves of `__aexit__`'s documented contract, and neither had a test -- so the branch
+    could be inverted, which swaps "report" and "stay quiet" without changing either message.
+    """
+    server = CursorServer(b"0123456789", close_fails=True)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as exc:
+            async with sftp.open_file(b"/data.bin"):
+                pass
+        assert exc.value.args[0] == "server returned FAILURE: close refused"
+
+    # And the other way: the caller's exception is the one that explains what happened, so a
+    # CLOSE failing underneath it is swallowed rather than allowed to take its place.
+    server = CursorServer(b"0123456789", close_fails=True)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ZeroDivisionError):
+            async with sftp.open_file(b"/data.bin"):
+                _ = 1 / 0
+    # Swallowed is not the same as skipped. `_close_quietly` suppresses everything, so a
+    # handle or a session lost on the way in would look identical from out here -- the
+    # server having been asked is the only thing that says the handle was released.
+    assert server.closes == [HANDLE]
+
+
+async def test_the_cursor_advances_across_successive_writes():
+    """`self._position += written` against `= written`, the write-side twin of readinto's.
+
+    They agree on the first call and diverge on every one after it: assignment parks the
+    cursor at the length of the last write, so a third write lands on top of the second.
+    """
+    server = CursorServer()
+    async with (
+        open_session(server) as sftp,  # type: ignore[arg-type]
+        sftp.open_file(b"/data.bin", OpenFlag.WRITE | OpenFlag.CREAT) as remote,
+    ):
+        assert await remote.write(b"abcd") == 4
+        assert remote.tell() == 4
+        assert await remote.write(b"ef") == 2
+        assert remote.tell() == 6
+    assert bytes(server.content) == b"abcdef"
+
+
+async def test_the_file_object_flushes_through_fsync(tmp_path: Path):
+    """`RemoteFile.fsync` had no test at all -- the lane reported "no tests", not a survivor.
+
+    One line forwarding an open handle, and the handle is the whole content of it: passing
+    `None` instead reaches the session with nothing to flush. Driven against the real server
+    because `fsync@openssh.com` is an extension and whether it is *there* is half the answer.
+    """
+    needs_real_server()
+    path = tmp_path / "data.bin"
+    path.write_bytes(b"")
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        async with sftp.open_file(str(path).encode(), OpenFlag.WRITE | OpenFlag.CREAT) as remote:
+            _ = await remote.write(b"durable")
+            await remote.fsync()
+        assert path.read_bytes() == b"durable"
+
+    # And the refusal, which is the other half: a file that is not open has no handle to
+    # flush, and that must say so rather than reaching the server with nothing.
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        spent = sftp.open_file(str(path).encode())
+        async with spent:
+            pass
+        with pytest.raises(StateError):
+            await spent.fsync()
+
+
 async def test_a_seek_before_the_start_is_refused(tmp_path: Path):
     needs_real_server()
     (tmp_path / "data.bin").write_bytes(b"0123456789")
@@ -719,6 +990,61 @@ async def test_a_range_write_refuses_a_negative_offset():
     with pytest.raises(ValueError) as refusal:
         _ = await write_range(server, -1, b"payload")
     assert refusal.value.args[0] == "offset must not be negative, got -1"
+
+
+async def test_write_at_refuses_a_negative_offset_by_name():
+    """The session-level guard, which is a different one from `write_range_from`'s.
+
+    Both exist and only the inner one had its message pinned, so the outer could raise
+    `ValueError(None)` -- an exception with nothing in it, at the layer a caller actually
+    calls.
+    """
+    server = CursorServer(b"0123456789")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as refusal:
+            _ = await sftp.write_at(HANDLE, -1, b"payload")
+    assert refusal.value.args[0] == "offset must not be negative, got -1"
+    assert server.writes == []
+
+
+async def test_write_at_of_nothing_returns_zero_and_asks_the_server_nothing():
+    """`return 0` and `return 1` both look like "an empty write wrote nothing".
+
+    The return value is the byte count a caller adds to a running total, so the difference is
+    a transfer that reports one byte more than it sent, per empty write.
+    """
+    server = CursorServer(b"0123456789")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert await sftp.write_at(HANDLE, 0, b"") == 0
+        assert await sftp.write_at(HANDLE, 0, memoryview(b"")) == 0
+    assert server.writes == []
+
+
+async def test_write_at_hands_the_sessions_tunables_to_the_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Two arguments whose only job is to arrive, and which every caller passes by default.
+
+    `depth` and `idle_timeout` are session tunables forwarded into `write_range_from`. Dropped,
+    the callee's own defaults apply -- so a session opened with a shallow pipeline or a short
+    idle timeout would silently get neither, and no test asserting on *bytes* can see it. The
+    non-default values are the whole point: with the defaults passed, the mutation restates
+    what was already going to happen.
+    """
+    captured: dict[str, object] = {}
+
+    async def recording_write_range_from(*args: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 7
+
+    monkeypatch.setattr("gantry_sftp.session._session.write_range_from", recording_write_range_from)
+    server = CursorServer(b"0123456789")
+    async with open_session(server, depth=3, idle_timeout=11.5) as sftp:  # type: ignore[arg-type]
+        assert await sftp.write_at(HANDLE, 4, b"payload") == 7
+
+    assert captured["depth"] == 3
+    assert captured["idle_timeout"] == 11.5
+    assert captured["offset"] == 4
 
 
 async def test_a_range_read_refuses_a_negative_offset():

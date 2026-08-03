@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 from tests.test_recursive import VMS_ROOT, TreeServer
 
+from gantry_sftp.codec import StatusCode
 from gantry_sftp.exceptions import (
     CapabilityError,
     NoSuchFileError,
@@ -226,6 +227,11 @@ async def test_chdir_to_something_that_is_not_a_directory_is_refused(tmp_path: P
         assert refused.value.args[0] == (
             f"chdir() needs a directory and {remote(target)!r} is a file"
         )
+        # The state beside the sentence. `path` is what an operator looks at and `code` is
+        # what `except` ladders and the retry classifier branch on -- a `ServerError` with no
+        # code reads as a different kind of failure from the one this is.
+        assert refused.value.path == remote(target)
+        assert refused.value.code == int(StatusCode.FAILURE)
 
         # And nothing moved: a failed chdir must not leave the session somewhere new.
         assert await sftp.getcwd() == remote(tmp_path)

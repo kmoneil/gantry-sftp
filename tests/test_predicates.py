@@ -39,11 +39,15 @@ import anyio
 import pytest
 
 from gantry_sftp.codec import (
+    EMPTY_ATTRS,
     Attrs,
     AttrsReply,
     FrameSplitter,
     Init,
     LStat,
+    Name,
+    NameEntry,
+    RealPath,
     Stat,
     Status,
     StatusCode,
@@ -480,6 +484,16 @@ class SparseServer:
                 self._reply(Version(3, ()))
             elif isinstance(packet, Stat | LStat):
                 self._reply(AttrsReply(packet.request_id, self.attrs))
+            elif isinstance(packet, RealPath):
+                # Echoed rather than rewritten: `chdir` shares `_classify` with the
+                # predicates and has to canonicalise before it can classify, so reaching the
+                # shared refusal at all needs this answered (D-105 slice 25).
+                self._reply(
+                    Name(
+                        packet.request_id,
+                        (NameEntry(packet.path, packet.path, EMPTY_ATTRS),),
+                    )
+                )
             else:
                 self._reply(Status(packet.request_id, StatusCode.OP_UNSUPPORTED, b"not scripted"))
 
@@ -553,6 +567,31 @@ async def test_a_kind_that_cannot_be_classified_raises_rather_than_guessing():
             assert unclassifiable.value.feature == (
                 f"{name}() against a server that sends no permission bits"
             )
+
+
+async def test_chdir_shares_the_predicates_refusal_rather_than_wording_its_own():
+    """`_classify` is shared by the predicates and by `chdir`, and D-103 is why.
+
+    One decision, one wording. `chdir` differs only in what it does with a *missing* path --
+    a predicate answers `False`, `chdir` raises -- so the unclassifiable case has to arrive
+    identically or there are two messages describing one refusal. Lives here rather than in
+    `test_working_directory.py` because what is being asserted is the sharing, and the
+    argument the two `_classify` arguments carry is only observable through this message.
+    """
+    server = SparseServer(Attrs(size=11))
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(CapabilityError) as unclassifiable:
+            await sftp.chdir(b"/somewhere")
+
+    # Names `chdir` and names the path, both of which `chdir` forwards and nothing read.
+    assert unclassifiable.value.args[0].startswith(
+        "chdir() cannot be answered for b'/somewhere': the server returned attributes "
+        "with no permission bits"
+    )
+    assert unclassifiable.value.path == b"/somewhere"
+    assert unclassifiable.value.feature == (
+        "chdir() against a server that sends no permission bits"
+    )
 
 
 # --- the blocking form -------------------------------------------------------------------------

@@ -26,6 +26,7 @@ from gantry_sftp.codec import (
     OpenFlag,
     Read,
     RealPath,
+    Remove,
     Stat,
     Status,
     StatusCode,
@@ -338,8 +339,11 @@ async def test_realpath_refuses_a_reply_carrying_several_names():
     """
 
     class Ambiguous(FakeServer):
+        asked: int | None = None
+
         def _handle(self, packet: object) -> None:
             if isinstance(packet, RealPath):
+                self.asked = packet.request_id
                 self._reply(
                     Name(
                         packet.request_id,
@@ -360,6 +364,81 @@ async def test_realpath_refuses_a_reply_carrying_several_names():
     assert exc.value.args[0] == (
         "REALPATH of b'.' answered with 2 names, and exactly one is the only useful answer"
     )
+    # The state beside the sentence: which request this was. Taken from the server rather than
+    # from a literal, so it is the id that actually went on the wire.
+    assert exc.value.request_id == server.asked
+
+
+async def test_an_operation_whose_only_answer_is_a_status_refuses_another_shape():
+    """`_expect_status` is the spine of a dozen operations and its refusal had no test.
+
+    Every caller here -- remove, rmdir, mkdir, setstat, close, fsync -- sends a request the
+    protocol says answers with a STATUS. A reply of another shape is a server this client
+    cannot interpret rather than one refusing, and the two have to read differently: a
+    `ProtocolError` is not retryable and a `ServerError` may be.
+    """
+
+    class WrongShape(FakeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, Remove):
+                self._reply(Handle(packet.request_id, b"\x00\x00\x00\x00"))
+                return
+            super()._handle(packet)
+
+    server = WrongShape()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ProtocolError) as exc:
+            await sftp.remove("/data/whatever")
+
+    assert exc.value.args[0] == "server answered with Handle where STATUS was expected"
+
+
+async def test_realpath_refuses_a_reply_that_is_not_a_name_at_all():
+    """The third shape of the same reply, and the one with no test until D-105's slice 25.
+
+    Two names and zero names were both pinned; a reply that is not a ``NAME`` reached
+    ``_unexpected`` and nothing read what it produced -- so the packet, the expected-type word
+    and the path could all be dropped or nulled with the suite green.
+    """
+
+    class WrongType(FakeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, RealPath):
+                self._reply(Handle(packet.request_id, b"\x00\x00\x00\x00"))
+                return
+            super()._handle(packet)
+
+    server = WrongType()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ProtocolError) as exc:
+            _ = await sftp.realpath(".")
+
+    # Names the type that arrived *and* the one that was due. Either half alone is a message
+    # that cannot be acted on.
+    assert exc.value.args[0] == "server answered with Handle where NAME was expected"
+
+
+async def test_realpath_carries_the_path_when_the_server_declines():
+    """A refusal is not a protocol violation, and the path is what makes it actionable.
+
+    `_unexpected` hands the path to `raise_for_status`, and that argument is only observable
+    on this branch -- the two `ProtocolError` branches never look at it. So a test that only
+    ever sends the wrong packet *type* cannot see the path being dropped.
+    """
+
+    class Declining(FakeServer):
+        def _handle(self, packet: object) -> None:
+            if isinstance(packet, RealPath):
+                self._reply(Status(packet.request_id, StatusCode.NO_SUCH_FILE, b"nope", b""))
+                return
+            super()._handle(packet)
+
+    server = Declining()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(NoSuchFileError) as exc:
+            _ = await sftp.realpath("missing")
+
+    assert exc.value.path == b"missing"
 
 
 async def test_realpath_refuses_a_reply_carrying_no_names_and_says_so():
@@ -370,8 +449,11 @@ async def test_realpath_refuses_a_reply_carrying_no_names_and_says_so():
     """
 
     class Empty(FakeServer):
+        asked: int | None = None
+
         def _handle(self, packet: object) -> None:
             if isinstance(packet, RealPath):
+                self.asked = packet.request_id
                 self._reply(Name(packet.request_id, ()))
                 return
             super()._handle(packet)
@@ -384,6 +466,7 @@ async def test_realpath_refuses_a_reply_carrying_no_names_and_says_so():
     assert exc.value.args[0] == (
         "REALPATH of b'.' answered with 0 names, and exactly one is the only useful answer"
     )
+    assert exc.value.request_id == server.asked
 
 
 async def test_open_and_close_round_trip():
