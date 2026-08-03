@@ -1094,6 +1094,10 @@ The path named is the deepest level that actually failed, which is not always th
 asked for: `makedirs("/locked/a/b")` against a directory you may not write reports
 `/locked/a`, because that is the one to fix.
 
+Planning a scheduled ingest on top of `entry.modified`? Read
+[Incremental ingest](#incremental-ingest-and-the-two-ways-it-loses-data) first — the
+one-second granularity turns the obvious loop into silent data loss.
+
 ## Walking and recursive download
 
 ```python
@@ -1717,7 +1721,10 @@ structured field, which is exact.
 ### What this cannot promise
 
 - **One-second granularity.** v3 has no sub-second field, so two files written in the same
-  second are indistinguishable by mtime and mtime alone is not a change detector.
+  second are indistinguishable by mtime and mtime alone is not a change detector. This is not
+  a rounding inconvenience — it is the reason a `mtime > watermark` ingest loop **loses files
+  permanently and reports success**. See [Incremental ingest](#incremental-ingest-and-the-two-ways-it-loses-data),
+  which is the only pattern where this bites and the one everybody writes first.
 - **Clock skew is not ours to correct.** Comparing a local mtime against a remote one compares
   two machines' clocks.
 - **2038 or 2106.** The wire field is `uint32` seconds: usable to 2106-02-07 read as unsigned,
@@ -1727,6 +1734,51 @@ structured field, which is exact.
   far-future dates deliberately.
 
 `examples/preserve_times.py` runs all of this.
+
+## Incremental ingest, and the two ways it loses data
+
+The loop nearly every scheduled SFTP job runs:
+
+> list a drop directory → take what is newer than a stored watermark and matches a pattern →
+> transfer it → publish it → advance the watermark
+
+This library ships every piece and **not** a `since()` method, because retention, dedupe and
+clock-trust policy are exactly what differs between deployments. What it ships instead is
+`examples/incremental_ingest.py` and these two warnings, both of which are one line of caller
+code away from silent data loss.
+
+**1. `mtime > watermark` loses files.** v3 carries whole seconds. A file that lands 0.9 s into
+the same second as the file that set your watermark reports the *same* timestamp, so `>`
+excludes it — today, and on every run after. Measured against a real `sftp-server`:
+
+```
+                 local mtime      over SFTP
+orders-002.csv   ...000.1     →   22:13:20Z     ← set the watermark
+orders-003.csv   ...000.9     →   22:13:20Z     ← different file, identical timestamp
+```
+
+`>=` on its own is not the fix either: it re-transfers the file that set the watermark on every
+run. The fix is `>=` **plus a record of which names were already taken at that exact second** —
+a set that resets whenever the watermark moves, so it grows with the busiest single second
+rather than with the directory. Holding the watermark one second behind and accepting a
+second's worth of re-transfers is also correct and cheaper to store; pick one deliberately.
+
+**2. Advancing the watermark to "now" drops whatever landed mid-run.** "Now" is later than the
+newest file the run actually saw, so anything that arrived between the listing and the write is
+already behind the watermark when the next run starts — gone, with no error anywhere. Advance
+to the **largest modification time actually seen** instead, which cannot skip a file because a
+file nobody has listed yet is not in that maximum.
+
+Read `entry.modified` from the [listing](#listing) rather than calling `getmtime` per file: v3
+sends attributes with every `READDIR` entry, so the timestamp is already in your hand and
+`getmtime` is a round trip you do not need. `getmtime` is for a path you were handed rather
+than one you listed.
+
+A third state to decide rather than discover: `entry.modified` is `None` when the server sent
+no `ACMODTIME`, which is legal. Treating that as 1970 makes the file look ancient and it is
+never ingested — silent loss by a different route.
+
+`tests/test_incremental_ingest.py` fails if either trap is reintroduced.
 
 ## Permissions
 
