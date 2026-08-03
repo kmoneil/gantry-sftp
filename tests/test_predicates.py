@@ -309,6 +309,39 @@ async def test_getsize_of_a_link_measures_what_was_asked_for(tmp_path: Path):
         assert await sftp.getsize(remote(link), follow_symlinks=False) == len(remote(target))
 
 
+async def test_isfile_and_getmtime_follow_by_default_and_stop_when_asked(tmp_path: Path):
+    """The two accessors whose `follow_symlinks` default and forward were both free.
+
+    `isdir` and `getsize` had this pair; `isfile` and `getmtime` did not, so their default
+    could flip to `False` and their forward could be nulled -- and `None` is falsy, which is
+    the same as asking for `lstat`. Every existing call passed the default, so the two spelled
+    the same answer (D-105 slice 27).
+    """
+    needs_real_server()
+    target = tmp_path / "data.csv"
+    target.write_bytes(b"payload")
+    os.utime(target, (1_600_000_007, 1_600_000_000))
+    link = tmp_path / "alias"
+    link.symlink_to(target)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        # A link to a file is a file when followed and a symlink when not.
+        assert await sftp.isfile(remote(link)) is True
+        assert await sftp.isfile(remote(link), follow_symlinks=False) is False
+
+        followed = await sftp.getmtime(remote(link))
+        assert followed is not None
+        assert int(followed.timestamp()) == 1_600_000_000
+        # The link has an mtime of its own -- its creation -- so the two differ, which is what
+        # makes the argument observable at all.
+        unfollowed = await sftp.getmtime(remote(link), follow_symlinks=False)
+        assert unfollowed is not None
+        assert int(unfollowed.timestamp()) != 1_600_000_000
+
+
 async def test_reading_an_attribute_of_an_absent_path_raises(tmp_path: Path):
     """`getsize` and `getmtime` are accessors, not predicates: absent is an error, not a value.
 
@@ -345,6 +378,29 @@ async def test_makedirs_creates_every_missing_level(tmp_path: Path):
         await sftp.makedirs(remote(tmp_path / "a" / "b" / "c"))
 
     assert (tmp_path / "a" / "b" / "c").is_dir()
+
+
+async def test_makedirs_on_a_directory_that_exists_costs_one_request(tmp_path: Path):
+    """`exist_ok` has to reach the *first* `MKDIR`, and the recovery path hides it if it does not.
+
+    Dropped there, the first attempt is strict, fails, and the missing-parents recovery runs --
+    which re-tries with the real `exist_ok` and succeeds. Same end state, extra round trips per
+    call, and no assertion about the *result* can see it. The counter can (D-105 slice 27).
+    """
+    needs_real_server()
+    (tmp_path / "already").mkdir()
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        before = sftp.requests_sent
+        await sftp.makedirs(remote(tmp_path / "already"), exist_ok=True)
+        # Two, and both are named: the `MKDIR` that fails, and the `STAT` that decides the
+        # failure was "already a directory" -- v3 answers a refused MKDIR with a bare FAILURE,
+        # so `exist_ok` costs a round trip when it fires and `mkdir`'s docstring says so.
+        # Dropped from the first call the recovery walk runs instead and this is five.
+        assert sftp.requests_sent - before == 2
 
 
 async def test_makedirs_governs_the_last_component_only(tmp_path: Path):

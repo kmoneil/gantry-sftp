@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from pathlib import Path
 
 import anyio
@@ -276,6 +277,22 @@ def test_ok_and_eof_are_not_errors(code: StatusCode):
     raise_for_status(Status(1, code))
 
 
+def test_a_status_whose_message_is_not_utf8_still_produces_an_error():
+    """The server's own bytes reach our error text, and a strict decode would raise there.
+
+    A `STATUS` message is whatever the far end put in it -- a server in another locale, a
+    filename echoed back, a middlebox's banner -- so it is not ours to assume well-formed. The
+    one place it is read is while *building* the exception, which is where an exception
+    replaces a diagnosis with a crash. Third instance of this shape after both schedulers and
+    the `ssh -G` probe (D-105 slice 27).
+    """
+    with pytest.raises(ServerError) as exc:
+        raise_for_status(Status(1, StatusCode.FAILURE, b"disk \xff full  "))
+    # Replaced, not raised -- and still stripped, which is the third part of the same call.
+    assert exc.value.args[0] == "server returned FAILURE: disk \ufffd full"
+    assert exc.value.message == b"disk \xff full  "
+
+
 def test_a_status_without_a_message_still_produces_a_usable_error():
     # Many servers send no message at all, so the summary has to stand on its own.
     with pytest.raises(ServerError) as exc:
@@ -328,6 +345,39 @@ async def test_realpath_returns_the_canonical_name():
     server = FakeServer()
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         assert await sftp.realpath(".") == b"/canonical"
+
+
+async def test_realpath_defaults_to_the_current_directory():
+    """The default is `b"."` and every call site passed it explicitly, so it was never used.
+
+    It is the spelling that asks the server where it put you, and the same literal is what the
+    rootedness probe sends -- so it is asserted on the wire rather than only in the answer
+    (D-105 slice 27).
+    """
+    server = FakeServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        assert await sftp.realpath() == b"/canonical"
+
+    asked = [packet for packet in server.seen if isinstance(packet, RealPath)]
+    assert [packet.path for packet in asked] == [b"."]
+
+
+async def test_the_rootedness_probe_asks_for_the_current_directory_by_name():
+    """The other user of that literal, and it decides whether path arithmetic is allowed here.
+
+    A relative path triggers one `REALPATH` of `.` -- of `.` specifically, because the answer
+    is cached as the server's default directory and anything else would cache a different
+    question under that name.
+    """
+    server = FakeServer()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        # Any relative-path operation that needs `/` arithmetic; `walk` is the cheapest, and
+        # what it goes on to do against this fake does not matter -- the probe is what does.
+        with suppress(Exception):
+            _ = [entry async for entry in sftp.walk(b"somewhere")]
+
+    asked = [packet for packet in server.seen if isinstance(packet, RealPath)]
+    assert asked[0].path == b"."
 
 
 async def test_realpath_refuses_a_reply_carrying_several_names():

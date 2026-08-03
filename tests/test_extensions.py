@@ -10,6 +10,7 @@ against a live server that answers differently when the fields are swapped.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -596,6 +597,10 @@ async def test_plain_rename_refuses_an_existing_target_on_a_real_server(tmp_path
         with pytest.raises(ServerError) as exc:
             await sftp.rename(str(source), str(target))
         assert exc.value.code == int(StatusCode.FAILURE)
+        # Which name was refused, and it is the *destination* -- the one already occupied.
+        # v3's FAILURE says nothing at all here (OpenSSH's message is the constant word
+        # "Failure"), so the path is the entire content of this error (D-105 slice 27).
+        assert exc.value.path == os.fsencode(target)
 
         # And onto a name that is free, the same request succeeds.
         await sftp.rename(str(source), str(tmp_path / "free.txt"))

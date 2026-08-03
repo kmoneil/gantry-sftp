@@ -235,6 +235,32 @@ async def test_a_bytes_local_path_is_refused_by_every_transfer(tmp_path: Path):
     assert not (tmp_path / "out.txt").exists(), "get() wrote a file it should have refused"
 
 
+async def test_a_local_path_that_is_not_bytes_either_gets_the_other_half_of_the_message(
+    tmp_path: Path,
+):
+    """`bytes` is the interesting wrong type and it is not the only one (D-105 slice 27).
+
+    The refusal picks its second sentence from whether the value was `bytes` -- the "you are
+    one argument out" case -- or anything else, and only the first branch had a test. The
+    other could have been emptied or case-mangled, which is the sentence a caller gets when
+    they hand over an `int` from a config file or a `list` from an `argparse` mistake.
+    """
+    needs_real_server()
+    source = tmp_path / "data.txt"
+    source.write_bytes(b"payload")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(TypeError) as wrong:
+            await sftp.get(os.fsencode(source), 7)  # type: ignore[arg-type]
+        assert wrong.value.args[0] == (
+            "get() needs a Path or str for its local path, not int: it is opened by this "
+            "process, so it has to be something pathlib accepts"
+        )
+
+
 async def test_the_local_path_still_takes_both_of_the_types_it_declares(tmp_path: Path):
     """Guards the guard: a check that refused everything would pass every test above."""
     needs_real_server()
