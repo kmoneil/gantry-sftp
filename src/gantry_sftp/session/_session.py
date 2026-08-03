@@ -253,8 +253,8 @@ class SessionOptions:
             in memory: peak is ``depth`` x the derived request size, about 16 MiB at the
             shipped defaults and the same in both directions. Raising it past the default
             buys nothing -- one session is one channel is one 2 MiB window -- so this is a
-            knob for *lowering*, when a container's limit is what binds. See README,
-            "What a transfer costs in memory".
+            knob for *lowering*, when a container's limit is what binds. See
+            ``docs/tuning.md``, "What a transfer costs in memory".
     """
 
     request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT
@@ -3823,8 +3823,8 @@ class Session:
                 **This bounds one call and nothing adds the calls up.** M of them in your task
                 group is M x this number in flight, and the total is the caller's to own -- it
                 is close to free on one session and it is the session count that costs. The
-                README's *"``concurrency=`` bounds one call, and you own the product"* is where
-                that lives and DESIGN.md §5.2 has the measurement (D-116).
+                ``docs/concurrency.md``'s *"``concurrency=`` bounds one call, and you own the
+                product"* is where that lives and DESIGN.md §5.2 has the measurement (D-116).
 
         Returns:
             Counts, bytes, and every entry that was skipped with the reason it was.
@@ -6050,7 +6050,7 @@ async def _negotiate(transport: Transport, codec: Codec, deadline: float | None)
     accepts the connection and never finishes a write hung here with nothing to stop it. Nine
     bytes cannot fill a pipe, so the case needed a peer that was already wedged -- but a bound
     that holds only while the failure is implausible is not a bound, and this library's own
-    README promises timeouts on every wait.
+    documentation promises timeouts on every wait (``docs/reliability.md``).
 
     The deadline spans the handshake rather than each chunk of it: per-chunk would let a
     server dribble one byte at a time indefinitely and never trip, which is a hang wearing a

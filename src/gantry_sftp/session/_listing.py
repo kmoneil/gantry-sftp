@@ -175,7 +175,8 @@ class DirEntry:
     third state DoD 2 exists to stop being discovered rather than decided. The directory a
     listing came from is the one the caller passed to :meth:`Session.listdir` or
     :meth:`Session.scandir`, and joining onto it is :func:`check_listed_name` plus
-    :func:`join_remote` -- two lines, documented in the README beside ``glob``.
+    :func:`join_remote` -- two lines, documented in ``docs/listing-and-matching.md`` beside
+    ``glob``.
 
     Attributes:
         filename: The name, exactly as the server sent it. Bytes, because it is not

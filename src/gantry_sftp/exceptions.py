@@ -128,12 +128,12 @@ class ConnectError(SFTPError):
             last 56 KiB, with ``... [N bytes of stderr omitted] ...`` in between when a
             chatty child overflows it. Both ends are kept because the first lines say what
             was attempted and the last say how it ended, and ``ssh -vvv`` is exactly the
-            situation that overflows the cap. This is the whole point of the class.
-            ``Error reading SSH protocol banner`` is what paramiko tells you when the real
-            message was ``Permission denied (publickey)`` or ``Host key verification
-            failed`` -- the diagnosis was always there, and it was thrown away. It is not
-            parsed here either, because parsing it would mean guessing, and the raw text is
-            worth more than our guess about it. See
+            situation that overflows the cap. This is the whole point of the class: a
+            client that re-diagnoses the failure itself reports a generic banner error
+            where the real message was ``Permission denied (publickey)`` or ``Host key
+            verification failed`` -- the diagnosis was always there, and summarising it
+            threw it away. It is not parsed here either, because parsing it would mean
+            guessing, and the raw text is worth more than our guess about it. See
             :class:`~gantry_sftp.transport.StderrBuffer` for the two limits as tunables.
         argv: The exact command that was run, with no shell involved. Useful in a bug
             report and safe to show: credentials never appear in argv (see
@@ -570,7 +570,7 @@ def _flatten_exception_group(error: BaseException) -> BaseException:
     up not applied, which is precisely the bug it exists to prevent. It was one copy, in
     ``session/_upload.py``, and the transport did not have it: an ``except ConnectError`` placed
     outside ``async with open_ssh_transport(...)`` -- the natural spelling, and the one the
-    README documents -- never matched.
+    documentation shows -- never matched.
 
     Args:
         error: The exception to unwrap. Anything that is not a group is returned unchanged.

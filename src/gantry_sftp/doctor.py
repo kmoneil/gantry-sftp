@@ -4,12 +4,12 @@
     python -m gantry_sftp doctor example.com    # and what that server negotiated
     python -m gantry_sftp doctor --json         # the same report, for CI
 
-**This is the one diagnostic a paramiko-shaped library cannot write** (D-90). paramiko and
-asyncssh *are* the SSH environment: there is no external binary they did not run, no
-``ssh_config`` somebody else wrote, no agent socket resolved by a program they do not own. This
-library spawns OpenSSH, which is the deployment dependency D-89 documents as a liability — and
-it is exactly why there is something here to report. The report is the same resolution and the
-same negotiation a real session performs, printed instead of used.
+**There is something here to report only because this library does not implement SSH** (D-90).
+A client that *is* the SSH environment has nothing to diagnose: no external binary it did not
+run, no ``ssh_config`` somebody else wrote, no agent socket resolved by a program it does not
+own. This one spawns OpenSSH, which is the deployment dependency D-89 documents as a liability —
+and the same fact is what makes a report possible. What is printed is the same resolution and
+the same negotiation a real session performs, printed instead of used.
 
 Three decisions worth stating, because each could have gone the other way.
 

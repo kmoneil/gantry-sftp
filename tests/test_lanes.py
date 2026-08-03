@@ -43,7 +43,12 @@ def _load_runner():
 lanes = _load_runner()
 
 WORKFLOW_TEXT = WORKFLOW_PATH.read_text(encoding="utf-8")
-README_TEXT = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+DEVELOPMENT_TEXT = (REPO_ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+"""Where the lane table lives since D-125 split the README into `docs/`.
+
+It moved with the rest of the contributor prose, and this assertion moved with it rather than
+being dropped: a lane that exists and is documented nowhere is a lane nobody runs.
+"""
 PRECOMMIT_TEXT = (REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
 
 
@@ -63,8 +68,8 @@ def test_every_lane_is_invoked_by_name_in_the_ci_workflow(lane) -> None:
 
 
 @pytest.mark.parametrize("lane", lanes.LANES, ids=lambda lane: lane.name)
-def test_every_lane_is_named_in_the_readme(lane) -> None:
-    assert f"lanes.py {lane.name}" in README_TEXT
+def test_every_lane_is_named_in_the_development_docs(lane) -> None:
+    assert f"lanes.py {lane.name}" in DEVELOPMENT_TEXT
 
 
 def test_the_workflow_spells_out_no_test_command_of_its_own() -> None:

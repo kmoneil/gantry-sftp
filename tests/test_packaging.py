@@ -141,7 +141,115 @@ def test_the_built_version_comes_from_the_package(distribution: tuple[Path, Path
     assert sdist.name == f"gantry_sftp-{gantry_sftp.__version__}.tar.gz"
 
 
-# --- The README is a shipped artifact, so its facts are asserted too (D-89) ----------------
+# --- The docs are shipped artifacts, so their facts are asserted too (D-89) ----------------
+
+DOCS = ROOT / "docs"
+"""Where the reference prose lives, since D-125 split it out of one 3000-line README.
+
+Each assertion below reads the file that now *holds* the fact rather than the README, and the
+distinction is the point of the split: a fact belongs on the page a reader is on when they need
+it, and a test that kept pointing at the front page would quietly stop checking anything the day
+the sentence moved.
+"""
+
+
+def doc(name: str) -> str:
+    """One documentation page, read by name, failing loudly if it has been renamed.
+
+    A missing page would otherwise make an `in` assertion below fail with "not found in ''",
+    which reads as a reworded sentence rather than as a deleted file.
+    """
+    page = DOCS / name
+    assert page.is_file(), f"docs/{name} is gone; the fact it holds needs a new home"
+    return page.read_text(encoding="utf-8")
+
+
+def test_every_guide_the_readme_advertises_exists():
+    """The front page is now a table of contents, and a dead row in it is worse than no row.
+
+    D-125 moved the reference prose into `docs/`, which makes the README's job pointing at it.
+    A link that 404s on the day somebody renames a page is the failure this catches, and it is
+    derived from the README's own links rather than from a list kept beside them.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    linked = sorted(set(re.findall(r"\]\(docs/([a-z-]+\.md)[)#]", readme)))
+    assert len(linked) > 8, f"the README stopped linking the guides: {linked}"
+    missing = [name for name in linked if not (DOCS / name).is_file()]
+    assert not missing, f"README links documentation that does not exist: {missing}"
+
+
+def test_the_documentation_index_and_the_readme_offer_the_same_guides():
+    """Two tables of contents, so two places to forget a page.
+
+    `docs/README.md` is what a reader browsing the directory sees and the README table is what
+    everyone else sees. They are hand-maintained on purpose -- each has its own wording -- so
+    the property asserted is that they name the same set of files, not that they read alike.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    index = doc("README.md")
+    from_readme = set(re.findall(r"\]\(docs/([a-z-]+\.md)[)#]", readme))
+    from_index = set(re.findall(r"\]\(([a-z-]+\.md)[)#]", index))
+    assert from_readme - from_index == set(), "the docs index is missing a guide the README has"
+    assert from_index - from_readme == set(), "the docs index has a guide the README does not"
+
+
+def heading_slugs(page: Path) -> set[str]:
+    """Every anchor a Markdown page defines, spelled the way GitHub spells them.
+
+    Lowercase, drop anything that is not a word character, a space or a hyphen, then spaces to
+    hyphens. Two details are easy to get wrong and both invent broken links that are not broken:
+    an underscore is a word character and survives, and a heading ending in a stripped character
+    -- ``rooted at `/` `` -- keeps the trailing hyphen.
+    """
+    slugs: set[str] = set()
+    for line in page.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#"):
+            text = re.sub(r"[^\w\s-]", "", line.lstrip("#").strip().lower())
+            slugs.add(re.sub(r"\s+", "-", text))
+    return slugs
+
+
+def markdown_documents() -> list[Path]:
+    return [ROOT / "README.md", *sorted(DOCS.glob("*.md")), ROOT / "examples" / "README.md"]
+
+
+@pytest.mark.parametrize("page", markdown_documents(), ids=lambda p: f"{p.parent.name}/{p.name}")
+def test_every_internal_link_resolves(page: Path):
+    """D-125. Splitting one file into thirteen makes a dead link the new drift.
+
+    Every cross-reference used to be an anchor inside the same document, where a rename broke
+    something visible immediately. They are now file-plus-anchor across a tree, and a stale one
+    is invisible to every other test here: the prose still reads correctly and the link still
+    looks like a link. So both halves are checked -- the file exists, and the anchor is a heading
+    that file actually defines.
+    """
+    broken: list[str] = []
+    for match in re.finditer(r"\]\(([^)]+)\)", page.read_text(encoding="utf-8")):
+        target = match.group(1)
+        if target.startswith(("http://", "https://", "mailto:")):
+            continue
+        relative, _, anchor = target.partition("#")
+        destination = (page.parent / relative).resolve() if relative else page
+        if relative and not destination.exists():
+            broken.append(f"{target} (no such file)")
+        elif anchor and destination.suffix == ".md" and anchor not in heading_slugs(destination):
+            broken.append(f"{target} (no such heading)")
+    assert not broken, f"{page.name} links nowhere: " + "; ".join(broken)
+
+
+def test_the_link_check_is_not_vacuous():
+    """Guards the guard, in both directions.
+
+    A regex that matched no links, or a slugger that returned no headings, would make every page
+    above pass while checking nothing -- and the slugger is the half that can fail quietly, since
+    it only has to be *wrong* rather than empty to start excusing dead anchors.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert len(re.findall(r"\]\(([^)]+)\)", readme)) > 12
+    # Two headings whose slugs exercise the rules the docstring above calls easy to get wrong:
+    # an underscore survives, and a heading ending in a stripped character keeps its hyphen.
+    assert "when-the-ssh_config-is-not-yours" in heading_slugs(DOCS / "connecting.md")
+    assert "servers-whose-namespace-is-not-rooted-at-" in heading_slugs(DOCS / "transfers.md")
 
 
 def test_the_readme_and_pyproject_agree_on_the_python_floor():
@@ -156,16 +264,15 @@ def test_the_readme_and_pyproject_agree_on_the_python_floor():
     assert "- Python 3.13+" in readme
 
 
-def test_the_readme_quotes_the_missing_ssh_hint_exactly_as_the_code_produces_it():
-    """The hint is quoted verbatim in the README, which makes it a two-place fact.
+def test_the_docs_quote_the_missing_ssh_hint_exactly_as_the_code_produces_it():
+    """The hint is quoted verbatim in the docs, which makes it a two-place fact.
 
-    It is the highest-value sentence in the document -- the one a reader in a broken container
-    acts on -- so a reworded hint that leaves the README behind is the drift worth catching.
-    Whitespace is normalised because the README reflows it to the page width; wording is not.
+    It is the highest-value sentence in the documentation -- the one a reader in a broken
+    container acts on -- so a reworded hint that leaves the prose behind is the drift worth
+    catching. Whitespace is normalised because the page reflows it to the width; wording is not.
     """
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     produced = " ".join(missing_executable_hint("ssh", errno_value=errno.ENOENT).split())
-    quoted = " ".join(readme.split())
+    quoted = " ".join(doc("connecting.md").split())
     assert f"hint: {produced}" in quoted
 
 
@@ -182,18 +289,20 @@ def test_the_documented_memory_bound_is_derived_from_the_shipped_constants():
     the per-connection clamp, which can only make it smaller. So the documented figure is the
     ceiling rather than an estimate.
     """
+    tuning = doc("tuning.md")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     peak = DEFAULT_PIPELINE_DEPTH * PREFERRED_READ_LENGTH
     mebibytes = round(peak / 2**20)
 
-    # Whitespace-normalised, as the ssh-hint test is and for the same reason: the README aligns
+    # Whitespace-normalised, as the ssh-hint test is and for the same reason: the page aligns
     # the expression to read as arithmetic, and a reflow is not a drift in the fact.
     times = "\u00d7"  # written as an escape; RUF001 is right that the glyph reads as an `x`
-    spelled = " ".join(readme.split())
+    spelled = " ".join(tuning.split())
     assert f"= 1 {times} {DEFAULT_PIPELINE_DEPTH} {times} {PREFERRED_READ_LENGTH} bytes" in spelled
     assert f"concurrent transfers {times} depth {times} request size" in spelled
-    assert f"{mebibytes} MiB per transfer" in readme
-    # And the same figure on the deployment screen, which is the one a reader meets first.
+    assert f"{mebibytes} MiB per transfer" in tuning
+    # And the same figure on the deployment screen, which is the one a reader meets first --
+    # still the README, because sizing a container is a decision taken before installing.
     assert f"About {mebibytes} MiB of memory per concurrent transfer" in readme
     # The write side shares the bound, so a divergence between the two preferred lengths would
     # make one of the two directions cost more than the document says.
@@ -201,38 +310,39 @@ def test_the_documented_memory_bound_is_derived_from_the_shipped_constants():
 
 
 def test_the_lowered_depth_example_still_arrives_at_the_number_it_claims():
-    """The README offers `depth=8` as the way into a smaller container and states the result.
+    """The docs offer `depth=8` as the way into a smaller container and state the result.
 
     Worth its own assertion because it is the actionable half: a reader who copies the setting
     is trusting the figure beside it, and that figure is a second place the arithmetic lives.
     """
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    tuning = doc("tuning.md")
     lowered = 8
-    assert f"SessionOptions(depth={lowered})" in readme
-    assert f"about {round(lowered * PREFERRED_READ_LENGTH / 2**20)} MiB" in readme
+    assert f"SessionOptions(depth={lowered})" in tuning
+    assert f"about {round(lowered * PREFERRED_READ_LENGTH / 2**20)} MiB" in tuning
 
 
-def test_the_readme_says_who_owns_the_total_concurrency_and_the_tree_methods_point_at_it():
+def test_the_docs_say_who_owns_the_total_concurrency_and_the_tree_methods_point_at_it():
     """D-116. Two layers bound the concurrency and the caller owns the product.
 
-    A fact stated in four places is four places to update, so the README section is the anchor
-    and the two `concurrency=` docstrings defer to it rather than restate it. That arrangement
-    is only safe if something notices when a pointer stops pointing anywhere -- a docstring
-    naming a README section that has been renamed is worse than one that said nothing, because
-    it reads as a citation.
+    A fact stated in four places is four places to update, so one section is the anchor and the
+    two `concurrency=` docstrings defer to it rather than restate it. That arrangement is only
+    safe if something notices when a pointer stops pointing anywhere -- a docstring naming a
+    section that has been renamed is worse than one that said nothing, because it reads as a
+    citation.
 
     The measurement behind it is in DESIGN 5.2 and is deliberately not asserted here: it is a
     throughput result, it belongs to the machine it was taken on, and `benchmarks/` is the only
     place figures live (D-94).
     """
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    concurrency = doc("concurrency.md")
     # The code span is spelled with one backtick in Markdown and two in the docstrings' RST, so
     # the assertion is on the words. Asserting the punctuation would fail on a correct citation.
     anchor = "bounds one call, and you own the product"
-    assert f"### `concurrency=` {anchor}" in readme
+    assert f"### `concurrency=` {anchor}" in concurrency
     # The memory section states the same product for a different cost, and the two halves
-    # drifting apart is exactly what D-101 and this card each fixed one side of.
-    assert "#concurrency-bounds-one-call-and-you-own-the-product" in readme
+    # drifting apart is exactly what D-101 and this card each fixed one side of. It now lives on
+    # another page, so the link that joins them crosses a file and is checked as one.
+    assert "concurrency.md#concurrency-bounds-one-call-and-you-own-the-product" in doc("tuning.md")
 
     downloads = Session.get_tree.__doc__
     uploads = Session.put_tree.__doc__
@@ -274,9 +384,16 @@ def shipped_prose() -> list[Path]:
     may state what it measured -- both are excluded as measurement lanes rather than as documents.
     CLAUDE.md is out because it is addressed to whoever changes the library rather than to whoever
     uses it, and it quotes the banned shape on purpose, inside the rule that bans it.
+
+    **`docs/` is in, and adding it was the whole risk of D-125.** The ban below was written when
+    the documentation was one file; moving 2700 lines of prose out of that file without widening
+    the sweep would have left the rule intact and pointed at a README with nothing left in it --
+    a green test over an empty subject, which is the failure mode this repository keeps finding
+    in its own guards.
     """
     return [
         ROOT / "README.md",
+        *sorted((ROOT / "docs").rglob("*.md")),
         *sorted((ROOT / "examples").rglob("*.md")),
         *sorted((ROOT / "examples").rglob("*.py")),
         *sorted((ROOT / "src").rglob("*.py")),
@@ -382,12 +499,17 @@ def test_the_readme_sends_a_reader_who_wants_numbers_somewhere_real():
 
 # --- What the distribution carries, decided rather than defaulted (D-94) --------------------
 
-SHIPPED = ("src", "tests", "examples", "live-tests", "scripts", "README.md", "LICENSE")
+SHIPPED = ("src", "tests", "examples", "live-tests", "scripts", "docs", "README.md", "LICENSE")
 """Top-level entries an sdist must carry.
 
 `tests/` and `examples/` are in for a reason worth stating, because "why ship tests?" gets asked
 every few years: Debian, Fedora and conda-forge rebuild from the sdist and run the suite to
 validate their build, and `examples/` is tested documentation with a README of its own.
+
+`docs/` joined them in D-125, and the reason is the same one that put the README here. The
+documentation used to *be* the README, so shipping it was automatic; splitting it out would have
+silently reduced what a user receives to a table of contents whose every row is a dead link. An
+sdist is what a distribution packager builds from and what an air-gapped user reads.
 """
 
 WITHHELD = (

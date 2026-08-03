@@ -1044,11 +1044,10 @@ class GantrySFTPFile(AbstractBufferedFile):  # type: ignore[misc]  # fsspec ship
     the *same* scheduler a whole-file transfer uses, so a block larger than one request becomes
     several requests in flight rather than one round trip per request.
 
-    The one-``READ``-per-call shape this deliberately does not have is ``paramiko#2453``: the
-    incumbent hands back paramiko's own file object, whose reads cost a round trip each, so
-    reading a file through it is slower than downloading the whole thing with the same library.
-    That is a pathology rather than a margin, which is why it is named here and why
-    ``benchmarks/`` is where any figure for it lives.
+    The shape this deliberately does not have is one ``READ`` per call, awaited: reads then cost
+    a round trip each, and pulling a file through the object is slower than downloading the whole
+    thing with the same library. That is a pathology rather than a margin, which is why the
+    benchmark lane gates on it rather than merely reporting it.
 
     **One handle, held for the object's lifetime**, rather than an ``OPEN``/``CLOSE`` pair per
     block. That is why :meth:`close` is overridden -- ``AbstractBufferedFile.close`` finalises

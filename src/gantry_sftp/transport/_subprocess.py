@@ -427,7 +427,7 @@ async def _open_process_transport(
             # The stderr drain runs in a task group, so *anything* the caller's body raises
             # comes back out of it wrapped -- anyio wraps even a single exception. Without
             # this, an `except ConnectError` placed outside `async with open_ssh_transport()`
-            # never matches, which is the natural spelling and the one the README documents.
+            # never matches, which is the natural spelling and the one the docs show.
             # Re-raising the flattened exception is safe with @asynccontextmanager: it is the
             # same object contextlib threw in, so the `async with` propagates it normally.
             raise _flatten_exception_group(group) from None
