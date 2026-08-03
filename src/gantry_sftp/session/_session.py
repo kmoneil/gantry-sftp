@@ -5266,10 +5266,23 @@ def _claim_directory(
     case-folding filesystem -- and the consequence is quieter: the two remote directories'
     contents merge, so the *structure* is wrong even where no individual file is lost. Returns
     a one-element tuple on collision and an empty one otherwise, so the caller stays flat.
+
+    **The identity is the resolved path's, and that is the difference from the file case**
+    (D-123). A *file* is opened ``O_NOFOLLOW``, so a symlink at that name is refused and its own
+    inode is the honest answer. A directory is created with ``mkdir(exist_ok=True)``, whose
+    ``FileExistsError`` branch asks ``is_dir()`` -- which follows -- so a link to a directory is
+    written *through*, and the link's own inode would report a name this run had not claimed.
+    Two remote directories then merged into one local one with nothing said. Resolving here
+    keeps the legitimate use of a pre-created link (one remote directory pointed somewhere the
+    caller chose) and catches only the shape that merges two.
+
+    Both calls take the resolved path so the pair cannot be split; the *collision* still names
+    the path the caller would go and look at rather than what it resolved to.
     """
-    first = ledger.collides_with(local_directory)
+    created = local_directory.resolve()
+    first = ledger.collides_with(created)
     if first is None:
-        ledger.claim(local_directory, entry.path)
+        ledger.claim(created, entry.path)
         return ()
     return (PathCollision(str(local_directory), entry.path, first),)
 

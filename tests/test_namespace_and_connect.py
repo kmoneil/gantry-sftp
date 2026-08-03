@@ -178,7 +178,10 @@ def test_a_listing_entry_carries_no_path_and_that_is_the_decision():
     assert not hasattr(gantry_sftp.DirEntry, "path")
     assert not hasattr(gantry_sftp.DirEntry, "directory")
     # And the reason it cannot be filled: this is the same type, built from a local stat.
-    local = gantry_sftp.session.local_dir_entry(b"report.csv", (ROOT / "README.md").stat())
+    # `__file__` rather than a repository file: any real `stat_result` proves the point, and
+    # reaching for the repo root is what keeps a test out of the mutation lane (see
+    # `[tool.mutmut]`), which is where this file's other assertions earn their keep.
+    local = gantry_sftp.session.local_dir_entry(b"report.csv", Path(__file__).stat())
     assert isinstance(local, gantry_sftp.DirEntry)
     assert local.filename == b"report.csv"
 

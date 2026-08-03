@@ -434,6 +434,7 @@ only_mutate = [
     "src/gantry_sftp/transport/*",
 ]
 pytest_add_cli_args_test_selection = ["tests/"]
+also_copy = ["examples/"]
 # `tests/test_packaging.py` is ignored for the same reason and it is worth stating
 # separately, because the symptom is different: it resolves the repository root through
 # `Path(__file__).parent.parent`, which under mutmut is `mutants/` -- a tree with a
@@ -441,16 +442,25 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # directory that was never meant to be a distribution. It also mutates nothing: it builds
 # a wheel from the real source tree and cannot kill a codec mutant.
 # `tests/test_lanes.py` is the third with the same root cause and the same shape: it loads
-# `scripts/lanes.py` by path from the repository root, and `mutants/` has no `scripts/`
-# because mutmut copies `source_paths` and nothing else. Collection dies on the missing
-# file. Same remedy, and the same reason not to reach for `also_copy`: the module imports
-# no `gantry_sftp`, so copying it in would add wall-clock and kill no mutant.
-# `tests/test_namespace_and_connect.py` is the fourth, found in 0.11 when a codec change
-# needed the lane and the lane would not start. It parses `examples/*.py` from the
-# repository root to check that no ordinary example imports the codec; under mutmut that
-# glob matches nothing, so the allowlist looks stale and the *inverse* test passes
-# vacuously. Worth naming rather than just ignoring: a test that resolves the repo root
-# does not merely fail here, it can also pass for the wrong reason.
+# `scripts/lanes.py` by path from the repository root, and `mutants/` holds only
+# `source_paths`, the tests and whatever `also_copy` names -- no `scripts/`. Collection dies
+# on the missing file. Same remedy, and the reason NOT to add it to `also_copy`: the module
+# imports no `gantry_sftp`, so copying it in would add wall-clock and kill no mutant.
+# `also_copy = ["examples/"]` is why two files are NOT in the list below, and it is the
+# opposite call to `test_lanes.py`'s. `tests/test_incremental_ingest.py` (D-100) imports
+# `examples/incremental_ingest.py` and drives `open_session` against a real `sftp-server`
+# in-process, so its kills are real ones -- copying the directory in keeps them, where an
+# ignore would have made it the sixth file whose behaviours all read as survivors. It cost
+# nothing else: `examples/test_examples.py` runs each example as a *subprocess*, which
+# imports the installed library rather than the mutated copy, and it is outside
+# `pytest_add_cli_args_test_selection` anyway.
+# `tests/test_namespace_and_connect.py` was the fourth entry in this list and is no longer
+# ignored, which took two fixes rather than one. Its examples glob is answered by
+# `also_copy` above. Its *second* repo-root dependency was recorded nowhere: it reached for
+# `ROOT / "README.md"` only to obtain some real `stat_result`, and `Path(__file__).stat()`
+# does that without leaving the file. Worth keeping as the reason a stale ignore is
+# expensive -- the entry named one cause, the file had two, and under mutmut its glob
+# matched nothing so the *inverse* assertion passed vacuously rather than failing.
 # `tests/test_layer_discipline.py` needs no ignore but carries one `skipif` for the same
 # family, added with D-118. Its hashlib rule parses every shipped module and asserts each
 # `hashlib.<constructor>` call passes `usedforsecurity=False`; under mutmut `PACKAGE_ROOT`
@@ -467,8 +477,9 @@ pytest_add_cli_args_test_selection = ["tests/"]
 # asserting a `warnings.warn` `stacklevel` therefore measures a different thing here. It skips
 # on `MUTANT_UNDER_TEST`, which mutmut sets for the whole run, so ordinary runs are unchanged.
 # Without the skip the lane cannot start at all: stats collection fails on that one assertion.
-# `tests/test_sync_facade.py` is the fifth, and it is the first with a different root
-# cause: it does not resolve the repository root, it introspects `Session` itself. Under
+# `tests/test_sync_facade.py` is the fourth in the list below and the only one with a
+# different root cause: it does not resolve the repository root, it introspects `Session`
+# itself -- it was the fifth of five when `test_namespace_and_connect.py` was still here. Under
 # mutmut the class carries the trampoline's own members -- `xǁSessionǁ__init____mutmut_1`,
 # `...__mutmut_orig`, one pair per mutant -- so the parity check reports several hundred
 # "async methods with no blocking form" and the baseline never starts. It was invisible
@@ -480,6 +491,5 @@ pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
     "--ignore=tests/test_lanes.py",
-    "--ignore=tests/test_namespace_and_connect.py",
     "--ignore=tests/test_sync_facade.py",
 ]

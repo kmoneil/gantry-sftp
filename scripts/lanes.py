@@ -62,7 +62,7 @@ class Lane:
             with the line that would fix them.
         reports_only: Why this lane reports instead of gating, or ``""`` if it gates. A
             non-gating lane with no reason is not allowed, so opting out is a written act.
-        takes: Rough wall clock, so nobody starts the four-minute one by accident.
+        takes: Rough wall clock, so nobody starts a long one by accident.
         env: Environment variables this lane sets over the caller's own, empty for most.
             A lane whose behaviour depends on one is a lane a developer cannot reproduce by
             copying the ``runs:`` line, so :func:`describe` prints it.
@@ -195,19 +195,23 @@ LANES: tuple[Lane, ...] = (
     ),
     Lane(
         name="mutation",
-        summary="mutmut over codec/ -- whether an assertion would notice the line being wrong",
+        summary=(
+            "mutmut over codec/, session/ and transport/ -- whether an assertion would "
+            "notice the line being wrong"
+        ),
         tool="mutmut",
         args=("run",),
         needs=(
-            "uv sync. Writes a mutants/ copy of src/ and a generated setup.cfg, both "
-            "gitignored. Follow it with `mutmut results` to see the survivors"
+            "uv sync. Writes a mutants/ copy of src/, the tests and examples/, plus a "
+            "generated setup.cfg, all gitignored. Follow it with `mutmut results` to see "
+            'the survivors, and scope a slice with `mutmut run "gantry_sftp.session._glob*"`'
         ),
         reports_only=(
             "`mutmut run` exits 0 whether or not mutants survive, and the register of "
             "known-equivalent survivors lives in the gitignored _plans/ tree, so there is "
             "nothing in this repository for a machine to compare a run against"
         ),
-        takes="about four minutes",
+        takes="minutes scoped to one module, hours over all three packages",
     ),
 )
 

@@ -1344,6 +1344,75 @@ async def test_two_directories_that_fold_together_are_reported_not_merged(
     assert caught.value.files == 2
 
 
+async def test_a_symlinked_directory_in_the_destination_is_reported_not_merged(tmp_path: Path):
+    """D-123. A link to a directory *inside* the destination merged two remote directories.
+
+    The two halves of the destination-safety story disagreed. ``_ensure_directory`` creates
+    with ``mkdir(exist_ok=True)``, whose ``FileExistsError`` branch asks ``is_dir()`` -- which
+    follows -- so the directory is "created" through the link; then the ledger's identity was
+    ``lstat``, which sees the *link*, so the second name looked free. The file path refuses
+    exactly this shape with ``O_NOFOLLOW``.
+
+    A hard link cannot stand in here the way it does for case folding: only a symlink can name
+    a directory twice. Nothing in this test is hostile-server input -- the link is in the
+    caller's own destination, which is where the shape is reachable.
+    """
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (destination / "Docs").mkdir()
+    # Points *inside* the destination, which is the only shape that gets this far:
+    # `check_contained` resolves symlinks, so a link out of the tree is already refused.
+    (destination / "mirror").symlink_to(destination / "Docs", target_is_directory=True)
+
+    tree = {
+        b"/root": (named(b"Docs", DIRECTORY), named(b"mirror", DIRECTORY)),
+        b"/root/Docs": (named(b"a.csv", REGULAR, 3),),
+        b"/root/mirror": (named(b"b.csv", REGULAR, 5),),
+    }
+    files = {b"/root/Docs/a.csv": b"aaa", b"/root/mirror/b.csv": b"bbbbb"}
+    server = TreeServer(tree=tree, files=files)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(DestinationCollisionError) as caught:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    assert [(item.remote, item.first) for item in caught.value.collisions] == [
+        (b"/root/mirror", b"/root/Docs")
+    ]
+    # The path the caller goes and looks at, not the one it resolved to.
+    assert [item.local for item in caught.value.collisions] == [str(destination / "mirror")]
+    # Reported rather than prevented, which is what the case-folding sibling above does too:
+    # the contents still transfer and the operator is told the structure is not faithful. What
+    # this fixes is the *silence* -- before it, `get_tree` returned success.
+    assert caught.value.files == 2
+    assert sorted(item.name for item in (destination / "Docs").iterdir()) == ["a.csv", "b.csv"]
+
+
+async def test_a_symlinked_directory_pointing_outside_is_refused_by_containment(tmp_path: Path):
+    """D-123's other half: the escaping shape never reaches the ledger, and says why.
+
+    Pinned because it is the reason the ledger may follow the link at all. If containment
+    stopped resolving symlinks, following here would turn a refusal into a write outside the
+    destination -- so the two checks are load-bearing for each other rather than redundant.
+    """
+    destination = tmp_path / "out"
+    destination.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (destination / "mirror").symlink_to(elsewhere, target_is_directory=True)
+
+    tree = {
+        b"/root": (named(b"mirror", DIRECTORY),),
+        b"/root/mirror": (named(b"b.csv", REGULAR, 5),),
+    }
+    server = TreeServer(tree=tree, files={b"/root/mirror/b.csv": b"bbbbb"})
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(UnsafePathError) as caught:
+            _ = await sftp.get_tree(b"/root", destination)
+
+    assert caught.value.reason == "a path that escapes the destination directory"
+    assert list(elsewhere.iterdir()) == []
+
+
 async def test_the_refused_entry_is_reported_in_the_skip_list(tmp_path: Path):
     destination = tmp_path / "out"
     destination.mkdir()

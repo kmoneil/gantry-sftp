@@ -115,6 +115,7 @@ test that proves it, because a prevention claim without a test is a rumour.
 | Timestamps replaced by the time of the transfer | `preserve_times=` in both directions, stamping a descriptor rather than a path | `tests/test_timestamps.py` |
 | A hostile filename escaping the destination directory | every server-supplied name is checked before it reaches the filesystem: absolute paths, `..`, and a parent directory that is a symlink pointing out of the tree | `tests/test_localpath.py`, `tests/test_recursive.py` |
 | Two legal remote names silently becoming one local file | the collision check asks the filesystem for identity rather than folding the name, so Unicode normalisation and Windows trailing dots come free | `tests/test_localpath.py` |
+| Two remote *directories* silently merging into one local one | a directory is created with `mkdir(exist_ok=True)`, which succeeds through a symlink, so a directory's claim is recorded against the resolved path rather than the link's own inode | `tests/test_recursive.py` |
 | A resume that adopts the wrong bytes | a partial that cannot be a prefix is refused, and `resume_check` reports what was actually proven rather than that something was | `tests/test_resume.py`, `tests/test_content_verification.py` |
 | A `UnicodeDecodeError` on somebody else's filename | bytes end to end: `DirEntry.filename` is bytes, every `Session` method takes `bytes` or `str`, `realpath` returns bytes, and the decode question is decided once on the download side | `tests/test_listing.py` |
 | A `Path` silently becoming `\incoming\data.csv` on the server | a remote path is `bytes` or `str` and a `Path` is refused by name. `pathlib` drops a trailing slash and renders separators as backslashes on Windows, and a backslash is a legal character in a POSIX filename, so the server would create it rather than refuse it | `tests/test_path_types.py` |
@@ -1198,6 +1199,17 @@ refused, recorded in `result.skipped`, and reported at the end. A file left by a
 run is not a collision, since overwriting that is the point of re-running a download, and it is
 what `resume=` depends on. Which member of a colliding pair survives is `READDIR` order, so it
 is the server's choice and not reproducible; the error names both.
+
+**Directories are remembered by what they open, not by what they are.** A file is opened
+`O_NOFOLLOW`, so a symlink sitting at that name is refused outright and its own inode is the
+honest identity. A directory is created with `mkdir(exist_ok=True)`, which succeeds *through* a
+link to a directory — so a directory's claim is recorded against the resolved path. Without
+that, a destination holding `mirror -> Docs` would take two remote directories into one local
+one and report success. A link pointing **out** of the destination never gets that far: the
+containment check resolves symlinks and refuses it. A link you created yourself, pointing at one
+directory you meant, still works — what is reported is the second remote directory arriving on
+a local one this run already claimed. Directory collisions are reported rather than prevented:
+the contents transfer and the report says the structure is not faithful.
 
 `examples/destination_collision.py` runs it.
 

@@ -29,7 +29,7 @@ import pytest
 
 from gantry_sftp import connect
 from gantry_sftp.exceptions import ConnectError, DestinationNotAllowedError
-from gantry_sftp.transport import build_ssh_argv
+from gantry_sftp.transport import _destination, build_ssh_argv
 from gantry_sftp.transport._destination import (
     ALLOWED_HOSTS_ENV,
     _environment_layer,
@@ -64,6 +64,11 @@ def argv_for(host: str, **kwargs: object) -> list[str]:
         ("example.com.", "example.com"),
         ("  example.com  ", "example.com"),
         ("EXAMPLE.com.", "example.com"),
+        # `rstrip` takes a character *set*, not a suffix, so the argument has to be exactly the
+        # one character meant. A name ending in any other character keeps it -- the case that
+        # catches a set that grew. Same shape as `_mkdir_parents`' `rstrip(b"/")`.
+        ("exampleX", "examplex"),
+        ("example.com..", "example.com"),
     ],
 )
 def test_a_host_folds_to_one_form(given: str, expected: str):
@@ -301,6 +306,13 @@ async def test_a_probe_that_cannot_run_refuses_rather_than_allowing(tmp_path: Pa
         "refusing the connection rather than allowing an unverified destination"
         in (exc.value.args[0])
     )
+    # The state, not only the sentence. Every field here could be dropped or nulled with the
+    # message unchanged, and an operator reading a refusal needs the policy that produced it
+    # and the argv that failed -- this is the site where they have nothing else to go on.
+    assert exc.value.host == "example.com"
+    assert exc.value.layers == (("*.corp.example.com",),)
+    assert exc.value.argv == (*probe[:-4], "-G", "--", "example.com")
+    assert exc.value.argv[0] == str(missing)
 
 
 async def test_a_probe_that_exits_non_zero_refuses_and_keeps_stderr_verbatim(tmp_path: Path):
@@ -322,6 +334,14 @@ async def test_a_probe_that_exits_non_zero_refuses_and_keeps_stderr_verbatim(tmp
     assert exc.value.argv[0] == str(fake)
     # Rendered by ConnectError.__str__, so it reaches an operator without being re-formatted.
     assert "ssh: something went wrong" in str(exc.value)
+    # This site's message was the one the other two had and it did not: `stderr` being asserted
+    # is what made it look covered, and the whole sentence could be replaced with `None`.
+    assert exc.value.args[0] == (
+        "cannot check whether 'example.com' is an allowed destination: 'ssh -G' exited 255; "
+        "refusing the connection rather than allowing an unverified destination"
+    )
+    assert exc.value.host == "example.com"
+    assert exc.value.layers == (("*.corp.example.com",),)
 
 
 async def test_a_probe_that_reports_no_hostname_refuses(tmp_path: Path):
@@ -334,7 +354,101 @@ async def test_a_probe_that_reports_no_hostname_refuses(tmp_path: Path):
     with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
         await check_destination(probe, "example.com", environ={})
     assert exc.value.effective_host is None
-    assert "reported no hostname" in exc.value.args[0]
+    assert exc.value.args[0] == (
+        "cannot check whether 'example.com' is an allowed destination: 'ssh -G' reported no "
+        "hostname; refusing the connection rather than allowing an unverified destination"
+    )
+    assert exc.value.host == "example.com"
+    assert exc.value.layers == (("*.corp.example.com",),)
+    assert exc.value.argv == (*probe[:-4], "-G", "--", "example.com")
+
+
+async def test_a_probe_that_hangs_is_bounded_rather_than_hanging_the_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``ALLOWED_HOSTS_PROBE_TIMEOUT`` is documented as bounding the probe; nothing read it.
+
+    The outer ``fail_after`` is the point: without it, dropping the inner bound makes this test
+    *hang* rather than fail, which is a proof that reports the wrong thing when it breaks.
+    ``CanonicalizeHostname`` makes the probe do DNS, so this is not a theoretical wait.
+
+    Three numbers, spread so neither answer is a race: the probe is bounded at 0.5 s, the outer
+    net catches at 3 s -- six times the margin, on a machine the benchmark lane can be loading
+    -- and the fake sleeps past both. The outer one is also what keeps this cheap when it does
+    fire, since a mutant that removes the bound costs 3 s per backend rather than the sleep.
+    """
+    fake = tmp_path / "hanging-ssh"
+    _ = fake.write_text("#!/bin/sh\nsleep 5\n")
+    fake.chmod(0o700)
+    probe = argv_for("example.com", ssh_executable=str(fake))
+    monkeypatch.setattr(_destination, "ALLOWED_HOSTS_PROBE_TIMEOUT", 0.5)
+
+    with anyio.fail_after(3):
+        with (
+            allowed_hosts(["*.corp.example.com"]),
+            pytest.raises(DestinationNotAllowedError) as exc,
+        ):
+            await check_destination(probe, "example.com", environ={})
+
+    # It refuses through the probe-failed path, carrying the TimeoutError that produced it.
+    assert exc.value.args[0].startswith(
+        "cannot check whether 'example.com' is an allowed destination: the 'ssh -G' probe failed"
+    )
+    assert "TimeoutError()" in exc.value.args[0]
+    assert exc.value.effective_host is None
+
+
+async def test_a_probe_whose_stderr_is_not_utf8_still_produces_a_refusal(tmp_path: Path):
+    """A strict decode would raise ``UnicodeDecodeError`` from inside the error path.
+
+    ``ssh``'s stderr is bytes from a program in another locale, so it is not ours to assume
+    well-formed -- and the one place it is read is while building the refusal, where an
+    exception replaces a security decision with a crash.
+    """
+    fake = tmp_path / "noisy-ssh"
+    _ = fake.write_text("#!/bin/sh\nprintf 'ssh: \\377 broke\\n' >&2\nexit 255\n")
+    fake.chmod(0o700)
+    probe = argv_for("example.com", ssh_executable=str(fake))
+
+    with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "example.com", environ={})
+    assert exc.value.returncode == 255
+    assert exc.value.stderr.strip() == "ssh: � broke"
+
+
+async def test_a_probe_whose_stdout_is_not_utf8_still_reports_the_hostname(tmp_path: Path):
+    """Same byte on the channel the *answer* arrives on, where a crash loses the answer.
+
+    The hostname line is well-formed and a different line is not, which is the shape a locale
+    or a rewritten banner produces. The check has to survive it and still read the hostname.
+    """
+    fake = tmp_path / "mixed-ssh"
+    _ = fake.write_text("#!/bin/sh\nprintf 'user \\377\\nhostname evil.example.com\\n'\nexit 0\n")
+    fake.chmod(0o700)
+    probe = argv_for("example.com", ssh_executable=str(fake))
+
+    with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "example.com", environ={})
+    assert exc.value.effective_host == "evil.example.com"
+
+
+async def test_a_refusal_names_every_pattern_in_the_layer_that_refused():
+    """A one-element join puts nothing between anything, so the separator was unasserted.
+
+    Read while deciding which pattern to add, so a list rendered without separators sends the
+    reader to fix the wrong thing. The patterns are also reversed against the order they were
+    written in, which is what makes "the layer's own order is kept" observable.
+    """
+    with (
+        allowed_hosts(["sftp.corp.example.com", "backup.corp.example.com"]),
+        pytest.raises(DestinationNotAllowedError) as exc,
+    ):
+        await check_destination(argv_for("evil.net"), "evil.net", environ={})
+    assert exc.value.args[0] == (
+        "'evil.net' is not an allowed destination; it matches no pattern in 1 of the 1 active "
+        "allowlist layers ('sftp.corp.example.com', 'backup.corp.example.com'). Layers narrow "
+        "and never widen, so a host must satisfy every one of them"
+    )
 
 
 @pytest.mark.parametrize(
@@ -350,6 +464,11 @@ async def test_a_probe_that_reports_no_hostname_refuses(tmp_path: Path):
         # The format promises no uniqueness, so the last wins: a control must not be
         # shadowable by an earlier line.
         ("hostname first.example.com\nhostname second.example.com\n", "second.example.com"),
+        # The value is everything after the *first* space, so a value carrying one is kept
+        # whole and matches no pattern. Splitting on the last space instead would read this
+        # line's keyword as `hostname real.example.com` and find no hostname at all -- and the
+        # difference is only visible on a line with more than two fields.
+        ("hostname real.example.com evil.example.com\n", "real.example.com evil.example.com"),
     ],
 )
 def test_which_hostname_the_probe_output_yields(output: str, expected: str | None):
