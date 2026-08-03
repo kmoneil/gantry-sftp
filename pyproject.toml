@@ -21,7 +21,7 @@ keywords = ["sftp", "ssh", "filexfer", "openssh", "file-transfer"]
 # Windows and refuse there rather than crashing. The `ssh` transport and every remote-only
 # operation are platform-independent; see README "Requirements" and `session/_platform.py`.
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Operating System :: POSIX",
   "Programming Language :: Python :: 3 :: Only",
@@ -49,9 +49,17 @@ fsspec = [
     "fsspec>=2026.7.0",
 ]
 
-# No `[project.urls]`. There is no remote repository yet, and METADATA advertising a Homepage
-# that 404s is the same defect as a docstring pointing at a gitignored file: a reader is told
-# where to go and cannot get there. It comes back with the repository.
+# The repository exists as of 0.1.0, so these come back -- they were absent until then because
+# METADATA advertising a Homepage that 404s is the same defect as a docstring pointing at a
+# gitignored file: a reader is told where to go and cannot get there.
+#
+# `Changelog` is listed because PyPI renders it as its own link on the project page, and a
+# release without a reachable changelog makes every user diff two sdists to find out what moved.
+[project.urls]
+Homepage = "https://github.com/kmoneil/gantry-sftp"
+Source = "https://github.com/kmoneil/gantry-sftp"
+Issues = "https://github.com/kmoneil/gantry-sftp/issues"
+Changelog = "https://github.com/kmoneil/gantry-sftp/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

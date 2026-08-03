@@ -155,7 +155,7 @@ __all__ = [
     "with_reconnect",
 ]
 
-__version__ = "0.0.0"
+__version__ = "0.1.0"
 """The one place the version is written.
 
 ``pyproject.toml`` reads it from here through ``[tool.hatch.version]`` rather than restating

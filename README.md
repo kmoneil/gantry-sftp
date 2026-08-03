@@ -3,7 +3,7 @@
 A modern Python SFTP library that **does not implement SSH at all**.
 
 OpenSSH already exists and is already installed. `gantry-sftp` runs it as a subprocess, which
-hands back a plaintext, framed SFTP byte stream — so there is **zero cryptography in this
+hands back a plaintext, framed SFTP byte stream, so there is **zero cryptography in this
 package**, and key exchange, host-key verification, `ssh_config`, `ProxyJump` and
 `ControlMaster` are all things you already have rather than things this library reimplements.
 
@@ -13,6 +13,10 @@ an ergonomics layer.
 ```console
 pip install gantry-sftp
 ```
+
+[![PyPI](https://img.shields.io/pypi/v/gantry-sftp)](https://pypi.org/project/gantry-sftp/)
+[![Python](https://img.shields.io/pypi/pyversions/gantry-sftp)](https://pypi.org/project/gantry-sftp/)
+[![License](https://img.shields.io/pypi/l/gantry-sftp)](LICENSE)
 
 ```python
 from gantry_sftp.sync import connect
@@ -29,10 +33,10 @@ renamed over the destination, so a consumer polling that directory sees the old 
 one and never a half-written one. `result` says which mechanism it actually got, because every
 step of it is an optional server extension.
 
-**No event loop is needed for any of that.** The core is async — `anyio`, so asyncio *and* trio —
-and `gantry_sftp.sync` is a blocking facade over the same code rather than a second
-implementation of it. If you are writing a script, stay here. If you are writing a service, drop
-the `.sync` and add `async` / `await`:
+**No event loop is needed for any of that.** The core is async, written against `anyio` so it runs
+on asyncio *and* trio, and `gantry_sftp.sync` is a blocking facade over the same code rather than
+a second implementation of it. If you are writing a script, stay here. If you are writing a
+service, drop the `.sync` and add `async` / `await`:
 
 ```python
 import anyio
@@ -59,7 +63,7 @@ same sentence as the reason to use it, so it is here rather than at the bottom.
   sent. Everything that only talks to the far end works there. See
   [Requirements](#requirements) for why, and for the full list.
 - **About 16 MiB of memory per concurrent transfer**, which is `depth × request size` and is
-  independent of the file's size — a 40 GB download costs what a 40 MB one does. Lower `depth`
+  independent of the file's size: a 40 GB download costs what a 40 MB one does. Lower `depth`
   for a smaller container. If you are on Cloud Run, Lambda or Fly, note also that **`/tmp` is
   memory there**, so a staged download counts against your limit twice. See
   [what a transfer costs in memory](docs/tuning.md#what-a-transfer-costs-in-memory), which gives
@@ -75,7 +79,7 @@ $ python -m gantry_sftp doctor
 gantry-sftp doctor
 
 local
-  library                 0.0.0 (filexfer v3)
+  library                 0.1.0 (filexfer v3)
   ssh executable          ssh -- a bare name, so PATH decides at spawn time
   ssh version             OpenSSH_10.0p2 Debian-7+deb13u4, OpenSSL 3.5.6 7 Apr 2026
   transfers               supported
@@ -143,26 +147,26 @@ suite. If you would rather read code than prose, start there.
 
 ## What it does
 
-- **Transfers that tell you what happened.** `get` and `put` return a result object — which checks
-  ran, which could not, what a resume adopted, whether the timestamps survived — rather than a
-  byte count.
+- **Transfers that tell you what happened.** `get` and `put` return a result object rather than a
+  byte count: which checks ran, which could not, what a resume adopted, whether the timestamps
+  survived.
 - **Atomic publish by default**, with the mechanism named in the result, because every step of it
   is an optional extension and a downgrade you were not told about is worse than a refusal.
 - **Resume in both directions**, opt-in, and labelled with what it actually proves rather than
   with a claim that something was proven.
 - **Content verification** on a ladder: server-side hashing where it exists, a re-read where it
-  does not, and a size check that is always available — reporting `unavailable` rather than
+  does not, and a size check that is always available. It reports `unavailable` rather than
   success when a rung could not run.
 - **A zip-slip defence on every recursive download.** Server-supplied names are attacker-supplied
   names, and every one is validated before it reaches your filesystem.
 - **Bytes end to end**, so a filename that is not valid UTF-8 is an ordinary filename rather than
   a `UnicodeDecodeError`.
-- **Typed errors carrying state, not strings** — a `ConnectError` holds OpenSSH's own stderr
+- **Typed errors carrying state, not strings**. A `ConnectError` holds OpenSSH's own stderr
   verbatim, a `TransferError` holds both paths and the offset it stopped at.
 - **Timeouts on every wait**, including the send, so a transfer cannot hang with nothing to
   escape it.
 - **One connection, many transfers**, multiplexed over a single `ssh` child.
-- **A `pathlib`-shaped path object**, an **fsspec filesystem**, and a **blocking facade** — three
+- **A `pathlib`-shaped path object**, an **fsspec filesystem**, and a **blocking facade**: three
   ways in besides the async session.
 
 Full detail is in the guides above. `python -m gantry_sftp doctor` reports what your machine can
@@ -171,15 +175,58 @@ performance, and it writes its figures to a report rather than to this file.
 
 ## Status
 
-**Pre-alpha, and honest about it.** Nothing is published yet and the API will change.
+**0.1.0, the first public release. Alpha, and honest about it: the API can still change**, and
+while the major version is `0` a breaking change lands in the minor version. Two already have,
+deliberately, in the releases leading to this one.
 
 The protocol layer is complete: all 27 filexfer v3 packet types, encoded and decoded, each with a
 byte-level fixture asserted in **both** directions, checked against `draft-ietf-secsh-filexfer-02`
 and OpenSSH's own source. The thesis is proven end to end against a real `sshd` over a
-`tc netem`-shaped link, and against three different server implementations. Where this library is
-behind, and where the architecture costs something, is written down in
-[Why this exists](docs/architecture.md#where-this-library-is-behind) rather than left for you to
-find.
+`tc netem`-shaped link, and against three different server implementations.
+
+[`CHANGELOG.md`](CHANGELOG.md) has what is in this release **and what its known limitations are**:
+Windows transfers refuse by design, `ssh` is a system dependency, and two more. Where this library
+is behind is also in [Why this exists](docs/architecture.md#where-this-library-is-behind). Both are
+written down rather than left for you to find.
+
+## How this was built
+
+**This library was built with AI assistance.** Most of the code and prose here was written by a
+language model, directed, reviewed and accepted by a human author who is responsible for the
+result. It is stated because you would reasonably want to know, not because it is an excuse or a
+selling point.
+
+**Humans and models produce slop in roughly equal measure.** Neither one is the reason software is
+good or bad. What decides that is the verification: what is actually tested, what is measured
+against a real system instead of recalled, and which claims something would catch if they stopped
+being true. A careful human and a careful model with the same test suite land in the same place,
+and so do a careless one of each.
+
+So the rules for this repository are aimed at that, and they are enforced rather than professed.
+The specific failure mode worth designing against is **confident plausibility**: a packet layout
+recalled from memory looks exactly like one read off a wire, and a fallback described in a
+docstring reads exactly like a fallback somebody tested.
+
+- **Byte layouts are validated against the source, never from memory:**
+  `draft-ietf-secsh-filexfer-02` and OpenSSH's own `PROTOCOL` and `sftp.h`. Every one of the 27
+  packet types carries a byte-level fixture asserted on encode *and* decode, because a codec
+  tested only against its own encoder is tested against nothing.
+- **Claims about servers are measured, not remembered.** Extension behaviour, status codes, and
+  the argument order of `SYMLINK` (which the reference server reverses relative to the draft) were
+  each settled by asking a real server and keeping the answer. The suite drives the genuine
+  OpenSSH `sftp-server`, and a matrix lane drives three different implementations, because a fake
+  only ever confirms what its author already believed.
+- **A prevention claim without a test is a rumour.** The table in
+  [Why this exists](docs/architecture.md#the-failures-this-prevents) names the test for each row.
+  Documentation facts are pinned the same way: the memory figure is derived from the shipped
+  constants rather than typed, the `ssh` hint is quoted from the code that produces it, and every
+  link in these documents is checked to resolve.
+- **Mutation testing on the codec**, because a passing suite proves the tests ran, not that they
+  would have noticed.
+
+None of that makes the code correct. It makes the *claims* checkable, which is the part you cannot
+verify by reading a diff, and it is the standard this project should be held to no matter who or
+what typed it.
 
 ## Requirements
 
@@ -204,7 +251,7 @@ find.
 
 ## Development
 
-The suite runs with no network, no containers and no keys — it drives the genuine OpenSSH
+The suite runs with no network, no containers and no keys. It drives the genuine OpenSSH
 `sftp-server` over a pipe:
 
 ```console
@@ -214,7 +261,7 @@ uv sync --all-extras
 
 [Development](docs/development.md) covers the rest: the CI matrix, the controlled `ssh`
 environment every security assertion depends on, and the four lanes that run longer than a commit
-hook — leak detection, `tc netem` link shaping, benchmarks, and mutation testing.
+hook: leak detection, `tc netem` link shaping, benchmarks, and mutation testing.
 
 ## License
 

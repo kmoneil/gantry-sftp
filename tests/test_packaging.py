@@ -49,6 +49,57 @@ def test_the_licence_text_ships_in_the_repository():
     assert "3. Grant of Patent License." in text
 
 
+def test_the_changelog_exists_and_names_this_version():
+    """D-124. A release whose changelog does not mention it is a changelog nobody can use.
+
+    The version is single-sourced from ``__init__.py``, so this is the one place the two are
+    compared: a bump that forgets the entry ships METADATA pointing at a `Changelog` URL whose
+    top section describes the release before it.
+    """
+    changelog = ROOT / "CHANGELOG.md"
+    assert changelog.is_file(), "CHANGELOG.md is missing"
+    text = changelog.read_text(encoding="utf-8")
+    assert f"## {gantry_sftp.__version__}" in text, (
+        f"CHANGELOG.md has no section for {gantry_sftp.__version__}"
+    )
+
+
+def test_the_changelog_states_the_limitations_rather_than_only_the_features():
+    """The honesty property, in the one document a user reads at upgrade time.
+
+    D-88 established that the costs stay stated even when the figures go, and pinned that for
+    `benchmarks/README.md`. A release note is where the same rule bites hardest: a list of
+    features with no limitations reads as a complete description and is not one. These four are
+    decided, tested positions rather than defects to fix -- what would be dishonest is letting a
+    user discover them.
+    """
+    text = ROOT / "CHANGELOG.md"
+    changelog = " ".join(text.read_text(encoding="utf-8").split())
+    for admission in (
+        "Transfers refuse on Windows",
+        "`ssh` is a system dependency",
+        "transient `FAILURE`",
+        "Connecting is slower",
+    ):
+        assert admission in changelog, (
+            f"the changelog stopped naming a known limitation: {admission}"
+        )
+
+
+def test_the_project_urls_point_at_something_a_reader_can_reach():
+    """They were absent until 0.1.0 and the reason was written into `pyproject.toml`.
+
+    METADATA advertising a Homepage that 404s is the same defect as a docstring pointing at a
+    gitignored file, so the field came back with the repository rather than before it. Asserted
+    now so it cannot quietly go missing in a build config edit -- PyPI renders each of these as a
+    link on the project page, and a release with none is one a reader cannot get behind.
+    """
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "[project.urls]" in pyproject
+    for field in ("Homepage", "Source", "Issues", "Changelog"):
+        assert f"{field} = " in pyproject, f"[project.urls] lost {field}"
+
+
 def test_pyproject_declares_the_licence_file():
     """A `license-files` entry is what puts `License-File:` in METADATA. Without it the build
     is happy, the metadata is wrong, and nothing fails."""
@@ -499,7 +550,17 @@ def test_the_readme_sends_a_reader_who_wants_numbers_somewhere_real():
 
 # --- What the distribution carries, decided rather than defaulted (D-94) --------------------
 
-SHIPPED = ("src", "tests", "examples", "live-tests", "scripts", "docs", "README.md", "LICENSE")
+SHIPPED = (
+    "src",
+    "tests",
+    "examples",
+    "live-tests",
+    "scripts",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+)
 """Top-level entries an sdist must carry.
 
 `tests/` and `examples/` are in for a reason worth stating, because "why ship tests?" gets asked
