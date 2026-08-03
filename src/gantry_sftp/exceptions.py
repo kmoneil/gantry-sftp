@@ -22,6 +22,7 @@ __all__ = [
     "CapabilityError",
     "ConnectError",
     "DestinationCollisionError",
+    "DestinationNotAllowedError",
     "HostKeyError",
     "InsecureOptionWarning",
     "NoSuchFileError",
@@ -212,6 +213,52 @@ class HostKeyError(ConnectError):
     mentions host keys and is not one -- the remedy is a ``HostKeyAlgorithms`` setting, not a
     changed identity, and folding it in would make this class mean two different things.
     """
+
+
+class DestinationNotAllowedError(ConnectError):
+    """The connection was refused by this process's own allowlist, before any host was dialled.
+
+    D-121. Raised by :func:`gantry_sftp.allowed_hosts`' policy when the destination satisfies
+    fewer than all of the active layers, and **also** when the destination cannot be determined
+    at all -- a failed, timed-out or unparseable ``ssh -G`` probe. That second case is the
+    errored third state of the predicate, and it refuses: any way of breaking the probe would
+    otherwise be a way of defeating the allowlist.
+
+    A :class:`ConnectError` rather than a sibling of it, because to the caller it is a
+    connection that did not happen, and ``except ConnectError`` should not start missing
+    failures because a policy was switched on.
+
+    The distinction it carries that a message cannot: ``host`` is what the caller asked for and
+    ``effective_host`` is what ``ssh_config`` turned it into, which are different whenever a
+    ``Hostname`` or ``Match host`` rewrite is in play -- and telling an operator only the first
+    would name a host that is not the one being refused. ``effective_host`` is ``None`` when the
+    probe never got that far.
+
+    Attributes:
+        host: The destination as the caller supplied it.
+        effective_host: What ``ssh -G`` reported, or ``None`` if it could not be read.
+        layers: Every allowlist layer that was in force, outermost first.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        host: str,
+        effective_host: str | None,
+        layers: tuple[tuple[str, ...], ...],
+        stderr: str = "",
+        argv: tuple[str, ...] = (),
+        returncode: int | None = None,
+    ) -> None:
+        # stderr/argv/returncode go to ConnectError rather than into the message, so a failed
+        # probe renders through the same __str__ as every other connection failure. OpenSSH's
+        # stderr verbatim is the base class's whole point; a subclass that formatted its own
+        # copy would be the one place it arrived differently.
+        super().__init__(message, stderr=stderr, argv=argv, returncode=returncode)
+        self.host = host
+        self.effective_host = effective_host
+        self.layers = layers
 
 
 class UnsafePathError(SFTPError):

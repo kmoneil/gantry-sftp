@@ -57,6 +57,7 @@ from gantry_sftp.exceptions import (
     CapabilityError,
     ConnectError,
     DestinationCollisionError,
+    DestinationNotAllowedError,
     HostKeyError,
     InsecureOptionWarning,
     NoSuchFileError,
@@ -95,7 +96,7 @@ from gantry_sftp.session import (
     open_session,
     with_reconnect,
 )
-from gantry_sftp.transport import open_ssh_transport
+from gantry_sftp.transport import allowed_hosts, open_ssh_transport
 
 __all__ = [
     "LOG_FIELDS",
@@ -104,6 +105,7 @@ __all__ = [
     "CapabilityError",
     "ConnectError",
     "DestinationCollisionError",
+    "DestinationNotAllowedError",
     "DirEntry",
     "DownloadResult",
     "EntryKind",
@@ -137,6 +139,7 @@ __all__ = [
     "Verify",
     "WalkEntry",
     "__version__",
+    "allowed_hosts",
     "check_listed_name",
     "connect",
     "is_retryable",

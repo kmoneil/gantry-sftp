@@ -1935,6 +1935,68 @@ config" rather than half of one. Everything the config would have supplied, mean
 identity file and username, has an explicit parameter, so the trade is verbosity rather than
 capability.
 
+### Restricting where a connection may go
+
+If a hostname comes from user input — a job config, an API request, a `gantry-sftp://` URL —
+then the application chooses the destination and the user chooses the application's mind. That
+is server-side request forgery, and nothing in this library restricted it before 0.11.
+
+The control is an allowlist, and it is **off by default** because only the deployment knows
+the policy:
+
+```python
+from gantry_sftp import allowed_hosts
+
+with allowed_hosts(["*.corp.example.com", "sftp.partner.net"]):
+    async with connect(host_from_user) as sftp:
+        ...
+```
+
+Or, for a whole process, without touching any code — which is the only spelling that reaches
+`pd.read_parquet("gantry-sftp://…")`, since a URL is that adapter's entire interface:
+
+```
+export GANTRY_SFTP_ALLOWED_HOSTS='*.corp.example.com,sftp.partner.net'
+```
+
+**Layers narrow and never widen.** The environment variable is one layer, each `allowed_hosts`
+block is another, and a host must satisfy *every* active layer. So a deployment's floor cannot
+be raised by code running inside it, and nesting two scopes is an intersection rather than a
+replacement. An inner scope that could re-admit a host an outer one refused would be a control
+that any library in the process could switch off.
+
+**It matches the effective host, not the name you passed.** An `ssh_config` rewrites the
+destination *after* the name reaches it — measured against OpenSSH 10.0p2:
+
+```
+Host allowed.example.com
+  Hostname 169.254.169.254        # the cloud metadata endpoint
+```
+
+An allowlist checking the string would approve that connection. This one asks `ssh -G` what the
+command will really dial and checks the answer, so the rewrite is caught and the refusal names
+both halves. It also means a legitimate `ssh_config` alias works: you allowlist the destination,
+not the nickname.
+
+A refusal is a `DestinationNotAllowedError`, which is a `ConnectError` — so `except ConnectError`
+does not start missing failures because a policy was switched on. It carries `host`,
+`effective_host` and the layers that refused it.
+
+Three things it deliberately does not do, because a control that overstates itself is worse than
+an absent one:
+
+- **It does not defeat DNS rebinding.** This library resolves no names — `ssh` does, inside the
+  subprocess — so there is no address for us to pin. A validator that resolved, approved, and
+  then let `ssh` resolve again would be reproducing a published bug class rather than fixing one.
+- **It assumes the `ssh_config` is trusted**, because `ssh -G` evaluates `Match exec` and that
+  runs a program. This is not a weakening: a config you do not trust is already arbitrary code
+  execution, and [the control for that](#when-the-ssh_config-is-not-yours) is `config_file=os.devnull`.
+  An allowlist defends against an untrusted *host*, not an untrusted *config*.
+- **It is not egress control.** Only the network binds the socket.
+
+When no policy is active nothing is spawned and nothing is checked, so an unrestricted caller
+pays no process and no latency for the feature existing.
+
 ### Passwords
 
 A large fraction of enterprise SFTP endpoints, including MOVEit, GoAnywhere, Cleo and Sterling,

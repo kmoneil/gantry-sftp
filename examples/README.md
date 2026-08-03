@@ -21,6 +21,7 @@ python examples/retry.py                          # a link that drops, reconnect
 python examples/concurrent_transfers.py           # many transfers over one session
 python examples/cancellation.py                   # stop a transfer, and what it leaves behind
 python examples/connect_errors.py                 # why the connection failed, as a class
+python examples/allowed_hosts.py                  # restricting where a connection may go
 python examples/doctor.py                         # what this machine can do, as a report and as data
 python examples/password_auth.py                  # password= , and where the secret does not go
 python examples/observability.py                  # the logs, a frame dump, and the counters
@@ -71,6 +72,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `predicates.py`           | `exists()` / `isdir()` / `isfile()` / `islink()` / `getsize()` / `getmtime()` / `makedirs()`, the third state a predicate has — a refusal is not `False` — and the two questions a broken symlink separates |
 | `doctor.py`               | `python -m gantry_sftp doctor` as data: `local_diagnosis()` for a container health check with no network, `server_diagnosis()` for the handshake a transfer would make, and the exit codes that let a Dockerfile tell "no ssh" from "host unreachable" |
 | `glob_patterns.py`        | `glob()`: the `glob(3)` dialect and where it differs from `fnmatch`, the dotfile rule, `**`, a trailing `/`, POSIX character classes (`log.[[:digit:]]`, ASCII-only) and what a **misspelled** class name does, and a match whose path goes straight to `get()` — then the same job with a **regex**, which no pattern can express, over `check_listed_name` / `join_remote` / `local_child` |
+| `allowed_hosts.py`       | `allowed_hosts()` and `GANTRY_SFTP_ALLOWED_HOSTS`: restricting where a connection may go when the hostname came from somebody else — why layers only narrow, why the *effective* host is what is checked rather than the name you passed, and the three things it deliberately does not do |
 | `fsspec_urls.py`          | `gantry_sftp.fsspec`: why registration is explicit and what `sftp://` already resolves to, `ls` and `info` agreeing about a symlink where the incumbent's disagree, byte ranges through a URL, a password that reaches the constructor and none of the four surfaces fsspec would serialise it into, and the three arguments a URL may **not** set because they name a local path |
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, the names a hostile server gets refused, and `server_root` — why an absolute path costs no probe |
 | `destination_collision.py` | `DestinationCollisionError`: two legal remote names that a case-folding destination makes one file, and why the check asks the filesystem rather than the name |

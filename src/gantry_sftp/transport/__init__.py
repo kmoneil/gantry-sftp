@@ -29,6 +29,12 @@ from gantry_sftp.transport._askpass import (
     askpass_environment,
 )
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE, Transport
+from gantry_sftp.transport._destination import (
+    ALLOWED_HOSTS_ENV,
+    ALLOWED_HOSTS_PROBE_TIMEOUT,
+    active_layers,
+    allowed_hosts,
+)
 from gantry_sftp.transport._diagnosis import (
     AUTH_MARKERS,
     HOST_KEY_MARKERS,
@@ -48,6 +54,8 @@ from gantry_sftp.transport._subprocess import (
 )
 
 __all__ = [
+    "ALLOWED_HOSTS_ENV",
+    "ALLOWED_HOSTS_PROBE_TIMEOUT",
     "ASKPASS_ANSWER_VARIABLE",
     "ASKPASS_ARMING_VARIABLES",
     "AUTH_MARKERS",
@@ -62,6 +70,8 @@ __all__ = [
     "StderrBuffer",
     "SubprocessTransport",
     "Transport",
+    "active_layers",
+    "allowed_hosts",
     "askpass_environment",
     "build_ssh_argv",
     "classify_failure",

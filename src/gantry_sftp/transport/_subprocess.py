@@ -43,6 +43,7 @@ from gantry_sftp.transport._askpass import (
     askpass_environment,
 )
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE
+from gantry_sftp.transport._destination import check_destination
 from gantry_sftp.transport._diagnosis import (
     classify_failure,
     missing_executable_hint,
@@ -552,6 +553,10 @@ async def open_ssh_transport(
         subsystem=subsystem,
         ssh_executable=ssh_executable,
     )
+    # D-121. Before anything is spawned, and only when a policy is actually active -- an
+    # unrestricted caller pays nothing here, not even a process. The argv is passed verbatim
+    # because `-o` overrides change where this connection goes and therefore change the answer.
+    await check_destination(argv, host)
     # The helper exists for exactly as long as the connection does. `nullcontext` keeps the
     # key-based path -- which is every other caller -- writing no files at all.
     askpass: AbstractContextManager[Mapping[str, str] | None] = (
