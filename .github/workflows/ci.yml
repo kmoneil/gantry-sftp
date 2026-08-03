@@ -88,6 +88,23 @@ jobs:
       - run: uv run --frozen python scripts/lanes.py fast
 
   # ---------------------------------------------------------------------------
+  # The same unit tests again with the resource-leak check armed (D-115). A separate job
+  # rather than a flag on `fast`, because two passes over `gc.get_objects()` per test cost
+  # more as the heap grows and the gating lane should stay under a minute.
+  # ---------------------------------------------------------------------------
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py leaks
+
+  # ---------------------------------------------------------------------------
   # A real sshd on localhost. Linux only for now: the harness probes for its binaries and
   # validates its sshd config with `sshd -t` rather than assuming either, so it may well run
   # on macOS -- but "may well" is not a lane, and adding a runner is cheap once there is a

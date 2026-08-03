@@ -37,11 +37,12 @@ The tools are resolved inside ``.venv`` rather than taken from ``PATH``, for the
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import textwrap
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +63,9 @@ class Lane:
         reports_only: Why this lane reports instead of gating, or ``""`` if it gates. A
             non-gating lane with no reason is not allowed, so opting out is a written act.
         takes: Rough wall clock, so nobody starts the four-minute one by accident.
+        env: Environment variables this lane sets over the caller's own, empty for most.
+            A lane whose behaviour depends on one is a lane a developer cannot reproduce by
+            copying the ``runs:`` line, so :func:`describe` prints it.
     """
 
     name: str
@@ -71,6 +75,7 @@ class Lane:
     needs: str
     reports_only: str
     takes: str
+    env: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def gates(self) -> bool:
@@ -111,6 +116,20 @@ LANES: tuple[Lane, ...] = (
         ),
         reports_only="",
         takes="under a minute",
+    ),
+    Lane(
+        name="leaks",
+        summary="the unit suite again, failing the test that left a transport or child alive",
+        tool="python",
+        args=("-m", "pytest"),
+        needs=(
+            "uv sync, and the same openssh-server the fast lane wants. Arms the autouse "
+            "check with GANTRY_SFTP_LEAK_CHECK=1 -- the fast lane leaves it off because two "
+            "passes over gc.get_objects() per test cost more as the heap grows"
+        ),
+        reports_only="",
+        takes="minutes -- the same tests as `fast`, about an order of magnitude slower",
+        env={"GANTRY_SFTP_LEAK_CHECK": "1"},
     ),
     Lane(
         name="live",
@@ -272,7 +291,8 @@ def describe(width: int = 96) -> str:
         shown = tool.relative_to(REPO_ROOT) if tool.is_relative_to(REPO_ROOT) else tool
         lines.append(f"  {lane.name:<11} {verdict:<13} {lane.takes}")
         lines.extend(_wrapped(lane.summary, width))
-        lines.append(f"    runs:  {shown} {' '.join(lane.args)}")
+        prefix = "".join(f"{name}={value} " for name, value in sorted(lane.env.items()))
+        lines.append(f"    runs:  {prefix}{shown} {' '.join(lane.args)}")
         lines.extend(_wrapped(f"needs: {lane.needs}", width))
         if lane.reports_only:
             lines.extend(_wrapped(f"why it does not gate: {lane.reports_only}", width))
@@ -292,7 +312,8 @@ def run_lane(lane: Lane, *, dry_run: bool = False) -> int:
         which is a missing ``uv sync`` rather than a failing lane, and says so.
     """
     argv = lane_argv(lane)
-    print(f">>> {lane.name}: {' '.join(argv)}")
+    prefix = "".join(f"{name}={value} " for name, value in sorted(lane.env.items()))
+    print(f">>> {lane.name}: {prefix}{' '.join(argv)}")
     if dry_run:
         return 0
     if not Path(argv[0]).exists():
@@ -302,7 +323,10 @@ def run_lane(lane: Lane, *, dry_run: bool = False) -> int:
             file=sys.stderr,
         )
         return 127
-    return subprocess.run(argv, cwd=REPO_ROOT, check=False).returncode
+    # The lane's own variables are layered over the caller's rather than replacing them:
+    # a lane still needs PATH, HOME and whatever the developer's shell supplies.
+    environment = {**os.environ, **lane.env} if lane.env else None
+    return subprocess.run(argv, cwd=REPO_ROOT, check=False, env=environment).returncode
 
 
 def main(argv: Sequence[str] | None = None) -> int:

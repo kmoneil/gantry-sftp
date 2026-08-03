@@ -262,6 +262,55 @@ def test_no_lane_is_run_through_a_shell(monkeypatch: pytest.MonkeyPatch) -> None
     assert "shell" not in kwargs
 
 
+def test_a_lanes_environment_is_layered_over_the_callers_rather_than_replacing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-115. The `leaks` lane is only a lane because of its variable, so it has to arrive.
+
+    And the layering is the part worth pinning: replacing the environment rather than adding
+    to it would take PATH and HOME away from the subprocess, which fails in a way that blames
+    the tests rather than the runner.
+    """
+    calls: list[dict[str, object]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setenv("SOMETHING_THE_CALLER_SET", "kept")
+    monkeypatch.setattr(lanes, "lane_argv", lambda lane: [sys.executable, lane.name])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert lanes.main(["leaks"]) == 0
+    environment = calls[0]["env"]
+    assert isinstance(environment, dict)
+    assert environment["GANTRY_SFTP_LEAK_CHECK"] == "1"
+    assert environment["SOMETHING_THE_CALLER_SET"] == "kept"
+
+
+def test_a_lane_with_no_environment_of_its_own_inherits_rather_than_being_handed_a_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`env=None` is inheritance. Every lane but one wants exactly that."""
+    calls: list[dict[str, object]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(lanes, "lane_argv", lambda lane: [sys.executable, lane.name])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert lanes.main(["fast"]) == 0
+    assert calls[0]["env"] is None
+
+
+def test_the_table_shows_a_lanes_environment_so_the_runs_line_can_be_copied() -> None:
+    """A `runs:` line that omits the variable is a line that does something else when pasted."""
+    table = lanes.describe()
+    assert "GANTRY_SFTP_LEAK_CHECK=1 .venv/bin/python -m pytest" in table
+
+
 def test_lanes_run_in_the_order_given(monkeypatch: pytest.MonkeyPatch) -> None:
     ran: list[str] = []
 
@@ -323,7 +372,7 @@ def test_an_unknown_lane_names_the_ones_that_exist(
     assert lanes.main(["fats"]) == 2
     assert capsys.readouterr().err == (
         "error: unknown lane 'fats'; known lanes are "
-        "gates, fast, live, matrix, netem, benchmarks, mutation\n"
+        "gates, fast, leaks, live, matrix, netem, benchmarks, mutation\n"
     )
 
 

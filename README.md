@@ -2628,6 +2628,7 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 | --- | --- | --- |
 | `lanes.py gates` | ruff, mypy `--strict`, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit | nothing; POSIX only |
 | `lanes.py fast` | unit tests, the real `sftp-server` rows, every example as a subprocess | `openssh-server` for some rows |
+| `lanes.py leaks` | the unit tests again, failing the one that left a transport, session or child process alive | `openssh-server` for some rows |
 | `lanes.py live` | a real `sshd` on localhost: transport, `ssh` environment, cancellation, handles | `openssh-server` |
 | `lanes.py matrix` | one client against three servers: OpenSSH, asyncssh, paramiko | `uv sync --group bench` |
 | `lanes.py netem` | every pipelining claim, on a `tc`-shaped link at 5/50/200 ms RTT | `CAP_NET_ADMIN` |
@@ -2720,6 +2721,46 @@ against OpenSSH 10.0p2:
   `WAYLAND_DISPLAY`, either alone being enough to make a passphrase-protected key authenticate
   through a helper. Both were missing from the set; `WAYLAND_DISPLAY` appears nowhere in
   `ssh(1)`.
+
+### The leak lane
+
+```bash
+python scripts/lanes.py leaks
+```
+
+The same unit tests as `fast`, with an autouse fixture that fails **the test that leaked** a
+transport, a session, a dispatcher or a child process. It is armed by `GANTRY_SFTP_LEAK_CHECK`
+and off otherwise, because it makes two full passes over `gc.get_objects()` per test — a cost
+that scales with the live heap, and lands about an order of magnitude above `fast` on the whole
+suite. The gating lane should stay under a minute.
+
+Which test fails is the entire point. The last leak of this shape — `Process.aclose()` never
+called, leaving the pipe transports open for the garbage collector — surfaced as failures in
+*unrelated later tests*, which is indistinguishable from flakiness while it is happening and
+costs an afternoon of reading the wrong module.
+
+**It counts live instances of a few named types, not bytes and not total objects**, and the
+reason is measured rather than assumed. All three were compared against the two leak shapes
+this project has actually had:
+
+| case | fds | total objects | watched types |
+| --- | --- | --- | --- |
+| clean transfer, ×3 | +0 | +1 | none |
+| a plain file left open | +1 | +3 | none |
+| `Process` never closed | +0 | +29 | `Process` +2 |
+| async generator abandoned | +0 | +100 | `Dispatcher`, `Process`, `Session`, `SubprocessTransport` |
+
+`tracemalloc` bytes and the total object count both see the leaks, and neither can be
+thresholded: across 294 real tests, 22% grow the total object count and one reaches **146
+objects** — an fsspec test whose subject is a `storage_options` dict. The real leaks are +29
+and +100, so a threshold clearing the noise misses the leak. Counting the resource-bearing
+types instead needs no threshold at all — one survivor is a failure — and across those same
+294 tests it grew zero times. It also names what leaked, which is what the last one needed.
+
+`tests/test_leakcheck.py` leaks on purpose in both shapes and asserts the detector reports
+them, because a detector nobody has watched fail is a decoration. Adding a new transport means
+adding it to `WATCHED_TYPES`; a test asserts that list covers every `Transport` the package
+exports, so a new one cannot go unwatched silently.
 
 ### The netem lane
 

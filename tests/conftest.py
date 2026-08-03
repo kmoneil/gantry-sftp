@@ -19,6 +19,7 @@ from gantry_sftp.codec import Codec
 from gantry_sftp.exceptions import _flatten_exception_group
 from gantry_sftp.session import Dispatcher
 from gantry_sftp.transport import Transport
+from leakcheck import leak_check_enabled, settle
 
 
 @asynccontextmanager
@@ -60,6 +61,42 @@ async def negotiate(transport: Transport) -> Codec:
     while codec.state.name != "READY":
         codec.receive(await transport.receive())
     return codec
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_resources(request: pytest.FixtureRequest):
+    """Fail the test that leaked a transport, a session or a child process (D-115).
+
+    Armed by ``GANTRY_SFTP_LEAK_CHECK`` and inert otherwise: it makes two full passes over
+    ``gc.get_objects()`` per test, a cost that scales with the live heap rather than being a
+    flat per-test constant, and lands about an order of magnitude above the default lane over
+    the whole suite. `scripts/lanes.py leaks` is the spelling that arms it.
+
+    **The point is which test fails, not that one does.** The last leak of this shape
+    (`Process.aclose()` never called) showed up as failures in unrelated *later* tests, so the
+    message names the type that survived and the test that left it behind.
+
+    See :mod:`tests.leakcheck` for why this counts a few named types rather than bytes or the
+    total object count -- both of which see the leaks and neither of which can be thresholded,
+    with the numbers that settled it.
+    """
+    if not leak_check_enabled():
+        yield
+        return
+
+    before = settle()
+    yield
+    after = settle()
+
+    grown = after.growth_since(before)
+    if grown:
+        detail = ", ".join(f"{name} +{count}" for name, count in grown.items())
+        pytest.fail(
+            f"{request.node.nodeid} leaked: {detail}. These objects were still alive after "
+            f"two gc.collect() passes, so something still references them. A transport, "
+            f"session or process that outlives its test will be blamed on a later one -- see "
+            f"tests/leakcheck.py."
+        )
 
 
 @pytest.fixture(params=["asyncio", "trio"])
