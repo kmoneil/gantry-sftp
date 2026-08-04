@@ -1408,3 +1408,261 @@ def test_a_url_opens_end_to_end_through_fsspecs_own_entry_points(tree: Path, dro
 def test_the_file_object_is_ours_rather_than_a_paramiko_one(fs, drop: str):
     with fs.open(f"{drop}/report.csv", "rb") as handle:
         assert isinstance(handle, GantrySFTPFile)
+
+
+# --- D-135: the errors name the path, at every site that raises them --------------------------
+#
+# `_translated(remote)` appears eight times in this module and each one is a separate call with
+# its own argument. Nulled, the `FileNotFoundError` fsspec's callers catch names nothing -- and
+# fsspec's *contract* is only the exception type, so a usable message is entirely ours.
+#
+# One case per site rather than one for the helper: "count the sites by what they do, not by
+# their name" is this register's own rule, and eight callers of one helper are eight places the
+# argument can be dropped.
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("cat_file", ()),
+        ("_rm", ()),
+        ("modified", ()),
+        ("info", ()),
+        ("ls", ()),
+    ],
+)
+def test_an_operation_on_a_missing_path_names_that_path(fs, drop: str, operation, arguments):
+    missing = f"{drop}/not-here.csv"
+    with pytest.raises(FileNotFoundError) as exc:
+        getattr(fs, operation)(missing, *arguments)
+    assert exc.value.args[0] == missing
+
+
+def test_moving_a_missing_path_names_it(fs, drop: str):
+    with pytest.raises(FileNotFoundError) as exc:
+        fs.mv(f"{drop}/not-here.csv", f"{drop}/elsewhere.csv")
+    assert exc.value.args[0] == f"{drop}/not-here.csv"
+
+
+# --- the symlink rules, where following one is the whole difference ---------------------------
+
+
+def test_removing_a_symlink_removes_the_link_and_not_its_target(fs, drop: str, tree: Path):
+    """`isdir(follow_symlinks=False)` and `remove`, not `rmdir` on what it points at.
+
+    `latest.csv` points at `report.csv`. Followed, an `rm` of the link would be an `rm` of the
+    file -- silent data loss of exactly the shape a drop directory is the scene of.
+    """
+    fs._rm(f"{drop}/latest.csv")  # noqa: SLF001
+
+    assert not (tree / "incoming" / "latest.csv").is_symlink()
+    assert (tree / "incoming" / "report.csv").read_bytes() == b"id,total\n1,42\n"
+
+
+def test_removing_a_symlink_to_a_directory_unlinks_it_rather_than_removing_the_directory(
+    fs, drop: str, tree: Path
+):
+    # `isdir` following the link would route this to `rmdir`, which refuses a symlink -- and on
+    # a server where it did not, would take the directory's contents with it.
+    (tree / "incoming" / "to-archive").symlink_to(tree / "incoming" / "archive")
+
+    fs._rm(f"{drop}/to-archive")  # noqa: SLF001
+
+    assert not (tree / "incoming" / "to-archive").exists(follow_symlinks=False)
+    assert (tree / "incoming" / "archive" / "old.csv").exists(), "the target directory went too"
+
+
+def test_a_dangling_symlink_counts_as_occupying_its_name(fs, drop: str):
+    """`_occupied` asks with `follow_symlinks=False`, and a dangling link is the case.
+
+    A name holding a broken symlink *is* taken -- `mkdir` there fails -- so a check that
+    followed the link would report the name free and turn a `FileExistsError` into whatever
+    the server says instead.
+    """
+    assert fs._occupied(f"{drop}/dangling") is True  # noqa: SLF001
+    assert fs._occupied(f"{drop}/report.csv") is True  # noqa: SLF001
+    assert fs._occupied(f"{drop}/not-here.csv") is False  # noqa: SLF001
+
+
+def test_making_a_directory_where_a_dangling_symlink_sits_says_it_exists(fs, drop: str):
+    # The two halves of `_creating` together: the server refuses, `_occupied` says the name is
+    # taken, and the refusal becomes the `FileExistsError` fsspec's callers expect.
+    with pytest.raises(FileExistsError) as exc:
+        fs.mkdir(f"{drop}/dangling", create_parents=False)
+    assert exc.value.args[0] == f"{drop}/dangling"
+
+
+# --- directories, and the flags that decide whether an existing one is an error ---------------
+
+
+def test_mkdir_with_parents_tolerates_a_directory_that_is_already_there(fs, drop: str):
+    # `exist_ok=True` on the `makedirs` branch: fsspec's `mkdir(create_parents=True)` is
+    # `os.makedirs`-shaped, and a second call must not raise.
+    fs.mkdir(f"{drop}/new/deep", create_parents=True)
+    fs.mkdir(f"{drop}/new/deep", create_parents=True)
+    assert fs.isdir(f"{drop}/new/deep")
+
+
+def test_mkdir_without_parents_refuses_a_directory_that_is_already_there(fs, drop: str):
+    # And the other branch does *not* tolerate it, which is what `create_parents` selects.
+    with pytest.raises(FileExistsError):
+        fs.mkdir(f"{drop}/archive", create_parents=False)
+
+
+def test_uploading_a_local_directory_creates_the_remote_one(fs, drop: str, tmp_path: Path):
+    """`put_file` on a directory is a `makedirs`, and `exist_ok=True` makes it repeatable.
+
+    An upload loop that walks a tree calls this once per directory, and the second run of the
+    same job hits every one of them again.
+    """
+    (tmp_path / "batch").mkdir()
+    fs.put_file(tmp_path / "batch", f"{drop}/batch")
+    fs.put_file(tmp_path / "batch", f"{drop}/batch")
+    assert fs.isdir(f"{drop}/batch")
+
+
+def test_uploading_creates_the_remote_parent(fs, drop: str, tmp_path: Path):
+    # The parent of the *destination*, so `fs.put_file(x, url + "/2026/report.csv")` works the
+    # way the same call does on every other fsspec backend.
+    source = tmp_path / "upload.csv"
+    _ = source.write_bytes(b"id\n9\n")
+    fs.put_file(source, f"{drop}/2026/q1/report.csv")
+    assert fs.cat_file(f"{drop}/2026/q1/report.csv") == b"id\n9\n"
+
+
+def test_an_upload_reports_progress_through_the_bridge(fs, drop: str, tmp_path: Path):
+    # `progress=_bridge(callback)` on the fast path, which is a different call site from
+    # `get_file`'s and had nothing reading it.
+    source = tmp_path / "upload.csv"
+    _ = source.write_bytes(b"id\n5\n" * 100)
+    recorder = _Recorder()
+
+    fs.put_file(source, f"{drop}/watched.csv", callback=recorder)
+
+    assert recorder.seen, "the callback never moved on the upload path"
+    assert recorder.seen[-1][0] == source.stat().st_size
+
+
+# --- the file object, and the fields a listing carries ----------------------------------------
+
+
+def test_opening_a_file_forwards_the_block_size_and_the_caching_it_was_given(fs, drop: str):
+    """Four arguments handed to `GantrySFTPFile`, each droppable on its own.
+
+    `block_size` is the one with teeth: dropped, every read of a parquet footer falls back to
+    the class default, and the round-trip count a caller tuned for goes with it.
+    """
+    with fs._open(f"{drop}/big.bin", block_size=4096, cache_type="none") as handle:  # noqa: SLF001
+        assert handle.blocksize == 4096
+        assert handle.mode == "rb"
+        assert handle.autocommit is True
+        assert handle.read(4) == bytes(range(256))[:4]
+
+
+def test_a_listing_carries_the_owner_and_the_times_under_the_names_fsspec_uses(fs, drop: str):
+    """`uid`/`gid` and `mtime`/`time`, which are four separate assignments to one dict.
+
+    A key that changes case is a key nothing reads, and a value crossed onto its neighbour
+    reports the group as the owner. `time` is fsspec's name for the *access* time -- ours is
+    `atime` -- and conflating the two is what a swap here looks like.
+    """
+    entry = fs.info(f"{drop}/report.csv")
+
+    assert entry["uid"] == os.getuid()
+    assert entry["gid"] == os.getgid()
+    assert entry["mtime"] == pytest.approx(
+        (tree_path := Path(entry["name"])).stat().st_mtime, abs=1
+    )
+    assert entry["time"] == pytest.approx(tree_path.stat().st_atime, abs=1)
+    assert entry["size"] == tree_path.stat().st_size
+
+
+def test_a_buffered_write_accumulates_across_chunks(fs, drop: str):
+    """`self._written += written`, where `=` reports only the last chunk and `-=` counts down.
+
+    fsspec's buffered file flushes whenever the buffer fills, so a write larger than the block
+    size arrives as several `_upload_chunk` calls -- and the running total is what the last one
+    checks against the size it promised.
+    """
+    payload = b"".join(f"{n:07d}\n".encode() for n in range(20000))
+    with fs.open(f"{drop}/streamed.csv", "wb", block_size=4096) as handle:
+        _ = handle.write(payload)
+
+    assert fs.cat_file(f"{drop}/streamed.csv") == payload
+    assert fs.info(f"{drop}/streamed.csv")["size"] == len(payload)
+
+
+def test_a_buffered_write_of_nothing_still_creates_the_file(fs, drop: str):
+    # `payload.nbytes and self._handle is not None` -- an `or` there writes an empty payload
+    # through a handle that may not exist yet, and the guard is what makes a zero-byte upload
+    # land as a zero-byte file rather than as an error.
+    with fs.open(f"{drop}/empty.csv", "wb") as handle:
+        _ = handle.write(b"")
+
+    assert fs.cat_file(f"{drop}/empty.csv") == b""
+    assert fs.info(f"{drop}/empty.csv")["size"] == 0
+
+
+# --- the last of it: names, ranges, and registration ------------------------------------------
+
+
+def test_a_path_that_is_not_valid_utf8_survives_the_round_trip(fs, drop: str, tree: Path):
+    """`surrogateescape` both ways, which is the only thing that makes such a name operable.
+
+    `_encode` is the inverse of the decode every listing goes through. Strict, it raises on a
+    name the server just handed us; any other handler, and the bytes that go back out are not
+    the bytes that came in -- so the file cannot be opened, moved or deleted by this client at
+    all. Ordinary on Linux, and the axis this suite has to vary along.
+    """
+    listed = [name for name in fs.ls(drop) if "caf" in name]
+    assert listed, "the fixture's non-UTF-8 name did not survive listing"
+
+    (odd,) = listed
+    assert fs.cat_file(odd) == b"\xe9"
+    # Round-tripped through *our* encoder rather than compared to a literal: what is asserted is
+    # that what we send equals what the filesystem holds.
+    assert Path(os.fsdecode(gantry_fsspec._encode(odd))).read_bytes() == b"\xe9"  # noqa: SLF001
+
+
+def test_a_zero_length_range_asks_the_server_for_nothing(fs, drop: str):
+    """`end <= start` is empty, and `<` would send a zero-length READ instead of short-circuiting.
+
+    A zero-length READ is legal and answers with empty DATA, so the bytes are right either way
+    -- what changes is a round trip per call, on the path a block cache uses most.
+    """
+    with fs.open(f"{drop}/report.csv", "rb") as handle:
+        before = fs.sftp.requests_sent
+        assert handle._fetch_range(5, 5) == b""  # noqa: SLF001
+        assert fs.sftp.requests_sent == before, "an empty range still went to the server"
+
+
+def test_a_range_asks_for_the_length_it_was_given(fs, drop: str):
+    # `end - start`, where `+` asks for a length that runs past the end of the file -- which a
+    # server clamps, so the bytes look right and only the request is wrong.
+    with fs.open(f"{drop}/report.csv", "rb") as handle:
+        assert handle._fetch_range(3, 8) == b"total"  # noqa: SLF001
+
+
+def test_registration_replaces_a_protocol_that_is_already_resolved(monkeypatch):
+    """`clobber=True`, which is what makes `override=True` mean anything.
+
+    fsspec's `register_implementation` defaults to `clobber=False` and then *raises* when the
+    protocol is already in the live registry -- so without this the deliberate override would
+    fail with fsspec's error rather than doing what the caller asked, and only after they had
+    already read the warning and decided.
+    """
+    register("gantry-sftp")
+    # Registering the same name a second time is what a caller doing `register(override=True)`
+    # in a module imported twice looks like, and it must not raise.
+    register("gantry-sftp")
+    assert registry.get("gantry-sftp") is GantrySFTPFileSystem
+
+
+def test_the_incumbent_check_reads_the_class_key_fsspec_actually_uses(monkeypatch):
+    # `known_implementations` maps a protocol to a dict whose `"class"` entry is the import
+    # path. Read under any other key it is always `None`, so every protocol looks unclaimed and
+    # the refusal that protects `sftp://` never fires.
+    assert known_implementations["sftp"]["class"] == ("fsspec.implementations.sftp.SFTPFileSystem")
+    with pytest.raises(ValueError) as exc:
+        register("sftp")
+    assert "already registered to" in exc.value.args[0]
