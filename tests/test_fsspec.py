@@ -43,7 +43,7 @@ from fsspec.registry import (
 
 from gantry_sftp import fsspec as gantry_fsspec
 from gantry_sftp.codec import Attrs
-from gantry_sftp.exceptions import CapabilityError, NoSuchFileError
+from gantry_sftp.exceptions import CapabilityError, NoSuchFileError, ServerError
 from gantry_sftp.fsspec import (
     _AUTHORITY_ONLY,
     _QUERY_FLOATS,
@@ -1596,12 +1596,16 @@ def test_a_buffered_write_accumulates_across_chunks(fs, drop: str):
     size arrives as several `_upload_chunk` calls -- and the running total is what the last one
     checks against the size it promised.
     """
-    payload = b"".join(f"{n:07d}\n".encode() for n in range(20000))
+    chunks = [bytes([ordinal]) * 20_000 for ordinal in b"abc"]
     with fs.open(f"{drop}/streamed.csv", "wb", block_size=4096) as handle:
-        _ = handle.write(payload)
+        for chunk in chunks:
+            # One `write` per chunk, because fsspec flushes the *whole* buffer rather than
+            # block-sized pieces of it -- a single large write is one `_upload_chunk` call and
+            # cannot see an offset that fails to accumulate.
+            _ = handle.write(chunk)
 
-    assert fs.cat_file(f"{drop}/streamed.csv") == payload
-    assert fs.info(f"{drop}/streamed.csv")["size"] == len(payload)
+    assert fs.cat_file(f"{drop}/streamed.csv") == b"".join(chunks)
+    assert fs.info(f"{drop}/streamed.csv")["size"] == sum(len(c) for c in chunks)
 
 
 def test_a_buffered_write_of_nothing_still_creates_the_file(fs, drop: str):
@@ -1827,3 +1831,168 @@ def test_an_override_replaces_a_protocol_that_is_already_resolved():
 
     register("sftp", override=True)
     assert registry.get("sftp") is GantrySFTPFileSystem
+
+
+# --- D-135, the tail: guards, keys and the round trips they decide ---------------------------
+
+
+@pytest.mark.parametrize("url", ["gantry-sftp://h/x?cwd=", "gantry-sftp://h/x?user="])
+def test_a_query_parameter_with_an_empty_value_is_kept_rather_than_dropped(url: str):
+    """`keep_blank_values=True`, without which `?cwd=` vanishes instead of meaning something.
+
+    `parse_qsl` drops empty values by default, so the parameter would not appear at all --
+    which is not the same as being rejected. An unknown parameter is refused loudly here, so a
+    silently *dropped* one is the single shape this module's parsing is written to prevent.
+    """
+    key = url.rsplit("?", 1)[1].rstrip("=")
+    kwargs = GantrySFTPFileSystem._get_kwargs_from_urls(url)  # noqa: SLF001
+    assert key in kwargs or key in _SESSION_KEYS
+    if key in kwargs:
+        assert kwargs[key] == ""
+
+
+def test_a_listing_says_whether_each_entry_is_a_link(fs, drop: str):
+    # `islink` is a separate key from `type`, as it is in fsspec's own LocalFileSystem, and it
+    # is seeded `False` and set `True` only on the symlink branch -- so both the key's spelling
+    # and its seed matter, and a listing where everything is a link is as wrong as one where
+    # nothing is.
+    entries = {entry["name"]: entry for entry in fs.ls(drop, detail=True)}
+
+    assert entries[f"{drop}/report.csv"]["islink"] is False
+    assert entries[f"{drop}/latest.csv"]["islink"] is True
+    assert entries[f"{drop}/archive"]["islink"] is False
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("gantry-sftp://h/incoming/", "/incoming"),
+        ("gantry-sftp://h/incoming//", "/incoming"),
+        ("gantry-sftp://h/", "/"),
+        # `rstrip` takes a character *set*, not a suffix: any other string strips its letters
+        # too, and a remote name ending in one of them loses it.
+        ("gantry-sftp://h/incomingX", "/incomingX"),
+    ],
+)
+def test_a_url_path_keeps_every_character_that_is_not_a_trailing_slash(given: str, expected: str):
+    assert GantrySFTPFileSystem._strip_protocol(given) == expected  # noqa: SLF001
+
+
+def test_a_path_that_is_not_a_string_is_the_root(fs):
+    """`not isinstance(text, str) or not text`, where an `and` needs *both* to be wrong.
+
+    fsspec calls `_strip_protocol` with whatever a caller passed, and `infer_storage_options`
+    can hand back something that is not a path at all. With `and`, an empty string falls
+    through to `rstrip` and the root marker is never reached.
+    """
+    assert GantrySFTPFileSystem._strip_protocol("") == "/"  # noqa: SLF001
+    assert GantrySFTPFileSystem._strip_protocol("gantry-sftp://h") == "/"  # noqa: SLF001
+
+
+def test_a_name_the_server_refuses_to_stat_is_not_occupied(fs, drop, monkeypatch):
+    """`_occupied`'s `except SFTPError: return False`, which decides what a refusal means.
+
+    Returning `True` there turns every unreadable name into "already exists", so a `mkdir`
+    that failed for a reason the server did not explain is reported as a `FileExistsError` --
+    sending the caller to delete something that may not be there.
+    """
+
+    def refuse(_self, _path, **_kwargs):
+        raise ServerError("no", code=4)
+
+    monkeypatch.setattr(type(fs.sftp), "exists", refuse)
+    assert fs._occupied(f"{drop}/report.csv") is False  # noqa: SLF001
+
+
+def test_reading_an_empty_range_costs_no_round_trip(fs, drop: str):
+    # `length <= 0` short-circuits; `< 0` sends a zero-length READ, which is legal and answers
+    # with empty DATA -- so the bytes agree and only the request count does not.
+    before = fs.sftp.requests_sent
+    assert fs.cat_file(f"{drop}/report.csv", start=4, end=4) == b""
+    # One OPEN, one FSTAT, one CLOSE -- and no READ.
+    assert fs.sftp.requests_sent - before == 3
+
+
+def test_a_progress_bridge_sets_the_size_once_however_many_chunks_arrive(fs, drop, tmp_path):
+    """`sized.add(total)`, where adding `None` makes the guard match nothing.
+
+    fsspec's callback is incremental with the size set *once*; this library's is absolute. The
+    bridge remembers which totals it has announced, and remembering the wrong thing means
+    `set_size` fires on every chunk -- which resets a progress bar to the start each time.
+    """
+    sizes: list[int | None] = []
+
+    class _CountingSize(_Recorder):
+        def set_size(self, size):  # type: ignore[no-untyped-def]
+            sizes.append(size)
+            super().set_size(size)
+
+    source = tmp_path / "big-upload.bin"
+    _ = source.write_bytes(b"x" * 400_000)
+    fs.put_file(source, f"{drop}/big-upload.bin", callback=_CountingSize())
+
+    assert len(sizes) == 1, f"the size was announced {len(sizes)} times"
+
+
+def test_closing_a_filesystem_that_never_connected_does_nothing(tree: Path):
+    """`_stack` and `_owner_pid` start as `None`, and `close()` reads both.
+
+    Seeded to anything else that is not `None`, `close()` on an instance nobody used tries to
+    unwind a stack that does not exist -- and merely *resolving* a URL constructs one of these,
+    so an unused instance is the common case rather than the odd one.
+    """
+    filesystem = LocalGantryFS(str(tree), skip_instance_cache=True)
+    assert filesystem._stack is None  # noqa: SLF001
+    assert filesystem._owner_pid is None  # noqa: SLF001
+    filesystem.close()  # must not raise
+
+
+def test_closing_a_file_twice_closes_the_handle_once(fs, drop: str):
+    """`already = self.closed`, read *before* the base class closes anything.
+
+    The handle is released in a `finally`, so the second `close()` reaches it too -- and
+    `already` is the only thing that stops a second `CLOSE` going out for a handle the server
+    has already forgotten. Reading it after `super().close()` would make it always `True` and
+    leak the handle instead.
+    """
+    handle = fs.open(f"{drop}/report.csv", "rb")
+    assert handle.read(2) == b"id"
+
+    before = fs.sftp.requests_sent
+    handle.close()
+    after_first = fs.sftp.requests_sent
+    handle.close()
+
+    assert after_first > before, "the handle was never closed"
+    assert fs.sftp.requests_sent == after_first, "a second CLOSE went out for a closed handle"
+
+
+def test_reading_a_file_that_vanished_names_it(fs, drop: str, tree: Path):
+    # `_read_handle`'s own `_translated(self._remote)`, which is a different call site from
+    # `cat_file`'s: the file object opens lazily, so the failure arrives on the first *read*.
+    handle = fs.open(f"{drop}/report.csv", "rb")
+    (tree / "incoming" / "report.csv").unlink()
+
+    with pytest.raises(FileNotFoundError) as exc:
+        _ = handle.read(4)
+    assert exc.value.args[0] == f"{drop}/report.csv"
+
+
+def test_a_path_like_local_object_is_accepted_and_becomes_a_path(fs, drop: str, tmp_path: Path):
+    """`_local_path` returns `Path(resolved)`, and `__fspath__` is the third accepted spelling.
+
+    A `str` and a `Path` are the obvious two; anything implementing `__fspath__` is the one
+    nothing exercised, and it is what a caller passes when they wrap paths in a type of their
+    own. `Path(None)` would refuse every one of them.
+    """
+
+    class Wrapped:
+        def __init__(self, where: Path) -> None:
+            self._where = where
+
+        def __fspath__(self) -> str:
+            return str(self._where)
+
+    destination = tmp_path / "via-fspath.csv"
+    fs.get_file(f"{drop}/report.csv", Wrapped(destination))
+    assert destination.read_bytes() == b"id,total\n1,42\n"
