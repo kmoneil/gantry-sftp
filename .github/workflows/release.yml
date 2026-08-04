@@ -105,6 +105,21 @@ jobs:
             exit 1
           fi
 
+      - name: Refuse a tag whose changelog section is still 'Unreleased'
+        # `tests/test_packaging.py` accepts either a `## <version>` heading or `## Unreleased`,
+        # because before the first tag the honest answer is the second one -- and a dated
+        # heading for a release nobody can install is the failure that check exists to prevent.
+        # Tagging is the moment that stops being true, and it is the only moment: nothing a
+        # commit-time hook can see distinguishes "not released yet" from "forgot to write it up".
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -qE "^## ${version}( |$)" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## ${version}' section; rename '## Unreleased' and date it" >&2
+            exit 1
+          fi
+
       - run: uv build --no-build-isolation
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

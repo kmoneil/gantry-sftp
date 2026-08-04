@@ -149,9 +149,9 @@ pd.read_parquet(
 )
 ```
 
-### Two things about fsspec's own design to know before you deploy this
+### Three things about fsspec's own design to know before you deploy this
 
-Neither is a defect of this adapter, and both will surprise you if nobody says them.
+None is a defect of this adapter, and each will surprise you if nobody says it.
 
 - **One connection per thread, not per host.** fsspec caches filesystem instances by a token
   that includes the thread id, and the cache holds a strong reference on purpose, so
@@ -163,10 +163,12 @@ Neither is a defect of this adapter, and both will surprise you if nobody says t
 - **A password in a URL is a password in `storage_options`** for every other fsspec
   filesystem, which is what `__reduce__` pickles — so a dask scheduler ships it to every
   worker — and what `to_json()` serialises, with `include_password` defaulting to `True`.
-  **Not here**: the password reaches the constructor and is never stored on the instance, so
-  none of those carry it. The cost is stated rather than hidden — the password is not part of
-  the cache token either, so two filesystems differing only in password come back as one
-  instance holding the first.
+  **Not here**: `_strip_tokenize_options` means the password reaches the constructor and never
+  reaches `storage_options`, so none of those carry it. It is held on the instance, because the
+  connection is opened lazily and something has to remember it — as a `Secret`, whose `repr()`
+  is `'<redacted>'`, so an object dump of a cached filesystem does not disclose it either. The
+  cost is stated rather than hidden — the password is not part of the cache token either, so two
+  filesystems differing only in password come back as one instance holding the first.
 - **That cost is an authentication one.** The second caller's password is never checked against
   anything, so a password that is *wrong* for the account still gives a working session,
   authenticated by whoever constructed first. With one principal in the process that is a stale
@@ -175,5 +177,13 @@ Neither is a defect of this adapter, and both will surprise you if nobody says t
   is a legitimate connection that simply is not theirs. **Pass `skip_instance_cache=True`
   whenever more than one principal can reach the process.** Keeping the password out of the
   token stays right regardless; this is what its price is.
+- **`ls()` holds the whole directory, and the server decides how big that is.** fsspec's
+  contract is that `ls` returns a list, so there is no streaming form of it to reach for and no
+  override that could add one. A directory with millions of entries — or a hostile server
+  answering `READDIR` with new names forever — is unbounded allocation driven by the peer.
+  Nothing is capped, because a silent cap breaks the legitimate large directory *and* reports
+  success. When the directory is untrusted or merely enormous, drop to
+  [`Session.scandir`](listing-and-matching.md#streaming-a-directory-you-did-not-size), which
+  holds one batch.
 
 Runnable: `examples/fsspec_urls.py`.

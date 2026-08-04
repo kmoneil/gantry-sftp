@@ -3,9 +3,13 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## 0.1.0 (2026-08-03)
+## Unreleased
 
-First public release.
+**Nothing has been released yet.** No `v*` tag exists, `git describe --tags` returns a bare sha,
+and the distribution is not on PyPI — so there is no version out there to diff against and every
+entry below is part of what the first release will say. The heading gets a number and a date when
+a tag is cut, not before: a dated heading for a release nobody can install is the kind of claim
+this project asks its own docs not to make.
 
 ### What it is
 
@@ -37,6 +41,12 @@ is a protocol codec, a request scheduler and an ergonomics layer.
 - **A zip-slip defence** on every recursive download: server-supplied names are attacker-supplied
   names, validated before they reach your filesystem, with the finished path re-checked against
   the destination after symlinks resolve.
+- **A password never reaches argv, a file, a log record, or a frame-locals dump.** It travels in
+  the `ssh` child's environment through a throwaway `SSH_ASKPASS` helper, and it is held in
+  `gantry_sftp.transport.Secret`, a `str` whose `repr()` is `'<redacted>'` — which is the form
+  Sentry, `pytest --showlocals`, `rich` and IPython all render a captured local with. Every entry
+  point taking a `password` wraps its own binding, and `tests/test_askpass.py` derives that list
+  from the source so a new one cannot be added without deciding.
 - **Bytes end to end**, so a filename that is not valid UTF-8 is an ordinary filename.
 - **Typed errors carrying state**. `ConnectError` holds OpenSSH's stderr verbatim, `TransferError`
   holds both paths and the offset it stopped at.
@@ -63,6 +73,10 @@ is a protocol codec, a request scheduler and an ergonomics layer.
   only for servers that surface `strerror`.
 - **`check-file` reaches one server of the three tested.** Rung 1 of the verification ladder is
   real and absent from nearly every endpoint. Rung 3 is available everywhere.
+- **`ls()` through the fsspec adapter holds the whole directory**, because fsspec's contract is
+  that it returns a list. A directory the server can grow without bound is unbounded allocation
+  driven by the peer; `Session.scandir` is the streaming form, and nothing is capped because a
+  silent cap breaks the legitimate large directory *and* reports success.
 - **Connecting is slower** than a library that implements SSH in-process, because spawning `ssh`
   costs a fork, an exec and OpenSSH's own config parsing. For connection-heavy work,
   `ControlMaster` is the fix, and it has to be asked for: this library ships `ControlMaster=no`,

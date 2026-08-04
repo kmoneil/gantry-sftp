@@ -49,6 +49,7 @@ from typing import override
 __all__ = [
     "ASKPASS_ANSWER_VARIABLE",
     "ASKPASS_ARMING_VARIABLES",
+    "Secret",
     "askpass_environment",
 ]
 
@@ -63,6 +64,20 @@ class Secret(str):
     and are exactly what a frame-locals dumper walks. Sentry captures locals by default, and so
     do ``pytest --showlocals``, ``rich`` tracebacks and IPython's verbose mode. Every one of
     them renders a local with :func:`repr`, so ``repr`` is the boundary to defend.
+
+    **Every entry point taking a ``password`` has to do the wrapping itself, and for a while
+    only one did.** Rebinding inside :func:`~gantry_sftp.transport.open_ssh_transport` protects
+    *its* parameter; :func:`gantry_sftp.connect`, the four blocking spellings in
+    :mod:`gantry_sftp.sync` and :class:`~gantry_sftp.fsspec.GantrySFTPFileSystem` each hold
+    their own binding, in their own frame, for exactly as long as the caller's ``with`` block
+    -- so a traceback crossing any of them rendered the plaintext while the environment
+    dictionary one frame down rendered ``'<redacted>'``. All of them now rebind on entry, and
+    ``tests/test_askpass.py`` derives that list from the signatures rather than restating it,
+    so an entry point added later fails by name instead of inheriting the gap.
+
+    The fsspec adapter is the one that is not a generator: fsspec's registry caches the
+    instance for the life of the process, so ``self._password`` is what an object dump renders
+    and the wrapping happens at the assignment.
 
     This is still a real :class:`str` everywhere it has to be one: ``ssh`` receives the actual
     secret through the child's environment, and comparisons against a plain ``str`` behave

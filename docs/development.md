@@ -22,7 +22,7 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 
 | lane                  | what it proves                                                                                  | needs, beyond `uv sync`        |
 | --------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------ |
-| `lanes.py gates`      | ruff, mypy `--strict`, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit | nothing; POSIX only            |
+| `lanes.py gates`      | ruff, mypy `--strict`, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit, the secrets scan | nothing; POSIX only            |
 | `lanes.py audit`      | known advisories against the versions `uv.lock` pins                                           | `uv sync --group audit`, network |
 | `lanes.py fast`       | unit tests, the real `sftp-server` rows, every example as a subprocess                          | `openssh-server` for some rows |
 | `lanes.py leaks`      | the unit tests again, failing the one that left a transport, session or child process alive     | `openssh-server` for some rows |
@@ -71,6 +71,28 @@ mypy's `deprecated` error code and ty's `deprecated` rule both run, and a third 
 `basedpyright` with type checking switched off and `reportDeprecated` switched on, because the
 three checkers vendor different typeshed snapshots and the one that already carries a
 deprecation is not always the one you were going to run.
+
+`detect-secrets` runs over **every** file type rather than over Python, because a credential
+lands in a YAML, a TOML or a Markdown snippet at least as easily as in a module. It carries a
+committed `.secrets.baseline`, and the thing to understand about that file before trusting it is
+that it is **not a list of excused files**: an entry is keyed by file, hashed secret and line, so
+a real credential added to an already-listed file still fails. That was verified rather than
+assumed, by dropping an AWS key into `tests/test_fsspec.py` — a file with four baselined entries
+— and watching the hook refuse it.
+
+The 22 entries it starts with were each read before they were written down, and none is a
+credential: fixture passwords the suite greps for on purpose (`hunter2`,
+`correct-horse-battery-staple`, `s3cret-that-must-not-be-in-argv`), bare `-----BEGIN PRIVATE
+KEY-----` header lines with no key material behind them, an environment variable's *name*, and an
+OpenSSH `Permission denied (password)` message. Regenerate with
+
+```console
+$ .venv/bin/detect-secrets scan $(git ls-files) > .secrets.baseline
+```
+
+when a fixture moves, and **read the diff** — a baseline regenerated without being read is the
+one way this check becomes decoration. A single false positive is better marked in place with a
+`pragma: allowlist secret` comment than by growing the file.
 
 One hook **reports instead of gating**, and it is the only one: `parked-worktrees` lists any
 worktree left behind under `.claude/worktrees/` and always exits 0. Working in a worktree is

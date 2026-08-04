@@ -111,7 +111,7 @@ from gantry_sftp.session import (
     WalkEntry,
 )
 from gantry_sftp.session import open_session as _async_open_session
-from gantry_sftp.transport import Transport
+from gantry_sftp.transport import Secret, Transport
 from gantry_sftp.transport import open_local_server_transport as _async_open_local_server_transport
 from gantry_sftp.transport import open_ssh_transport as _async_open_ssh_transport
 
@@ -1362,6 +1362,12 @@ class BoundPortal:
             A ready :class:`SyncSession`. Both the session and the connection close when the
             block exits.
         """
+        # Before the partial, not after: this is a @contextmanager generator whose frame lives
+        # for the whole block, and `functools.partial` reprs every argument bound into it -- so
+        # an unwrapped password would render twice in one frame-locals dump, once as the local
+        # and once inside `factory`. See :class:`~gantry_sftp.transport.Secret`.
+        if password is not None:
+            password = Secret(password)
         factory = partial(
             _async_connect,
             host,
@@ -1402,6 +1408,9 @@ class BoundPortal:
             A :class:`SyncTransport`, carrying this portal so :meth:`open_session` uses the
             same loop rather than starting a second one.
         """
+        # Before the partial, for the reason :meth:`connect` gives.
+        if password is not None:
+            password = Secret(password)
         factory = partial(
             _async_open_ssh_transport,
             host,
@@ -1520,6 +1529,11 @@ def connect(
         A ready :class:`SyncSession`. The session, the connection and the loop behind them all
         end with the block.
     """
+    # A @contextmanager generator's frame outlives this line for as long as the block runs, so
+    # the rebinding happens at every entry point rather than only at the innermost one. See
+    # :class:`~gantry_sftp.transport.Secret`.
+    if password is not None:
+        password = Secret(password)
     with (
         start_blocking_portal() as portal,
         BoundPortal(portal).connect(
@@ -1566,6 +1580,9 @@ def open_ssh_transport(
         A :class:`SyncTransport` carrying the portal started for this block, so
         :func:`open_session` runs on the same loop.
     """
+    # Rebound here as well as downstream, for the reason :func:`connect` gives.
+    if password is not None:
+        password = Secret(password)
     with (
         start_blocking_portal() as portal,
         BoundPortal(portal).open_ssh_transport(

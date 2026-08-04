@@ -131,7 +131,7 @@ def _wrong_type(path: object) -> str:
     """Explain a path argument that is neither ``bytes``, ``str`` nor an :class:`SFTPPath`.
 
     A ``pathlib`` path gets its own sentence for the reason
-    :func:`gantry_sftp.session._session._wrong_path_type` gives: it is the type callers actually
+    :func:`gantry_sftp.session._policy._wrong_path_type` gives: it is the type callers actually
     reach for, and ``pathlib``'s job is to normalise a name this one has to preserve.
     """
     kind = type(path).__name__

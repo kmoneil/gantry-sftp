@@ -154,10 +154,27 @@ That last surface is the least obvious one. The environment dictionary carrying 
 local variable in an `@asynccontextmanager` generator, so its frame stays alive for the whole
 connection, and Sentry captures frame locals by default, as do `pytest --showlocals`, `rich`
 tracebacks and IPython's verbose mode. Every one of them renders a local with `repr()`, so the
-secret is held in a `str` subclass whose `repr()` is `'<redacted>'`. It is still an ordinary
-string everywhere it has to be one, so `ssh` receives it intact. What that does **not** cover,
-stated plainly: a reporter that calls `str()` rather than `repr()`, a core dump, and
+secret is held in a `str` subclass whose `repr()` is `'<redacted>'` —
+`gantry_sftp.transport.Secret`, public for the reason below. It is still an ordinary string
+everywhere it has to be one, so `ssh` receives it intact. What that does **not** cover, stated
+plainly: a reporter that calls `str()` rather than `repr()`, a core dump, and
 `/proc/<pid>/environ`, the last being the deliberate trade that buys not being in argv.
+
+**The wrapping happens at every entry point, not only at the innermost one**, and that is worth
+saying because it did not always. `password=` is a parameter of `connect()`, of the four
+blocking spellings in `gantry_sftp.sync`, and of `GantrySFTPFileSystem` — each of which binds it
+in its _own_ frame, for as long as your `with` block lasts. Wrapping inside
+`open_ssh_transport` protects that function's binding and no other, so a traceback crossing any
+of the outer ones rendered the plaintext while the environment dictionary one frame further
+down rendered `'<redacted>'`. All of them now rebind on entry. The fsspec adapter is the
+exception to the shape rather than to the rule: it is not a generator, but fsspec's registry
+caches the instance for the life of the process, so the wrapping is on the attribute instead.
+
+`tests/test_askpass.py` proves this twice, because two different mistakes are possible. One test
+fails a connection through each entry point and asserts the plaintext appears in no frame a
+reporter would capture; the other reads the list of functions taking a `password` out of the
+source itself and asserts each one wraps, so an entry point added later fails by name rather
+than quietly inheriting the gap.
 
 ### `options=` matches names the way `ssh` does
 

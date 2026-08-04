@@ -12,18 +12,27 @@ The end-to-end proof that a real ``ssh`` authenticates through it is in
 
 from __future__ import annotations
 
+import ast
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
+import anyio
 import pytest
+from anyio.from_thread import start_blocking_portal
 
+import gantry_sftp
+import gantry_sftp.sync
+import gantry_sftp.transport
+from gantry_sftp.sync import BoundPortal
 from gantry_sftp.transport import (
     ASKPASS_ANSWER_VARIABLE,
     ASKPASS_ARMING_VARIABLES,
+    Secret,
     askpass_environment,
 )
 
@@ -289,3 +298,257 @@ def test_the_arming_variables_are_the_measured_set():
 def test_the_answer_variable_is_not_a_name_an_inherited_environment_would_collide_with():
     assert ASKPASS_ANSWER_VARIABLE.startswith("GANTRY_SFTP_")
     assert ASKPASS_ANSWER_VARIABLE not in os.environ
+
+
+# --- Secret: the boundary a frame-locals dumper meets ---------------------------------------
+#
+# `Secret` existed and was applied at exactly one of the seven functions that take a
+# `password`: `transport.open_ssh_transport`. The other six -- every entry point a caller
+# actually reaches for -- held the plaintext in a decorated-generator frame or on a cached
+# instance for the life of the connection, which is precisely the hazard `Secret`'s own
+# docstring describes. Rebinding inside `open_ssh_transport` protects *its* local; a caller's
+# frame is a different frame.
+#
+# Two tests, because they fail on different mistakes. The first catches a site that rebinds
+# too late (after a `partial` has already captured the plaintext); the second catches a site
+# that does not rebind at all, including one added next year.
+
+REDACTED_PASSWORD = "correct-horse-battery-staple"
+
+UNROUTABLE_PORT = 0
+"""A port `build_ssh_argv` refuses, so the failure happens before anything is spawned.
+
+The traceback still crosses every frame between the caller and the refusal, which is the whole
+surface under test -- and no `ssh` child, no temporary directory and no network are involved,
+so this stays in the fast lane the module docstring promises.
+"""
+
+
+def gantry_frames_rendering(exc: BaseException, needle: str) -> list[str]:
+    """Every `gantry_sftp` frame local whose `repr` carries `needle`.
+
+    `capture_locals=True` is not a contrivance: it is what Sentry does by default, and what
+    `pytest --showlocals`, `rich` tracebacks and IPython's verbose mode all do. Each renders a
+    local with `repr`, which is why `repr` is the boundary `Secret` defends.
+    """
+    rendered = traceback.TracebackException.from_exception(exc, capture_locals=True)
+    return [
+        f"{Path(frame.filename).name}:{frame.lineno} {frame.name}() -> {name}"
+        for frame in rendered.stack
+        if "gantry_sftp" in (frame.filename or "")
+        for name, value in (frame.locals or {}).items()
+        if needle in value
+    ]
+
+
+def refuse_through_async_connect() -> None:
+    async def attempt() -> None:
+        async with gantry_sftp.connect(
+            "example.com",
+            port=UNROUTABLE_PORT,
+            password=REDACTED_PASSWORD,
+            config_file=os.devnull,
+        ):
+            pytest.fail("the port should have been refused")
+
+    anyio.run(attempt)
+
+
+def refuse_through_async_open_ssh_transport() -> None:
+    async def attempt() -> None:
+        async with gantry_sftp.transport.open_ssh_transport(
+            "example.com",
+            port=UNROUTABLE_PORT,
+            password=REDACTED_PASSWORD,
+            config_file=os.devnull,
+        ):
+            pytest.fail("the port should have been refused")
+
+    anyio.run(attempt)
+
+
+def refuse_through_sync_connect() -> None:
+    with gantry_sftp.sync.connect(
+        "example.com", port=UNROUTABLE_PORT, password=REDACTED_PASSWORD, config_file=os.devnull
+    ):
+        pytest.fail("the port should have been refused")
+
+
+def refuse_through_sync_open_ssh_transport() -> None:
+    with gantry_sftp.sync.open_ssh_transport(
+        "example.com", port=UNROUTABLE_PORT, password=REDACTED_PASSWORD, config_file=os.devnull
+    ):
+        pytest.fail("the port should have been refused")
+
+
+def refuse_through_bound_portal_connect() -> None:
+    with (
+        start_blocking_portal() as portal,
+        BoundPortal(portal).connect(
+            "example.com", port=UNROUTABLE_PORT, password=REDACTED_PASSWORD, config_file=os.devnull
+        ),
+    ):
+        pytest.fail("the port should have been refused")
+
+
+def refuse_through_bound_portal_open_ssh_transport() -> None:
+    with (
+        start_blocking_portal() as portal,
+        BoundPortal(portal).open_ssh_transport(
+            "example.com", port=UNROUTABLE_PORT, password=REDACTED_PASSWORD, config_file=os.devnull
+        ),
+    ):
+        pytest.fail("the port should have been refused")
+
+
+@pytest.mark.parametrize(
+    "reach_the_refusal",
+    [
+        pytest.param(refuse_through_async_connect, id="connect"),
+        pytest.param(refuse_through_async_open_ssh_transport, id="open_ssh_transport"),
+        pytest.param(refuse_through_sync_connect, id="sync.connect"),
+        pytest.param(refuse_through_sync_open_ssh_transport, id="sync.open_ssh_transport"),
+        pytest.param(refuse_through_bound_portal_connect, id="BoundPortal.connect"),
+        pytest.param(
+            refuse_through_bound_portal_open_ssh_transport, id="BoundPortal.open_ssh_transport"
+        ),
+    ],
+)
+def test_a_failed_connection_shows_no_frame_holding_the_plaintext_password(reach_the_refusal):
+    # The regression test for the finding. Before the fix this failed on four of the six ids,
+    # and `BoundPortal.connect` reported the secret *twice* in one frame -- once as the local
+    # and once inside the `functools.partial` repr, which renders every argument bound into it.
+    with pytest.raises(ValueError) as refusal:
+        reach_the_refusal()
+
+    showing = gantry_frames_rendering(refusal.value, REDACTED_PASSWORD)
+    assert not showing, (
+        f"the password is readable in {len(showing)} frame local(s) that a traceback reporter "
+        f"would capture: {showing}"
+    )
+
+
+def test_the_redacted_password_is_still_the_password_everywhere_it_has_to_be():
+    # `Secret` defends `repr` and nothing else on purpose: `ssh` receives the real value
+    # through the child's environment. A wrapper that broke equality or `str` would break
+    # authentication rather than protect it.
+    secret = Secret(REDACTED_PASSWORD)
+    assert repr(secret) == "'<redacted>'"
+    assert str(secret) == REDACTED_PASSWORD
+    assert secret == REDACTED_PASSWORD
+    assert f"{secret}" == REDACTED_PASSWORD
+    assert repr({"GANTRY_SFTP_ASKPASS_ANSWER": secret}) == (
+        "{'GANTRY_SFTP_ASKPASS_ANSWER': '<redacted>'}"
+    )
+
+
+def test_secret_is_importable_from_the_package_the_docstrings_name():
+    # `_logging.py` cited `gantry_sftp.transport.Secret` while `Secret` was reachable only
+    # through the private `transport._askpass`, so both references were dead -- and every
+    # entry point that has to wrap lives outside that package.
+    assert gantry_sftp.transport.Secret is Secret
+    assert "Secret" in gantry_sftp.transport.__all__
+
+
+# --- the same rule, derived rather than restated ---------------------------------------------
+
+
+def functions_taking_a_password() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Every function in the shipped source that declares a `password` parameter.
+
+    Read off the package that is actually imported rather than off a path resolved from this
+    file, so a mutation run reads its own copy of the source instead of the pristine tree.
+    """
+    root = Path(gantry_sftp.__file__).parent
+    found: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for module in sorted(root.rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        owners = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+            if isinstance(node, ast.ClassDef)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            arguments = node.args
+            declared = arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+            if not any(argument.arg == "password" for argument in declared):
+                continue
+            owner = owners.get(node)
+            qualified = f"{owner.name}.{node.name}" if owner is not None else node.name
+            found[f"{module.relative_to(root).as_posix()}:{qualified}"] = node
+    return found
+
+
+MUST_WRAP_THE_PASSWORD = frozenset(
+    {
+        "_connect.py:connect",
+        "fsspec.py:GantrySFTPFileSystem.__init__",
+        "sync.py:connect",
+        "sync.py:open_ssh_transport",
+        "sync.py:BoundPortal.connect",
+        "sync.py:BoundPortal.open_ssh_transport",
+        "transport/_askpass.py:_askpass_environment",
+        "transport/_subprocess.py:open_ssh_transport",
+    }
+)
+"""Every function whose `password` outlives the call, and must therefore become a `Secret`.
+
+Six of these are decorated generators, so the frame holding the parameter stays alive for as
+long as the `with` block does. The seventh, `GantrySFTPFileSystem.__init__`, is not a generator
+at all -- fsspec's registry caches the instance for the life of the process, so `self._password`
+is what an object dump renders instead.
+"""
+
+EXEMPT_FROM_WRAPPING = {
+    "transport/_askpass.py:_validate_password": (
+        "a predicate: it inspects, raises, binds nothing, and has returned before the "
+        "connection it validates for exists"
+    ),
+    "transport/_askpass.py:askpass_environment": (
+        "the one-line `yield from` wrapper over `_askpass_environment`, which does wrap. Its "
+        "only shipped caller has already rebound, so nothing reaches it unwrapped in this "
+        "library -- but a caller reaching for it directly with a plain `str` keeps that `str` "
+        "in two generator frames. Left out deliberately: the fix was scoped to the connection "
+        "entry points, and widening it here means wrapping in both halves of the split that "
+        "D-107 made for the mutation lane"
+    ),
+    "transport/_subprocess.py:_askpass_is_armed": (
+        "reads `password is not None` and nothing else; the value is never bound or rendered"
+    ),
+}
+"""Functions that take a `password` and legitimately do not wrap it, each with its reason.
+
+A reason rather than a bare list, because the next person to add one has to write down why --
+which is the step that would have caught the six sites this section exists for.
+"""
+
+
+def wraps_its_password(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether the body ever builds a `Secret` out of the `password` parameter."""
+    return any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "Secret"
+        and any(
+            isinstance(argument, ast.Name) and argument.id == "password" for argument in call.args
+        )
+        for call in ast.walk(node)
+    )
+
+
+def test_every_function_taking_a_password_has_been_decided_about():
+    # The half a per-site fix cannot cover: a *new* entry point. This is the same technique
+    # `tests/test_sync_facade.py` uses on the async surface -- derive the set from the code, so
+    # an addition fails by name here rather than by nobody noticing.
+    assert set(functions_taking_a_password()) == MUST_WRAP_THE_PASSWORD | set(EXEMPT_FROM_WRAPPING)
+
+
+@pytest.mark.parametrize("where", sorted(MUST_WRAP_THE_PASSWORD))
+def test_it_rebinds_the_password_to_a_secret(where):
+    assert wraps_its_password(functions_taking_a_password()[where]), (
+        f"{where} takes a password that outlives the call and never wraps it in Secret(), so "
+        f"the plaintext is what a frame-locals dumper renders"
+    )

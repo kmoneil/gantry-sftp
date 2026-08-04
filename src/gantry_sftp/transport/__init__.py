@@ -11,6 +11,12 @@ Available transports:
 * :func:`open_ssh_transport` -- ``ssh -s sftp``. The default, and the reason the library
   contains no cryptography.
 * :func:`open_local_server_transport` -- ``sftp-server`` on a pipe, no ``ssh`` at all.
+
+:class:`Secret` is exported from here rather than kept private because **every entry point that
+takes a ``password`` has to use it**, and those live in three other modules -- ``_connect``,
+``sync`` and ``fsspec``. A credential boundary reachable only through a private module is one
+each of them reaches around; ``tests/test_askpass.py`` derives the list of callers that must
+rebind from the signatures themselves, and that test needs a public name to check against.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from gantry_sftp.transport._argv import (
 from gantry_sftp.transport._askpass import (
     ASKPASS_ANSWER_VARIABLE,
     ASKPASS_ARMING_VARIABLES,
+    Secret,
     askpass_environment,
 )
 from gantry_sftp.transport._base import DEFAULT_RECEIVE_SIZE, Transport
@@ -67,6 +74,7 @@ __all__ = [
     "LOGGED_ENVIRONMENT_VARIABLES",
     "PASSWORD_AUTH_OPTIONS",
     "SFTP_SERVER_CANDIDATES",
+    "Secret",
     "StderrBuffer",
     "SubprocessTransport",
     "Transport",

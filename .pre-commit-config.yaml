@@ -103,6 +103,26 @@ repos:
         language: system
         pass_filenames: false
 
+      # Runs on every file type rather than on Python, because a credential lands in a YAML, a
+      # TOML or a Markdown snippet at least as easily as in a module.
+      #
+      # `.secrets.baseline` holds 22 entries and **every one was read before it was written**:
+      # fixture passwords this suite greps for on purpose (`hunter2`,
+      # `correct-horse-battery-staple`, `s3cret-that-must-not-be-in-argv`), bare PEM *header*
+      # lines with no key material behind them, an environment variable's *name*, and an
+      # OpenSSH "Permission denied (password)" string. No real credential is in it.
+      #
+      # The baseline is not a file-level exclusion and that is what makes it safe to have: it
+      # is keyed by (file, hashed secret, line), so a genuine secret added to an
+      # already-listed file still fails -- proved by dropping an AWS key into
+      # `tests/test_fsspec.py`, which the hook refused with the baseline in place. Regenerate
+      # with `.venv/bin/detect-secrets scan $(git ls-files) > .secrets.baseline` when a
+      # fixture moves, and read the diff rather than trusting it.
+      - id: detect-secrets
+        name: no new secrets (detect-secrets)
+        entry: .venv/bin/detect-secrets-hook --baseline .secrets.baseline
+        language: system
+
       # The one hook here that reports instead of gating -- it always exits 0, and the reason
       # a parked worktree must not fail a commit is in the script's header. `verbose` is not
       # decoration: pre-commit shows the stdout of a *failing* hook only, so a hook that never

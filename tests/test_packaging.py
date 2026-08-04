@@ -51,18 +51,34 @@ def test_the_licence_text_ships_in_the_repository():
     assert "3. Grant of Patent License." in text
 
 
-def test_the_changelog_exists_and_names_this_version():
+def test_the_changelog_describes_the_code_as_it_stands():
     """D-124. A release whose changelog does not mention it is a changelog nobody can use.
 
     The version is single-sourced from ``__init__.py``, so this is the one place the two are
     compared: a bump that forgets the entry ships METADATA pointing at a `Changelog` URL whose
     top section describes the release before it.
+
+    **Two states are legal and the second one is not laxity.** A section named for
+    ``__version__`` is one. An ``## Unreleased`` section is the other, and it is what is true
+    before a version is tagged -- which for a repository with no ``v*`` tag and nothing on PyPI
+    is every commit so far. Requiring the numbered heading unconditionally is what produced the
+    thing this test exists to prevent, in the opposite direction: a dated
+    ``## 0.1.0 (2026-08-03)`` for a release nobody could install, which read to its own author as
+    proof that a version was already out.
+
+    What is *not* legal is neither: a tree whose changelog names no version and admits to no
+    pending work has stopped describing the code. And the stronger requirement -- that a tagged
+    release carries the numbered heading rather than ``Unreleased`` -- is enforced at the only
+    moment it can be, in ``release.yml``, beside the check that the tag matches the version.
     """
     changelog = ROOT / "CHANGELOG.md"
     assert changelog.is_file(), "CHANGELOG.md is missing"
     text = changelog.read_text(encoding="utf-8")
-    assert f"## {gantry_sftp.__version__}" in text, (
-        f"CHANGELOG.md has no section for {gantry_sftp.__version__}"
+    named = f"## {gantry_sftp.__version__}" in text
+    pending = "## Unreleased" in text
+    assert named or pending, (
+        f"CHANGELOG.md has neither a section for {gantry_sftp.__version__} nor an "
+        f"'## Unreleased' section, so it describes neither a release nor the work since one"
     )
 
 

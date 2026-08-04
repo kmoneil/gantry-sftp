@@ -109,6 +109,61 @@ def show_what_the_password_path_changes() -> None:
     print()
 
 
+async def refused_by_open_ssh_transport(secret: str, port: int) -> ConnectError:
+    """Fail a connection through the two-call spelling, and hand back its error."""
+    connected = None
+    try:
+        async with (
+            open_ssh_transport(
+                "127.0.0.1",
+                port=port,
+                config_file=os.devnull,
+                password=secret,
+            ) as transport,
+            open_session(transport) as sftp,
+        ):
+            connected = repr(sftp)
+    except ConnectError as error:
+        return error
+    raise SystemExit(f"unexpectedly connected: {connected}")
+
+
+async def refused_by_connect(secret: str, port: int) -> ConnectError:
+    """The same failure through ``connect()``, which binds the password in a frame of its own.
+
+    **Running both is the point, not thoroughness.** ``password=`` is a parameter of each entry
+    point, and each holds its own binding for as long as the caller's block lasts -- so a
+    version of this example that exercised only the inner one checked the frame claim on the
+    single path where it was already true, and the path the README opens with rendered the
+    plaintext. Wrapping in one function protects that function's local and no other.
+    """
+    connected = None
+    try:
+        async with gantry_sftp.connect(
+            "127.0.0.1",
+            port=port,
+            config_file=os.devnull,
+            password=secret,
+        ) as sftp:
+            connected = repr(sftp)
+    except ConnectError as error:
+        return error
+    raise SystemExit(f"unexpectedly connected: {connected}")
+
+
+def report_where_the_secret_went(label: str, secret: str, error: ConnectError) -> None:
+    """The three checks this example exists to make, for one entry point.
+
+    ``ps`` shows argv to every user on the machine; it never shows the password, because the
+    password was never there. The third line is the one nobody looks at, and it is the one that
+    needs a per-entry-point answer rather than a single global one.
+    """
+    print(f"  via {label}")
+    print(f"    password anywhere in argv:      {secret in ' '.join(error.argv)}")
+    print(f"    password anywhere in the error: {secret in str(error)}")
+    print(f"    password in any dumped frame:   {secret in dumped_frames(error)}")
+
+
 async def against_a_closed_port() -> None:
     """Spawn a real ssh with a real password and show where the secret ended up.
 
@@ -117,32 +172,21 @@ async def against_a_closed_port() -> None:
     command line, and that is decided before a single packet is sent.
     """
     secret = "hunter2-not-a-real-password"
+    port = closed_port()
     show_what_the_password_path_changes()
 
-    try:
-        async with (
-            open_ssh_transport(
-                "127.0.0.1",
-                port=closed_port(),
-                config_file=os.devnull,
-                password=secret,
-            ) as transport,
-            open_session(transport) as sftp,
-        ):
-            print(f"unexpectedly connected: {sftp!r}")
-    except ConnectError as error:
-        print("the command that actually ran:")
-        print(f"  {' '.join(error.argv)}")
-        print()
-        # The assertion this example exists to demonstrate. `ps` shows argv to every user on
-        # the machine; it never shows the password, because the password was never there.
-        print(f"  password anywhere in argv:      {secret in ' '.join(error.argv)}")
-        print(f"  password anywhere in the error: {secret in str(error)}")
-        print(f"  password in any dumped frame:   {secret in dumped_frames(error)}")
-        print()
-        print(f"and the connection failed for its own reason: {type(error).__name__}")
-        for line in (error.stderr or "(nothing)").strip().splitlines():
-            print(f"    | {line}")
+    through_transport = await refused_by_open_ssh_transport(secret, port)
+    through_connect = await refused_by_connect(secret, port)
+
+    print("the command that actually ran:")
+    print(f"  {' '.join(through_transport.argv)}")
+    print()
+    report_where_the_secret_went("open_ssh_transport()", secret, through_transport)
+    report_where_the_secret_went("connect()", secret, through_connect)
+    print()
+    print(f"and the connection failed for its own reason: {type(through_transport).__name__}")
+    for line in (through_transport.stderr or "(nothing)").strip().splitlines():
+        print(f"    | {line}")
 
 
 async def against_a_real_server(destination: str) -> None:

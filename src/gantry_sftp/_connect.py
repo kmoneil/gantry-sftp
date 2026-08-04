@@ -30,7 +30,7 @@ from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 
 from gantry_sftp.session import DEFAULT_SESSION_OPTIONS, Session, SessionOptions, open_session
-from gantry_sftp.transport import open_ssh_transport
+from gantry_sftp.transport import Secret, open_ssh_transport
 
 __all__ = ["connect"]
 
@@ -106,6 +106,13 @@ async def connect(
         ProtocolError: If the server negotiates a filexfer version other than 3 -- see
             :func:`~gantry_sftp.session.open_session`, which is where the handshake happens.
     """
+    # Rebound rather than copied to a new name, and rebound *here* rather than left to
+    # `open_ssh_transport`, which does the same to its own parameter. That protects its frame,
+    # not this one: this is an @asynccontextmanager generator, so its frame -- and every local
+    # in it -- stays alive for the whole connection and is what a frame-locals dumper walks.
+    # See :class:`~gantry_sftp.transport.Secret`.
+    if password is not None:
+        password = Secret(password)
     async with (
         open_ssh_transport(
             host,

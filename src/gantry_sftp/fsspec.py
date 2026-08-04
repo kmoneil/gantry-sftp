@@ -103,6 +103,7 @@ from gantry_sftp.session import (
     join_remote,
 )
 from gantry_sftp.sync import BoundPortal, SyncSession
+from gantry_sftp.transport import Secret
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Mapping
@@ -537,7 +538,13 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         self.ssh_executable = ssh_executable
         self.cwd = cwd
         self.session_options = session
-        self._password = password
+        # Wrapped rather than stored raw, and the reason differs from every other site: this is
+        # not a generator frame but an instance fsspec's registry caches for the life of the
+        # process, so `self._password` is what any object dump -- a debugger, a `vars()`, a
+        # reporter walking `self` out of a frame -- renders. `_strip_tokenize_options` already
+        # keeps it out of `storage_options`; this covers the object itself. See
+        # :class:`~gantry_sftp.transport.Secret`.
+        self._password = Secret(password) if password is not None else None
         self._stack: ExitStack | None = None
         self._session: SyncSession | None = None
         self._owner_pid: int | None = None
@@ -684,6 +691,16 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         apart up front: ``OPENDIR`` on a file answers ``NO_SUCH_FILE`` rather than a distinct
         status, since the server remaps ``ENOTDIR``. So the ``LSTAT`` that separates "not a
         directory" from "not there" is asked only once the listing has already failed.
+
+        **The whole listing is accumulated in memory and the server decides how large that is**,
+        which :meth:`~gantry_sftp.Session.listdir` says too and which is repeated here because
+        an fsspec caller never reads that docstring. A directory with millions of entries -- or
+        a server willing to answer ``READDIR`` with new names forever -- is unbounded allocation
+        driven by the peer. There is no escape *at this method*: ``ls`` returns a list by
+        fsspec's contract, so streaming it is not something an override can offer. Reach for
+        :meth:`gantry_sftp.Session.scandir`, which holds one batch, when the directory is
+        untrusted or merely enormous. Nothing is capped, because a silent cap breaks the
+        legitimate large directory **and** reports success.
         """
         directory = self._strip_protocol(path)
         parent = _encode(directory)

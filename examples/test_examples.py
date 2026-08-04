@@ -171,6 +171,13 @@ def test_the_password_example_proves_the_secret_is_not_on_the_command_line():
     assert returncode == 0
     assert "password anywhere in argv:      False" in stdout
     assert "password anywhere in the error: False" in stdout
+    # Pinned per entry point rather than once. The frame line was printed and never asserted,
+    # and the example only ever ran the two-call spelling -- the one site that already wrapped
+    # its parameter -- so the claim held on the single path it exercised while `connect()`,
+    # which the README opens with, put the plaintext in a frame any reporter would capture.
+    assert "via open_ssh_transport()" in stdout
+    assert "via connect()" in stdout
+    assert stdout.count("password in any dumped frame:   False") == 2
     # And it must still be showing *why* the parameter has to exist: the shipped default is
     # not a preference here, it is what makes the feature impossible without it.
     assert "BatchMode=yes   <- suppresses ssh's askpass helper" in stdout

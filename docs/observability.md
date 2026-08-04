@@ -160,7 +160,10 @@ A password never reaches argv, a file, or a log record. It travels in the child'
 via an `SSH_ASKPASS` helper, and:
 
 - the value renders as `'<redacted>'` in any frame-locals dump. Sentry, `pytest --showlocals`,
-  `rich` and IPython all render locals with `repr`, and that is the boundary it defends;
+  `rich` and IPython all render locals with `repr`, and that is the boundary
+  `gantry_sftp.transport.Secret` defends. Every entry point taking a `password` wraps its own
+  binding, because each holds one in its own frame for the life of the block — see
+  [Passwords](connecting.md#passwords) for why that is a list rather than a single site;
 - the environment is masked by name before it can reach a log record, so the record says
   `'GANTRY_SFTP_ASKPASS_ANSWER': '<redacted>'`, since the _presence_ of an askpass answer is exactly
   what a failed password authentication needs to know, and the value is not;
@@ -173,7 +176,7 @@ reporter that calls `str()` rather than `repr()` on a local, a core dump, and
 `/proc/<pid>/environ`. The last is the deliberate trade: owner-and-root readable beats `ps`
 output readable by every user on the machine.
 
-`examples/logging.py` runs all of this with no arguments.
+`examples/observability.py` runs all of this with no arguments.
 
 ### `doctor`, the diagnostic no other Python SFTP library can ship
 

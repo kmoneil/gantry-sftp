@@ -100,8 +100,8 @@ LANES: tuple[Lane, ...] = (
     Lane(
         name="gates",
         summary=(
-            "ruff, mypy, ty, complexipy, the deprecation check, the uv.lock check and the "
-            "exec-bit check"
+            "ruff, mypy, ty, complexipy, the deprecation check, the uv.lock check, the "
+            "exec-bit check and the secrets scan"
         ),
         tool="pre-commit",
         args=("run", "--all-files"),
