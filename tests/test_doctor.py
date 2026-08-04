@@ -29,27 +29,34 @@ import os
 import pwd
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from gantry_sftp import __version__
+from gantry_sftp import doctor as gantry_doctor
 from gantry_sftp.__main__ import build_parser, main, parse_options
 from gantry_sftp.codec import IMPLEMENTED_EXTENSIONS, PROTOCOL_VERSION, _extensions
 from gantry_sftp.doctor import (
+    TYPICAL_HANDLE,
     Exit,
     LocalDiagnosis,
     ServerDiagnosis,
+    _limits_of,
     local_diagnosis,
     overall_status,
     render_json,
     render_text,
+    server_diagnosis,
     ssh_config_path,
 )
+from gantry_sftp.exceptions import NoSuchFileError
 from gantry_sftp.session import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
     DEFAULT_REQUEST_TIMEOUT,
+    ServerLimits,
 )
 
 SECRET = "hunter2-in-the-environment"  # noqa: S105 -- the thing the leak test greps for
@@ -435,3 +442,525 @@ def test_the_implemented_extension_set_is_the_one_with_bodies():
     assert with_bodies <= set(IMPLEMENTED_EXTENSIONS), (
         "an extension has a wire body but is not reported as implemented"
     )
+
+
+# --- the connecting half, which the mutation lane reported as 81 mutants with no test ---------
+#
+# `server_diagnosis` is the one function here that opens a connection, so every test above
+# stops short of it -- and the lane's reading for it was **"no tests"** rather than "survived":
+# nothing ran, as opposed to something running and not noticing. It is also the function with
+# the most to get wrong. Six arguments are forwarded to `connect`, sixteen fields are read off
+# the session, and its whole contract is that it *refuses to raise* -- a diagnostic that dies on
+# the condition it was run to diagnose has nothing to say about the only case that matters.
+#
+# `connect` is replaced rather than a server stood up, because what is under test is the
+# reading, not the protocol: `live-tests/` is where a real handshake is exercised.
+
+
+class _Profile:
+    label = "OpenSSH"
+    description = "OpenSSH's own sftp-server"
+    version = "9.6"
+
+
+class _FakeSession:
+    """A session with every field `server_diagnosis` reads, each a distinguishable value."""
+
+    extensions = (b"posix-rename@openssh.com", b"fsync@openssh.com", b"vendor-thing@example")
+    profile = _Profile()
+    server_version = 3
+    depth = 7
+    reaped = 2
+
+    def __init__(self, limits: ServerLimits | None = None) -> None:
+        self.limits = limits if limits is not None else ServerLimits(max_read_length=32768)
+
+    def sizes_for(self, handle: bytes) -> object:
+        self.handle_asked_about = handle
+
+        class _Sizes:
+            read_length = 31000
+            write_length = 30000
+
+        return _Sizes()
+
+    def realpath(self) -> bytes:
+        return "/incoming/caf\udce9".encode("utf-8", "surrogateescape")
+
+
+@pytest.fixture
+def recorded_connect(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """Replace `connect` with a recorder that yields `_FakeSession`, and hand back the record."""
+    seen: dict[str, object] = {}
+    session = _FakeSession()
+
+    @contextmanager
+    def fake_connect(host: str, **kwargs: object):  # type: ignore[no-untyped-def]
+        seen.update(kwargs, host=host)
+        yield session
+
+    monkeypatch.setattr(gantry_doctor, "connect", fake_connect)
+    return seen, session
+
+
+def test_server_diagnosis_forwards_every_argument_it_accepts(recorded_connect, tmp_path: Path):
+    """Six arguments, each droppable on its own with everything else still green.
+
+    Non-default values throughout, because an argument that forwards its own default is
+    invisible -- and `identity_file` and `config_file` are exactly the two a caller reaches for
+    when reproducing the connection that is actually failing.
+    """
+    seen, _session = recorded_connect
+    _ = server_diagnosis(
+        "example.com",
+        user="bob",
+        port=2222,
+        identity_file=str(tmp_path / "id_ed25519"),
+        config_file=str(tmp_path / "ssh_config"),
+        options={"Compression": "yes"},
+    )
+
+    assert seen == {
+        "host": "example.com",
+        "user": "bob",
+        "port": 2222,
+        "identity_file": str(tmp_path / "id_ed25519"),
+        "config_file": str(tmp_path / "ssh_config"),
+        "options": {"Compression": "yes"},
+    }
+
+
+def test_server_diagnosis_reads_every_field_off_the_session(recorded_connect):
+    """Sixteen fields, and the three extension tuples are the ones worth reading twice.
+
+    `implemented`, `unimplemented` and `absent` are three views of one comparison between what
+    the server advertised and what this library can send. Swapping any two of them turns
+    "we do not use this" into "your server does not offer it", which sends a reader to the
+    wrong side of the connection.
+    """
+    _seen, session = recorded_connect
+    report = server_diagnosis("example.com")
+
+    assert report.reached is True
+    assert report.host == "example.com"
+    assert report.error is None
+    assert report.server == "OpenSSH"
+    assert report.server_description == "OpenSSH's own sftp-server"
+    assert report.server_version == "9.6"
+    assert report.protocol_version == 3
+
+    assert report.extensions == (
+        "posix-rename@openssh.com",
+        "fsync@openssh.com",
+        "vendor-thing@example",
+    )
+    assert report.implemented == ("posix-rename@openssh.com", "fsync@openssh.com")
+    assert report.unimplemented == ("vendor-thing@example",)
+    assert "posix-rename@openssh.com" not in report.absent
+    assert set(report.absent) == set(IMPLEMENTED_EXTENSIONS) - set(report.implemented)
+
+    assert report.limits == {
+        "max_packet_length": None,
+        "max_read_length": 32768,
+        "max_write_length": None,
+        "max_open_handles": None,
+    }
+    assert report.read_size == 31000
+    assert report.write_size == 30000
+    assert report.depth == 7
+    assert report.reaped == 2
+    # Decoded leniently and reversibly, because a start directory can be a name no encoding
+    # explains -- the same rule the rest of this library applies to server-supplied names.
+    assert report.start_directory == "/incoming/caf\udce9"
+    assert session.handle_asked_about == TYPICAL_HANDLE
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (NoSuchFileError("no such file", code=2), "NoSuchFileError: no such file"),
+        (
+            OSError("ssh: connect to host example.com port 22: Connection refused"),
+            "OSError: ssh: connect to host example.com port 22: Connection refused",
+        ),
+    ],
+)
+def test_server_diagnosis_reports_a_failure_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception, expected: str
+):
+    """**Refusing to raise is the design**, and it is the only case that matters.
+
+    A diagnostic that dies on the condition it was run to diagnose has nothing to say about it.
+    The message carries the exception's *type* as well as its text, because "Connection
+    refused" and "Permission denied" arrive as different classes and the class is what a reader
+    acts on.
+    """
+
+    @contextmanager
+    def failing_connect(_host: str, **_kwargs: object):  # type: ignore[no-untyped-def]
+        raise failure
+        yield  # pragma: no cover -- unreachable, and what makes this a context manager
+
+    monkeypatch.setattr(gantry_doctor, "connect", failing_connect)
+    report = server_diagnosis("example.com")
+
+    assert report.reached is False
+    assert report.host == "example.com"
+    assert report.error == expected
+    assert report.exit_code is Exit.UNREACHABLE
+    # Nothing was negotiated, so nothing is claimed about it.
+    assert report.extensions == ()
+    assert report.limits is None
+    assert report.protocol_version is None
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        (ServerLimits(), None),
+        (
+            ServerLimits(
+                max_packet_length=34000,
+                max_read_length=32768,
+                max_write_length=32768,
+                max_open_handles=100,
+            ),
+            {
+                "max_packet_length": 34000,
+                "max_read_length": 32768,
+                "max_write_length": 32768,
+                "max_open_handles": 100,
+            },
+        ),
+        # A `0` from the server means *no limit* on that field, which `ServerLimits` also stores
+        # as `None` -- so a `None` inside an answer is "unlimited" and must still be rendered.
+        (
+            ServerLimits(max_packet_length=34000),
+            {
+                "max_packet_length": 34000,
+                "max_read_length": None,
+                "max_write_length": None,
+                "max_open_handles": None,
+            },
+        ),
+    ],
+)
+def test_the_two_absences_are_kept_apart(limits: ServerLimits, expected: object):
+    """No answer at all is `None`; an answer with a gap in it is a dict with a `None` in it.
+
+    Collapsing the two would make the diagnostic assert its own conservative defaults back at
+    the reader as though the server had stated them -- on the one report whose value is that it
+    says what the *server* said.
+    """
+    assert _limits_of(limits) == expected
+
+
+# --- the branch this platform never takes ----------------------------------------------------
+
+
+@pytest.fixture
+def no_pwd(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """Make `import pwd` fail, which is the only way to reach the Windows fallback here.
+
+    Nineteen of this module's survivors lived in that branch: on any platform with `pwd` the
+    `try` succeeds and none of it executes, so the environment variable names, their order and
+    the shape of the path were all free. `None` in `sys.modules` is what makes an `import`
+    raise `ImportError` without touching the real module.
+    """
+    monkeypatch.setitem(sys.modules, "pwd", None)
+
+
+def test_the_windows_fallback_prefers_userprofile(no_pwd):
+    # OpenSSH on Windows uses the profile directory, so `USERPROFILE` is the right source
+    # there rather than a second-best one -- and it has to win over `HOME`, which a
+    # Git-for-Windows shell will also have set, to somewhere else.
+    found = ssh_config_path({"USERPROFILE": r"C:\Users\bob", "HOME": "/msys/home/bob"})
+    assert found == Path(r"C:\Users\bob") / ".ssh" / "config"
+
+
+def test_the_windows_fallback_takes_home_when_there_is_no_profile(no_pwd):
+    assert ssh_config_path({"HOME": "/home/bob"}) == Path("/home/bob") / ".ssh" / "config"
+
+
+def test_the_windows_fallback_says_tilde_when_it_knows_nothing(no_pwd):
+    """`~` unexpanded, deliberately: a wrong absolute path reads as an answer, `~` reads as one.
+
+    Left as the literal rather than expanded, because expanding it here would go through
+    `Path.home()` and land back on `$HOME` -- the very thing this function exists not to use.
+    """
+    assert ssh_config_path({}) == Path("~") / ".ssh" / "config"
+
+
+def test_the_windows_fallback_reads_the_real_environment_when_given_none(no_pwd, monkeypatch):
+    # `environ=None` means "the process environment", and the fallback is the one branch that
+    # consults it at all.
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setenv("HOME", "/from/the/process")
+    assert ssh_config_path() == Path("/from/the/process") / ".ssh" / "config"
+
+
+# --- running `ssh -V`, whose three failures each have their own sentence ---------------------
+
+
+def test_the_version_probe_asks_for_what_it_needs(monkeypatch: pytest.MonkeyPatch):
+    """`check=False` and a timeout, both carried rather than observable in the answer.
+
+    `-V` prints to **stderr** and exits non-zero on some builds, so `check=True` would turn an
+    ordinary OpenSSH into "no ssh here" -- the single most misleading thing this report could
+    say. The timeout is what stops a wedged binary hanging the diagnostic; neither shows up in
+    the return value, so both are read off the call.
+    """
+    seen: dict[str, object] = {}
+
+    def spy(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        seen.update(kwargs, argv=argv)
+        return subprocess.CompletedProcess(argv, returncode=255, stderr=b"OpenSSH_10.0p2\n")
+
+    monkeypatch.setattr(gantry_doctor.subprocess, "run", spy)
+    version, error = gantry_doctor._ssh_version("ssh")  # noqa: SLF001
+
+    assert (version, error) == ("OpenSSH_10.0p2", None), "a non-zero exit was read as a failure"
+    assert seen["argv"] == ["ssh", "-V"]
+    assert seen["check"] is False
+    assert seen["timeout"] == gantry_doctor._SSH_VERSION_TIMEOUT  # noqa: SLF001
+    assert seen["capture_output"] is True
+
+
+def test_a_version_banner_that_is_not_utf8_is_still_reported(monkeypatch: pytest.MonkeyPatch):
+    # The banner is somebody else's bytes. A strict decode would raise `UnicodeDecodeError`
+    # from inside the function whose job is to explain why `ssh` is not usable.
+    def spy(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, returncode=0, stderr=b"OpenSSH_\xff9.6\n")
+
+    monkeypatch.setattr(gantry_doctor.subprocess, "run", spy)
+    version, error = gantry_doctor._ssh_version("ssh")  # noqa: SLF001
+
+    assert version == "OpenSSH_\ufffd9.6"
+    assert error is None
+
+
+# --- the JSON report -------------------------------------------------------------------------
+
+
+def test_the_json_report_is_stable_and_readable():
+    """Indented and key-sorted, and both are for the reader rather than the parser.
+
+    A diff of two `doctor --json` runs is how somebody compares a working host with a broken
+    one, and neither an unsorted nor a single-line document diffs usefully.
+    """
+    document = render_json(local())
+    assert "\n" in document, "the report is a single line, so it cannot be diffed"
+    lines = document.splitlines()
+    assert lines[1].startswith('  "'), "the first key is not indented by two"
+    assert not lines[1].startswith("   "), "indented by more than two"
+    keys = [line.strip().split(":")[0] for line in lines if line.startswith('  "')]
+    assert keys == sorted(keys), "top-level keys are not sorted"
+
+
+def test_the_json_report_takes_its_status_from_the_server_too():
+    """`overall_status(local, server)`, not `overall_status(local, None)`.
+
+    Dropping the second argument makes a run against an unreachable host exit `0` and print
+    `OK` -- the exact failure `doctor` exists to report, reported as success.
+    """
+    payload = json.loads(render_json(local(), reachable(reached=False, error="refused")))
+
+    assert payload["status"] == Exit.UNREACHABLE.name
+    assert payload["exit"] == int(Exit.UNREACHABLE)
+    assert payload["server"]["error"] == "refused"
+
+
+# --- the rendered report, pinned whole ---------------------------------------------------------
+#
+# Fourteen of `render_text`'s mutants and every one of the four line helpers' survived a suite
+# that asserts on *substrings*. A heading could lose its case, a blank line could become `"XX"`,
+# `lines +=` could become `lines =` and drop everything above it, and a `', '` join could become
+# something else -- all invisible to `assert "..." in report`.
+#
+# So the whole report is pinned, the way a packet is pinned by a golden frame: this is an output
+# format, people diff two runs of it, and an assertion that reads part of a line cannot see the
+# line move. Four shapes, because the branches are in the data rather than in the call.
+
+
+REACHED_REPORT = """\
+gantry-sftp doctor
+
+local
+  library                 0.0.0 (filexfer v3)
+  ssh executable          ssh -- a bare name, so PATH decides at spawn time
+  ssh version             OpenSSH_10.0p2
+  transfers               supported
+  ssh config              /home/bob/.ssh/config
+  environment             SSH_AUTH_SOCK=/run/agent
+  defaults                depth=64 request_timeout=30.0 idle_timeout=60.0
+
+server example.com
+  identified as           openssh -- OpenSSH's sftp-server
+  protocol                v3
+  extensions              2 advertised, 1 used here
+    uses                  posix-rename@openssh.com
+    ignores               statvfs@openssh.com
+    absent                fsync@openssh.com -- documented fallback
+  limits.max_packet_length262144
+  limits.max_read_length  261120
+  request size            read=261120 write=261120 (for a 4-byte handle)
+  depth                   64
+  start directory         /home/bob
+  handles reaped          0
+
+exit 0 (OK)"""
+
+
+def test_the_whole_report_for_a_server_that_answered():
+    assert render_text(local(environment={"SSH_AUTH_SOCK": "/run/agent"}), reachable()) == (
+        REACHED_REPORT
+    )
+
+
+LOCAL_PROBLEMS_REPORT = """\
+gantry-sftp doctor
+
+local
+  library                 0.0.0 (filexfer v3)
+  ssh executable          /usr/bin/ssh -- an absolute path, probed under SystemRoot (Windows)
+  ssh version             OpenSSH_10.0p2
+  transfers               NOT SUPPORTED here -- needs os.pread, os.pwrite (remote-only ops work)
+  ssh config              /home/bob/.ssh/config (absent)
+  environment             none of the steering variables are set
+  defaults                depth=64 request_timeout=30.0 idle_timeout=60.0
+
+server example.com
+  NOT REACHED
+    ConnectError: refused
+
+    ssh said no
+
+exit 4 (NO_LOCAL_IO)"""
+
+
+def test_the_whole_report_when_this_machine_is_the_problem():
+    """Two local problems and a multi-line failure, which is the shape a real one has.
+
+    The blank line inside the reason is rendered as an *empty* line rather than as four spaces,
+    which is what keeps a pasted `ssh` transcript readable. And the exit is the **local**
+    status: an unreachable host on a machine that cannot do local file I/O is a machine that
+    cannot do local file I/O, and saying so is the difference between one remedy and a hunt.
+    """
+    report = render_text(
+        local(
+            transfers_supported=False,
+            missing_local_io=("os.pread", "os.pwrite"),
+            ssh_config_present=False,
+            ssh_executable="/usr/bin/ssh",
+            ssh_resolved_from="an absolute path, probed under SystemRoot (Windows)",
+        ),
+        reachable(reached=False, error="ConnectError: refused\n\nssh said no", limits=None),
+    )
+    assert report == LOCAL_PROBLEMS_REPORT
+
+
+def test_the_report_takes_its_exit_from_the_server_when_the_machine_is_fine():
+    """`overall_status(local, server)` in both halves of the exit line, and a missing reason.
+
+    Dropping the server from either half prints `exit 0 (OK)` for a host that was never
+    reached -- the one thing this report exists to say, said backwards. They are two separate
+    calls in one f-string, so each is asserted.
+    """
+    report = render_text(local(), reachable(reached=False, error=None, limits=None))
+
+    assert report.endswith("\n\nexit 5 (UNREACHABLE)")
+    assert report.splitlines()[-4:-2] == ["  NOT REACHED", "    no reason recorded"]
+
+
+def test_a_server_that_advertised_no_limits_says_so_rather_than_reporting_our_guesses():
+    # The other side of `_limits_of`'s two absences: the renderer has to say the extension was
+    # not offered, not print the conservative defaults the session then uses as though the
+    # server had stated them.
+    report = render_text(local(), reachable(limits=None))
+
+    assert "  limits                  not advertised; conservative defaults in use" in (
+        report.splitlines()
+    ), "asserted as a whole line: a substring check passes a line that grew around it"
+    assert "limits.max_packet_length" not in report
+
+
+def test_more_than_one_steering_variable_is_listed_comma_separated():
+    # A single-variable case cannot see the separator, and this is a line an operator scans.
+    report = render_text(local(environment={"SSH_AUTH_SOCK": "/run/agent", "SSH_ASKPASS": "/x"}))
+    assert "  environment             SSH_AUTH_SOCK=/run/agent, SSH_ASKPASS=/x" in (
+        report.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("executable", "note"),
+    [
+        ("ssh", "a bare name, so PATH decides at spawn time"),
+        ("/usr/bin/ssh", "an absolute path, probed under SystemRoot (Windows)"),
+        (r"C:\Windows\System32\OpenSSH\ssh.exe", "a bare name, so PATH decides at spawn time"),
+    ],
+)
+def test_how_the_executable_will_be_found_is_said_in_words(executable: str, note: str):
+    """Both branches, and the third case is the one that surprises.
+
+    A Windows-shaped path is *not* absolute to `pathlib` on POSIX, so it reads as a bare name
+    here -- which is correct for the platform doing the reporting and is why this is computed
+    rather than inferred from the string's shape.
+    """
+    assert gantry_doctor._resolution_note(executable) == note  # noqa: SLF001
+
+
+def test_an_extension_name_that_is_not_utf8_is_reported_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The extension table is the server's bytes, and a strict decode raises inside the report.
+
+    Reaching a server that advertises a name no encoding explains is exactly the situation
+    `doctor` is run for -- so this is the one path where a `UnicodeDecodeError` would be
+    thrown by the diagnostic instead of by the thing being diagnosed.
+    """
+
+    class _Odd(_FakeSession):
+        extensions = (b"posix-rename@openssh.com", b"vendor-\xff@example")
+
+    @contextmanager
+    def fake_connect(_host: str, **_kwargs: object):  # type: ignore[no-untyped-def]
+        yield _Odd()
+
+    monkeypatch.setattr(gantry_doctor, "connect", fake_connect)
+    report = server_diagnosis("example.com")
+
+    assert report.extensions == ("posix-rename@openssh.com", "vendor-\ufffd@example")
+    assert report.unimplemented == ("vendor-\ufffd@example",)
+
+
+def test_the_local_report_forwards_the_environment_it_was_given(monkeypatch: pytest.MonkeyPatch):
+    """Two forwards, neither observable in the answer on this platform.
+
+    `resolve_ssh_executable` reads the environment only on Windows and `ssh_config_path` reads
+    it only where `pwd` is missing -- so on Linux both could be called with `None` and the
+    report would be identical. What is asserted is therefore the call, not the result.
+    """
+    seen: dict[str, object] = {}
+    environ = {"SystemRoot": r"C:\Windows"}
+
+    def spy_executable(*, environ: object = None) -> str:
+        seen["executable_environ"] = environ
+        return "ssh"
+
+    def spy_config(passed: object = None) -> Path:
+        seen["config_environ"] = passed
+        return Path("/home/bob/.ssh/config")
+
+    monkeypatch.setattr(gantry_doctor, "resolve_ssh_executable", spy_executable)
+    monkeypatch.setattr(gantry_doctor, "ssh_config_path", spy_config)
+    _ = local_diagnosis(environ)
+
+    assert seen == {"executable_environ": environ, "config_environ": environ}
+
+
+def test_whether_the_config_file_is_there_is_a_boolean(tmp_path: Path):
+    # `None` is falsy, so every `if report.ssh_config_present` reads the same -- and the report
+    # then renders " (absent)" for a file that is right there.
+    absent = local_diagnosis({"HOME": str(tmp_path)})
+    assert absent.ssh_config_present in (True, False), "not a bool, so `is True` cannot be used"
