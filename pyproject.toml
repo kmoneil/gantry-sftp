@@ -243,6 +243,11 @@ ban-relative-imports = "parents"
 # and `__reduce__` for the literal they passed in.
 "tests/test_fsspec.py" = ["S105", "S106"]
 "tests/test_transport.py" = ["S105", "S106"]
+# `connect()` forwards twelve values and the mutation lane cannot see one of them -- the
+# function is `@asynccontextmanager`-decorated, so it generates no mutants at all (D-107).
+# The hand-written table that replaces the lane has to pass a *non-default* for every
+# argument or a forwarded one is invisible, and one of those arguments is the password.
+"tests/test_namespace_and_connect.py" = ["S106"]
 "live-tests/test_password_auth.py" = ["S105", "S106"]
 "examples/password_auth.py" = ["S105", "S106"]
 # Same shape again: the example's point is that this literal reaches the constructor and then

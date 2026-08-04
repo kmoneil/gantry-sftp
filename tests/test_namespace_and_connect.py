@@ -384,6 +384,67 @@ async def test_connect_applies_the_session_options_it_is_given(monkeypatch: pyte
     assert seen["port"] == 2222
 
 
+async def test_connect_forwards_the_arguments_no_mutation_can_reach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Nine ssh arguments and three session tunables, none of which anything read.
+
+    The test above drives three of the nine and leaves `identity_file`, `password`,
+    `config_file`, `options`, `env` and `ssh_executable` unasserted -- so `connect` could drop
+    the credential on the floor and every proof in this file would still pass.
+
+    **The mutation lane cannot supply this one, which is why it is written by hand.** `connect`
+    is `@asynccontextmanager`-decorated and mutmut declines a decorated function, so the
+    library's headline entry point generates **zero** mutants (D-107, and D-132 put the module
+    in scope expecting otherwise). Its body is nothing but forwarding, which is the shape this
+    repository has been bitten by repeatedly and the exact defect found in the fsspec adapter's
+    own `_connect` on the same day: all nine of its forwarded arguments were droppable in
+    silence.
+
+    Every value below is deliberately **not** the default. An argument that forwards a value
+    equal to its default is invisible: dropping it changes nothing observable, and the test
+    passes for a reason unrelated to the wiring.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    seen: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def fake_transport(host: str, **kwargs: object) -> AsyncGenerator[Transport]:
+        seen.update(kwargs, host=host)
+        async with open_local_server_transport() as transport:
+            yield transport
+
+    monkeypatch.setattr("gantry_sftp._connect.open_ssh_transport", fake_transport)
+
+    async with connect(
+        "example.invalid",
+        user="bob",
+        port=2222,
+        identity_file=str(tmp_path / "id_ed25519"),
+        password="hunter2",
+        config_file=str(tmp_path / "ssh_config"),
+        options={"Compression": "yes"},
+        env={"LANG": "C"},
+        ssh_executable=str(tmp_path / "ssh"),
+        session=SessionOptions(request_timeout=7.5, idle_timeout=8.5, depth=3),
+    ) as sftp:
+        assert sftp.depth == 3
+
+    assert seen == {
+        "host": "example.invalid",
+        "user": "bob",
+        "port": 2222,
+        "identity_file": str(tmp_path / "id_ed25519"),
+        "password": "hunter2",
+        "config_file": str(tmp_path / "ssh_config"),
+        "options": {"Compression": "yes"},
+        "env": {"LANG": "C"},
+        "ssh_executable": str(tmp_path / "ssh"),
+    }
+
+
 async def test_connect_defaults_match_the_two_call_spelling(monkeypatch: pytest.MonkeyPatch):
     """With no ``session=``, the fused call must produce the session the long form does."""
     if find_sftp_server() is None:
