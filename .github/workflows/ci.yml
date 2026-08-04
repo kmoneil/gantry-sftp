@@ -141,6 +141,31 @@ jobs:
       - run: uv run --frozen python scripts/lanes.py matrix
 
   # ---------------------------------------------------------------------------
+  # The one performance lane that runs per change, and the reason it can is that it counts
+  # work rather than timing it: the same transfer retires the same instructions and reaches
+  # the same peak resident set whoever else is on the runner, so this is the only lane here
+  # whose numbers a shared host does not move. It needs no `bench` group -- it measures us,
+  # over `sftp-server` on a pipe.
+  #
+  # The committed baseline is per architecture and per CPython patch release, and this runner
+  # is neither the one it was taken on. That half therefore reports rather than gates until
+  # somebody generates an x86_64 baseline here; the *shape* half -- cost per byte must not
+  # grow with the file -- needs no baseline and gates everywhere. The report says in one line
+  # which of the two ran, so a lane that could not compare says so instead of passing quietly.
+  # ---------------------------------------------------------------------------
+  cost:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server valgrind
+      - run: uv python install
+      - run: uv sync --frozen
+      - run: uv run --frozen python scripts/lanes.py cost
+
+  # ---------------------------------------------------------------------------
   # Measuring lanes. Not on pull requests: a shared runner's throughput varies with whoever
   # else is on the host, and both of these compare ratios of measured throughput. They run on
   # demand and weekly, and they report -- `scripts/lanes.py` records why each one does not

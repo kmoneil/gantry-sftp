@@ -377,7 +377,7 @@ def test_an_unknown_lane_names_the_ones_that_exist(
     assert lanes.main(["fats"]) == 2
     assert capsys.readouterr().err == (
         "error: unknown lane 'fats'; known lanes are "
-        "gates, fast, leaks, live, matrix, netem, benchmarks, mutation\n"
+        "gates, fast, leaks, live, matrix, netem, benchmarks, cost, mutation\n"
     )
 
 

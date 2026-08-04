@@ -99,6 +99,12 @@ That is the payload buffering, which is the part that scales. Add a few hundred 
 connection for the frame splitter and the transport's read buffer, and whatever your own
 program holds.
 
+**This is measured, not just asserted.** `scripts/lanes.py cost` sweeps peak resident set across
+16 → 256 MiB in both directions and fails the run if it grows with the file or if a transfer costs
+more over an empty session than the expression above allows. Measured on that lane, a transfer
+costs about 1.2 MiB over an idle session and the curve is flat to ~1% across the whole range —
+so the "independent of the file's size" half is a check rather than a promise.
+
 **`depth` is what you lower**, and it is the whole of the knob — `SessionOptions(depth=8)`
 brings a transfer to about 2 MiB, at the cost of throughput on a high-latency link, where the
 requests in flight are what hides the round trip. The request size is not a parameter: it is

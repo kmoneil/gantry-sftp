@@ -1,10 +1,19 @@
 # benchmarks
 
-Where every performance number this project has comes from, and **none of them is committed**.
-A run writes `_reports/benchmarks.md`, which git ignores; this directory keeps the method, the
-fairness rules and the two scenarios that gate. It is also excluded from the built distribution,
-because no packager runs a benchmark and it needs paramiko and asyncssh — the Python
-cryptography this library exists not to need — to do anything at all (D-88, D-94).
+Where every performance number this project has comes from, and **no throughput figure is
+committed**. A run writes `_reports/benchmarks.md`, which git ignores; this directory keeps the
+method, the fairness rules and the scenarios that gate. It is also excluded from the built
+distribution, because no packager runs a benchmark and it needs paramiko and asyncssh — the
+Python cryptography this library exists not to need — to do anything at all (D-88, D-94).
+
+**One file here is committed and holds numbers, and the distinction it rests on is the point of
+this paragraph.** `instructions-<arch>.json` records how many machine instructions this process
+retires moving a file. That is a count of **work**, not a rate: it comes out the same on a busy
+machine and an idle one, so it says something about this code rather than about a host. A
+throughput figure cannot be committed because it is a claim about a machine the reader does not
+have; an instruction count can, for the same reason a golden frame can. It is the whole of
+D-63's answer, and [the lane it feeds](#the-cost-lane-the-one-that-gates-a-figure) is
+below.
 
 The reason is the ranking rule the project is built on: a correctness gap outranks a throughput
 feature, and a repository that says so and then carries a table of ratios against its
@@ -15,6 +24,7 @@ profile, its server and its benchmark is an anecdote.
 ```bash
 uv sync --group bench                        # paramiko and asyncssh
 python scripts/lanes.py benchmarks           # about ten minutes
+python scripts/lanes.py cost                 # about two minutes; needs valgrind, not the group
 ```
 
 That lane is `pytest benchmarks/ -s`, and `scripts/lanes.py` is where it is spelled out — one
@@ -48,7 +58,8 @@ unshaped profile needs no `tc` at all and runs in a plain checkout.
 | atomic publish 16 MiB | not a comparison. What *our own* default costs against our own in-place path |
 | our own CPU per byte | not a comparison, and **unshaped only**. This process's CPU per MiB in both directions, net of connecting, and the MiB/s ceiling that implies. DESIGN §5.1's route past the 2 MiB channel window is more transports — and one process is one GIL however many `ssh` children it spawns, so this is the ceiling underneath that one (D-113). A link constraint is exactly what it must not measure, which is why it runs on the one profile that is not constraining anything |
 | read 16 MiB: file object vs whole file | not a comparison, and the one row besides the sweep that **gates**. Our own `open_file().read()` in fixed blocks against our own `get`, plus paramiko's file object as a control. `paramiko#2453` reports their `SFTPFile.read()` at 25x their own `get`; the obvious implementation of a byte-range read reproduces it, so this row is how we know which one we shipped (D-86) |
-| download / upload: throughput against size | the **shape**, on two profiles. Ten sizes bracketing every boundary the design has, so a cliff at a byte count is visible as a curve rather than inferred from two points. This is the only scenario that **gates** — see below |
+| download / upload: throughput against size | the **shape**, on two profiles. Ten sizes bracketing every boundary the design has, so a cliff at a byte count is visible as a curve rather than inferred from two points. It **gates** — see below |
+| download / upload: instructions and peak memory against size | **not in this lane, and not wall clock at all.** `scripts/lanes.py cost` counts the instructions this process retires moving a file, which is the one performance number here that may be committed and the one that gates a *figure* (D-63). Its own section is below |
 
 Across five link profiles: unshaped, 5 ms, 50 ms, 200 ms, and 50 ms rate-limited to 100 Mbit/s.
 The rated one exists because loopback has no bandwidth ceiling unless you configure one, so
@@ -82,20 +93,127 @@ Three things about it are decisions rather than defaults:
   pathology must not be able to fail this lane. Their falls land in the report's caveats as
   `Control finding`, read off medians without the separability requirement, because an
   incumbent's stall is bimodal and its fast mode would hide it.
-- **Our own curve gates, and that is not the gate D-63 is about.** D-63 is the missing
-  *regression* gate: it needs a committed baseline to compare a run's figures against, and it is
-  blocked on not having one. This assertion needs no baseline and quotes no figure — it compares
-  rungs of a single run's curve against each other, and fails when throughput falls below half
-  the best measured at any smaller size *by a margin that run's own samples separate*. Whether a
-  number moving between runs should fail CI is still D-63's question.
+- **Our own curve gates, and that is not the gate D-63 was about.** D-63 was the missing
+  *regression* gate, blocked on having no baseline it was allowed to commit. This assertion needs
+  no baseline and quotes no figure — it compares rungs of a single run's curve against each
+  other, and fails when throughput falls below half the best measured at any smaller size *by a
+  margin that run's own samples separate*. Whether a number moving between runs should fail CI is
+  answered by the instruction lane below, on a different instrument.
 
-**What this gate cannot catch, measured rather than guessed.** A *fixed* per-transfer cost is
-invisible to a monotonicity test wherever the curve is still climbing steeply, because doubling the
-size outruns a constant. paramiko is the demonstration: its 32 KiB and 64 KiB uploads stall on a
-~42 ms floor, which unshaped is a 99% collapse and fires every detector here — and at 50 ms RTT the
-same +32 ms and +39 ms appear on the same two rungs while throughput keeps rising, so the shaped
-curve reads as clean. That is why the unshaped profile stays in the sweep: it is the one where a
-fixed cost dwarfs the transfer instead of hiding inside a round trip.
+**What this gate cannot catch, measured rather than guessed.** Two things, and neither is a
+tuning problem.
+
+A *fixed* per-transfer cost is invisible to a monotonicity test wherever the curve is still
+climbing steeply, because doubling the size outruns a constant. paramiko is the demonstration:
+its 32 KiB and 64 KiB uploads stall on a ~42 ms floor, which unshaped is a 99% collapse and fires
+every detector here — and at 50 ms RTT the same +32 ms and +39 ms appear on the same two rungs
+while throughput keeps rising, so the shaped curve reads as clean. That is why the unshaped
+profile stays in the sweep: it is the one where a fixed cost dwarfs the transfer instead of hiding
+inside a round trip.
+
+And a **superlinear** cost passes for as long as throughput is still rising, which can be the
+whole ladder. An O(n²) reassembler — one that walks everything it already holds once per arriving
+chunk — costs 32% of the wall clock at 16 MiB and produces **no cliff and no dip, in either
+direction**, measured in `_plans/probes/superlinear_blind_spot_probe.py`. Nor can the tolerance be
+tightened into catching it: the marginal-cost ratio it produces (1.11–1.50 across runs) sits
+inside the *same statistic's* range on a healthy run (0.71–1.11). The signal and the noise are the
+same size, so this is a limit of the instrument rather than of the threshold — which is what the
+instruction lane exists to get past.
+
+## The cost lane: the one that gates a figure
+
+```bash
+python scripts/lanes.py cost
+```
+
+Everything above times a transfer. This counts one, under `cachegrind`, over a real
+`sftp-server` on a pipe — no `ssh`, no network, no comparison libraries. What it reports is
+**instructions this process retired**, which is our own CPU per byte: DESIGN §5.2's second
+ceiling, and the axis D-112's ~11× improvement in `encode(WRITE)` moved without any clock here
+being able to see it.
+
+**Why it may gate when nothing else here may.** Two independent reasons, and both had to hold.
+An instruction count is a count of work rather than a rate, so committing a baseline for it does
+not breach the rule that keeps throughput figures out of this tree. And it does not move with the
+machine: with `PYTHONHASHSEED` pinned a pure-compute workload is **bit-identical** run to run, and
+a real 16 MiB download — subprocess, scheduler, `pwrite` and all — reproduces to about 0.06%,
+against a wall-clock spread that reaches 10 on the same rungs. That is why this is the only
+performance lane that runs on a pull request.
+
+Two assertions, needing different things:
+
+- **The shape.** Marginal instructions per MiB — what the bytes one rung adds over the rung below
+  cost — is one number under work that is linear in the file size, whatever the fixed cost per
+  transfer is. A rung more than 1.25× the cheapest step below it fails. This needs **no baseline**
+  and runs on any machine. Measured margin: a healthy run's steps agree to 1.005, and the O(n²)
+  reassembler the wall-clock sweep cannot see comes out at 1.53.
+- **The figures**, against `instructions-<arch>.json`, at an 8% band. A rung that got *costlier*
+  fails; one that got cheaper is a note asking for the baseline to be refreshed, because a
+  baseline left pessimistic stops being able to see the next regression.
+
+The band is the one number here that took three tries, and the wrong answers are worth knowing
+about. Two runs of one rung agreed to 0.06%, and a second pair to 0.5% — both of which are what a
+sample of two looks like, not what the instrument does. A **24-run pool** of one rung spans 2.6%,
+minimum-of-three groups inside it span 2.1%, and a group taken an hour earlier fell below that
+pool's floor entirely; across a session the honest figure is about 4%. The variation is not the
+interpreter — with the hash seed pinned that part is bit-identical — it is how much of the stream
+each `read` returns, which is the operating system's call and moves with what else is running.
+
+So the gate catches a change of roughly a tenth or more, which is where D-112's 11× lives, and it
+does **not** catch a single extra copy of the payload on the data path — about 2.6% here. Getting
+that would mean holding the read granularity still, which means a deterministic in-process
+transport instead of a real pipe. Every run prints its own widest spread next to the verdict, so a
+band that has quietly stopped meaning anything is visible in the report rather than inferred.
+
+A count only reproduces against one instruction set and one CPython patch release, and the
+baseline records both. Against a machine matching neither, the shape half still gates and the
+report states in one line why the other did not — a lane that cannot compare has to say so,
+rather than passing because it looked at nothing.
+
+Regenerate with `GANTRY_SFTP_INSTRUCTION_BASELINE=write python scripts/lanes.py instructions`,
+then read the diff and commit it. It is never rewritten on your behalf: a baseline that refreshed
+itself whenever a run disagreed with it would agree with every run, including the one that made
+everything twice as expensive.
+
+### Peak memory, in the same lane and on the same argument
+
+`docs/tuning.md` puts a bound on the deployment screen, where a Cloud Run reader meets it: peak
+memory is `concurrent transfers × depth × request size`, about 16 MiB per transfer at the shipped
+defaults, and **independent of the file's size in both directions**. Until D-138 the only thing
+behind that was `tests/test_packaging.py` checking the sentence against `DEFAULT_PIPELINE_DEPTH`
+and `PREFERRED_READ_LENGTH` — arithmetic over the documented values, which cannot say whether a
+transfer stays inside them.
+
+Two more assertions, both internal to one run: the peak must not grow with the file across
+16 → 256 MiB, and the most a transfer costs over an empty session must stay under the documented
+expression plus slack. Measured, the claim holds — the ladder is flat to about 1% in both
+directions, and a transfer costs roughly 1.2 MiB over an empty session against a 16 MiB bound.
+
+**The instrument is `VmHWM` from `/proc/self/status`, and `ru_maxrss` is not a portable
+alternative to it.** Across `posix_spawn` the child inherits the parent's high-water mark through
+the `vfork` window, so `getrusage` in a subprocess-per-rung harness reports whatever the *parent*
+did. A first pass using it said this library buffers whole files in both directions, byte-identical
+between them — which was the harness, and the tell was that two unrelated code paths agreed to the
+kilobyte. One process per rung is required for the same family of reason: a high-water mark can
+only ever report the largest transfer the process has already done. Linux only, stated rather than
+worked around.
+
+**The gate has been watched failing**, which is the only thing that separates a check from a
+claim: the same download with one `read_bytes()` added peaks at 45,800 / 94,504 / 291,228 KiB
+against the bounded path's flat ~30,000, and the numbers are pinned in
+`tests/test_memory_harness.py`.
+
+**What this lane does not gate**, since its name would suggest otherwise: nothing about
+pipelining, round trips or the link. Round-trip counts are asserted elsewhere (D-111), by the same
+reasoning — a count is variance-free and is a shape rather than a figure.
+
+Three environment facts, each cheap to get wrong. `cachegrind` is used rather than a perf-counter
+tool because `perf_event_open` needs a privilege this project's container does not have, and
+cachegrind is userspace simulation that needs none. `setarch --addr-no-randomize`, which the
+method this was drawn from recommends, **also** needs a privilege the container lacks
+(`Operation not permitted`) — and is unnecessary here, because valgrind lays out the address space
+itself. And cachegrind is roughly a two-orders-of-magnitude slowdown, which is why this is a lane
+and never a hook — the same reason `mutation` is one.
 
 Sample counts are per profile (`Profile.sweep_repeats`) because a rung costs about 2 ms unshaped
 and 220 ms at 50 ms RTT. The unshaped profile takes 25 samples per small rung and needs them:
@@ -221,10 +339,16 @@ larger than anything being compared.
 
 ## Where the figures are
 
-**Not here, and not anywhere committed.** The suite writes its full report to
-`_reports/benchmarks.md`, which is gitignored, and that is the only place an absolute number or
-a cross-library ratio lives. Re-derive them with `python scripts/lanes.py benchmarks`; the run
+**No throughput figure is here or anywhere committed.** The suite writes its full report to
+`_reports/benchmarks.md`, which is gitignored, and that is the only place an absolute rate or a
+cross-library ratio lives. Re-derive them with `python scripts/lanes.py benchmarks`; the run
 takes about ten minutes and prints the same tables it writes.
+
+The one committed file that holds numbers is `instructions-<arch>.json`, and the rule it obeys
+is this section's rather than an exception to it: it carries **counts of work**, which are
+properties of this code, not rates, which are properties of a machine and an afternoon. Read the
+[cost lane](#the-cost-lane-the-one-that-gates-a-figure) for why that distinction is
+the thing that made a regression gate possible at all.
 
 The reason is the ranking rule this project is built on: a correctness gap outranks a throughput
 feature, and a repository that says so and then carries a table of ratios against its
@@ -233,8 +357,8 @@ which was long enough to make the point that they had to leave the README and no
 pretend they belonged here instead (D-94).
 
 What survives in the committed tree is this document -- the method, the fairness rules and the
-two gates -- because those are decisions and they are worth reviewing. A figure is an
-observation of one machine on one afternoon, and it ages whether or not anybody re-reads it.
+gates -- because those are decisions and they are worth reviewing. A rate is an observation of
+one machine on one afternoon, and it ages whether or not anybody re-reads it.
 
 **The line to apply when adding one**, because "no numbers" is not quite the rule and pretending
 it is invites the next person to delete something load-bearing: a figure that is *evidence for a

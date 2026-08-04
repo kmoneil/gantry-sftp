@@ -16,6 +16,14 @@ reason now has an exception inside it, and the exception is what the field has t
 one run, so it asserts. Measurement and assertion are not the same axis as absolute and
 relative, and the field says which is which rather than implying a lane is all one thing.
 
+**``cost`` is the lane that shows what the reason above was really about** (D-63, D-138). It
+measures performance and it gates, because what it measures is a *count of work* rather than a
+rate: the same transfer retires the same instructions and reaches the same peak resident set on a
+busy machine as on an idle one, so a baseline for it can be committed where a baseline of MiB/s
+could not be. So the thing that kept performance out of the gating set was never that performance
+is measured -- it was that a rate needs a machine beside it to mean anything, and a count does
+not.
+
 Nothing here installs anything, and that is deliberate rather than lazy. A lane that ran
 ``uv sync --group bench`` on your behalf would make "the comparison libraries are deliberately
 not installed by default" false whenever somebody ran the wrong lane -- and that default is
@@ -192,6 +200,30 @@ LANES: tuple[Lane, ...] = (
             "two rows of a single run rather than a figure against a remembered one"
         ),
         takes="minutes",
+    ),
+    Lane(
+        name="cost",
+        summary=(
+            "what a transfer costs this process -- instructions retired and peak memory -- "
+            "as counts of work rather than rates, so they gate"
+        ),
+        tool="python",
+        args=(
+            "-m",
+            "pytest",
+            "benchmarks/test_instructions.py",
+            "benchmarks/test_memory.py",
+            "-s",
+        ),
+        needs=(
+            "valgrind (apt-get install valgrind) and openssh-server. Not the bench group -- "
+            "this lane measures only us, over sftp-server on a pipe, so paramiko and asyncssh "
+            "are irrelevant to it. The memory half also needs /proc and skips elsewhere with "
+            "the reason. Regenerate the instruction baseline with "
+            "GANTRY_SFTP_INSTRUCTION_BASELINE=write and commit the diff"
+        ),
+        reports_only="",
+        takes="about two minutes",
     ),
     Lane(
         name="mutation",

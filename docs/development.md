@@ -29,11 +29,37 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 | `lanes.py matrix`     | one client against three servers: OpenSSH, asyncssh, paramiko                                   | `uv sync --group bench`        |
 | `lanes.py netem`      | every pipelining claim, on a `tc`-shaped link at 5/50/200 ms RTT                                | `CAP_NET_ADMIN`                |
 | `lanes.py benchmarks` | wall clock and CPU against paramiko and asyncssh                                                | both of the two above          |
+| `lanes.py cost`       | what a transfer costs this process: instructions retired and peak memory                        | `valgrind`, `openssh-server`   |
 | `lanes.py mutation`   | whether an assertion would notice the line being wrong                                          | nothing                        |
 
-The first four **gate**: a failure stops the change. The last three **report**, meaning they
-measure, or assert against a baseline that is not in this tree, and `scripts/lanes.py` carries the
-reason next to each one, so opting a lane out of gating is a written act rather than a habit.
+The first five **gate**: a failure stops the change. `netem`, `benchmarks` and `mutation`
+**report**, meaning they measure, or assert against a baseline that is not in this tree, and
+`scripts/lanes.py` carries the reason next to each one, so opting a lane out of gating is a
+written act rather than a habit.
+
+`cost` is the one performance lane that gates, and the reason is worth reading before adding
+another. It measures a transfer as **counts of work** rather than as a rate — instructions
+retired, and peak resident set — so it comes out the same on a busy machine and on an idle one,
+which is what lets a baseline for it be committed where a baseline of MiB/s could not be. Four
+things fail a run.
+
+**Instructions**, under `cachegrind`: cost per byte drifting more than 8% from
+`benchmarks/instructions-<arch>.json`, and cost per byte *growing with the file*, which is a
+superlinear cost and is invisible to the wall-clock sweep for as long as throughput is still
+rising. Eight percent is twice the measured run-to-run spread, so what it catches is a change of
+roughly a tenth or more — the class D-112's 11× belongs to, and not a single extra copy on the
+data path. Regenerate the baseline with `GANTRY_SFTP_INSTRUCTION_BASELINE=write` and commit the
+diff; it is never rewritten on your behalf. A count only reproduces against one instruction set
+and one CPython patch release, both of which the file records — on a machine matching neither,
+the shape half still gates and the report says in one line why the other did not.
+
+**Peak memory**, from `/proc/self/status`: the peak growing with the file across a 16× range of
+sizes, or a transfer costing more over an empty session than `docs/tuning.md`'s expression allows.
+This is the first measurement behind that page's bound — before it, the only thing checking
+"about 16 MiB per transfer, independent of the file's size" was arithmetic over the two constants
+the sentence quotes. Needs no baseline; both assertions are internal to one run. Linux only, and
+it skips elsewhere with the reason: `getrusage`'s `ru_maxrss` is **not** a portable substitute,
+because across `posix_spawn` it reports the *parent's* peak (D-138).
 
 Type checking is deliberately two-tool: mypy is stricter and catches gaps ty misses. A
 finding gets fixed at the source, never silenced with an ignore.
