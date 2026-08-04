@@ -49,7 +49,7 @@ for what that trade does and does not buy.
 from __future__ import annotations
 
 import logging
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import PurePath
 from time import monotonic
@@ -58,7 +58,6 @@ __all__ = [
     "LOG_FIELDS",
     "MASKED",
     "MAX_VALUE_CHARS",
-    "OUR_OWN_VOCABULARY",
     "SENSITIVE_ENVIRONMENT_KEYS",
     "SENSITIVE_KEY_MARKERS",
     "fields_of",
@@ -109,23 +108,6 @@ A formatter reads it with :func:`record_fields`, or directly::
 Records this library emits before an operation exists -- there are none today -- would carry
 nothing, so a formatter must tolerate the attribute being absent. That is what
 :func:`record_fields` is for.
-"""
-
-OUR_OWN_VOCABULARY = frozenset({"operation", "event", "error", "mechanism"})
-"""Field keys whose values this library chooses from a fixed set, so they are not escaped.
-
-Every other value on a record is ``repr``-escaped, because a remote name is chosen by the
-server and an unescaped one in a log stream can forge a record or drive a terminal. These four
-are not: ``operation`` is one of this library's own method names, ``event`` is one of four
-words, ``error`` is a Python class name and ``mechanism`` is an enum member's name. Escaping
-them produces ``"operation": "'get'"``, which nobody will write an alert against -- the quotes
-become part of the value the sink indexes.
-
-**The failure direction is deliberate.** Forgetting to add a key here over-escapes a field,
-which reads badly; adding one wrongly would let a value the far end chose through unescaped.
-So this list is short, closed, and every entry is a value with a *finite* set of possibilities
-that this library enumerates -- which is the property `tests/test_observability.py` asserts,
-rather than the list itself.
 """
 
 SENSITIVE_ENVIRONMENT_KEYS = frozenset({"GANTRY_SFTP_ASKPASS_ANSWER"})
@@ -210,15 +192,29 @@ def fields_of(**fields: object) -> dict[str, dict[str, object]]:
 
 
 def _extra(fields: Mapping[str, object]) -> dict[str, dict[str, object]]:
-    """:func:`fields_of` for a mapping that is already assembled.
+    r""":func:`fields_of` for a mapping that is already assembled.
 
     Separate from the keyword form for one reason, and it is a crash rather than a style
     preference: ``fields_of(**a, **b)`` raises ``TypeError`` when ``a`` and ``b`` share a key,
     inside a logging call, in whatever code path happened to be logging. Merging into a dict
     literal first lets the later value win -- which is also the right answer, since what an
     operation *recorded* is more current than what it was *called with*.
+
+    **Every value is escaped; no key is exempt** (D-130). There used to be an
+    ``OUR_OWN_VOCABULARY`` allowlist of four keys -- ``operation``, ``event``, ``error``,
+    ``mechanism`` -- whose values skipped :func:`_structured` on the grounds that this library
+    picks them from a closed set and that escaping would render ``"operation": "'get'"``. Both
+    halves were wrong by the time the mutation lane reached this module. The quotes had already
+    gone: :func:`_unquoted` strips them, so escaping an ASCII identifier is the identity
+    function and the exemption bought *nothing* for the three keys that really are closed. And
+    ``error`` is not closed -- it is ``type(exc).__name__`` for whatever exception crossed
+    :func:`operation`, and ``type("bad\\nname", (Exception,), {})`` is a legal class, so the one
+    key the allowlist could not vouch for was the one it exempted. `docs/observability.md` had
+    said "names are escaped" without qualification throughout; the code was the half that was
+    wrong. The allowlist shape is the finding, not its contents: it omitted silently, which is
+    the same mechanism as D-132's.
     """
-    return {LOG_FIELDS: {key: _field(key, value) for key, value in fields.items()}}
+    return {LOG_FIELDS: {key: _structured(value) for key, value in fields.items()}}
 
 
 def record_fields(record: logging.LogRecord) -> dict[str, object]:
@@ -272,6 +268,25 @@ def operation(logger: logging.Logger, name: str, **fields: object) -> Generator[
 
     Yields:
         A dictionary to record results into.
+
+    Note:
+        The body is :func:`_operation` and **that split is for the mutation lane** (D-107),
+        exactly as :func:`~gantry_sftp.transport._askpass.askpass_environment` is split. mutmut
+        does not instrument a decorated function, so this one -- three ``isEnabledFor`` guards,
+        two subtractions, and the ``start`` / ``ok`` / ``failed`` literals every record in the
+        library is keyed on -- generated no mutants at all while it was decorated. Undecorated,
+        the body is instrumented. Do not fold it back in.
+    """
+    yield from _operation(logger, name, **fields)
+
+
+def _operation(logger: logging.Logger, name: str, **fields: object) -> Iterator[dict[str, object]]:
+    """The body of :func:`operation`; see there for what it does and why it is split.
+
+    Yields:
+        The result dictionary, exactly once. ``yield from`` in the wrapper forwards a throw at
+        the yield point straight into this generator, so the ``except BaseException`` below
+        still sees a cancellation -- which is the whole reason the closing record survives one.
     """
     started = monotonic()
     result: dict[str, object] = {}
@@ -297,7 +312,10 @@ def operation(logger: logging.Logger, name: str, **fields: object) -> Generator[
                 name,
                 _render(fields),
                 _render(result),
-                type(error).__name__,
+                # Escaped here and raw below, so each is escaped exactly once: the message is
+                # written straight out, while the field goes through `_extra`, which escapes
+                # every value it is handed. See `_class_name` for why a class name needs it.
+                _class_name(error),
                 elapsed,
                 extra=_extra(
                     {
@@ -340,7 +358,21 @@ def summarise(error: BaseException) -> str:
     Returns:
         The class name and a ``repr``-escaped, truncated rendering of its message.
     """
-    return f"{type(error).__name__} {_capped(repr(str(error)))}"
+    return f"{_class_name(error)} {_capped(repr(str(error)))}"
+
+
+def _class_name(error: BaseException) -> str:
+    r"""An exception's class name, escaped like any other string this library did not choose.
+
+    **A class name is not a closed set** (D-130). It reads like one -- every exception this
+    library raises is declared with ``class`` and so has an identifier for a name -- which is
+    why three sites interpolated ``type(error).__name__`` raw into a record. But ``__name__`` is
+    whatever the type was built with, and ``type("bad\\nname", (Exception,), {})`` is a legal
+    class, so a caller's exception could put a newline in a log line and forge the record after
+    it. Escaping is free where the name really is an identifier: ``repr`` of one, with
+    :func:`_unquoted` taking the quotes back off, is the identity function.
+    """
+    return _scalar(type(error).__name__)
 
 
 def _render(fields: Mapping[str, object]) -> str:
@@ -353,24 +385,6 @@ def _render(fields: Mapping[str, object]) -> str:
     ``PosixPath(...)``, which is the same escaping with less noise.
     """
     return "".join(f" {key}={_value(value)}" for key, value in fields.items())
-
-
-def _field(key: str, value: object) -> object:
-    """One value as *data* rather than as text, for the ``extra=`` mapping.
-
-    Numbers and booleans pass through, because a threshold alert on ``bytes`` or a filter on a
-    boolean is the reason to have the key rather than the sentence. So do the four keys in
-    :data:`OUR_OWN_VOCABULARY`, whose values this library picks from a closed set -- a quoted
-    ``"'get'"`` is not a value anybody can query on.
-
-    Everything else -- a remote path most of all -- goes through exactly the rendering
-    :func:`_value` applies to the message, which is ``repr`` plus the cap. See :func:`fields_of`
-    for why that escaping is load-bearing on this surface too and not merely inherited from the
-    text one.
-    """
-    if key in OUR_OWN_VOCABULARY and isinstance(value, str):
-        return value
-    return _structured(value)
 
 
 def _structured(value: object) -> object:

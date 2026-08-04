@@ -26,6 +26,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import anyio
@@ -36,7 +37,7 @@ from hypothesis import strategies as st
 from gantry_sftp._logging import (
     MASKED,
     MAX_VALUE_CHARS,
-    OUR_OWN_VOCABULARY,
+    fields_of,
     mask_environment,
     operation,
     record_fields,
@@ -654,27 +655,59 @@ def test_a_number_stays_a_number_so_a_threshold_alert_can_be_written():
     assert not isinstance(record_fields(finish)["bytes"], str)
 
 
-def test_our_own_vocabulary_is_not_escaped_because_nobody_can_query_a_quoted_value():
+def test_the_keys_this_library_chooses_still_read_as_themselves():
+    """Escaping every key costs nothing where the value really is an identifier.
+
+    This is what the old ``OUR_OWN_VOCABULARY`` exemption was protecting -- ``operation`` must
+    not arrive as ``"'get_tree'"``, because the quotes would become part of the value a sink
+    indexes and nobody writes an alert against those. It holds without an exemption:
+    ``repr`` of an identifier, with the quotes taken back off, is the identity function.
+    """
     (start, _) = emit("gantry_sftp.session", "get_tree", remote=b"/a")
     assert record_fields(start)["operation"] == "get_tree"
     assert record_fields(start)["event"] == "start"
 
 
-def test_every_name_in_our_own_vocabulary_is_a_value_this_library_chooses():
-    """The property behind the exemption, rather than the list.
+@pytest.mark.parametrize("key", ["operation", "event", "error", "mechanism", "remote"])
+def test_no_key_is_exempt_from_escaping(key: str):
+    """D-130, and the direction the old exemption failed in.
 
-    A key is exempt from escaping only if its value comes from a *closed* set this library
-    enumerates. Adding a key here whose value the far end supplies would put an unescaped,
-    attacker-chosen string on a log record -- so the reason each one qualifies is written down,
-    and this test is what stops the set growing without one.
+    ``OUR_OWN_VOCABULARY`` named four keys whose values skipped escaping on the grounds that
+    this library picks them from a closed set. Three of them were closed and lost nothing by
+    being escaped; ``error`` was not closed at all -- see the test below -- and it was the one
+    the list vouched for. The property that replaces the list is that there is no list: a key
+    cannot be added to an exemption that does not exist.
     """
-    reasons = {
-        "operation": "one of this library's own method names",
-        "event": "one of start / ok / failed / retrying",
-        "error": "a Python exception class name",
-        "mechanism": "a PublishMechanism member's name",
-    }
-    assert set(OUR_OWN_VOCABULARY) == set(reasons)
+    escaped = fields_of(**{key: "forged\nrecord"})["gantry"][key]
+    assert escaped == "forged\\nrecord"
+    assert "\n" not in escaped
+
+
+def test_an_exception_class_name_cannot_forge_a_record(caplog: pytest.LogCaptureFixture):
+    """The bug the mutation lane found in ``error``'s exemption (D-130).
+
+    A class name reads like a closed set -- everything raised here is declared with ``class``
+    and so is named by an identifier -- but ``__name__`` is whatever the type was built with,
+    and ``type(...)`` takes any string. So the one key ``OUR_OWN_VOCABULARY`` could not vouch
+    for was the one it exempted, and the newline reached the message, the field and
+    ``summarise`` alike: three sites, one wrong assumption about who chooses that string.
+    """
+    forged = type("Forged\nDEBUG fake record", (RuntimeError,), {})
+
+    logger = logging.getLogger("gantry_sftp.session")
+    with (
+        caplog.at_level(logging.DEBUG, logger="gantry_sftp.session"),
+        pytest.raises(forged),
+        operation(logger, "get", remote=b"/a.csv"),
+    ):
+        raise forged("boom")
+
+    record = caplog.records[-1]
+    assert "\n" not in record.getMessage()
+    assert "Forged\\nDEBUG fake record" in record.getMessage()
+    assert record_fields(record)["error"] == "Forged\\nDEBUG fake record"
+    # And the third site, which renders a class name without going through a field at all.
+    assert "\n" not in summarise(forged("boom"))
 
 
 def test_a_failure_carries_the_exception_class_as_a_field():
@@ -698,6 +731,49 @@ def test_a_failure_carries_the_exception_class_as_a_field():
     assert fields["event"] == "failed"
     assert fields["error"] == "ValueError"
     assert isinstance(fields["elapsed"], float)
+    # The failure record's own `operation` key, which nothing asserted: every test that pins it
+    # reads a *successful* record, and the two branches spell the key separately. A record that
+    # says which operation failed is the one an alert is written on.
+    assert fields["operation"] == "put"
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["ok", "failed"])
+def test_elapsed_is_a_duration_and_not_merely_a_float(fail: bool):
+    """``isinstance(..., float)`` is not an assertion about the number.
+
+    ``monotonic()`` counts from an arbitrary epoch, so ``monotonic() + started`` is a float,
+    lands on the record, renders through ``%.3f`` and reads as a plausible time to every
+    assertion this suite had -- while being roughly twice the machine's uptime. The oracle has
+    to be a *second* measurement rather than the type: the operation cannot have taken longer
+    than the wall-clock the test measured around it. Both branches compute this separately.
+    """
+    logger = logging.getLogger("gantry_sftp.session")
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    before = monotonic()
+    try:
+        if fail:
+            with pytest.raises(ValueError), operation(logger, "put", remote=b"/a"):
+                raise ValueError("no")
+        else:
+            with operation(logger, "get", remote=b"/a"):
+                pass
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    outer = monotonic() - before
+
+    elapsed = record_fields(records[-1])["elapsed"]
+    assert isinstance(elapsed, float)
+    assert 0.0 <= elapsed <= outer
 
 
 def test_a_result_key_that_shadows_a_field_does_not_crash_the_log_call():
@@ -759,6 +835,103 @@ def test_a_scalar_inside_a_collection_is_still_escaped_and_capped():
     unquoted = repr(b"x" * 400)[2:-1]
     assert fields["argv"][0] == unquoted[:MAX_VALUE_CHARS] + f"+{len(unquoted) - MAX_VALUE_CHARS}"
     assert list(fields["steering"]) == ["A\\nB"]
+
+
+def test_a_message_with_more_than_one_field_renders_exactly(caplog: pytest.LogCaptureFixture):
+    """Every other message assertion here uses one field, ``startswith`` or ``in``.
+
+    None of those can see what joins the pairs together, so the separator between them was
+    unasserted -- a mutation putting four characters between every field passed the whole
+    suite. A record is read by a person at 3am and parsed by a sink; the exact spelling of
+    the line with two fields on it is the specification of both.
+    """
+    logger = logging.getLogger("gantry_sftp.session")
+    with (
+        caplog.at_level(logging.DEBUG, logger="gantry_sftp.session"),
+        operation(logger, "get", remote=b"/a.csv", local="out.csv") as record,
+    ):
+        record["bytes"] = 1024
+
+    start, finish = (record.getMessage() for record in caplog.records)
+    assert start == "get start remote=b'/a.csv' local='out.csv'"
+    assert finish.startswith("get ok remote=b'/a.csv' local='out.csv' bytes=1024 elapsed=")
+
+
+def test_a_field_at_exactly_the_cap_is_not_truncated_either():
+    """The same boundary the frame dumper has a test for, on the surface that copied its rule.
+
+    ``_capped`` is deliberately a second copy of :data:`gantry_sftp.codec.MAX_FIELD_BYTES`'s
+    rule rather than an import of it, so it needs a second copy of the off-by-one test: at
+    exactly the cap the value is whole, one past it says how many it dropped. Without this,
+    ``<=`` reads as ``<`` and every 96-character name is reported as truncated by zero.
+    """
+    at_cap = "a" * MAX_VALUE_CHARS
+    assert fields_of(remote=at_cap)["gantry"]["remote"] == at_cap
+    assert fields_of(remote=at_cap + "a")["gantry"]["remote"] == at_cap + "+1"
+
+
+@pytest.mark.parametrize("value", ["Kevin's.csv", b"Kevin's.csv"], ids=["str", "bytes"])
+def test_a_name_with_an_apostrophe_still_loses_reprs_quotes(value: str | bytes):
+    """The axis every other rendering test here holds constant: which quote ``repr`` picks.
+
+    ``repr`` switches to double quotes for a value containing a single one, so ``Kevin's.csv``
+    renders as ``"Kevin's.csv"`` and ``b"Kevin's.csv"`` -- a whole branch of the unquoting that
+    no test reached, because every sample was a path made of letters and slashes. An apostrophe
+    in a filename is not an exotic input; it is Tuesday.
+    """
+    assert fields_of(remote=value)["gantry"]["remote"] == "Kevin's.csv"
+
+
+@pytest.mark.parametrize("value", ["", b""], ids=["str", "bytes"])
+def test_an_empty_field_arrives_empty_rather_than_as_two_quote_characters(value: str | bytes):
+    """``_SHORTEST_LITERAL`` is 2 because ``repr("")`` is two quotes and nothing between.
+
+    The constant's own docstring names this case and nothing exercised it, so the ``>=`` that
+    admits it read exactly like a ``>`` that does not -- and under that spelling an empty name
+    arrives at the sink as the two characters ``''``, which is a value somebody has to learn
+    means "empty" rather than a directory called ``''``.
+    """
+    assert fields_of(remote=value)["gantry"]["remote"] == ""
+
+
+def test_a_value_whose_repr_is_not_a_quoted_literal_is_left_whole():
+    """The docstring's own carve-out, and it had no test on either side of the branch.
+
+    ``None`` is the reachable case -- ``mechanism`` is ``None`` for an upload that published
+    by writing in place -- and its ``repr`` is four characters with no quotes anywhere. Strip
+    the outer pair anyway and the field says ``on``.
+    """
+    assert fields_of(mechanism=None)["gantry"]["mechanism"] == "None"
+
+
+def test_a_hostile_repr_that_opens_with_a_quote_is_not_trimmed_into_something_else():
+    """The other side of that branch: a ``repr`` that *starts* like a literal and is not one.
+
+    Nothing stops a caller's object rendering however it likes, and the unquoting has to decide
+    on the pair rather than on the opening character -- otherwise the first and last characters
+    of an arbitrary rendering are silently eaten, which is a value nobody can trace back to
+    what produced it.
+    """
+
+    class Misleading:
+        def __repr__(self) -> str:
+            return "'oops"
+
+    assert fields_of(remote=Misleading())["gantry"]["remote"] == "'oops"
+
+
+def test_a_str_field_is_escaped_as_thoroughly_as_a_bytes_one():
+    """Same rule, other spelling. ``local`` is a ``str`` on every call site that has one.
+
+    The escaping tests all fed ``bytes``, because that is what ``READDIR`` returns -- so the
+    ``str`` half of the same path was covered only by values with nothing in them to escape,
+    which cannot tell escaping from a passthrough.
+    """
+    escaped = fields_of(local="/incoming/" + HOSTILE.decode("latin-1"))["gantry"]["local"]
+    assert isinstance(escaped, str)
+    assert "\n" not in escaped
+    assert "\x1b" not in escaped
+    assert escaped.startswith("/incoming/")
 
 
 def test_record_fields_tolerates_a_record_from_anywhere_else():

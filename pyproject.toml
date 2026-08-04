@@ -436,10 +436,20 @@ source_paths = ["src/"]
 # leaked password rather than a wrong timestamp. Reading them is not evidence: the 0.11 review
 # called `_localpath.py` exemplary on the same basis, and D-105's sixth slice then found that a
 # server could name a file `CON.a.txt` and reach the console.
+#
+# **And `_logging.py`, which is not in a package at all** (D-130). Every top-level module in
+# `src/gantry_sftp/` was outside all three globs above, so none of them had ever had a mutant
+# generated -- and this one holds `mask_environment` / `_is_sensitive`, which is the chokepoint
+# the Definition of Done 3 names in as many words: "anything that can carry a credential is
+# redaction-checked before it can reach a log, a frame dump, an exception, or a telemetry span".
+# One function enforces that for the whole library. `path.py` and `fsspec.py` are the other two
+# security-bearing modules on this list and are still outside it; D-132 is the argument for
+# inverting the scope so the next one is not.
 only_mutate = [
     "src/gantry_sftp/codec/*",
     "src/gantry_sftp/session/*",
     "src/gantry_sftp/transport/*",
+    "src/gantry_sftp/_logging.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/"]
 also_copy = ["examples/"]

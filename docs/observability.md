@@ -104,7 +104,7 @@ The rest are per operation: `remote` and `local`; `bytes`; `files`, `directories
 on a tree; `mechanism` on a `put`; `pid`, `argv`, `returncode` and `steering` on the transport;
 `attempt`, `attempts` and `delay` on the retry warning.
 
-Three properties worth knowing, because they are decisions rather than accidents:
+Four properties worth knowing, because they are decisions rather than accidents:
 
 - **Numbers stay numbers.** `bytes` and `elapsed` arrive as an int and a float, so `bytes > 1e9`
   is a query rather than a substring match that also catches 10240.
@@ -112,7 +112,15 @@ Three properties worth knowing, because they are decisions rather than accidents
   gets the same `repr` escaping the frame dump uses — a `\n` cannot forge a record and the value
   is pure ASCII, which matters because a filename that was never valid UTF-8 would otherwise
   break `json.dumps(...).encode()` in the sink. What it does _not_ get is `repr`'s surrounding
-  quotes, since those would become part of the value you filter on.
+  quotes, since those would become part of the value you filter on. **No key is exempt**, which
+  is worth stating because four of them used to be: `operation`, `event`, `error` and `mechanism`
+  skipped escaping on the grounds that this library picks them from a closed set. It bought
+  nothing — escaping an identifier and taking the quotes back off returns the identifier — and
+  `error` is `type(exc).__name__`, which is whatever the class was built with rather than a set
+  anybody enumerates.
+- **`elapsed` is measured across the operation, including a failed or cancelled one.** A record
+  is closed on the way out whichever way the body left, so "started and never finished" means a
+  hang rather than an error you did not see.
 - **A list stays a list and a mapping stays a mapping.** `argv` is an array and `steering` an
   object, each scalar inside escaped and capped, rather than one long truncated string.
 
