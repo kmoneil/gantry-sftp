@@ -80,14 +80,43 @@ def needs_real_server() -> None:
 # --- what the facade is derived from -------------------------------------------------------
 
 
+MUTMUT_MARKER = "__mutmut_"
+"""What mutmut's synthetic class members all carry in their names, and nothing else does.
+
+**D-131.** This file used to be on the mutation lane's `--ignore` list, and the reason was
+circular: `sync.py` is the biggest module in the library, what proves it correct is the parity
+derived below, and under mutmut every mutated class carries one `xǁSessionǁmethod__mutmut_N`
+per mutant -- 2403 of them against 59 real members on `Session` alone. So the parity check
+reported hundreds of imaginary "async methods with no blocking form", failed on arrival, and
+stopped the run before a single mutant was generated. The module that most needed the lane was
+excluded by the test that would have judged it.
+
+Filtering them out is the cheapest of the three ways out D-131 listed, and the objection to it
+is real: this is somebody else's private naming and it has changed before. What makes it the
+right trade anyway is **which way it fails**. If mutmut renames its mangling, this filter stops
+matching, the synthetic members come back, and the parity tests fail loudly with a list of
+names that are obviously not ours -- the same failure as today, no worse. It cannot fail
+*quietly*, and a filter that hid a genuinely missing blocking method is the only outcome that
+would have been worth refusing.
+
+`getattr_static` is what keeps the marker from being needed for a second reason: it does not
+run a descriptor, so no mutant executes merely by being enumerated here.
+"""
+
+
 def public_members(cls: type) -> dict[str, Any]:
     """Everything a caller can reach on a class, without triggering a descriptor.
 
     `getattr_static` rather than `getattr`, because a `property` read on the class would give
     back the property object anyway but a `getattr` on an instance would run it.
+
+    Members mutmut generated are not members of the class this repository wrote -- see
+    :data:`MUTMUT_MARKER`. Outside the lane there are none and this is an identity filter.
     """
     return {
-        name: inspect.getattr_static(cls, name) for name in dir(cls) if not name.startswith("_")
+        name: inspect.getattr_static(cls, name)
+        for name in dir(cls)
+        if not name.startswith("_") and MUTMUT_MARKER not in name
     }
 
 
@@ -123,9 +152,32 @@ its reason or quietly grow a fifth entry nobody argued for.
 
 def test_the_derivation_is_not_vacuous():
     # Guards the guards: every parity test below is a loop over these, and an empty dict
-    # would make all of them pass while proving nothing.
+    # would make all of them pass while proving nothing. It is also what catches the
+    # `MUTMUT_MARKER` filter over-applying, since removing real members lands here.
     assert len(ASYNC_MEMBERS) > 40
     assert sum(inspect.iscoroutinefunction(m) for m in ASYNC_MEMBERS.values()) > 25
+
+
+@pytest.mark.parametrize(
+    "cls", [Session, SyncSession, SFTPPath, SyncSFTPPath, RemoteFile, SyncRemoteFile]
+)
+def test_the_mutmut_filter_removes_nothing_this_repository_wrote(cls: type):
+    """The must-not-flag control beside the must-flag case, which is the half that matters.
+
+    A sweep that over-applies is the one that gets a rule deleted: a filter which quietly ate
+    a real method would make `test_every_session_method_has_a_blocking_form` pass by having
+    nothing left to check. Outside the mutation lane this is an identity filter and the
+    assertion below says so directly, rather than trusting the count above to notice.
+    """
+    everything = {name for name in dir(cls) if not name.startswith("_")}
+    kept = set(public_members(cls))
+    dropped = everything - kept
+
+    assert all(MUTMUT_MARKER in name for name in dropped), (
+        f"the filter removed members that are not mutmut's: {sorted(dropped - kept)}"
+    )
+    if "MUTANT_UNDER_TEST" not in os.environ:
+        assert dropped == set(), f"nothing to filter outside the lane, yet dropped {dropped}"
 
 
 def test_every_session_method_has_a_blocking_form():

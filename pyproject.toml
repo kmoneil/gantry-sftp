@@ -395,14 +395,19 @@ venv = ".venv"
 useLibraryCodeForTypes = false
 
 # ---------------------------------------------------------------------------
-# mutmut -- codec and correctness layer carry a mutation run
+# mutmut -- the whole shipped package carries a mutation run
 #
-# `source_paths` is the whole package, not just codec/, and that is load-bearing:
-# mutmut copies source_paths into `mutants/` and then *removes* the real src/ from
-# sys.path. Pointing it at `src/gantry_sftp/codec/` alone produced a mutants/ tree
-# with no `gantry_sftp/__init__.py`, so `gantry_sftp` resolved as a namespace
-# package containing only `codec` and every other import failed. Copy the package,
-# restrict the mutation to codec/ with `only_mutate`.
+# The Definition of Done asks for "codec and correctness layer". The scope is wider
+# than that and the reason is on `do_not_mutate` below: the rule was written before
+# this package held the argument-injection defence, the credential path, the
+# redaction chokepoint and the fix for a reproduced RCE, and every one of those was
+# outside the scope the rule names.
+#
+# `source_paths` is the whole package rather than a subdirectory, and that is
+# load-bearing: mutmut copies source_paths into `mutants/` and then *removes* the
+# real src/ from sys.path. Pointing it at `src/gantry_sftp/codec/` alone produced a
+# mutants/ tree with no `gantry_sftp/__init__.py`, so `gantry_sftp` resolved as a
+# namespace package containing only `codec` and every other import failed.
 #
 # Test selection is `tests/` and deliberately excludes `examples/`: each example
 # runs as a subprocess, which imports the *installed* library rather than the
@@ -423,33 +428,34 @@ useLibraryCodeForTypes = false
 # ---------------------------------------------------------------------------
 [tool.mutmut]
 source_paths = ["src/"]
-# Both layers, which is what the Definition of Done asks for -- "codec **and correctness
-# layer** carry a mutmut run" -- and which was not achievable until 0.11. The `session/`
-# half was blocked upstream from 2026-07-26 until mutmut 3.7.0 shipped
-# `fix(#525): implement full async-gen wrapper`; see D-21. Scope a working run with a
-# wildcard rather than by editing this line: `mutmut run "gantry_sftp.session._retry*"`.
+# **The scope is a denylist, and that is D-132.** It used to be `only_mutate`, naming
+# `codec/`, `session/` and `transport/` -- and an allowlist omits silently. A module added
+# outside those globs was not mutated, produced no survivors, appeared in no report, and
+# therefore looked exactly like a module with nothing wrong. That is not hypothetical: it
+# happened three times. `transport/` was added late, by somebody noticing. `_logging.py` --
+# the redaction chokepoint the Definition of Done 3 names in as many words -- was found by
+# D-130, having never had a mutant. `fsspec.py`, which holds the fix for a *reproduced* remote
+# code execution (D-120), and `path.py`, which holds `check_component`, were found by D-133 in
+# the same sweep.
 #
-# **And `transport/`, which the Definition of Done does not name and which needs the lane
-# most.** The rule says "codec and correctness layer"; it was written before this package held
-# the argument-injection defence (`_argv.py`) and the credential path (`_askpass.py`), which
-# are the two files in this library where a missed test costs an injected `ssh` flag or a
-# leaked password rather than a wrong timestamp. Reading them is not evidence: the 0.11 review
-# called `_localpath.py` exemplary on the same basis, and D-105's sixth slice then found that a
-# server could name a file `CON.a.txt` and reach the console.
+# Held the other way up, every absence is a statement instead of a silence: everything in
+# `src/` is mutated, a new module is in the lane the day it lands, and forgetting costs
+# wall-clock and a survivor list somebody has to look at rather than costing coverage and
+# saying nothing. Which way the default fails is the whole of the argument.
 #
-# **And `_logging.py`, which is not in a package at all** (D-130). Every top-level module in
-# `src/gantry_sftp/` was outside all three globs above, so none of them had ever had a mutant
-# generated -- and this one holds `mask_environment` / `_is_sensitive`, which is the chokepoint
-# the Definition of Done 3 names in as many words: "anything that can carry a credential is
-# redaction-checked before it can reach a log, a frame dump, an exception, or a telemetry span".
-# One function enforces that for the whole library. `path.py` and `fsspec.py` are the other two
-# security-bearing modules on this list and are still outside it; D-132 is the argument for
-# inverting the scope so the next one is not.
-only_mutate = [
-    "src/gantry_sftp/codec/*",
-    "src/gantry_sftp/session/*",
-    "src/gantry_sftp/transport/*",
-    "src/gantry_sftp/_logging.py",
+# A comment saying "remember to add new modules" was refused as the fix, and so was a test
+# asserting the allowlist covers every module -- that is a second place to state the scope,
+# which then has to agree with the first. Inverting the default removes the need for either.
+#
+# Scope a working run with a wildcard rather than by editing this: `mutmut run
+# "gantry_sftp.session._retry*"`. (The `session/` half of the lane was blocked upstream from
+# 2026-07-26 until mutmut 3.7.0 shipped `fix(#525): implement full async-gen wrapper`; see
+# D-21.)
+do_not_mutate = [
+    # Re-exports and a `__version__`. No function bodies, so mutmut generates nothing for it
+    # either way; listed so its absence from the survivor list is a statement rather than a
+    # thing nobody checked.
+    "src/gantry_sftp/__init__.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/"]
 also_copy = ["examples/"]
@@ -495,19 +501,23 @@ also_copy = ["examples/"]
 # asserting a `warnings.warn` `stacklevel` therefore measures a different thing here. It skips
 # on `MUTANT_UNDER_TEST`, which mutmut sets for the whole run, so ordinary runs are unchanged.
 # Without the skip the lane cannot start at all: stats collection fails on that one assertion.
-# `tests/test_sync_facade.py` is the fourth in the list below and the only one with a
-# different root cause: it does not resolve the repository root, it introspects `Session`
-# itself -- it was the fifth of five when `test_namespace_and_connect.py` was still here. Under
-# mutmut the class carries the trampoline's own members -- `xǁSessionǁ__init____mutmut_1`,
-# `...__mutmut_orig`, one pair per mutant -- so the parity check reports several hundred
-# "async methods with no blocking form" and the baseline never starts. It was invisible
-# until 0.11 because it only fires when `session/` is the mutated package, which is the
-# lane D-21 has never been able to run. Ignoring it kills nothing: mutmut mutates function
-# *bodies*, and this file asserts on names, signatures and return annotations, so it cannot
-# fail for any mutant.
+# `tests/test_sync_facade.py` was the fourth entry here and is no longer ignored (D-131). It
+# was the only one with a different root cause: it does not resolve the repository root, it
+# introspects `Session` itself. Under mutmut the class carries the trampoline's own members --
+# `xǁSessionǁ__init____mutmut_1`, `...__mutmut_orig`, one pair per mutant, 2403 of them against
+# 59 real ones -- so the parity check reported several hundred imaginary "async methods with no
+# blocking form" and the baseline never started.
+#
+# **That ignore was load-bearing in the wrong direction, which is why removing it mattered
+# more than the other three.** `sync.py` is the largest module in the library and what proves
+# it correct is this file, so the module that most needed the lane was excluded by the test
+# that would have judged it -- and mutating it anyway would have produced a survivor list that
+# was mostly the ignore. Fixed at the source: `public_members` drops names carrying mutmut's
+# `__mutmut_` marker, with the reasoning and the fails-loudly argument on `MUTMUT_MARKER`
+# there, plus a must-not-flag control test beside it. Ordinary runs are unchanged, because
+# outside the lane it is an identity filter.
 pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
     "--ignore=tests/test_lanes.py",
-    "--ignore=tests/test_sync_facade.py",
 ]

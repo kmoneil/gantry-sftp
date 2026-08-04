@@ -22,12 +22,14 @@ shipped one. The `ssh` path itself is `live-tests/test_fsspec_live.py`.
 from __future__ import annotations
 
 import inspect
+import io
 import os
 import subprocess
 import sys
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
 import fsspec
 import pytest
@@ -39,6 +41,8 @@ from fsspec.registry import (
     registry,
 )
 
+from gantry_sftp import fsspec as gantry_fsspec
+from gantry_sftp.codec import Attrs
 from gantry_sftp.exceptions import CapabilityError
 from gantry_sftp.fsspec import (
     _AUTHORITY_ONLY,
@@ -50,8 +54,10 @@ from gantry_sftp.fsspec import (
     PROTOCOL,
     GantrySFTPFile,
     GantrySFTPFileSystem,
+    _range,
     register,
 )
+from gantry_sftp.session import SessionOptions
 from gantry_sftp.sync import BoundPortal
 from gantry_sftp.transport import find_sftp_server
 
@@ -611,6 +617,124 @@ def test_the_refused_parameters_are_still_constructor_arguments(tmp_path: Path):
     assert filesystem.ssh_executable == str(tmp_path / "ssh")
 
 
+# --- the one method the harness above replaces --------------------------------------------
+#
+# `LocalGantryFS` overrides `_connect`, which is what makes every other test here run against
+# a real `sftp-server` without an `ssh`. The cost is that the shipped `_connect` is the one
+# method in this module no test reaches -- the mutation lane reported all 28 of its mutants as
+# "no tests", including every one of the nine arguments it forwards. A dropped `password=` or
+# `identity_file=` there connects as somebody else, or not at all, and nothing here would have
+# noticed. So this section stands the connection up against stand-ins for the two things it
+# calls, and reads what it passed.
+
+
+class _RecordingSession:
+    def __init__(self) -> None:
+        self.chdir_calls: list[object] = []
+
+    def chdir(self, path: object) -> None:
+        self.chdir_calls.append(path)
+
+
+class _RecordingPortal:
+    """Stands in for `BoundPortal`, recording the portal it was handed and the connect call."""
+
+    def __init__(self, portal: object) -> None:
+        self.portal = portal
+        _recorded["portal_arg"] = portal
+
+    @contextmanager
+    def connect(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        _recorded["args"] = args
+        _recorded["kwargs"] = kwargs
+        session = _RecordingSession()
+        _recorded["session"] = session
+        yield session
+
+
+_recorded: dict[str, Any] = {}
+
+
+@pytest.fixture
+def recording_connect(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """Replace the two things `_connect` calls, so the shipped body runs and spawns nothing."""
+    _recorded.clear()
+    sentinel = object()
+
+    @contextmanager
+    def fake_portal():  # type: ignore[no-untyped-def]
+        yield sentinel
+
+    monkeypatch.setattr(gantry_fsspec, "start_blocking_portal", fake_portal)
+    monkeypatch.setattr(gantry_fsspec, "BoundPortal", _RecordingPortal)
+    return sentinel
+
+
+def test_connect_forwards_every_constructor_argument_it_was_given(recording_connect, tmp_path):
+    """Nine arguments, each droppable on its own with the whole suite green.
+
+    Every value below is deliberately **not** the default, because an argument that forwards a
+    value equal to the default is invisible: dropping it changes nothing observable and the
+    lane and the test agree for the wrong reason.
+    """
+    options = SessionOptions(depth=7)
+    filesystem = GantrySFTPFileSystem(
+        "example.com",
+        user="bob",
+        port=2222,
+        identity_file=str(tmp_path / "id_ed25519"),
+        password="hunter2",
+        config_file=str(tmp_path / "ssh_config"),
+        options={"Compression": "yes"},
+        ssh_executable=str(tmp_path / "ssh"),
+        session=options,
+        skip_instance_cache=True,
+    )
+
+    assert filesystem.sftp is _recorded["session"]
+
+    assert _recorded["portal_arg"] is recording_connect, "BoundPortal got the wrong portal"
+    assert _recorded["args"] == ("example.com",)
+    assert _recorded["kwargs"] == {
+        "user": "bob",
+        "port": 2222,
+        "identity_file": str(tmp_path / "id_ed25519"),
+        "password": "hunter2",
+        "config_file": str(tmp_path / "ssh_config"),
+        "options": {"Compression": "yes"},
+        "ssh_executable": str(tmp_path / "ssh"),
+        "session": options,
+    }
+
+
+def test_connect_records_the_stack_and_the_pid_that_owns_it(recording_connect):
+    """`close()` is a no-op unless both were stored, and after a fork that is the point.
+
+    `_owner_pid` set to `None` makes every `close()` silently do nothing -- the connection
+    stays open and the `ssh` child is never reaped -- and `_stack` set to `None` does the same
+    from the other side.
+    """
+    filesystem = GantrySFTPFileSystem("example.com", skip_instance_cache=True)
+    _ = filesystem.sftp
+
+    assert filesystem._owner_pid == os.getpid()  # noqa: SLF001
+    assert filesystem._stack is not None  # noqa: SLF001
+
+    filesystem.close()
+    assert filesystem._stack is None  # noqa: SLF001
+    assert filesystem._session is None  # noqa: SLF001
+
+
+def test_connect_changes_directory_only_when_a_cwd_was_asked_for(recording_connect):
+    # Both directions: the guard inverted calls `chdir(None)` on every connection that did not
+    # ask for one, and skips it on every connection that did.
+    with_cwd = GantrySFTPFileSystem("example.com", cwd="/incoming", skip_instance_cache=True)
+    assert with_cwd.sftp.chdir_calls == ["/incoming"]
+
+    without = GantrySFTPFileSystem("example.com", skip_instance_cache=True)
+    assert without.sftp.chdir_calls == []
+
+
 # --- listing --------------------------------------------------------------------------------
 
 
@@ -732,6 +856,84 @@ def test_byte_ranges_including_the_negative_ones(fs, drop: str, start, end, expe
     assert fs.cat_file(f"{drop}/report.csv", start=start, end=end) == expected
 
 
+# --- the range arithmetic, asked directly rather than through a server ----------------------
+#
+# `_range` is pure, and every case above reaches it through `cat_file` against a real
+# `sftp-server` -- which always reports a size. So its whole sizeless branch, including the
+# refusal and every word of that refusal's message, had never executed. Driving a pure function
+# through the public name that calls it is also a filter: `cat_file` returns bytes, and two
+# different (offset, length) pairs that read the same bytes are indistinguishable there.
+#
+# These are not hypothetical inputs. A server that answers `STAT` without
+# `SSH_FILEXFER_ATTR_SIZE` is exactly what `Attrs`' own docstring is about -- absent is not
+# zero -- and this library's rule is that every server response has three shapes.
+
+
+def _sized(size: int | None) -> Attrs:
+    return Attrs(size=size)
+
+
+@pytest.mark.parametrize(("start", "end"), [(-1, None), (None, -1), (-2, -1)])
+def test_a_negative_range_needs_a_size_to_measure_back_from(start, end):
+    """The refusal, its message and the feature it carries -- none of which had run.
+
+    `CapabilityError` carries `feature=` so a caller can branch on *what* is unsupported
+    rather than on prose, which is the half that goes unread wherever the message is pinned.
+    """
+    with pytest.raises(CapabilityError) as exc:
+        _ = _range(_sized(None), start, end)
+    assert exc.value.args[0] == (
+        "a negative range is measured back from the end of the file, and this server "
+        "reported no size, so there is nothing to measure back from"
+    )
+    assert exc.value.feature == "a negative byte range"
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected"),
+    [
+        (None, None, (0, 1 << 40)),
+        (0, None, (0, 1 << 40)),
+        (0, 4, (0, 4)),
+        (4, 8, (4, 4)),
+        # Zero is not negative, and the guard reads `< 0` rather than `<= 0`. A bound of
+        # exactly zero from a server that reported no size is an empty read, not a refusal.
+        (0, 0, (0, 0)),
+        (4, 0, (4, 0)),
+    ],
+)
+def test_a_non_negative_range_does_not_need_a_size(start, end, expected):
+    # The other side of the same guard: only a *negative* bound needs a size, so an ordinary
+    # read from a server that reported none must still work.
+    assert _range(_sized(None), start, end) == expected
+
+
+def test_no_end_and_no_size_asks_for_everything_from_the_offset():
+    # `begin + _UNBOUNDED`, where a minus sign asks for nothing at all and reads zero bytes
+    # off a file whose size the server declined to give.
+    begin, length = _range(_sized(None), 10, None)
+    assert begin == 10
+    assert length == 1 << 40
+
+
+@pytest.mark.parametrize(
+    ("size", "start", "end", "expected"),
+    [
+        # An explicit zero end is empty, not "the whole file measured back from the end".
+        (10, 0, 0, (0, 0)),
+        (10, 3, 0, (3, 0)),
+        # A bound further back than the file is long clamps to the start, not past it.
+        (4, -10, None, (0, 4)),
+        (4, None, -10, (0, 0)),
+        # An empty file the server *did* report the size of, which is not the same as no size.
+        (0, -1, None, (0, 0)),
+        (0, None, -1, (0, 0)),
+    ],
+)
+def test_the_range_edges_that_a_whole_file_read_never_reaches(size, start, end, expected):
+    assert _range(_sized(size), start, end) == expected
+
+
 def test_reading_across_the_block_size_is_still_one_file(fs, drop: str, tree: Path):
     """The block cache asks for ranges; the point is that the seams are invisible.
 
@@ -802,8 +1004,126 @@ def test_get_file_and_put_file_use_this_librarys_transfer_path(fs, drop: str, tm
 def test_put_file_in_create_mode_refuses_an_existing_destination(fs, drop: str, tmp_path: Path):
     source = tmp_path / "upload.csv"
     _ = source.write_bytes(b"id\n5\n")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError) as exc:
         fs.put_file(source, f"{drop}/report.csv", mode="create")
+    # The path the refusal is about, which is the only thing in it a caller can act on.
+    assert exc.value.args[0] == f"{drop}/report.csv"
+    assert fs.cat_file(f"{drop}/report.csv") == b"id,total\n1,42\n", "refused and wrote anyway"
+
+
+# --- the fallback branch, which is a feature and had never run ------------------------------
+#
+# `get_file` and `put_file` hand back to `AbstractFileSystem` when there is no local *filename*
+# to work with -- a file-like `lpath`, or an explicit `outfile`. That is deliberate: this
+# library's transfer path places bytes with `os.pwrite` into a descriptor it opened itself, and
+# there is nothing there to open. Every test above passes a real path, so the branch never
+# executed and each of the six arguments it forwards was droppable in silence.
+
+
+class _Recorder(fsspec.Callback):
+    """An fsspec callback that records what it was told, for both transfer directions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.size: int | None = None
+        self.seen: list[tuple[int, int | None]] = []
+
+    def set_size(self, size):  # type: ignore[no-untyped-def]
+        self.size = size
+
+    def absolute_update(self, value):  # type: ignore[no-untyped-def]
+        self.seen.append((value, self.size))
+
+    def relative_update(self, inc=1):  # type: ignore[no-untyped-def]
+        previous = self.seen[-1][0] if self.seen else 0
+        self.seen.append((previous + inc, self.size))
+
+
+def test_an_explicit_outfile_hands_over_to_the_base_class(fs, drop: str, tmp_path: Path):
+    """Every argument in the fallback call, on the one branch of it that a caller can reach.
+
+    Three things are asserted because all three were droppable on their own: the bytes prove
+    `rpath` and `outfile` arrived, the untouched `lpath` proves the `or` is an `or`, and the
+    callback proves `callback=` survived `_or_default` -- which could hand back the no-op for a
+    caller who supplied a real one, leaving a progress bar that silently never moves.
+
+    With `and` in `outfile is not None or local is None`, a caller who passes both a filename
+    and an `outfile` gets the *fast* path: the bytes land in the file they named, the stream
+    they handed us stays empty, and nothing is raised to say so.
+    """
+    landing = tmp_path / "explicit-outfile.csv"
+    unwanted = tmp_path / "should-not-be-written.csv"
+    recorder = _Recorder()
+
+    # A real file rather than a `BytesIO`, because fsspec's copy loop closes the stream it
+    # was given and a closed `BytesIO` will not give its value back.
+    with landing.open("wb") as sink:
+        fs.get_file(f"{drop}/report.csv", str(unwanted), outfile=sink, callback=recorder)
+
+    assert landing.read_bytes() == b"id,total\n1,42\n"
+    assert not unwanted.exists(), "outfile was given and the bytes went to lpath anyway"
+    assert recorder.seen, "the callback was dropped on the fallback path"
+
+
+@pytest.mark.parametrize("direction", ["get", "put"])
+def test_a_file_like_local_reaches_a_base_class_that_cannot_take_one(fs, drop: str, direction):
+    """Found by the mutation lane, and it is a defect rather than a decision -- see D-134.
+
+    `_local_path` returns `None` for anything without `__fspath__`, and both transfer methods
+    read that as "fall back to fsspec's copy loop, which is the only thing that can write into
+    an open stream". The docstrings say so in as many words. It is not true of the base class
+    shipped in fsspec: `get_file` sets `outfile = lpath` and then calls `_parent(lpath)` on the
+    same object, and `put_file` calls `os.path.isdir(lpath)` before anything else. Both raise
+    before a byte moves.
+
+    Pinned rather than fixed here, because deciding what a file-like local *should* do is a
+    feature decision and this slice is a mutation grind. What this test buys meanwhile is that
+    the behaviour is stated: today it raises, and it raises from inside fsspec.
+    """
+    if direction == "get":
+        with pytest.raises(AttributeError):
+            fs.get_file(f"{drop}/report.csv", io.BytesIO())
+    else:
+        with pytest.raises(TypeError):
+            fs.put_file(io.BytesIO(b"id\n7\n"), f"{drop}/from-a-stream.csv")
+        assert not fs.exists(f"{drop}/from-a-stream.csv")
+
+
+# --- the local directories a download creates -----------------------------------------------
+
+
+def test_downloading_a_directory_creates_it_with_its_parents(fs, drop: str, tmp_path: Path):
+    # `parents=True` and `exist_ok=True` are both load-bearing and neither had a case: the
+    # destination's parents do not exist here, and the second call finds the directory there.
+    target = tmp_path / "nested" / "deeper" / "archive"
+    fs.get_file(f"{drop}/archive", str(target))
+    assert target.is_dir()
+
+    fs.get_file(f"{drop}/archive", str(target))
+    assert target.is_dir()
+
+
+def test_downloading_a_file_creates_the_local_parents(fs, drop: str, tmp_path: Path):
+    """A caller writing `fs.get(url, "out/2026/report.csv")` gets the base class's behaviour.
+
+    Two calls, because `exist_ok` only matters on the second: the first creates the tree and
+    the second finds it, which is the ordinary shape of a job that runs more than once.
+    """
+    target = tmp_path / "out" / "2026" / "report.csv"
+    fs.get_file(f"{drop}/report.csv", str(target))
+    assert target.read_bytes() == b"id,total\n1,42\n"
+
+    fs.get_file(f"{drop}/report.csv", str(target))
+    assert target.read_bytes() == b"id,total\n1,42\n"
+
+
+def test_a_download_of_a_missing_file_names_that_file(fs, drop: str, tmp_path: Path):
+    # `_translated(remote)` carries the path into the `FileNotFoundError` fsspec's callers
+    # catch; with the argument nulled the error names nothing and the chain is all that is
+    # left. fsspec's contract is the exception type; a usable message is ours.
+    with pytest.raises(FileNotFoundError) as exc:
+        fs.get_file(f"{drop}/not-here.csv", str(tmp_path / "out.csv"))
+    assert exc.value.args[0] == f"{drop}/not-here.csv"
 
 
 def test_a_progress_callback_is_bridged_rather_than_dropped(fs, drop: str, tmp_path: Path):
