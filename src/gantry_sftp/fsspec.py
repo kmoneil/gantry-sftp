@@ -766,7 +766,7 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
 
         Raises:
             FileNotFoundError: If the path does not exist.
-            UnsupportedError: If the server sent no modification time for it.
+            CapabilityError: If the server sent no modification time for it.
         """
         remote = self._strip_protocol(path)
         with _translated(remote):
@@ -788,7 +788,7 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         returning the modification time under a second name.
 
         Raises:
-            UnsupportedError: Always.
+            CapabilityError: Always.
         """
         remote = self._strip_protocol(path)
         raise CapabilityError(
@@ -1107,6 +1107,28 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         )
 
 
+def _measures_back(start: int | None, end: int | None) -> bool:
+    """Whether either bound is negative, and so is measured from the end of the file."""
+    return (start is not None and start < 0) or (end is not None and end < 0)
+
+
+def _absolute(bound: int, size: int | None) -> int:
+    """One slice bound as an absolute offset, clamped to the start of the file.
+
+    Args:
+        bound: A slice bound, negative for "back from the end".
+        size: What the server reported. ``None`` cannot reach the negative branch --
+            :func:`_range` refuses that combination before calling this -- but the fallback
+            is spelled anyway, because an unreachable ``None + int`` is still a type error.
+
+    Returns:
+        The offset the bound names, never below zero.
+    """
+    if bound >= 0:
+        return bound
+    return max(0, (size or 0) + bound)
+
+
 def _range(attrs: Attrs, start: int | None, end: int | None) -> tuple[int, int]:
     """Turn fsspec's slice-shaped range into an absolute offset and a length.
 
@@ -1119,21 +1141,23 @@ def _range(attrs: Attrs, start: int | None, end: int | None) -> tuple[int, int]:
         The absolute offset to read from, and how many bytes to ask for.
 
     Raises:
-        UnsupportedError: If a negative bound was given and the server reported no size, so
+        CapabilityError: If a negative bound was given and the server reported no size, so
             there is nothing to measure back from.
     """
     size = attrs.size
-    if size is None and ((start is not None and start < 0) or (end is not None and end < 0)):
+    if size is None and _measures_back(start, end):
         raise CapabilityError(
             "a negative range is measured back from the end of the file, and this server "
             "reported no size, so there is nothing to measure back from",
             feature="a negative byte range",
         )
-    begin = 0 if start is None else start if start >= 0 else max(0, (size or 0) + start)
-    if end is None:
-        stop = size if size is not None else begin + _UNBOUNDED
+    begin = 0 if start is None else _absolute(start, size)
+    if end is not None:
+        stop = _absolute(end, size)
+    elif size is None:
+        stop = begin + _UNBOUNDED
     else:
-        stop = end if end >= 0 else max(0, (size or 0) + end)
+        stop = size
     return begin, max(0, stop - begin)
 
 
@@ -1160,7 +1184,7 @@ class GantrySFTPFile(AbstractBufferedFile):  # type: ignore[misc]  # fsspec ship
     ) -> None:
         """Record the remote path before the base class asks the filesystem about it."""
         self._fs = fs
-        self._remote = fs._strip_protocol(path)  # noqa: SLF001 -- fsspec's own classmethod API
+        self._remote = fs._strip_protocol(path)  # noqa: SLF001  # fsspec's own classmethod API
         self._handle: bytes | None = None
         self._written = 0
         super().__init__(fs, path, *args, **kwargs)

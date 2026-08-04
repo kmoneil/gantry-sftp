@@ -312,10 +312,18 @@ class Dispatcher:
         capture: ``sent`` climbing while ``received`` does not is a server that has stopped
         answering, and both frozen is a transfer that stopped asking.
         """
-        state = "closed" if self._closed else "failed" if self._failure is not None else "open"
-        reader = (
-            "reading" if self._reading else "unstarted" if self._reader_scope is None else "stopped"
-        )
+        if self._closed:
+            state = "closed"
+        elif self._failure is not None:
+            state = "failed"
+        else:
+            state = "open"
+        if self._reading:
+            reader = "reading"
+        elif self._reader_scope is None:
+            reader = "unstarted"
+        else:
+            reader = "stopped"
         return (
             f"<Dispatcher {state} reader={reader} exchanges={len(self._exchanges)} "
             f"routes={len(self._routes)} unclaimed={self._unclaimed} reaped={self._reaped} "

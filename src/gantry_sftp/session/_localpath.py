@@ -71,7 +71,7 @@ def _windows_reason(name: bytes) -> str | None:
     """Why this name is unusable on Windows specifically, or ``None``."""
     if any(byte in name for byte in WINDOWS_FORBIDDEN_CHARACTERS):
         return "a character Windows does not allow in a filename"
-    if any(byte < 32 for byte in name):  # noqa: PLR2004 -- ASCII control range
+    if any(byte < 32 for byte in name):  # noqa: PLR2004  # ASCII control range
         return "a control character"
     if name.endswith((b".", b" ")):
         # Windows silently strips these, so `evil.txt.` and `evil.txt` are the same file --

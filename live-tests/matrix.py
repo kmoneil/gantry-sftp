@@ -191,7 +191,7 @@ def _listening_asyncssh(name: str, **listen_kwargs: Any) -> Generator[None]:
             assert asyncssh is not None
             server = await asyncssh.listen("127.0.0.1", **listen_kwargs)
             started.set()
-            while not stopping.is_set():  # noqa: ASYNC110 -- bridging a threading.Event
+            while not stopping.is_set():  # noqa: ASYNC110  # bridging a threading.Event
                 await asyncio.sleep(0.05)
             server.close()
 

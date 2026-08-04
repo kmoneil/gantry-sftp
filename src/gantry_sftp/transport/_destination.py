@@ -303,7 +303,12 @@ async def effective_host(argv: Sequence[str], host: str) -> str:
     try:
         with anyio.fail_after(ALLOWED_HOSTS_PROBE_TIMEOUT):
             completed = await anyio.run_process(probe, check=False)
-    except (OSError, TimeoutError) as failure:
+    except OSError as failure:
+        # Both failures of this probe arrive as an `OSError`, and the timeout is the one that
+        # does not look like it: `fail_after` raises the builtin `TimeoutError`, which **is**
+        # an `OSError` subclass, so naming it alongside would be redundant rather than
+        # documentary. Do not narrow this to a spawn error -- the timeout has to keep landing
+        # here, because the whole point of the branch is that a probe nobody can read refuses.
         raise DestinationNotAllowedError(
             f"cannot check whether {host!r} is an allowed destination: the 'ssh -G' probe "
             f"failed ({failure!r}); refusing the connection rather than allowing an "

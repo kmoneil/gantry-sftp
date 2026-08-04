@@ -139,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             options=options or None,
         )
     render = render_json if arguments.json else render_text
-    print(render(local, server))  # noqa: T201 -- printing the report is what this program is
+    print(render(local, server))  # noqa: T201  # printing the report is what this program is
     return int(overall_status(local, server))
 
 

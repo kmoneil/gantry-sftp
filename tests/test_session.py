@@ -591,7 +591,7 @@ async def test_get_closes_the_handle_even_when_the_transfer_fails(tmp_path: Path
 
     server = Refusing(content=b"x" * 100)
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        with pytest.raises(Exception):  # noqa: B017 -- the type is asserted below
+        with pytest.raises(Exception):  # noqa: B017  # the type is asserted below
             await sftp.get("/remote", tmp_path / "out.bin")
 
     assert any(isinstance(packet, Close) for packet in server.seen), (

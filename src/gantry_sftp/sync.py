@@ -1283,17 +1283,17 @@ def _inner(path: bytes | str | SyncSFTPPath) -> bytes | str:
 
 def _wrapped_session(facade: SyncSession) -> Session:
     """The async session a blocking one drives."""
-    return facade._session  # noqa: SLF001 -- one facade, two classes; see above
+    return facade._session  # noqa: SLF001  # one facade, two classes; see above
 
 
 def _portal_of(facade: SyncSession) -> BlockingPortal:
     """The live portal, refusing a session whose ``with`` block has ended."""
-    return facade._ready()  # noqa: SLF001 -- one facade, two classes; see above
+    return facade._ready()  # noqa: SLF001  # one facade, two classes; see above
 
 
 def _driven[T](facade: SyncSession, factory: Callable[[], AsyncGenerator[T]]) -> Iterator[T]:
     """One async generator, driven from this thread and finalised on the portal's."""
-    return facade._iterate(factory)  # noqa: SLF001 -- one facade, two classes; see above
+    return facade._iterate(factory)  # noqa: SLF001  # one facade, two classes; see above
 
 
 class BoundPortal:
@@ -1487,7 +1487,7 @@ class BoundPortal:
         try:
             yield wrapper
         finally:
-            wrapper._finish()  # noqa: SLF001  (the facade's own lifecycle, not another object's)
+            wrapper._finish()  # noqa: SLF001  # the facade's own lifecycle, not another object's
 
 
 @contextmanager

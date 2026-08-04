@@ -269,8 +269,8 @@ async def test_the_session_tunables_reach_the_session_each_attempt(tmp_path: Pat
     seen: dict[str, object] = {}
 
     async def record(sftp: Session) -> str:
-        seen["request_timeout"] = sftp._request_timeout  # noqa: SLF001 -- no public accessor
-        seen["idle_timeout"] = sftp._idle_timeout  # noqa: SLF001 -- likewise
+        seen["request_timeout"] = sftp._request_timeout  # noqa: SLF001  # no public accessor
+        seen["idle_timeout"] = sftp._idle_timeout  # noqa: SLF001  # likewise
         seen["depth"] = sftp.depth
         return "done"
 

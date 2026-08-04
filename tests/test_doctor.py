@@ -61,7 +61,7 @@ from gantry_sftp.session import (
     ServerLimits,
 )
 
-SECRET = "hunter2-in-the-environment"  # noqa: S105 -- the thing the leak test greps for
+SECRET = "hunter2-in-the-environment"  # noqa: S105  # the thing the leak test greps for
 
 
 def reachable(**overrides: object) -> ServerDiagnosis:

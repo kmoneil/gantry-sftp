@@ -41,7 +41,7 @@ for _extra in (_BENCHMARKS, _ROOT / "live-tests"):
         # path resolves it just as well and cannot shadow.
         sys.path.append(str(_extra))
 
-import _harness  # noqa: E402  -- imported as a module so the clock can be monkeypatched
+import _harness  # noqa: E402  # imported as a module so the clock can be monkeypatched
 from _harness import (  # noqa: E402
     Comparison,
     CpuCeiling,

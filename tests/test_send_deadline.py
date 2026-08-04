@@ -420,7 +420,7 @@ async def test_a_dispatcher_defaults_to_no_send_deadline():
     for none, since `None` has to keep meaning `None` all the way down.
     """
     dispatcher = Dispatcher(StallingServer(), Codec())  # type: ignore[arg-type]
-    assert dispatcher._send_timeout is None  # noqa: SLF001 -- the field is the assertion
+    assert dispatcher._send_timeout is None  # noqa: SLF001  # the field is the assertion
 
 
 # --- the paths that were already bounded, kept so they stay that way -------------------------

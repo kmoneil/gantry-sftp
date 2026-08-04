@@ -1037,7 +1037,7 @@ async def test_mkdir_on_a_real_server(tmp_path: Path):
         # And exist_ok does not excuse a *file* of the same name, which is a different
         # problem wearing the same status.
         (tmp_path / "afile").write_bytes(b"x")
-        with pytest.raises(Exception):  # noqa: B017 -- any refusal, and it must refuse
+        with pytest.raises(Exception):  # noqa: B017  # any refusal, and it must refuse
             await sftp.mkdir(str(tmp_path / "afile"), exist_ok=True)
 
 

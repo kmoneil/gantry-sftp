@@ -135,7 +135,7 @@ from gantry_sftp.session._listing import (
     modified_at,
 )
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
-from gantry_sftp.session._localtree import remote_component, walk_local
+from gantry_sftp.session._localtree import LocalWalkEntry, remote_component, walk_local
 from gantry_sftp.session._mode import (
     CREATE_BITS,
     PERMISSION_BITS,
@@ -298,6 +298,23 @@ taken are indistinguishable from the status code alone. The escape hatch for suc
 ``atomic=False``, and the error says so.
 """
 
+_FEATURE_DURABLE_UPLOAD = "durable upload"
+"""``CapabilityError.feature`` for every refusal ``require_fsync=True`` can produce.
+
+A constant rather than a literal per site because ``feature`` is the half of that exception a
+caller **branches on** -- it exists so a handler can ask *what* was unavailable without reading
+prose -- and the three sites that raise it are hundreds of lines apart: the pre-flight check
+against a server already known to refuse ``fsync``, the probe on the staging handle, and the
+in-place path. One of them drifting to "durable uploads" would break a caller's branch while
+every message still read correctly. The tests pin the value as a literal, on purpose: an
+assertion importing this name would move with it and prove nothing."""
+
+_FEATURE_ATOMIC_PUBLISH = "atomic publish"
+"""``CapabilityError.feature`` for every refusal ``require_atomic=True`` can produce.
+
+Same argument as :data:`_FEATURE_DURABLE_UPLOAD`, over the rootedness check and the two
+``posix-rename`` refusals."""
+
 
 def raise_for_status(status: Status, *, path: bytes | None = None) -> None:
     """Turn a non-OK STATUS into a typed exception.
@@ -413,7 +430,12 @@ class DirectoryScan:
 
     @override
     def __repr__(self) -> str:
-        state = "open" if self._handle is not None else ("spent" if self._entered else "unopened")
+        if self._handle is not None:
+            state = "open"
+        elif self._entered:
+            state = "spent"
+        else:
+            state = "unopened"
         return f"<DirectoryScan {self._path!r} {state}>"
 
     async def __aenter__(self) -> DirectoryScan:
@@ -559,7 +581,12 @@ class RemoteFile:
         actually asking about -- a read that returned less than expected is usually a cursor
         somewhere other than where its author believed.
         """
-        state = "open" if self._handle is not None else ("closed" if self._entered else "unopened")
+        if self._handle is not None:
+            state = "open"
+        elif self._entered:
+            state = "closed"
+        else:
+            state = "unopened"
         return f"<RemoteFile {self._path!r} {state} at {self._position}>"
 
     def _open_handle(self) -> bytes:
@@ -2549,7 +2576,12 @@ class Session:
             digest_size = hashlib.new(
                 parsed.algorithm.decode("ascii"), usedforsecurity=False
             ).digest_size
-        except (ValueError, UnicodeDecodeError) as unknown:
+        except ValueError as unknown:
+            # One `except` for two failures, and the second is why this must not be narrowed to
+            # the hashlib one: `algorithm` is the *server's* bytes, so a non-ASCII name raises
+            # `UnicodeDecodeError` from the `decode` above -- and that **is** a `ValueError`,
+            # which is also why a test written as `pytest.raises(ValueError)` cannot tell the
+            # two apart. Both are the same answer to the caller: a name we cannot size.
             raise ProtocolError(
                 f"server hashed with {parsed.algorithm!r}, which this Python cannot size, "
                 f"so its {len(parsed.digests)} digest bytes cannot be split",
@@ -3997,7 +4029,7 @@ class Session:
             refusal = CapabilityError(
                 f"require_fsync=True and this server has already answered OP_UNSUPPORTED for "
                 f"{EXTENSION_FSYNC}, so nothing can promise the bytes reached stable storage",
-                feature="durable upload",
+                feature=_FEATURE_DURABLE_UPLOAD,
                 missing=(EXTENSION_FSYNC,),
                 path=target,
             )
@@ -4048,7 +4080,7 @@ class Session:
         if staged_name is None or b"/" not in staged_name:
             # A staging name carrying a separator is used verbatim, so no parent is derived
             # from the target and there is nothing for a foreign namespace to break.
-            await self._require_rooted_paths(target, feature="atomic publish")
+            await self._require_rooted_paths(target, feature=_FEATURE_ATOMIC_PUBLISH)
         staged = staged_path(target, staging_token(), name=staged_name)
         return await self._put_atomically(
             upload, target, staged, require_atomic=policy.require_atomic
@@ -4314,7 +4346,7 @@ class Session:
             refusal = CapabilityError(
                 f"require_fsync=True and this server did not perform {EXTENSION_FSYNC} when "
                 f"asked, so nothing can promise the bytes reached stable storage",
-                feature="durable upload",
+                feature=_FEATURE_DURABLE_UPLOAD,
                 missing=(EXTENSION_FSYNC,),
                 path=path,
             )
@@ -4544,7 +4576,7 @@ class Session:
             refusal = CapabilityError(
                 f"require_fsync=True and this server did not perform {EXTENSION_FSYNC}, "
                 f"so nothing can promise the bytes reached stable storage",
-                feature="durable upload",
+                feature=_FEATURE_DURABLE_UPLOAD,
                 missing=(EXTENSION_FSYNC,),
             )
             refusal.add_note(self._server_note())
@@ -4614,7 +4646,7 @@ class Session:
                     f"require_atomic=True but {target!r} already exists and this server does "
                     f"not advertise {EXTENSION_POSIX_RENAME}; replacing it would mean "
                     f"removing it first, leaving a window with no file at all",
-                    feature="atomic publish",
+                    feature=_FEATURE_ATOMIC_PUBLISH,
                     missing=(EXTENSION_POSIX_RENAME,),
                     path=target,
                 ) from refusal
@@ -4668,7 +4700,7 @@ class Session:
         refusal = CapabilityError(
             f"require_atomic=True but {target!r} already exists and this server does not "
             f"advertise {EXTENSION_POSIX_RENAME}, so it cannot be replaced in one step",
-            feature="atomic publish",
+            feature=_FEATURE_ATOMIC_PUBLISH,
             missing=(EXTENSION_POSIX_RENAME,),
             path=target,
         )
@@ -4814,34 +4846,7 @@ class Session:
         _check_tree_concurrency(concurrency, progress=progress, caller="put_tree")
         root = self._resolve(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put_tree")
-        if resume and policy.atomic:
-            # The decision D-54 had to make, and it is `put`'s rule reaching a tree rather
-            # than a new one. `put(resume=True, atomic=True)` needs an explicit staging_name,
-            # because the generated one carries fresh randomness per call and last run's
-            # partial cannot be found again -- and `put_tree` cannot take a staging_name at
-            # all, since one name cannot serve a tree's many files. Deriving one per file from
-            # the target was rejected rather than overlooked: a predictable staging name is
-            # exactly what `staging_token` exists to avoid, and here it would be predictable
-            # for every file in the tree at once, so two mirrors resuming into one destination
-            # would interleave file by file. So tree resume means resuming the destination
-            # itself, which is `atomic=False`, and the caller is told rather than downgraded.
-            raise ValueError(
-                "put_tree() cannot resume with atomic publishing: each file stages under a "
-                "name generated fresh per call, so a previous run's partial cannot be found, "
-                "and a staging_name cannot be fixed for a whole tree. Pass "
-                "publish=Publish(atomic=False) to resume the destination files themselves, "
-                "or drop resume=True to re-upload the tree atomically"
-            )
-        if policy.staging_name is not None:
-            # Caught here rather than at the first file, because the failure is in the request
-            # and not in any one transfer: every file in the tree would stage under the same
-            # name, so the second would collide with the first and the report would blame a
-            # file chosen by walk order.
-            raise ValueError(
-                "put_tree() cannot take a staging_name: it applies to every file in the tree, "
-                "so they would all stage under one name and overwrite each other. Leave it "
-                "unset to get a generated hidden sibling per file."
-            )
+        _check_tree_publish(policy, resume=resume, caller="put_tree")
         requested_mode = resolve_mode(mode, caller="put_tree()")
         await self._require_rooted_paths(root, feature="uploading a tree")
         await self._mkdir_parents(root, exist_ok=True)
@@ -4873,10 +4878,14 @@ class Session:
                     if entry.relative:
                         await self.mkdir(remote_directory, exist_ok=True)
                         directories += 1
-                        if preserve_times:
-                            directory_times.append((remote_directory, _local_times(entry.path)))
-                        if requested_mode is Mode.PRESERVE:
-                            directory_modes.append((remote_directory, local_mode(entry.path)))
+                        _settle_remote_directory(
+                            entry,
+                            remote_directory,
+                            preserve_times=preserve_times,
+                            mode=requested_mode,
+                            times=directory_times,
+                            modes=directory_modes,
+                        )
                     skipped.extend(entry.skipped)
                     for name in entry.files:
                         yield _TreeUpload(
@@ -5581,6 +5590,47 @@ class _TreeUpload:
     remote: bytes
 
 
+def _settle_remote_directory(
+    entry: LocalWalkEntry,
+    remote_directory: bytes,
+    *,
+    preserve_times: bool,
+    mode: int | Mode | None,
+    times: list[tuple[bytes, Times]],
+    modes: list[tuple[bytes, int]],
+) -> None:
+    """Record what a just-created remote directory contributes to the final metadata pass.
+
+    The upload-side twin of :func:`_settle_directory`, and it is deliberately the same shape:
+    collect during the walk, apply after it. See :meth:`Session._set_directory_times` for why
+    the pass is deferred -- a directory's mtime is changed again by every file written into it,
+    so stamping it during the walk stamps it with the walk.
+
+    **Only ``Mode.PRESERVE`` reaches directories**, the same rule the download side states: an
+    explicit integer is a *file* mode, and ``mode=0o600`` applied here would build a tree that
+    nothing can descend into.
+
+    Called only where ``entry.relative`` is non-empty, which is the difference from the
+    download twin: this stamps the directory it was just handed, so the root -- named by the
+    caller, not created by us -- is not ours to modify. The entry is a
+    :class:`~gantry_sftp.session.LocalWalkEntry` and not a
+    :class:`~gantry_sftp.session.WalkEntry` for the reason that type exists: ``path`` here is a
+    real local path, and the two are kept apart so a local one cannot be sent to a server.
+
+    Args:
+        entry: The walked local directory, whose ``path`` is the source of both values.
+        remote_directory: Where it was just created on the server.
+        preserve_times: Whether to carry the local mtime/atime across.
+        mode: The resolved mode request; only ``Mode.PRESERVE`` is a directory instruction.
+        times: Collected ``(remote path, times)`` pairs, appended to in place.
+        modes: Collected ``(remote path, permission bits)`` pairs, appended to in place.
+    """
+    if preserve_times:
+        times.append((remote_directory, _local_times(entry.path)))
+    if mode is Mode.PRESERVE:
+        modes.append((remote_directory, local_mode(entry.path)))
+
+
 def _settle_directory(
     entry: WalkEntry,
     *,
@@ -5666,6 +5716,53 @@ def _check_tree_concurrency(
             f"reporting at once produce one stream of counters that reset unpredictably. Use "
             f"concurrency=1 to keep per-file progress, or drop progress= to keep the "
             f"concurrency and read the counts from the returned TreeResult"
+        )
+
+
+def _check_tree_publish(policy: Publish, *, resume: bool, caller: str) -> None:
+    """Refuse a publish policy that one name cannot serve a whole tree with.
+
+    Both refusals are about the **staging name**, which is per file for a reason, and both are
+    raised here rather than at the first transfer: the fault is in the request, so a report
+    blaming a file chosen by walk order would name the wrong thing.
+
+    Split out of :meth:`Session.put_tree` in the same shape as
+    :func:`_check_tree_concurrency`, which validates the argument beside these two. Nothing
+    downstream of it moved -- these guards read ``policy`` and ``resume`` and nothing the walk
+    builds, which is why they were already the first thing after the policy was resolved.
+
+    Args:
+        policy: The resolved publish policy.
+        resume: Whether the caller asked to resume.
+        caller: The public method name, without parentheses, for the messages.
+
+    Raises:
+        ValueError: If ``resume`` is asked for with atomic publishing, or if the policy
+            carries a ``staging_name``.
+    """
+    if resume and policy.atomic:
+        # The decision D-54 had to make, and it is `put`'s rule reaching a tree rather than a
+        # new one. `put(resume=True, atomic=True)` needs an explicit staging_name, because the
+        # generated one carries fresh randomness per call and last run's partial cannot be
+        # found again -- and `put_tree` cannot take a staging_name at all, since one name
+        # cannot serve a tree's many files. Deriving one per file from the target was rejected
+        # rather than overlooked: a predictable staging name is exactly what `staging_token`
+        # exists to avoid, and here it would be predictable for every file in the tree at once,
+        # so two mirrors resuming into one destination would interleave file by file. So tree
+        # resume means resuming the destination itself, which is `atomic=False`, and the caller
+        # is told rather than downgraded.
+        raise ValueError(
+            f"{caller}() cannot resume with atomic publishing: each file stages under a "
+            f"name generated fresh per call, so a previous run's partial cannot be found, "
+            f"and a staging_name cannot be fixed for a whole tree. Pass "
+            f"publish=Publish(atomic=False) to resume the destination files themselves, "
+            f"or drop resume=True to re-upload the tree atomically"
+        )
+    if policy.staging_name is not None:
+        raise ValueError(
+            f"{caller}() cannot take a staging_name: it applies to every file in the tree, "
+            f"so they would all stage under one name and overwrite each other. Leave it "
+            f"unset to get a generated hidden sibling per file."
         )
 
 

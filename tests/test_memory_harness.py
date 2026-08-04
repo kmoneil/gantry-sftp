@@ -23,7 +23,7 @@ for _extra in (_ROOT / "benchmarks", _ROOT / "live-tests"):
     if str(_extra) not in sys.path:
         sys.path.append(str(_extra))
 
-import _memory  # noqa: E402  -- imported as a module so `subprocess` can be monkeypatched
+import _memory  # noqa: E402  # imported as a module so `subprocess` can be monkeypatched
 from _instructions import MIB  # noqa: E402
 from _memory import (  # noqa: E402
     Growth,

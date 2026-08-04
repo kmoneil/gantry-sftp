@@ -29,7 +29,7 @@ for _extra in (_ROOT / "benchmarks", _ROOT / "live-tests"):
         # else is called `_instructions`, and the front of the path could shadow a real module.
         sys.path.append(str(_extra))
 
-import _instructions  # noqa: E402  -- imported as a module so `measure` can be monkeypatched
+import _instructions  # noqa: E402  # imported as a module so `measure` can be monkeypatched
 from _harness import SizePoint, SizeSweep  # noqa: E402
 from _instructions import (  # noqa: E402
     MIB,

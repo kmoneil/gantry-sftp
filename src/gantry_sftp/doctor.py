@@ -241,7 +241,7 @@ def ssh_config_path(environ: Mapping[str, str] | None = None) -> Path:
         The path, whether or not it exists.
     """
     try:
-        import pwd  # noqa: PLC0415 -- Unix-only, and this function is where that is handled
+        import pwd  # noqa: PLC0415  # Unix-only, and this function is where that is handled
     except ImportError:
         # Windows has no `pwd` and no getpwuid; there, OpenSSH does use the profile directory,
         # so the environment is the right source rather than a second-best one.
@@ -262,7 +262,7 @@ def _ssh_version(executable: str) -> tuple[str | None, str | None]:
         ``(version, None)`` or ``(None, why not)``.
     """
     try:
-        finished = subprocess.run(  # noqa: S603 -- resolved executable, list argv, no shell
+        finished = subprocess.run(  # noqa: S603  # resolved executable, list argv, no shell
             [executable, "-V"],
             capture_output=True,
             timeout=_SSH_VERSION_TIMEOUT,

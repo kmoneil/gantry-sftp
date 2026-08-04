@@ -564,7 +564,7 @@ def test_a_double_star_is_reachable_only_once_something_reaches_it():
     match outside it. Asserted directly, because through `match_path` the difference is one
     boolean at the end of a longer computation.
     """
-    from gantry_sftp.path import _spread  # noqa: PLC0415 -- private and pure, tested in place
+    from gantry_sftp.path import _spread  # noqa: PLC0415  # private and pure, tested in place
 
     assert _spread([False, False]) == [False, False]
     assert _spread([False, True, False]) == [False, True, True]

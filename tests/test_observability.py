@@ -93,7 +93,7 @@ pytestmark = pytest.mark.anyio
 HANDLE = b"\x00\x00\x00\x00"
 """OpenSSH's first handle: four NUL bytes, a packed integer rather than text."""
 
-PASSWORD = "hunter2-CANARY-must-not-appear"  # noqa: S105 -- the credential this module hunts for
+PASSWORD = "hunter2-CANARY-must-not-appear"  # noqa: S105  # the credential this module hunts for
 """The secret every surface below is searched for. A test that proves a password does not leak
 has to contain one."""
 

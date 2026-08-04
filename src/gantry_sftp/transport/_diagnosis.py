@@ -134,7 +134,7 @@ def _option_value(argv: Sequence[str], name: str) -> str | None:
             following = argv[index + 1]
             if following[:width].lower() == prefix:
                 return following[width:]
-        if argument[:2] == "-o" and argument[2 : 2 + width].lower() == prefix:
+        if argument.startswith("-o") and argument[2 : 2 + width].lower() == prefix:
             return argument[2 + width :]
     return None
 
