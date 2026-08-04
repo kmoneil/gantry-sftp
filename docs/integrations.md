@@ -52,6 +52,23 @@ trust-on-first-use with the trust part removed. Ours spawns `ssh`, which reads y
   `TypeError` on the other side; here an entry the server did not describe is `"other"`, and
   a broken symlink is reported rather than dropped or raised.
 
+**Downloading into a stream works; uploading out of one is refused.** `fs.get_file(url, sink)`
+with an open binary file — or the equivalent `outfile=` — writes into it, and the stream is
+left open for you to keep writing to. `fs.put_file(sink, url)` raises `TypeError` naming what
+to do instead.
+
+The asymmetry is fsspec's rather than ours, and both halves of it are worth knowing. On the
+download side, `AbstractFileSystem.get_file` accepts a file-like destination and then calls
+`_parent()` on the same object, so every backend that has not overridden it — `MemoryFileSystem`
+among them — raises `AttributeError` from inside fsspec instead. `LocalFileSystem` overrides it
+and works, so this adapter matches `LocalFileSystem`. On the upload side *nothing* accepts one,
+and the reason is not an oversight: a stream you write to needs no offsets, while a stream you
+read from has no size, no seek and no second read — which is
+[verification](transfers.md#verifying-a-transfer), [resume](transfers.md#resume) and retry
+respectively. An upload from
+a stream would be a second transfer path with none of the guarantees `put` exists for. Write the
+bytes to a file, or use fsspec's `pipe_file(path, value)` for a value already in memory.
+
 **Errors change shape at this boundary, deliberately.** fsspec's contract is `FileNotFoundError`
 — `AbstractFileSystem.info` is documented to raise it, `exists` is written around it, and pandas
 tests for it by name — so the adapter translates: `NoSuchFileError` becomes `FileNotFoundError`

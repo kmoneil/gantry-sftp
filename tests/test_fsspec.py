@@ -1065,28 +1065,124 @@ def test_an_explicit_outfile_hands_over_to_the_base_class(fs, drop: str, tmp_pat
     assert recorder.seen, "the callback was dropped on the fallback path"
 
 
-@pytest.mark.parametrize("direction", ["get", "put"])
-def test_a_file_like_local_reaches_a_base_class_that_cannot_take_one(fs, drop: str, direction):
-    """Found by the mutation lane, and it is a defect rather than a decision -- see D-134.
+# --- D-134: a file-like local, which the ecosystem answers asymmetrically ------------------
+#
+# Measured against the pinned fsspec rather than reasoned about. `MemoryFileSystem`, which
+# inherits `AbstractFileSystem.get_file`, raises `AttributeError: 'BytesIO' object has no
+# attribute 'startswith'` on a file-like `lpath` -- the base class accepts one and then calls
+# `_parent(lpath)` on the same object. `LocalFileSystem` overrides the method and works.
+# Nothing anywhere accepts a file-like *source* for `put_file`: the base calls
+# `os.path.isdir(lpath)` first, and `LocalFileSystem.put_file` hands straight to `cp_file`.
+#
+# So this adapter supports the download and refuses the upload, which is fsspec's own shape.
+# The asymmetry is principled rather than convenient: a stream you write to needs no offsets;
+# a stream you read from has no size, no seek and no second read -- verification rung 3,
+# resume and retry.
 
-    `_local_path` returns `None` for anything without `__fspath__`, and both transfer methods
-    read that as "fall back to fsspec's copy loop, which is the only thing that can write into
-    an open stream". The docstrings say so in as many words. It is not true of the base class
-    shipped in fsspec: `get_file` sets `outfile = lpath` and then calls `_parent(lpath)` on the
-    same object, and `put_file` calls `os.path.isdir(lpath)` before anything else. Both raise
-    before a byte moves.
 
-    Pinned rather than fixed here, because deciding what a file-like local *should* do is a
-    feature decision and this slice is a mutation grind. What this test buys meanwhile is that
-    the behaviour is stated: today it raises, and it raises from inside fsspec.
+def test_a_file_like_destination_is_written_into_rather_than_refused(fs, drop: str):
+    """The spelling `LocalFileSystem` supports, so this adapter supports it too."""
+    sink = io.BytesIO()
+    recorder = _Recorder()
+    fs.get_file(f"{drop}/report.csv", sink, callback=recorder)
+
+    assert sink.getvalue() == b"id,total\n1,42\n"
+    assert recorder.seen, "the callback never moved"
+    assert recorder.size == len(b"id,total\n1,42\n"), "the size came from the open handle"
+
+
+def test_a_file_like_destination_is_left_open(fs, drop: str):
+    """The one place the two download destinations differ, and it is deliberate.
+
+    fsspec's base class closes an `outfile` it was handed; `LocalFileSystem` does not close a
+    file-like `lpath`. Both are matched rather than unified, because a caller writing into
+    their own stream expects to keep writing to it -- and finding it closed is the kind of
+    thing that surfaces three functions later.
     """
-    if direction == "get":
-        with pytest.raises(AttributeError):
-            fs.get_file(f"{drop}/report.csv", io.BytesIO())
-    else:
-        with pytest.raises(TypeError):
-            fs.put_file(io.BytesIO(b"id\n7\n"), f"{drop}/from-a-stream.csv")
-        assert not fs.exists(f"{drop}/from-a-stream.csv")
+    sink = io.BytesIO()
+    fs.get_file(f"{drop}/report.csv", sink)
+
+    assert not sink.closed, "the caller's stream was closed under them"
+    sink.write(b"appended\n")
+    assert sink.getvalue().endswith(b"appended\n")
+
+
+def test_a_download_into_a_stream_is_read_in_blocks_rather_than_whole(fs, drop, monkeypatch):
+    """Both halves: the seams are invisible in the bytes, and the bound is what matters.
+
+    `big.bin` is 1 MiB and the shipped block size is 4 MiB, so the loop only runs twice if the
+    block size is cut. Content alone cannot tell the two apart -- `read(None)` reads to EOF and
+    reassembles to exactly the same bytes -- so the *number* of blocks is asserted, through the
+    callback, which gets one update per chunk. Reading to EOF here would pull the whole file
+    into memory, which is the bound this path exists to keep.
+    """
+    monkeypatch.setattr(type(fs), "blocksize", 4096)
+    expected = bytes(range(256)) * 4096
+    sink = io.BytesIO()
+    recorder = _Recorder()
+
+    fs.get_file(f"{drop}/big.bin", sink, callback=recorder)
+
+    assert sink.getvalue() == expected
+    assert len(recorder.seen) == len(expected) // 4096, "the file was not read a block at a time"
+
+
+def test_a_download_into_a_stream_names_a_missing_file(fs, drop: str):
+    # `_translated(remote)` carries the path into the `FileNotFoundError` fsspec's callers
+    # catch. This branch has its own call of it, so the path being nulled there is a separate
+    # defect from the same thing on the whole-file path.
+    with pytest.raises(FileNotFoundError) as exc:
+        fs.get_file(f"{drop}/not-here.csv", io.BytesIO())
+    assert exc.value.args[0] == f"{drop}/not-here.csv"
+
+
+def test_a_download_destination_that_is_neither_a_path_nor_a_file_is_refused_by_name(fs, drop):
+    """Refused here rather than handed to the base class to fail two frames down.
+
+    fsspec recognises a file object by `read`, `close` and `tell` -- note `read`, on a write
+    destination -- so a hand-rolled write-only object matches neither branch. The message says
+    which three attributes and names the escape hatch, because "unsupported type" would send a
+    reader looking for a supported one.
+    """
+
+    class WriteOnly:
+        def write(self, chunk: bytes) -> int:
+            return len(chunk)
+
+    with pytest.raises(TypeError) as exc:
+        fs.get_file(f"{drop}/report.csv", WriteOnly())
+    assert exc.value.args[0] == (
+        "a download destination must be a local path or an open binary file; WriteOnly is "
+        "neither. fsspec recognises a file object by its read, close and tell attributes, so "
+        "a write-only object needs all three -- or pass outfile=... alongside a path"
+    )
+
+
+def test_a_file_like_upload_source_is_refused_with_the_reason(fs, drop: str):
+    """The other half, and the refusal has to carry *why* or it reads as an omission.
+
+    No fsspec backend accepts one. What makes it a decision rather than a gap is the
+    consequence: an upload from a stream could not be verified, resumed or retried, which is
+    three of the guarantees `put` exists for.
+    """
+    with pytest.raises(TypeError) as exc:
+        fs.put_file(io.BytesIO(b"id\n7\n"), f"{drop}/from-a-stream.csv")
+    assert exc.value.args[0] == (
+        "an upload source must be a local path; BytesIO is not one. A stream has no size, no "
+        "seek and no second read, so it cannot be verified, resumed or retried, and no fsspec "
+        "backend accepts one here either. Write the bytes to a file and upload that, or use "
+        "pipe_file(path, value) for a value already in memory"
+    )
+    assert not fs.exists(f"{drop}/from-a-stream.csv"), "refused and uploaded anyway"
+
+
+def test_the_upload_refusal_comes_before_the_server_is_asked_anything(fs, drop: str):
+    # A malformed argument is reported as itself rather than as whatever the destination
+    # happens to be: `mode="create"` onto an existing file would otherwise win the race to
+    # raise, and the caller would fix the wrong thing.
+    with pytest.raises(TypeError):
+        fs.put_file(io.BytesIO(b"clobber"), f"{drop}/report.csv", mode="create")
+    assert fs.cat_file(f"{drop}/report.csv") == b"id,total\n1,42\n"
 
 
 # --- the local directories a download creates -----------------------------------------------

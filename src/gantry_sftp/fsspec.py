@@ -66,7 +66,7 @@ import threading
 from contextlib import ExitStack, contextmanager
 from contextlib import suppress as _suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal, Self, override
+from typing import TYPE_CHECKING, Any, Final, Literal, Self, TypeGuard, override
 from urllib.parse import parse_qsl
 
 try:
@@ -74,7 +74,7 @@ try:
     from fsspec.callbacks import DEFAULT_CALLBACK, Callback
     from fsspec.registry import known_implementations, register_implementation, registry
     from fsspec.spec import AbstractBufferedFile
-    from fsspec.utils import infer_storage_options
+    from fsspec.utils import infer_storage_options, isfilelike
 except ModuleNotFoundError as _exc:  # pragma: no cover -- proven by a subprocess test
     raise ModuleNotFoundError(
         "gantry_sftp.fsspec needs fsspec, which is an optional dependency of this library: "
@@ -213,6 +213,19 @@ _UNBOUNDED: Final = 1 << 40
 arithmetic without claiming to know a size nobody reported. It is a ceiling, not an
 allocation.
 """
+
+
+def _is_file_like(candidate: object) -> TypeGuard[IO[bytes]]:
+    """Whether ``candidate`` is an open binary file, by fsspec's own definition of one.
+
+    Wrapped rather than called inline so the narrowing reaches a type checker. Upstream,
+    ``fsspec.utils.isfilelike`` is annotated ``TypeGuard[IO[bytes]]`` and would narrow on its
+    own -- but fsspec ships no ``py.typed``, so that annotation does not reach us and the call
+    comes back as ``Any`` (D-109). Deferring to their predicate rather than restating it means
+    "file-like" keeps meaning here what it means to the base class we sit on: ``read``,
+    ``close`` and ``tell``, which is a *readable*'s vocabulary even for a write destination.
+    """
+    return bool(isfilelike(candidate))
 
 
 def _local_path(candidate: object) -> Path | None:
@@ -945,12 +958,37 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         arrival order, and checks the bytes it received against the size the server reported.
 
         ``callback`` is bridged rather than dropped -- a dropped one is a progress bar that
-        silently never moves. A file-like ``lpath``, or an explicit ``outfile``, is not this
-        path at all, since there is no local filename to write to, so both fall back to the
-        base class rather than pretending.
+        silently never moves.
+
+        **Three destinations, and only one of them is the fast path** (D-134). An explicit
+        ``outfile`` hands over to the base class, which is what has always happened. A
+        file-like ``lpath`` is copied by :meth:`_download_into` here rather than delegated,
+        because ``AbstractFileSystem.get_file`` accepts one -- ``if isfilelike(lpath): outfile
+        = lpath`` -- and then calls ``_parent(lpath)`` on the same object two lines later, so
+        delegating raises ``AttributeError`` from inside fsspec before a byte moves. Measured
+        against the pinned version, and against ``MemoryFileSystem``, which inherits the same
+        implementation and the same defect. ``LocalFileSystem`` overrides it and works, which
+        is why refusing a file-like ``lpath`` was declined: it is a spelling that works
+        elsewhere in the ecosystem.
+
+        Anything that is neither is refused by name rather than handed to the base class to
+        fail obscurely two frames down.
+
+        Raises:
+            TypeError: If ``lpath`` is neither a local path nor a readable file-like object.
         """
         remote = self._strip_protocol(rpath)
         local = _local_path(lpath)
+        if local is None and outfile is None:
+            if not _is_file_like(lpath):
+                raise TypeError(
+                    f"a download destination must be a local path or an open binary file; "
+                    f"{type(lpath).__name__} is neither. fsspec recognises a file object by "
+                    f"its read, close and tell attributes, so a write-only object needs all "
+                    f"three -- or pass outfile=... alongside a path"
+                )
+            self._download_into(remote, lpath, callback)
+            return
         if outfile is not None or local is None:
             super().get_file(
                 remote, lpath, callback=_or_default(callback), outfile=outfile, **kwargs
@@ -964,6 +1002,36 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
             # `fs.get(url, "out/2026/report.csv")` is entitled to the same behaviour here.
             local.parent.mkdir(parents=True, exist_ok=True)
             _ = self.sftp.get(remote, local, progress=_bridge(callback))
+
+    def _download_into(self, remote: str, sink: IO[bytes], callback: Callback | None) -> None:
+        """Copy a remote file into an already-open stream, block by block.
+
+        Not the whole-file transfer path, and it cannot be: that one places every payload with
+        ``os.pwrite`` at an explicit offset into a descriptor it opened itself, and a stream has
+        no offsets to place at. What it does use is :meth:`~gantry_sftp.sync.SyncSession.
+        open_file`, so each ``read`` still goes through the pipelining scheduler and a block
+        larger than one request still becomes several -- the same machinery
+        :class:`GantrySFTPFile` runs on.
+
+        **The stream is not closed**, which is deliberate and is the one place the two
+        destinations differ. fsspec's base class closes an ``outfile`` it was handed, and
+        ``LocalFileSystem`` -- the reference for this branch -- does not close a file-like
+        ``lpath``. Both behaviours are matched rather than unified, because a caller writing
+        into their own stream expects to keep writing to it.
+
+        Args:
+            remote: The path on the server, already stripped of its protocol.
+            sink: The open stream to write into. Left open.
+            callback: The caller's fsspec callback, or ``None``.
+        """
+        reporter = _or_default(callback)
+        with _translated(remote), self.sftp.open_file(_encode(remote)) as source:
+            # From the open handle rather than a second `stat` round trip. `None` is a legal
+            # answer -- a server need not report a size -- and is what fsspec's own loop passes.
+            reporter.set_size(source.stat().size)
+            while chunk := source.read(self.blocksize):
+                _ = sink.write(chunk)
+                reporter.relative_update(len(chunk))
 
     def put_file(
         self,
@@ -981,16 +1049,34 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
 
         ``mode="create"`` is honoured with an explicit refusal, matching the base class.
 
+        **A file-like ``lpath`` is refused rather than supported, and the asymmetry with
+        :meth:`get_file` is fsspec's rather than ours** (D-134). No backend accepts one here:
+        ``AbstractFileSystem.put_file`` calls ``os.path.isdir(lpath)`` before anything else and
+        ``LocalFileSystem`` -- which *does* handle a file-like download destination -- hands
+        straight to ``cp_file``. The reason is not an oversight in either place. A stream you
+        write to needs no offsets; a stream you read from has no size, no seek and no second
+        read, which is verification rung 3, resume and retry respectively. Uploading one would
+        be a second transfer path with none of the guarantees this one exists for.
+
+        The refusal comes before the ``mode`` check so that a malformed argument is reported as
+        itself rather than as whatever the server happens to say about the destination.
+
         Raises:
+            TypeError: If ``lpath`` is not a local path.
             FileExistsError: If ``mode`` is ``"create"`` and the destination exists.
         """
         remote = self._strip_protocol(rpath)
-        if mode == "create" and self.exists(remote):
-            raise FileExistsError(remote)
         local = _local_path(lpath)
         if local is None:
-            super().put_file(lpath, remote, callback=_or_default(callback), mode=mode, **kwargs)
-            return
+            raise TypeError(
+                f"an upload source must be a local path; {type(lpath).__name__} is not one. A "
+                f"stream has no size, no seek and no second read, so it cannot be verified, "
+                f"resumed or retried, and no fsspec backend accepts one here either. Write the "
+                f"bytes to a file and upload that, or use pipe_file(path, value) for a value "
+                f"already in memory"
+            )
+        if mode == "create" and self.exists(remote):
+            raise FileExistsError(remote)
         if local.is_dir():
             self.makedirs(remote, exist_ok=True)
             return
