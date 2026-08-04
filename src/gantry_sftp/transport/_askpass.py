@@ -185,7 +185,18 @@ def askpass_environment(
         a secret in a child environment and ``rmtree``s it in a ``finally``, generating exactly
         two mutants for its whole length. Undecorated, the body is instrumented. Do not fold it
         back in; if mutmut ever grows an ``allow_decorators``, delete the wrapper instead.
+
+    Note:
+        **Both halves rebind, and the second is not redundant with the first** (D-144). This is a
+        ``@contextmanager`` generator, so *this* frame holds ``password`` for as long as the
+        caller's ``with`` block, and :func:`_askpass_environment`'s frame holds its own for the
+        same span. Wrapping in one leaves the other rendering the plaintext to a frame-locals
+        dumper. Until D-144 neither rebound, and both were safe only because
+        :func:`~gantry_sftp.transport.open_ssh_transport` had already wrapped before calling in --
+        which is not a property a *public* function may rely on, since this one is exported for a
+        caller supplying their own helper through ``env=``.
     """
+    password = Secret(password)
     yield from _askpass_environment(password, env=env)
 
 
@@ -199,6 +210,12 @@ def _askpass_environment(
         the yield point straight into this generator, so the ``finally`` below still runs on
         the failure path -- which is the whole reason the removal is written as one.
     """
+    # Before the validation, not after, and the ordering is the point rather than tidiness:
+    # `_validate_password` *raises* on a password it refuses, so its frame is in that traceback
+    # with its own `password` local. Wrapping first means what it receives, and therefore what a
+    # reporter renders out of the rejection, is already redacted. Wrapping after would leave the
+    # one path that is guaranteed to produce a traceback as the one path that discloses.
+    password = Secret(password)
     _validate_password(password)
     if sys.platform.startswith("win"):
         raise NotImplementedError(

@@ -170,6 +170,13 @@ down rendered `'<redacted>'`. All of them now rebind on entry. The fsspec adapte
 exception to the shape rather than to the rule: it is not a generator, but fsspec's registry
 caches the instance for the life of the process, so the wrapping is on the attribute instead.
 
+The mechanism itself wraps too, which matters if you reach past the entry points:
+`gantry_sftp.transport.askpass_environment` is exported for a caller supplying their own helper
+through `env=`, and it holds the secret in a generator frame for the life of your block exactly as
+`connect()` does. It rebinds *before* validating, so a password refused for containing a newline
+does not disclose itself in the traceback that refusal produces — which is the one path guaranteed
+to make one.
+
 `tests/test_askpass.py` proves this twice, because two different mistakes are possible. One test
 fails a connection through each entry point and asserts the plaintext appears in no frame a
 reporter would capture; the other reads the list of functions taking a `password` out of the

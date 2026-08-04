@@ -491,6 +491,7 @@ MUST_WRAP_THE_PASSWORD = frozenset(
         "sync.py:BoundPortal.connect",
         "sync.py:BoundPortal.open_ssh_transport",
         "transport/_askpass.py:_askpass_environment",
+        "transport/_askpass.py:askpass_environment",
         "transport/_subprocess.py:open_ssh_transport",
     }
 )
@@ -504,16 +505,10 @@ is what an object dump renders instead.
 
 EXEMPT_FROM_WRAPPING = {
     "transport/_askpass.py:_validate_password": (
-        "a predicate: it inspects, raises, binds nothing, and has returned before the "
-        "connection it validates for exists"
-    ),
-    "transport/_askpass.py:askpass_environment": (
-        "the one-line `yield from` wrapper over `_askpass_environment`, which does wrap. Its "
-        "only shipped caller has already rebound, so nothing reaches it unwrapped in this "
-        "library -- but a caller reaching for it directly with a plain `str` keeps that `str` "
-        "in two generator frames. Left out deliberately: the fix was scoped to the connection "
-        "entry points, and widening it here means wrapping in both halves of the split that "
-        "D-107 made for the mutation lane"
+        "a private predicate with one caller, which wraps *before* calling it -- deliberately, "
+        "because this is the function that raises, so its frame is the one guaranteed to be in "
+        "a traceback. It receives a Secret and holds nothing else; wrapping again here would "
+        "redact an already-redacted value and hide that the ordering above is load-bearing"
     ),
     "transport/_subprocess.py:_askpass_is_armed": (
         "reads `password is not None` and nothing else; the value is never bound or rendered"
@@ -552,3 +547,76 @@ def test_it_rebinds_the_password_to_a_secret(where):
         f"{where} takes a password that outlives the call and never wraps it in Secret(), so "
         f"the plaintext is what a frame-locals dumper renders"
     )
+
+
+# --- D-144: the mechanism's own two frames -----------------------------------------------------
+#
+# `askpass_environment` is public, is a @contextmanager, and holds `password` for the caller's
+# whole block -- and so does the `_askpass_environment` body D-107 split out for the mutation
+# lane. Neither rebound until D-144. Both were safe only because `open_ssh_transport` wrapped
+# before calling in, which is not a property a *public* function may lean on: this one is
+# exported for a caller supplying their own helper through `env=`.
+
+D144_CANARY = "canary-D144-must-not-appear"
+
+
+def test_the_public_helpers_live_frames_do_not_hold_the_plaintext():
+    # Reached directly rather than through `open_ssh_transport`, so nothing wrapped on the way
+    # in -- the case the exemption used to cover.
+    #
+    # Inspects the *live* generator frames rather than a traceback, and the difference is the
+    # whole reason this test is written the way it is. Raising inside the caller's block does
+    # not put these frames in that exception's traceback, so the obvious version of this test
+    # passes with the fix and without it. What `Secret`'s docstring actually claims is that
+    # these frames "stay alive for the whole connection" -- so the honest check is to open the
+    # block and read them while they are, which is what a live-stack dumper walks.
+    manager = askpass_environment(D144_CANARY)
+    with manager as env:
+        assert env[ASKPASS_ANSWER_VARIABLE] == D144_CANARY
+        # The wrapper's own frame, and the split body it is delegating into via `yield from`.
+        # Both are suspended at their yield and both are alive for as long as this block is.
+        wrapper = manager.gen
+        body = wrapper.gi_yieldfrom
+        frames = [wrapper.gi_frame, body.gi_frame]
+        assert all(frames), "both generators should be suspended, not finished"
+
+        showing = [
+            f"{Path(frame.f_code.co_filename).name}:{frame.f_code.co_name}() -> {name}"
+            for frame in frames
+            for name, value in frame.f_locals.items()
+            if D144_CANARY in repr(value)
+        ]
+        assert not showing, f"a live frame renders the password: {showing}"
+
+
+def test_a_refused_password_does_not_disclose_itself_in_the_refusal():
+    # The ordering `_askpass_environment` documents. `_validate_password` is the function that
+    # raises, so its frame is the one *guaranteed* to reach a traceback -- which makes "wrap
+    # before validating" load-bearing rather than tidy. Wrapping afterwards would leave the one
+    # path that always produces a traceback as the one path that discloses.
+    refused = f"{D144_CANARY}\nsecond-line"
+    with pytest.raises(ValueError) as failure, askpass_environment(refused):
+        pytest.fail("should not have yielded an environment")
+
+    assert D144_CANARY not in failure.value.args[0]
+    showing = gantry_frames_rendering(failure.value, D144_CANARY)
+    assert not showing, f"the refused password is readable in {showing}"
+
+
+def test_wrapping_an_already_wrapped_secret_changes_nothing():
+    # After D-144 double wrapping is the normal case rather than an accident: open_ssh_transport
+    # wraps, then askpass_environment wraps what it was handed, then the body wraps again. Assert
+    # it rather than rely on `str` subclassing behaving.
+    once = Secret(D144_CANARY)
+    twice = Secret(once)
+    assert twice == D144_CANARY
+    assert str(twice) == D144_CANARY
+    assert repr(twice) == "'<redacted>'"
+    assert isinstance(twice, str)
+
+
+def test_the_secret_still_reaches_the_child_intact_through_both_wrappings():
+    # The half that must not break: `ssh` needs the real bytes. This runs the helper for real,
+    # which is what the rest of this module does and why it is the check that matters.
+    with askpass_environment(D144_CANARY) as env:
+        assert run_helper(env).stdout == f"{D144_CANARY}\n"
