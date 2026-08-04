@@ -123,6 +123,38 @@ bench = [
     "asyncssh>=2.19",
     "paramiko>=3.5",
 ]
+# `audit` is `scripts/audit_deps.py`'s tool, and it is its own group for the reason `bench`
+# is: pip-audit costs 18 packages over a default `uv sync` -- itself and 17 others, among
+# them `requests`, `urllib3`, `certifi`, `cyclonedx-python-lib` and `pip` itself -- which is
+# a third again as many as the whole default lane installs, for something one lane runs. It
+# does *not* pull `cryptography`, which was measured against this lock rather than assumed,
+# because that is the one dependency this project cannot quietly acquire.
+#
+# The floor is 2.10 because that is what the two behaviours the script depends on were
+# probed against: `--format json` emits `{"dependencies": [...], "fixes": []}` with a
+# `skip_reason` on anything it could not audit, and a *failure* to reach the advisory
+# service exits non-zero with **empty stdout** rather than with an empty finding list. That
+# second one is load-bearing -- it is the only thing separating "nothing is wrong" from
+# "nothing was checked", and `audit_deps.py` routes on it.
+audit = [
+    "pip-audit>=2.10",
+]
+# `build` exists so that the build backend comes out of `uv.lock` like everything else.
+#
+# `[build-system] requires` is the one dependency declaration in this file that `uv.lock`
+# does not cover: PEP 517 build requirements are resolved fresh, from PyPI, in an isolated
+# environment, every time anything builds this project -- so the code that produces the
+# artifact users install was the last unpinned, unhashed thing in the release path, after
+# `--frozen` closed the others. `release.yml` syncs this group and builds with
+# `--no-build-isolation`, which makes hatchling arrive hashed from the lock.
+#
+# It has to agree with `[build-system] requires` above, and `tests/test_packaging.py`
+# asserts that rather than trusting it: a `build` group that has drifted from the real build
+# requirement produces a build that either fails or quietly re-resolves, and the second one
+# looks exactly like this working.
+build = [
+    "hatchling>=1.27",
+]
 # fsspec is in `dev` rather than in a group of its own, which is the opposite call from
 # `bench` and for the reason `bench` states: fsspec is pure Python with **no required
 # dependencies at all** (measured -- every entry in its METADATA is behind an extra), so

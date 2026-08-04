@@ -23,6 +23,7 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 | lane                  | what it proves                                                                                  | needs, beyond `uv sync`        |
 | --------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------ |
 | `lanes.py gates`      | ruff, mypy `--strict`, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit | nothing; POSIX only            |
+| `lanes.py audit`      | known advisories against the versions `uv.lock` pins                                           | `uv sync --group audit`, network |
 | `lanes.py fast`       | unit tests, the real `sftp-server` rows, every example as a subprocess                          | `openssh-server` for some rows |
 | `lanes.py leaks`      | the unit tests again, failing the one that left a transport, session or child process alive     | `openssh-server` for some rows |
 | `lanes.py live`       | a real `sshd` on localhost: transport, `ssh` environment, cancellation, handles                 | `openssh-server`               |
@@ -32,10 +33,10 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 | `lanes.py cost`       | what a transfer costs this process: instructions retired and peak memory                        | `valgrind`, `openssh-server`   |
 | `lanes.py mutation`   | whether an assertion would notice the line being wrong                                          | nothing                        |
 
-The first five **gate**: a failure stops the change. `netem`, `benchmarks` and `mutation`
-**report**, meaning they measure, or assert against a baseline that is not in this tree, and
-`scripts/lanes.py` carries the reason next to each one, so opting a lane out of gating is a
-written act rather than a habit.
+Every lane **gates** — a failure stops the change — except `netem`, `benchmarks` and
+`mutation`, which **report**, meaning they measure, or assert against a baseline that is not in
+this tree. `scripts/lanes.py` carries the reason next to each one, so opting a lane out of
+gating is a written act rather than a habit.
 
 `cost` is the one performance lane that gates, and the reason is worth reading before adding
 another. It measures a transfer as **counts of work** rather than as a rate — instructions
@@ -92,6 +93,14 @@ The comparison libraries are a separate dependency group and are deliberately no
 default. They pull in `cryptography`, `pynacl` and `bcrypt`, and Python cryptography is precisely
 what this project exists not to need, and a `uv sync` that installed it would make that claim
 harder to check than it should be. No lane installs them on your behalf, for the same reason.
+
+There are four groups in all and the reason each is separate is on it in `pyproject.toml`.
+`dev` is the default and holds everything the gating lanes need. `bench` is the comparison
+libraries above. `audit` is `pip-audit`, which costs 18 packages over a default `uv sync` for
+something one lane runs. `build` is `hatchling`, and it exists so that `release.yml` can build
+with `--no-build-isolation` and have the backend come from `uv.lock` like everything else —
+PEP 517 build requirements are otherwise resolved fresh from PyPI, unpinned and unhashed, by
+whatever is doing the packaging.
 
 ### CI
 
@@ -153,6 +162,44 @@ against OpenSSH 10.0p2:
   `WAYLAND_DISPLAY`, either alone being enough to make a passphrase-protected key authenticate
   through a helper. Both were missing from the set; `WAYLAND_DISPLAY` appears nowhere in
   `ssh(1)`.
+
+### The audit lane
+
+```bash
+uv sync --group audit
+python scripts/lanes.py audit
+```
+
+`uv.lock` records a sha256 for every artifact it names, and `uv sync --frozen` refuses one whose
+bytes do not match — on a cold cache and a warm one alike. That is integrity, and it says nothing
+about whether the pinned version is *known to be broken*. This lane is the part that asks, and
+the first run of it found an advisory that had been sitting in the lock.
+
+It audits **two scopes and gives them two different verdicts**, which is the design decision
+worth knowing before reading the output:
+
+- **`shipped`** is what `pip install gantry-sftp[fsspec]` puts on a production machine — three
+  packages, because the runtime dependency is `anyio` and nothing else. An advisory here is
+  about what users run, so it **gates**.
+- **`toolchain`** is everything the lock can install, `bench` included. That is where
+  `cryptography` lives, and it is there to be measured against rather than shipped. An advisory
+  here is worth knowing and is not a reason to fail somebody's change, so it **reports** —
+  gating on it would let paramiko's dependencies block a release of a library that does not
+  ship them.
+
+**A run that could not reach the advisory service exits `2`, not `0`.** This is the one place
+the "skip with a reason rather than fail" rule used everywhere else here is deliberately not
+applied, and the reason is that a security scan has three states rather than two: `1` is "found
+something", `2` is "checked nothing", and only `0` means clean. pip-audit itself exits `1` for
+both a finding and a network failure, which is exactly the conflation this lane was built to
+undo — `scripts/audit_deps.py` tells them apart by whether stdout parsed as a report, and its
+header records why.
+
+It is also the one lane whose value is mostly in running on a **schedule**. An advisory is
+published against code that has not changed, so a lane that only ran per change would find it
+whenever somebody next happened to edit something. It runs per change *and* weekly, and again in
+`release.yml` before anything is uploaded — a published version cannot be withdrawn, and its
+gating scope is exactly the set a user of that artifact installs.
 
 ### The leak lane
 

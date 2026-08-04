@@ -59,6 +59,33 @@ jobs:
       - run: uv run --frozen python scripts/lanes.py gates
 
   # ---------------------------------------------------------------------------
+  # Known advisories against the versions `uv.lock` pins. Two scopes with two verdicts --
+  # what a user installs gates, what a developer installs reports -- and the argument for
+  # that split is in `scripts/audit_deps.py`'s header rather than repeated here.
+  #
+  # **The `schedule:` trigger is most of this job's value**, which is not true of any other
+  # job in this file. An advisory is published against code that has not changed, so a lane
+  # that ran only per change would find it whenever somebody next happened to edit
+  # something. It is deliberately not behind an `if:` for that reason: per change *and*
+  # weekly.
+  #
+  # It needs network by definition, and that is the one prerequisite here that is not
+  # `apt-get install`-able. A run that cannot reach the advisory service exits 2 -- neither
+  # a pass nor a finding -- rather than reporting a clean tree, so this job going red can
+  # mean PyPI is down. That is the intended behaviour and the output says which it was.
+  # ---------------------------------------------------------------------------
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --frozen --group audit
+      - run: uv run --frozen python scripts/lanes.py audit
+
+  # ---------------------------------------------------------------------------
   # The fast lane on all three platforms. This is the job that pays: `resolve_ssh_executable`
   # implements a SysNative-before-System32 probe for Windows OpenSSH that has never executed
   # on Windows, and `tests/test_argv.py` covers it only with injected inputs.

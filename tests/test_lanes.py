@@ -45,6 +45,16 @@ def _load_runner():
 lanes = _load_runner()
 
 WORKFLOW_TEXT = WORKFLOW_PATH.read_text(encoding="utf-8")
+RELEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+RELEASE_TEXT = RELEASE_PATH.read_text(encoding="utf-8")
+WORKFLOWS = {"ci.yml": WORKFLOW_TEXT, "release.yml": RELEASE_TEXT}
+"""Both workflows, because the properties below are about all of them and only one was read.
+
+The action-pinning and context-interpolation rules were written for `ci.yml` and asserted only
+there, while `release.yml` -- the one that runs with permission to publish -- was covered by a
+comment saying it followed the same rule. A rule enforced on the less dangerous of two files is
+a rule with its exception in the right place to hurt.
+"""
 DEVELOPMENT_TEXT = (REPO_ROOT / "docs" / "development.md").read_text(encoding="utf-8")
 """Where the lane table lives since D-125 split the README into `docs/`.
 
@@ -345,11 +355,12 @@ def test_every_directory_of_tests_is_reachable_from_some_lane() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_third_party_action_is_pinned_to_a_commit_sha() -> None:
+@pytest.mark.parametrize("workflow", sorted(WORKFLOWS), ids=lambda name: name)
+def test_every_third_party_action_is_pinned_to_a_commit_sha(workflow: str) -> None:
     # A floating tag is a mutable reference to somebody else's code running with a token in
     # scope. This project spawns `ssh` and handles credentials; it does not get to be
     # relaxed about that. The trailing comment is what makes the pin re-readable.
-    uses = re.findall(r"uses:\s*(\S+)(.*)$", WORKFLOW_TEXT, flags=re.MULTILINE)
+    uses = re.findall(r"uses:\s*(\S+)(.*)$", WORKFLOWS[workflow], flags=re.MULTILINE)
     assert uses
     for reference, trailer in uses:
         owner_repo, _, pin = reference.partition("@")
@@ -357,11 +368,13 @@ def test_every_third_party_action_is_pinned_to_a_commit_sha() -> None:
         assert re.search(r"#\s*v\d", trailer), f"{owner_repo} has no version comment"
 
 
-def test_no_run_step_interpolates_a_workflow_context() -> None:
+@pytest.mark.parametrize("workflow", sorted(WORKFLOWS), ids=lambda name: name)
+def test_no_run_step_interpolates_a_workflow_context(workflow: str) -> None:
     # The Actions analogue of this project's argv-injection rule. `${{ ... }}` inside a `run:`
     # block is substituted into the shell *before* it executes, so a branch name or PR title
-    # containing a metacharacter runs as code. Nothing here needs one.
-    commands = re.findall(r"^\s*- run:\s*(.+)$", WORKFLOW_TEXT, flags=re.MULTILINE)
+    # containing a metacharacter runs as code. Nothing here needs one -- release.yml reads the
+    # tag through the `GITHUB_REF_NAME` environment variable instead, which is inert.
+    commands = re.findall(r"^\s*- run:\s*(.+)$", WORKFLOWS[workflow], flags=re.MULTILINE)
     assert [command for command in commands if "${{" in command] == []
 
 
@@ -382,6 +395,81 @@ def test_the_windows_job_reports_rather_than_gates() -> None:
     # or a fallback lands -- this assertion is the thing that says the job may now block a
     # change, and it has to be edited deliberately for that to happen.
     assert "continue-on-error: ${{ matrix.os == 'windows-latest' }}" in WORKFLOW_TEXT
+
+
+# ---------------------------------------------------------------------------
+# The release path, which is the one that cannot be undone
+# ---------------------------------------------------------------------------
+
+
+def _uncommented(text: str) -> str:
+    """The workflow with its comment lines dropped.
+
+    Every assertion below is about what the file *runs*, and the comments explaining these
+    rules quote the spellings they argue against -- so a search over the raw text finds the
+    prose and fails on the explanation rather than on the command.
+    """
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+@pytest.mark.parametrize("subcommand", ["sync", "run"], ids=lambda name: f"uv {name}")
+def test_every_uv_invocation_in_the_release_path_is_frozen(subcommand: str) -> None:
+    """The publish path was the only one allowed to install something the lock does not name.
+
+    `uv sync` without `--frozen` re-resolves when the lock and `pyproject.toml` disagree, and
+    `uv.lock`'s 687 hashes are worth exactly what the flag insisting on them is worth. Every
+    job in `ci.yml` already passed it; the job that ends in an irreversible upload did not.
+    """
+    invocations = re.findall(rf"\buv {subcommand}\b[^\n|]*", _uncommented(RELEASE_TEXT))
+    assert invocations
+    unfrozen = [command for command in invocations if "--frozen" not in command]
+    assert unfrozen == []
+
+
+def test_the_release_builds_with_the_locked_backend_rather_than_a_fresh_resolve() -> None:
+    """PEP 517 build requirements are the one dependency declaration `uv.lock` does not cover.
+
+    Left isolated, the backend that produces the artifact is fetched unpinned and unhashed at
+    build time -- so the last unverified link in the release path was the code doing the
+    packaging. `--no-build-isolation` over a synced `build` group closes it; the group
+    agreeing with `[build-system] requires` is asserted in `tests/test_audit_deps.py`.
+    """
+    commands = re.findall(r"^\s*- run:\s*(.+)$", _uncommented(RELEASE_TEXT), flags=re.MULTILINE)
+    builds = [command for command in commands if "uv build" in command]
+    assert builds
+    for command in builds:
+        assert "--no-build-isolation" in command
+    assert "uv sync --frozen --group build" in _uncommented(RELEASE_TEXT)
+
+
+def test_the_release_is_gated_on_the_audit_lane() -> None:
+    # A published version cannot be withdrawn, and the audit's gating scope is exactly the set
+    # a user of that artifact installs. This is the moment it is worth the most.
+    assert "lanes.py audit" in RELEASE_TEXT
+
+
+def test_only_the_publishing_job_may_mint_a_token() -> None:
+    """`id-token: write` is what trusted publishing exchanges for an upload credential.
+
+    Granted at workflow level it would be in scope for every job, including the ones that run
+    the test suite. It is granted to `publish` alone, and the file says so in a comment -- this
+    is the assertion that makes the comment true.
+    """
+    assert "permissions:\n  contents: read\n" in RELEASE_TEXT
+    grants = re.findall(r"^\s*id-token: write", RELEASE_TEXT, flags=re.MULTILINE)
+    assert len(grants) == 1
+    _, _, after = RELEASE_TEXT.partition("  publish:")
+    assert "id-token: write" in after
+
+
+def test_the_release_holds_no_long_lived_credential() -> None:
+    # Trusted publishing (OIDC) is the whole point: a `PYPI_API_TOKEN` in repository secrets
+    # is exfiltrable by any workflow that runs untrusted code. Read over the uncommented file,
+    # because the comment arguing for OIDC names the thing it is arguing against.
+    settings = _uncommented(RELEASE_TEXT)
+    assert "PYPI_API_TOKEN" not in settings
+    assert "secrets." not in settings
+    assert "password:" not in settings
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +625,7 @@ def test_an_unknown_lane_names_the_ones_that_exist(
     assert lanes.main(["fats"]) == 2
     assert capsys.readouterr().err == (
         "error: unknown lane 'fats'; known lanes are "
-        "gates, fast, leaks, live, matrix, netem, benchmarks, cost, mutation\n"
+        "gates, audit, fast, leaks, live, matrix, netem, benchmarks, cost, mutation\n"
     )
 
 

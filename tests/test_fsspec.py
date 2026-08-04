@@ -1825,8 +1825,17 @@ def test_an_override_replaces_a_protocol_that_is_already_resolved():
     `register_implementation` defaults to `clobber=False` and *raises* when the protocol is
     already live in the registry -- so `override=True` would print the warning, get the
     caller's decision, and then not carry it out.
+
+    The incumbent is a stand-in rather than the real one, and that is not a shortcut.
+    `fsspec.get_filesystem_class("sftp")` *imports* fsspec's built-in implementation, which
+    raises `ImportError: SFTPFileSystem requires "paramiko" to be installed` -- and paramiko is
+    in the `bench` group, which the default lane deliberately does not install. So this test
+    passed only on a machine where somebody had run `uv sync --group bench` at some point, and
+    failed in the lane CI actually runs (DoD 1: control the environment a test depends on).
+    Nothing here is about paramiko: what is under test is that a name already live in
+    ``registry`` is replaced rather than raising, and any class standing in it proves that.
     """
-    _ = fsspec.get_filesystem_class("sftp")  # resolves the incumbent into the live registry
+    register_implementation("sftp", GantrySFTPFile, clobber=True)
     assert registry.get("sftp") is not GantrySFTPFileSystem
 
     register("sftp", override=True)

@@ -114,6 +114,24 @@ LANES: tuple[Lane, ...] = (
         takes="seconds",
     ),
     Lane(
+        name="audit",
+        summary=(
+            "known advisories against the versions uv.lock pins, in two scopes -- what a "
+            "user installs gates, what a developer installs reports"
+        ),
+        tool="python",
+        args=("scripts/audit_deps.py",),
+        needs=(
+            "uv sync --group audit, and a reachable PyPI. pip-audit is a group of its own "
+            "because it costs 18 packages over the default lane. This is also the one lane "
+            "that has to run on a schedule to be worth anything: an advisory is published "
+            "against code that has not changed, so a lane that only runs per change finds "
+            "it whenever somebody next edits something"
+        ),
+        reports_only="",
+        takes="a few seconds",
+    ),
+    Lane(
         name="fast",
         summary="unit tests, the real sftp-server rows, and every example run as a subprocess",
         tool="python",

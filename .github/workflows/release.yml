@@ -43,6 +43,18 @@ jobs:
   # Gate first. Publishing is the one irreversible step in this project -- a
   # version number on PyPI cannot be reused, even after a delete -- so the full
   # suite runs against the tagged tree before anything is built for upload.
+  #
+  # **Every `uv` invocation here takes `--frozen`, and it is the reason this job
+  # was edited.** It used to run a bare `uv sync --all-extras`, which is allowed
+  # to re-resolve when the lock and `pyproject.toml` disagree -- so the one lane
+  # that ends in an upload was the only one in the repository permitted to
+  # install something `uv.lock` does not name, and `ci.yml` had `--frozen` on
+  # all nine of its jobs. The hashes in the lock are only worth what the flag
+  # that insists on them is worth.
+  #
+  # The `audit` lane runs here too, and this is the moment it matters most: a
+  # published version is the one artifact that cannot be taken back, and its
+  # shipped-surface scope is exactly the set a user of that artifact installs.
   # ---------------------------------------------------------------------------
   verify:
     runs-on: ubuntu-latest
@@ -52,13 +64,23 @@ jobs:
         with:
           enable-cache: true
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-client openssh-server
-      - run: uv sync --all-extras
-      - run: uv run python scripts/lanes.py gates
-      - run: uv run python scripts/lanes.py fast
+      - run: uv sync --frozen --all-extras --group audit
+      - run: uv run --frozen python scripts/lanes.py gates
+      - run: uv run --frozen python scripts/lanes.py fast
+      - run: uv run --frozen python scripts/lanes.py audit
 
   # ---------------------------------------------------------------------------
   # Build once, publish that artifact. Building separately in the publish job
   # would upload something no test has seen.
+  #
+  # `--no-build-isolation` over a synced `build` group, rather than the default,
+  # and the default is what it looks like it is: PEP 517 resolves
+  # `[build-system] requires` fresh from PyPI into a throwaway environment, so
+  # the backend that *produces* the artifact was the last thing in this path
+  # arriving unpinned and unhashed. With the group synced it comes from
+  # `uv.lock` like everything else. The two builds were compared before this
+  # line was written -- same 48 entries, byte for byte identical -- so what
+  # changed is where hatchling came from and nothing else.
   # ---------------------------------------------------------------------------
   build:
     needs: verify
@@ -66,6 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv sync --frozen --group build
 
       - name: Refuse a tag that disagrees with the packaged version
         # The version is single-sourced from `src/gantry_sftp/__init__.py`, so a `v0.1.1` tag on
@@ -75,14 +98,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
-          packaged="$(uv run python -c 'import gantry_sftp; print(gantry_sftp.__version__)')"
+          packaged="$(uv run --frozen python -c 'import gantry_sftp; print(gantry_sftp.__version__)')"
           tagged="${GITHUB_REF_NAME#v}"
           if [ "$packaged" != "$tagged" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match __version__ ${packaged}" >&2
             exit 1
           fi
 
-      - run: uv build
+      - run: uv build --no-build-isolation
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: distribution
