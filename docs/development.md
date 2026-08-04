@@ -71,6 +71,16 @@ mypy's `deprecated` error code and ty's `deprecated` rule both run, and a third 
 three checkers vendor different typeshed snapshots and the one that already carries a
 deprecation is not always the one you were going to run.
 
+One hook **reports instead of gating**, and it is the only one: `parked-worktrees` lists any
+worktree left behind under `.claude/worktrees/` and always exits 0. Working in a worktree is
+supported, so failing the commit would be wrong every time somebody legitimately has two going —
+what it guards against is not knowing one is there. A session that ends a turn and a session
+sitting idle waiting for an answer look identical from outside, the worktree it leaves stays
+`locked` because the keep-or-remove prompt never runs for it, and nothing else in the repository
+mentions it: `git status` in the main checkout is clean whatever is parked next door. It says
+nothing when nothing is parked. It is marked `verbose` in `.pre-commit-config.yaml` because
+pre-commit shows the output of a *failing* hook only, and this one never fails.
+
 `tests/` and `examples/` need no network and are what `fast` runs. Every example is executed
 as a subprocess, because an example that has drifted out of sync with the library is a
 confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` on localhost;

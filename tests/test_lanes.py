@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -119,6 +121,164 @@ def test_the_deprecation_lane_covers_every_directory_of_python_in_the_repository
     )
     # mutants/ is a generated copy of src/ and would double every finding in it.
     assert "mutants" in config["exclude"]
+
+
+# ---------------------------------------------------------------------------
+# The parked-worktree warning
+# ---------------------------------------------------------------------------
+
+PARKED_SCRIPT = REPO_ROOT / "scripts" / "warn_parked_worktrees.sh"
+
+GIT_ENV = {
+    # `~/.gitconfig` is a read-only host mount here and a developer's own config anywhere else,
+    # so a repository built for a test resolves its identity, its default branch and whether it
+    # signs commits from the machine it happens to run on. DoD 1: control the environment.
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_AUTHOR_NAME": "Test",
+    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+    "GIT_COMMITTER_NAME": "Test",
+    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+}
+
+
+def _hook_block(hook_id: str) -> str:
+    """The one hook's settings, so a key asserted here cannot be satisfied by another hook.
+
+    Comments are dropped rather than kept. A stanza runs to the start of the next `- id:`, so
+    the prose introducing the *following* hook lands at the end of this one -- and every key
+    here is also a word somebody explains in a comment, which is a control test that fails for
+    a reason unrelated to what it controls.
+    """
+    blocks = re.split(r"^\s*- id: ", PRECOMMIT_TEXT, flags=re.MULTILINE)
+    matching = [block for block in blocks if block.startswith(f"{hook_id}\n")]
+    assert len(matching) == 1
+    settings = [line for line in matching[0].splitlines() if not line.lstrip().startswith("#")]
+    return "\n".join(settings)
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        env={**os.environ, **GIT_ENV},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def _repository(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "--quiet", "--initial-branch=main")
+    (repo / "file.txt").write_text("first\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "--quiet", "-m", "first")
+    return repo
+
+
+def _warn(cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(PARKED_SCRIPT)],
+        cwd=cwd,
+        env={**os.environ, **GIT_ENV},
+        capture_output=True,
+        text=True,
+        # The return code is the assertion in every test below -- it is what proves the hook
+        # warns rather than gates -- so raising on it here would delete the thing under test.
+        check=False,
+    )
+
+
+def test_the_parked_worktree_hook_runs_a_script_that_exists() -> None:
+    assert "bash scripts/warn_parked_worktrees.sh" in PRECOMMIT_TEXT
+    assert PARKED_SCRIPT.is_file()
+
+
+def test_the_parked_worktree_hook_is_verbose_or_it_reports_into_a_void() -> None:
+    """`verbose` is the difference between this hook working and this hook existing.
+
+    pre-commit prints the stdout of a hook that *fails*. This one never fails -- that is its
+    design, argued in the script's header -- so without `verbose: true` every warning it writes
+    is discarded, the hook passes, and the commit looks checked. It is the failure mode that
+    looks exactly like the success one, so it is asserted rather than remembered.
+    """
+    block = _hook_block("parked-worktrees")
+    assert "verbose: true" in block
+    # It reads the worktree list rather than the staged files, so file filters would gate it on
+    # something unrelated to what it checks.
+    assert "always_run: true" in block
+    assert "pass_filenames: false" in block
+
+
+def test_no_other_hook_was_made_verbose_by_this_one() -> None:
+    # The control for the assertion above: if `_hook_block` returned the whole file, every hook
+    # would appear verbose and the test above would pass without wiring anything.
+    assert "verbose" not in _hook_block("forbid-exec-bit")
+
+
+def test_a_repository_with_nothing_parked_says_nothing(tmp_path: Path) -> None:
+    done = _warn(_repository(tmp_path))
+    assert done.returncode == 0
+    assert done.stdout == ""
+
+
+def test_a_parked_worktree_is_named_with_its_branch(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _git(repo, "worktree", "add", "--quiet", "-b", "worktree-parked", ".claude/worktrees/parked")
+
+    done = _warn(repo)
+
+    # Exit 0 is the point, not an oversight: working in a worktree is supported, so a gate here
+    # would fail the normal case and get itself removed. See the script's header.
+    assert done.returncode == 0
+    assert "1 parked worktree(s)" in done.stdout
+    assert ".claude/worktrees/parked" in done.stdout
+    assert "[worktree-parked]" in done.stdout
+    assert "git worktree remove --force" in done.stdout
+
+
+def test_a_worktree_outside_the_sessions_directory_is_not_reported(tmp_path: Path) -> None:
+    # The decoy. A hook that warned about every worktree would be right about this one too, and
+    # would be noise on the deliberate, hand-made kind that is nobody's forgotten session.
+    repo = _repository(tmp_path)
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature", str(tmp_path / "elsewhere"))
+
+    done = _warn(repo)
+
+    assert done.returncode == 0
+    assert done.stdout == ""
+
+
+def test_the_worktree_being_committed_from_does_not_report_itself(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    parked = repo / ".claude" / "worktrees" / "parked"
+    _git(repo, "worktree", "add", "--quiet", "-b", "worktree-parked", str(parked))
+
+    done = _warn(parked)
+
+    assert done.returncode == 0
+    assert done.stdout == ""
+
+
+def test_a_registration_whose_directory_is_gone_is_still_reported(tmp_path: Path) -> None:
+    """The cheapest way to lose one is to delete the directory and leave the registration.
+
+    It is also the case that breaks the obvious implementation: reading the tip with
+    `git -C <path>` errors on exactly the worktree most worth reporting, which under `set -e`
+    is a hook that dies instead of warning.
+    """
+    repo = _repository(tmp_path)
+    parked = repo / ".claude" / "worktrees" / "parked"
+    _git(repo, "worktree", "add", "--quiet", "-b", "worktree-parked", str(parked))
+    shutil.rmtree(parked)
+
+    done = _warn(repo)
+
+    assert done.returncode == 0
+    assert ".claude/worktrees/parked" in done.stdout
+    assert "directory is gone" in done.stdout
 
 
 def test_the_ide_checker_treats_an_untyped_dependency_as_untyped() -> None:

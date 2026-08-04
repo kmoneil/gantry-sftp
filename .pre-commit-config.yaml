@@ -103,6 +103,19 @@ repos:
         language: system
         pass_filenames: false
 
+      # The one hook here that reports instead of gating -- it always exits 0, and the reason
+      # a parked worktree must not fail a commit is in the script's header. `verbose` is not
+      # decoration: pre-commit shows the stdout of a *failing* hook only, so a hook that never
+      # fails is silent without it, and this one would be installed and mute. `always_run`
+      # because what it looks at is the worktree list, not the staged files.
+      - id: parked-worktrees
+        name: parked background-session worktrees (warns, never fails)
+        entry: bash scripts/warn_parked_worktrees.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true
+
       # pytest is pre-push only: it is too slow for every commit, and the point of the gate
       # is that nothing broken leaves the machine. live-tests/ and benchmarks/ need
       # containers and a shaped link, and are excluded by pyproject's testpaths.
