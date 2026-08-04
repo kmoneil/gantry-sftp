@@ -2,13 +2,14 @@
 
 Authentication is OpenSSH's job, which means your `ssh_config` already works and there is
 nothing here to configure twice. What this page covers is the seams: whose config is being
-read, where a connection is allowed to go, passwords, and what a failure tells you.
+read, where a connection is allowed to go, passwords, which of your `ssh_config`'s settings
+this library overrides, and what a failure tells you.
 
 ## Authenticating
 
 There is no authentication code in this library, and that is the thesis working. `ssh` is the
 client, so every method it supports works here with no adapter: keys from the agent,
-`IdentityFile`, `ProxyJump`, host certificates, FIDO tokens, `Match` blocks, `ControlMaster`.
+`IdentityFile`, `ProxyJump`, host certificates, FIDO tokens, `Match` blocks.
 Point it at a host in your `ssh_config` and it connects the way `ssh` would.
 
 ```python
@@ -173,6 +174,78 @@ the default under its own spelling. The same shape defeated `PermitLocalCommand=
 `BatchMode` contradiction check above. Measured against OpenSSH 10.0p2; pinned by
 `tests/test_transport.py::test_ssh_matches_option_names_case_insensitively_and_takes_the_first`,
 which characterises `ssh` rather than us, so a change in that behaviour fails loudly.
+
+### What the shipped defaults are
+
+These `-o` options go on every command line unless you override them by name. A command-line `-o`
+beats your `ssh_config`, so this is the short list of settings where what you wrote in the config
+is not what `ssh` will use.
+
+| Option                  | Shipped | Why                                                                                                                                             |
+| ----------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BatchMode`             | `yes`   | No prompting. A transfer hung on an invisible password prompt is the most common way an automated job fails silently. `password=` relaxes it.      |
+| `StrictHostKeyChecking` | `yes`   | Refuse an unknown host key rather than trusting on first use. Weakening it warns.                                                                  |
+| `PermitLocalCommand`    | `no`    | `LocalCommand` in an `ssh_config` runs a program on _this_ machine. An SFTP client has no business doing that.                                     |
+| `ClearAllForwardings`   | `yes`   | Drop any forwarding a config tries to establish. Same reason.                                                                                      |
+| `ForwardX11`            | `no`    | Same reason.                                                                                                                                       |
+| `ForwardAgent`          | `no`    | Same reason.                                                                                                                                       |
+| `ControlMaster`         | `no`    | Declines to _become_ a multiplexing master. This one is not a security default and it is the one below.                                             |
+
+The table is `DEFAULT_SSH_OPTIONS` in the public `gantry_sftp.transport` namespace, so a program
+can read what it is getting rather than trust this page; `tests/test_packaging.py` asserts the two
+agree, which is what stops a new default shipping undocumented.
+
+### Connection reuse, and why the master is not ours to start
+
+Connecting is this library's weak spot — a fork, an exec and OpenSSH's own config parsing before
+a packet moves — and `ControlMaster` multiplexing is the fix for a workload that connects often.
+It is worth stating exactly what you get, because **one shipped default changes the answer**.
+
+`ControlMaster=no` is on every command line, and `-o` beats the config file. Measured against
+OpenSSH 10.0p2 with a config that asks for multiplexing:
+
+```console
+$ ssh -F cm.conf -G host | grep -i '^controlmaster\|^controlpath'
+controlmaster auto
+controlpath /tmp/cm-%r@%h:%p
+
+$ ssh -o ControlMaster=no -F cm.conf -G host | grep -i '^controlmaster\|^controlpath'
+controlmaster false
+controlpath /tmp/cm-%r@%h:%p
+```
+
+So `ControlPath` survives and `ControlMaster` does not. Concretely:
+
+- **An existing master is still used.** If something else already holds one at your `ControlPath`,
+  every connection this library makes goes down it and costs a Unix socket handshake. Nothing is
+  disabled on that path.
+- **This library will not create one.** So if the only `ssh` on the machine is ours, setting
+  `ControlMaster auto` in `~/.ssh/config` and changing nothing else buys **nothing**: the first
+  connection declines to host the master, and there is never one for the second to reuse.
+
+That default is deliberate rather than an oversight. Becoming a master means leaving a listening
+socket behind that outlives the process and accepts further connections to that host — a side
+effect worth having, and not one a library gets to take on your behalf without being asked.
+
+Ask for it either way:
+
+```python
+# 1. Run your own master, and this library uses it with no argument at all.
+#      ssh -MNf -S /tmp/cm-%r@%h:%p prod-sftp
+#    with a matching `ControlPath` in your ssh_config.
+
+# 2. Or let the first connection host it.
+async with connect("prod-sftp", options={"ControlMaster": "auto"}) as sftp:
+    ...
+```
+
+Option 2 replaces the shipped value rather than joining it on the command line, so there is no
+repeated-keyword ambiguity to reason about. Option 1 is the better fit for a long-lived worker,
+because the master's lifetime is then yours to end.
+
+What this does **not** buy is CPU. Reuse removes the handshake and TCP slow start; it does not
+change what this process spends per byte, which is the ceiling
+[`benchmarks/README.md`](../benchmarks/README.md) measures.
 
 ### Arming your own askpass helper
 

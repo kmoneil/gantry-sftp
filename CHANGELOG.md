@@ -65,7 +65,9 @@ is a protocol codec, a request scheduler and an ergonomics layer.
   real and absent from nearly every endpoint. Rung 3 is available everywhere.
 - **Connecting is slower** than a library that implements SSH in-process, because spawning `ssh`
   costs a fork, an exec and OpenSSH's own config parsing. For connection-heavy work,
-  `ControlMaster` is one `ssh_config` line.
+  `ControlMaster` is the fix, and it has to be asked for: this library ships `ControlMaster=no`,
+  so it uses a master you already have and will not start one. See
+  [Connection reuse](docs/connecting.md#connection-reuse-and-why-the-master-is-not-ours-to-start).
 - **The benchmark lane reports and does not gate**, apart from two scenarios that assert a shape
   rather than a ratio. No published figure has a regression test behind it, which is why no
   committed file carries one.

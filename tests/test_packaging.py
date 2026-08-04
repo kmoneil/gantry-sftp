@@ -33,7 +33,7 @@ from gantry_sftp.session import (
     PREFERRED_WRITE_LENGTH,
     Session,
 )
-from gantry_sftp.transport import missing_executable_hint
+from gantry_sftp.transport import DEFAULT_SSH_OPTIONS, missing_executable_hint
 
 ROOT = Path(__file__).resolve().parent.parent
 LICENCE = ROOT / "LICENSE"
@@ -511,6 +511,59 @@ def test_no_shipped_document_states_a_throughput_figure(document: Path):
         "throughput figures belong in benchmarks/README.md and nowhere else (D-88): "
         + "; ".join(offences)
     )
+
+
+def test_every_shipped_ssh_option_is_documented_with_the_value_it_ships():
+    """A `-o` on the command line beats the user's `ssh_config`, so every entry here is a setting
+    somebody may have written down and will not get. That makes the set a documentation
+    obligation rather than an implementation detail.
+
+    Found by `ControlMaster=no`, which shipped in `DEFAULT_SSH_OPTIONS` and appeared in no page
+    under `docs/` -- while `README.md`, `docs/architecture.md` and `benchmarks/README.md` each
+    described `ControlMaster` as something OpenSSH gives you for free. Measured against OpenSSH
+    10.0p2: a config asking for `ControlMaster auto` resolves to `controlmaster false` once our
+    `-o` is on the line, so a reader following those pages got no multiplexing and no way to find
+    out why. The only place the option was written down was `_plans/DESIGN.md`, which is
+    gitignored and ships nowhere.
+
+    The direction this fails in is the point (D-132's argument, one layer out): an allowlist of
+    documented options omits silently, so the check is driven from the constant. A default added
+    without a row fails here by name, and a row whose value drifts from the code fails with both
+    values quoted.
+    """
+    section = _section(doc("connecting.md"), "### What the shipped defaults are")
+    assert section, "docs/connecting.md lost the section listing the shipped ssh options"
+
+    wrong = []
+    for name, value in DEFAULT_SSH_OPTIONS.items():
+        row = next((r for r in section.splitlines() if r.startswith(f"| `{name}`")), "")
+        if not row:
+            wrong.append(f"{name}: shipped as {value!r} and the page has no row for it")
+        elif f"`{value}`" not in row:
+            wrong.append(f"{name}: code ships {value!r}, page row says something else")
+    assert not wrong, "docs/connecting.md disagrees with DEFAULT_SSH_OPTIONS: " + "; ".join(wrong)
+
+
+def _section(page: str, heading: str) -> str:
+    """The text under ``heading``, stopping at the next heading of the same depth or shallower.
+
+    Scoped rather than page-wide because this page carries **two** option tables -- the shipped
+    defaults and the password-auth overrides -- and ``BatchMode`` is in both, with `yes` in one
+    and `no` in the other. A page-wide row match takes whichever comes first, so the check would
+    have read the password table and passed while saying nothing about the defaults.
+    """
+    depth = len(heading) - len(heading.lstrip("#"))
+    lines = page.splitlines()
+    try:
+        start = lines.index(heading)
+    except ValueError:
+        return ""
+    body = []
+    for line in lines[start + 1 :]:
+        if line.startswith("#") and len(line) - len(line.lstrip("#")) <= depth:
+            break
+        body.append(line)
+    return "\n".join(body)
 
 
 def test_the_benchmark_lane_still_names_the_costs_it_measured():

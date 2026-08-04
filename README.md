@@ -4,8 +4,8 @@ A modern Python SFTP library that **does not implement SSH at all**.
 
 OpenSSH already exists and is already installed. `gantry-sftp` runs it as a subprocess, which
 hands back a plaintext, framed SFTP byte stream, so there is **zero cryptography in this
-package**, and key exchange, host-key verification, `ssh_config`, `ProxyJump` and
-`ControlMaster` are all things you already have rather than things this library reimplements.
+package**, and key exchange, host-key verification, `ssh_config` and `ProxyJump` are all things
+you already have rather than things this library reimplements.
 
 What is left is the part that is actually about SFTP: a protocol codec, a request scheduler, and
 an ergonomics layer.
@@ -132,7 +132,7 @@ task rather than by module:
 | [Paths, predicates and attributes](docs/paths.md) | `SFTPPath`, the bytes-versus-`Path` rule, `exists` / `is_dir` / `is_file`, a working directory, symlinks and `chmod` |
 | [Listing and matching](docs/listing-and-matching.md) | `listdir` / `scandir`, streaming a directory you did not size, and the `glob` dialect |
 | [Concurrency and byte ranges](docs/concurrency.md) | Many transfers over one connection, `concurrency=`, `open_file`, and reading part of a file |
-| [Connecting and authenticating](docs/connecting.md) | Keys, agents, `ssh_config`, passwords, restricting where a connection may go, and what a failure tells you |
+| [Connecting and authenticating](docs/connecting.md) | Keys, agents, `ssh_config`, passwords, restricting where a connection may go, which `ssh_config` settings this library overrides, and what a failure tells you |
 | [Reconnecting and timeouts](docs/reliability.md) | `with_reconnect`, deadlines on every wait, and stopping a transfer cleanly |
 | [Seeing what it is doing](docs/observability.md) | Structured logs, session counters, the frame dump, credential redaction, and `doctor` |
 | [fsspec, pandas and dask](docs/integrations.md) | `pd.read_parquet("gantry-sftp://…")`, and the two things to know before deploying it |

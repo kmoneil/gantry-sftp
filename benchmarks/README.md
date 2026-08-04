@@ -371,7 +371,11 @@ when the scheduler does, it is a result.
 **What is stated here is the half that is a disclosure rather than a claim.** This library is
 *slower to connect* than either alternative -- spawning `ssh` costs a fork, an exec and
 OpenSSH's own configuration parsing before a packet moves, and for connection-heavy work
-`ControlMaster` is the fix rather than an optimisation. And it **wins nothing on CPU**, because
+`ControlMaster` is the fix rather than an optimisation, once it is asked for: this library ships
+`ControlMaster=no` and uses an existing master rather than hosting one. No row is measured with
+multiplexing in play, and that is deliberate rather than incidental -- `client_kwargs` passes
+`config_file=os.devnull`, so a developer's `ControlPath` cannot change a number without changing
+the code. And it **wins nothing on CPU**, because
 `cryptography` is OpenSSL and the expensive part was never interpreted in either design; what
 moves out of Python is per-packet framing, and a pipe copy is paid for it.
 

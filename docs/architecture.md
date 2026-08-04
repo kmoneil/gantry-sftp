@@ -96,7 +96,9 @@ picture is worse than choosing a different one.
   does not place bytes in a local file work there.
 - **Connecting is slower than either alternative**, because spawning `ssh` costs a fork, an exec
   and OpenSSH's own config parsing before a packet moves. For connection-heavy work `ControlMaster`
-  is the answer, and it is one `ssh_config` line.
+  is the answer, and it takes one `ssh_config` line **plus** asking for it — this library ships
+  `ControlMaster=no` and so declines to host the master. See
+  [Connection reuse](connecting.md#connection-reuse-and-why-the-master-is-not-ours-to-start).
 - **It wins nothing on CPU.** Moving the cryptography out of Python does not make it free; it makes
   it somebody else's, and the cycles are still spent.
 
@@ -106,9 +108,13 @@ None of this is implemented here, which is why none of it can rot here. It is Op
 your `ssh` can do it, so can this:
 
 - **`ssh_config`, in full**: `Match`, `Include`, `ProxyJump`, `ProxyCommand`, `IdentityFile`.
-- **`ControlMaster` / `ControlPath` multiplexing.** If your `ssh_config` sets it, you have it, and
-  for connection-heavy work it is the fix rather than an optimisation, because connecting is this
-  library's weak spot.
+- **`ControlMaster` / `ControlPath` multiplexing** — the one entry on this list with a caveat, and
+  it is ours rather than OpenSSH's. An **existing** master is used with no argument at all, because
+  `ControlPath` is untouched. Hosting one is opt-in: this library ships `ControlMaster=no`, so a
+  config line alone buys nothing when the only `ssh` on the machine is this one. For
+  connection-heavy work it is still the fix rather than an optimisation, because connecting is this
+  library's weak spot — it just needs to be asked for. See
+  [Connection reuse](connecting.md#connection-reuse-and-why-the-master-is-not-ours-to-start).
 - **Host keys signed by a CA**, and an agent with more than one key in it.
 - **Reaching a host through a proxy or a bastion**: `ProxyJump`, and `ProxyCommand` for SOCKS. Port
   _forwardings_ are a different feature and this library switches them off on purpose: an SFTP
