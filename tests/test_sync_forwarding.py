@@ -521,3 +521,76 @@ def test_a_path_built_from_another_inherits_its_bytes_and_its_session(live):
     assert derived.session is sftp
     # An explicit session still wins over the inherited one.
     assert SyncSFTPPath(SyncSFTPPath(b"/other"), session=sftp).session is sftp
+
+
+@pytest.mark.parametrize(("blocking_type", "target", "name"), STREAMING)
+def test_a_streaming_method_defaults_the_way_the_async_one_does(
+    blocking_type, target, name, live, monkeypatch
+):
+    """The default half for the lazy shapes, which the table above cannot reach.
+
+    `case_sensitive: bool = True` on all three glob spellings is the live example: flipped to
+    `False` a pattern starts matching names it should not, and every existing case either
+    passes the argument or matches something whose case does not vary.
+    """
+    sftp, path, _handle = live
+    blocking = sftp if blocking_type is SyncSession else path
+
+    original = inspect.getattr_static(target, name)
+    record: dict[str, Any] = {}
+    monkeypatch.setattr(target, name, record_into(record, original))
+
+    args: list[Any] = []
+    expected: dict[str, Any] = {}
+    for parameter_name, parameter in inspect.signature(original).parameters.items():
+        if parameter_name == "self":
+            continue
+        if parameter.default is inspect.Parameter.empty:
+            sentinel = _Sentinel(parameter_name)
+            args.append(sentinel)
+            expected[parameter_name] = sentinel
+        else:
+            expected[parameter_name] = parameter.default
+
+    assert list(getattr(blocking, name)(*args)) == []
+    assert record.get("arrived") == expected
+
+
+@pytest.mark.parametrize("name", ["relative_to", "is_relative_to", "symlink_to"])
+def test_a_blocking_path_argument_is_unwrapped_before_it_crosses(name: str, live, monkeypatch):
+    """Three methods take `bytes | str | SyncSFTPPath`, and only two of those were ever passed.
+
+    `_inner` exists to unwrap the third, and the async side has never heard of a
+    `SyncSFTPPath` -- handing it one straight through would be a blocking object arriving on
+    the async surface. The axis to vary is the argument's own type, which is what the sentinel
+    table structurally cannot do: a sentinel is none of the three.
+    """
+    _sftp, path, _handle = live
+    original = inspect.getattr_static(SFTPPath, name)
+    record: dict[str, Any] = {}
+    monkeypatch.setattr(SFTPPath, name, record_into(record, original))
+
+    try:
+        getattr(path, name)(SyncSFTPPath(b"/incoming"))
+    except Exception:
+        if "arrived" not in record:
+            raise
+
+    assert list(record["arrived"].values()) == [b"/incoming"], (
+        f"{name} passed the blocking path across instead of its bytes: {record['arrived']}"
+    )
+
+
+def test_a_file_opened_from_a_path_can_actually_be_read(live, tmp_path: Path):
+    """`SyncSFTPPath.open` builds the blocking file itself, so it also supplies the portal.
+
+    Nothing forwarded here is wrong when the portal is dropped or nulled -- the arguments
+    reach the async `open` either way -- and the object handed back is simply unusable. So
+    this is the one member of its family that has to be proven by *using* what it returns.
+    """
+    sftp, _path, _handle = live
+    (tmp_path / "readable.txt").write_bytes(b"through the portal\n")
+
+    remote = SyncSFTPPath(str(tmp_path / "readable.txt").encode(), session=sftp)
+    with remote.open() as handle:
+        assert handle.read() == b"through the portal\n"
