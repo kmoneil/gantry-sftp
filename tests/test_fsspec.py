@@ -43,7 +43,7 @@ from fsspec.registry import (
 
 from gantry_sftp import fsspec as gantry_fsspec
 from gantry_sftp.codec import Attrs
-from gantry_sftp.exceptions import CapabilityError
+from gantry_sftp.exceptions import CapabilityError, NoSuchFileError
 from gantry_sftp.fsspec import (
     _AUTHORITY_ONLY,
     _QUERY_FLOATS,
@@ -1552,11 +1552,23 @@ def test_opening_a_file_forwards_the_block_size_and_the_caching_it_was_given(fs,
     `block_size` is the one with teeth: dropped, every read of a parquet footer falls back to
     the class default, and the round-trip count a caller tuned for goes with it.
     """
-    with fs._open(f"{drop}/big.bin", block_size=4096, cache_type="none") as handle:  # noqa: SLF001
+    handle = fs._open(  # noqa: SLF001
+        f"{drop}/big.bin",
+        block_size=4096,
+        autocommit=False,
+        cache_options={"trim": False},
+        cache_type="bytes",
+    )
+    try:
         assert handle.blocksize == 4096
         assert handle.mode == "rb"
-        assert handle.autocommit is True
+        # Non-default throughout: `autocommit` defaults to `True` and `cache_options` to `None`,
+        # so an argument dropped here is invisible to any call that passes the default.
+        assert handle.autocommit is False
+        assert handle.cache.trim is False
         assert handle.read(4) == bytes(range(256))[:4]
+    finally:
+        handle.close()
 
 
 def test_a_listing_carries_the_owner_and_the_times_under_the_names_fsspec_uses(fs, drop: str):
@@ -1666,3 +1678,152 @@ def test_the_incumbent_check_reads_the_class_key_fsspec_actually_uses(monkeypatc
     with pytest.raises(ValueError) as exc:
         register("sftp")
     assert "already registered to" in exc.value.args[0]
+
+
+# --- what a v3 ATTRS cannot carry, and the refusals that say so ------------------------------
+
+
+def test_a_server_that_sends_no_modification_time_is_refused_with_the_reason(fs, drop, monkeypatch):
+    """Every field in a v3 ATTRS is optional, so `getmtime` answering `None` is a real state.
+
+    `sftp-server` always sends one, which is why nothing here had ever reached this branch --
+    the whole refusal, its `feature`, its `path` and its message were free. `modified()` is on
+    `AbstractFileSystem`'s contract, so the alternative to refusing is returning a timestamp
+    nobody sent.
+    """
+    monkeypatch.setattr(type(fs.sftp), "getmtime", lambda _self, _path: None)
+
+    with pytest.raises(CapabilityError) as exc:
+        fs.modified(f"{drop}/report.csv")
+
+    assert exc.value.args[0] == (
+        f"the server sent no modification time for '{drop}/report.csv', so there is none to "
+        f"report -- every field in an SFTP v3 ATTRS is optional"
+    )
+    assert exc.value.feature == "modified()"
+    assert exc.value.path == f"{drop}/report.csv".encode()
+
+
+def test_there_is_no_creation_time_in_the_protocol_at_all(fs, drop: str):
+    """`created()` refuses unconditionally, and the refusal has to say why rather than how.
+
+    v3's ATTRS carries size, uid/gid, permissions and atime/mtime -- there is no creation time
+    to report from any server, so this is a statement about the protocol rather than about this
+    one. The `path` is carried anyway, because a caller walking a tree needs to know which
+    entry it gave up on.
+    """
+    with pytest.raises(CapabilityError) as exc:
+        fs.created(f"{drop}/report.csv")
+
+    assert exc.value.args[0] == (
+        f"SFTP v3 has no creation time: an ATTRS carries size, uid/gid, permissions and "
+        f"atime/mtime only, so '{drop}/report.csv' has no created timestamp to report"
+    )
+    assert exc.value.feature == "created()"
+    assert exc.value.path == f"{drop}/report.csv".encode()
+
+
+def test_an_entry_the_server_did_not_describe_is_other_rather_than_a_guess(fs, drop, monkeypatch):
+    """`"other"` is fsspec's third word, and it carries "the server did not say".
+
+    A v3 server need not send permission bits at all, and `S_ISDIR(None)` is a `TypeError` on
+    the incumbent. Here the entry is reported, typed as far as it can be, and the type is the
+    one fsspec's own vocabulary has for "neither file nor directory".
+    """
+    monkeypatch.setattr(type(fs.sftp), "lstat", lambda _self, _path: Attrs())
+
+    entry = fs.info(f"{drop}/report.csv")
+    assert entry["type"] == "other"
+    assert entry["name"] == f"{drop}/report.csv"
+
+
+def test_uploading_to_a_path_with_no_parent_does_not_try_to_create_one(fs, monkeypatch, tmp_path):
+    """`parent and parent != remote`, where an `or` makes a root-level destination self-creating.
+
+    `_parent("/x")` is `"/"`, and `_parent("/")` is `"/"` again -- so the guard's second half is
+    what stops a destination at the root asking the server to create the root, and the first
+    half is what stops an empty parent doing the same.
+    """
+    asked: list[str] = []
+    monkeypatch.setattr(type(fs.sftp), "makedirs", lambda _self, path, **_k: asked.append(path))
+    source = tmp_path / "upload.csv"
+    _ = source.write_bytes(b"id\n1\n")
+
+    fs.put_file(source, str(tmp_path / "at-the-top.csv"))
+
+    assert asked == [str(tmp_path)], f"asked to create something odd: {asked}"
+
+
+def test_the_default_upload_mode_is_overwrite(fs, drop: str, tmp_path: Path):
+    # The default is what a caller who says nothing gets, and it is the *permissive* one -- so
+    # a default of anything else turns every ordinary `put_file` into a refusal.
+    source = tmp_path / "upload.csv"
+    _ = source.write_bytes(b"replaced\n")
+    fs.put_file(source, f"{drop}/report.csv")
+    assert fs.cat_file(f"{drop}/report.csv") == b"replaced\n"
+
+
+def test_an_upload_that_the_server_refuses_names_the_destination(fs, drop, monkeypatch, tmp_path):
+    """`put_file`'s own `_translated(remote)`, which is its eighth call site.
+
+    Reached by making the transfer itself fail rather than the directory work above it: an
+    ordinary refusal on the way in is a `FAILURE`, which this boundary deliberately does *not*
+    translate, so the branch needs a `NoSuchFileError` to travel through it.
+    """
+    source = tmp_path / "upload.csv"
+    _ = source.write_bytes(b"id\n1\n")
+
+    def refuse(_self, _local, remote, **_kwargs):  # type: ignore[no-untyped-def]
+        raise NoSuchFileError("gone", code=2, path=remote)
+
+    monkeypatch.setattr(type(fs.sftp), "put", refuse)
+
+    with pytest.raises(FileNotFoundError) as exc:
+        fs.put_file(source, f"{drop}/vanished.csv")
+    assert exc.value.args[0] == f"{drop}/vanished.csv"
+
+
+def test_uploading_to_the_root_does_not_ask_the_server_to_create_it(fs, monkeypatch, tmp_path):
+    """`parent != remote`, which only a destination whose parent is itself can separate.
+
+    `_parent("/x")` is `"/"` and `_parent("/")` is `"/"` again, so at the root the two are
+    equal -- and an `or` there turns "skip, there is nothing above this" into `makedirs("/")`,
+    which on a strict server is a refusal on every upload to a top-level name.
+    """
+    asked: list[str] = []
+    monkeypatch.setattr(type(fs.sftp), "makedirs", lambda _s, path, **_k: asked.append(path))
+    monkeypatch.setattr(type(fs.sftp), "put", lambda _s, *_a, **_k: None)
+
+    fs.put_file(tmp_path / "x.csv", "/")
+
+    assert asked == [], f"asked to create the root: {asked}"
+
+
+def test_registering_our_own_protocol_twice_is_not_a_takeover(monkeypatch):
+    """`known.get("class")`, read under the key fsspec actually uses.
+
+    Under any other key the answer is always `None`, every protocol looks like somebody else's,
+    and re-registering our *own* name raises as though it were a takeover -- which is what a
+    module imported twice does.
+    """
+    monkeypatch.setitem(
+        known_implementations,
+        PROTOCOL,
+        {"class": f"gantry_sftp.fsspec.{GantrySFTPFileSystem.__name__}"},
+    )
+    register(PROTOCOL)
+    assert registry.get(PROTOCOL) is GantrySFTPFileSystem
+
+
+def test_an_override_replaces_a_protocol_that_is_already_resolved():
+    """`clobber=True`, without which the deliberate override fails with fsspec's own error.
+
+    `register_implementation` defaults to `clobber=False` and *raises* when the protocol is
+    already live in the registry -- so `override=True` would print the warning, get the
+    caller's decision, and then not carry it out.
+    """
+    _ = fsspec.get_filesystem_class("sftp")  # resolves the incumbent into the live registry
+    assert registry.get("sftp") is not GantrySFTPFileSystem
+
+    register("sftp", override=True)
+    assert registry.get("sftp") is GantrySFTPFileSystem
