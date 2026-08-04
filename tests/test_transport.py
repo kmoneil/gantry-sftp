@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 import anyio
@@ -33,6 +34,8 @@ from gantry_sftp.exceptions import ConnectError, _flatten_exception_group
 from gantry_sftp.transport import (
     ASKPASS_ARMING_VARIABLES,
     StderrBuffer,
+    SubprocessTransport,
+    _subprocess,
     build_ssh_argv,
     find_sftp_server,
     open_local_server_transport,
@@ -209,6 +212,224 @@ async def test_a_cancelled_transfer_still_reaps_the_child(tmp_path: Path):
     assert transport.returncode is not None, "the child outlived a cancelled transfer"
 
 
+# --- the teardown ladder, driven by a child that refuses to cooperate --------------------
+#
+# Every branch below is one a real child reaches only by misbehaving: a pipe the peer has
+# already broken, a server that ignores a closed stdin, one that ignores SIGTERM. What is
+# under test is *our* ladder, not the operating system's signals, and a stand-in reaches all
+# of it in milliseconds where a real child reaches none of it at all. The `live-tests/`
+# proofs against a real server stay the answer for whether the ladder is wired to anything;
+# these are the answer for what it does when each rung fails.
+
+
+class _FakeStream:
+    """A stdin/stdout stand-in that raises whatever a test hands it."""
+
+    def __init__(
+        self,
+        *,
+        close_error: BaseException | None = None,
+        receive_error: BaseException | None = None,
+    ) -> None:
+        self._close_error = close_error
+        self._receive_error = receive_error
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if self._receive_error is not None:
+            raise self._receive_error
+        return b""
+
+    async def send(self, data: bytes) -> None:
+        return None
+
+
+class _FakeProcess:
+    """An anyio ``Process`` stand-in whose teardown misbehaves on demand."""
+
+    def __init__(
+        self,
+        *,
+        stdin: _FakeStream | None = None,
+        stdout: _FakeStream | None = None,
+        close_error: BaseException | None = None,
+        close_hangs: bool = False,
+        wait_delay: float | None = None,
+        wait_for_kill: bool = False,
+    ) -> None:
+        self.stdin = stdin
+        self.stdout = stdout
+        self.pid = 424242
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+        self.waits = 0
+        self.waited = False
+        self.releases = 0
+        self._close_error = close_error
+        self._close_hangs = close_hangs
+        self._wait_delay = wait_delay
+        self._wait_for_kill = wait_for_kill
+        self._exited = anyio.Event()
+
+    async def aclose(self) -> None:
+        self.releases += 1
+        if self._close_error is not None:
+            raise self._close_error
+        if self._close_hangs:
+            await anyio.sleep_forever()
+
+    async def wait(self) -> int:
+        self.waits += 1
+        if self._wait_for_kill:
+            await self._exited.wait()
+        elif self._wait_delay is not None:
+            await anyio.sleep(self._wait_delay)
+        self.returncode = 0
+        self.waited = True
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+        self._exited.set()
+
+
+def _fake_transport(process: _FakeProcess) -> SubprocessTransport:
+    return SubprocessTransport(process, ["ssh", "-s", "--", "h", "sftp"], StderrBuffer())
+
+
+@pytest.mark.parametrize(
+    "error", [anyio.BrokenResourceError(), anyio.ClosedResourceError()], ids=["broken", "closed"]
+)
+async def test_closing_a_pipe_the_peer_already_broke_is_not_an_error(error: BaseException):
+    """Both members of both `suppress` tuples, which nothing had ever raised at.
+
+    `_close_stdin` and `_release_pipes` each suppress exactly two exception types, and a
+    tuple member is droppable one at a time -- so a teardown that used to be quiet starts
+    raising out of `aclose()`, at the point where the caller has already stopped caring and
+    has nothing left to do about it. Both types, both methods: dropping either member from
+    either tuple fails one of the four cases.
+    """
+    stdin_fails = _FakeProcess(stdin=_FakeStream(close_error=error))
+    await _fake_transport(stdin_fails).aclose()
+    assert stdin_fails.stdin is not None
+    assert stdin_fails.stdin.closed, "stdin was never closed, so nothing was suppressed"
+
+    release_fails = _FakeProcess(stdin=_FakeStream(), close_error=error)
+    await _fake_transport(release_fails).aclose()
+    assert release_fails.waited, "the child was never reaped"
+
+
+async def test_a_child_that_ignores_every_rung_is_still_torn_down(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The escalation ladder, which no test had ever climbed past its first rung.
+
+    Politeness first, but never indefinitely. Three bounds hold this together -- one on
+    handing the pipes back, one on the polite wait, one on the wait after ``SIGTERM`` -- and
+    each is droppable on its own, which turns a teardown into a hang.
+
+    **Dropping one cannot be caught from outside, and that is the point rather than a
+    limitation of this test.** ``aclose`` runs the whole ladder inside
+    ``anyio.CancelScope(shield=True)``, so no caller's deadline reaches in: the inner
+    ``move_on_after`` is the *only* bound that exists down here. A mutation that removes one
+    hangs forever and is caught by the mutation lane's own per-mutant timeout, which is the
+    correct verdict -- a teardown that never returns is exactly the defect. The
+    ``fail_after`` below is therefore not what catches those; it bounds this test against
+    the failures that are *not* shielded.
+
+    Cutting the grace period to milliseconds is what makes the rungs observable at all. The
+    mutation does not read the constant, so it does not shrink with it.
+    """
+    monkeypatch.setattr(_subprocess, "_TERMINATE_GRACE_SECONDS", 0.05)
+    process = _FakeProcess(stdin=_FakeStream(), close_hangs=True, wait_for_kill=True)
+
+    with anyio.fail_after(10):
+        await _fake_transport(process).aclose()
+
+    assert process.releases == 1, "the pipes were never handed back"
+    assert process.terminated, "a child that ignored the wait was never terminated"
+    assert process.killed, "a child that ignored SIGTERM was never killed"
+    assert process.waits == 3, "each rung waits once: politely, after terminate, after kill"
+
+
+@pytest.mark.parametrize("direction", ["stdin", "stdout"])
+async def test_a_transport_over_a_child_with_no_pipe_says_which_pipe_is_missing(direction: str):
+    """Two branches that carried `# pragma: no cover -- always piped by the openers here`.
+
+    True of the openers and never true of the class, which is public and takes the process it
+    is given. The pragmas are gone rather than re-argued: the reason the mutation register
+    called these unreachable was that nothing could build such a process, and the stand-in
+    above is exactly that -- so the cost of proving it is now two lines, where the argument
+    for skipping it was a fake nobody wanted to invent.
+    """
+    # Whichever pipe is under test is the one left as None; the other is present, so the
+    # refusal has to be about the missing one rather than about an empty process.
+    if direction == "stdin":
+        transport = _fake_transport(_FakeProcess(stdout=_FakeStream()))
+        with pytest.raises(ConnectError) as exc:
+            await transport.send(b"x")
+    else:
+        transport = _fake_transport(_FakeProcess(stdin=_FakeStream()))
+        with pytest.raises(ConnectError) as exc:
+            await transport.receive()
+    assert exc.value.args[0] == f"transport has no {direction}"
+
+
+async def test_receive_on_a_stream_closed_underneath_it_says_the_transport_is_closed():
+    # The `ClosedResourceError` branch, whose message is the one `_CLOSED_MESSAGE` exists to
+    # keep identical across all three of its sites -- and the only one nothing read.
+    process = _FakeProcess(stdout=_FakeStream(receive_error=anyio.ClosedResourceError()))
+    with pytest.raises(ConnectError) as exc:
+        await _fake_transport(process).receive()
+    assert exc.value.args[0] == "transport is closed"
+
+
+async def test_the_wait_for_the_exit_status_survives_a_cancel():
+    """The shield around the post-EOF wait, and what it is worth.
+
+    `ssh` writes its reason to stderr and then closes stdout, so the exit status and the
+    last of the diagnostics arrive just after the end of stream -- which is precisely when a
+    caller with a deadline is most likely to be cancelling us. Unshielded, the wait is
+    abandoned and the `ConnectError` carries `returncode=None`: the connection failed and
+    the error cannot say how.
+    """
+    process = _FakeProcess(stdout=_FakeStream(receive_error=anyio.EndOfStream()), wait_delay=0.1)
+    transport = _fake_transport(process)
+
+    async def read_until_it_gives_up() -> None:
+        with suppress(ConnectError):
+            await transport.receive()
+
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(read_until_it_gives_up)
+            await anyio.sleep(0.01)
+            tg.cancel_scope.cancel()
+
+    assert process.waited, "the cancel reached a wait that is supposed to be shielded from it"
+
+
+async def test_the_wait_for_the_exit_status_is_bounded(monkeypatch: pytest.MonkeyPatch):
+    # The other half of the same line: shielded from cancellation *and* bounded, or a child
+    # that never exits parks the error that was about to explain why.
+    monkeypatch.setattr(_subprocess, "_TERMINATE_GRACE_SECONDS", 0.05)
+    stdout = _FakeStream(receive_error=anyio.EndOfStream())
+    process = _FakeProcess(stdout=stdout, wait_for_kill=True)
+
+    with anyio.fail_after(10), pytest.raises(ConnectError) as exc:
+        await _fake_transport(process).receive()
+    assert exc.value.args[0] == "connection closed by the remote end"
+
+
 async def test_end_of_stream_reports_the_children_stderr(tmp_path: Path):
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
@@ -311,6 +532,64 @@ def test_stderr_that_is_not_utf8_does_not_raise():
     buffer = StderrBuffer()
     buffer.extend(b"Permission denied \xff\xfe\n")
     assert "Permission denied" in buffer.text()
+
+
+def test_the_tail_is_decoded_as_leniently_as_the_head():
+    """The head's lenient decode was proven and the tail's two were not.
+
+    The test above uses the default limits, so its stray bytes never leave the head -- and
+    `text()` decodes in three places, one per branch. Both tail decodes could lose
+    `errors="replace"`, or ask for an error handler that does not exist (the name lookup is
+    case-*sensitive*, unlike the encoding's), and the only thing that notices is stderr that
+    is not valid UTF-8 arriving after the head is full.
+    """
+    under_the_cap = StderrBuffer(head_limit=2, tail_limit=8)
+    under_the_cap.extend(b"AB\xff\xfe")
+    assert under_the_cap.text() == "AB��"
+    assert under_the_cap.dropped == 0
+
+    over_the_cap = StderrBuffer(head_limit=2, tail_limit=2)
+    over_the_cap.extend(b"AB" + b"m" * 5 + b"\xff\xfe")
+    assert over_the_cap.text() == "AB\n... [5 bytes of stderr omitted] ...\n��"
+
+
+def test_the_head_fills_to_its_limit_across_chunks_and_no_further():
+    """`room` is the head's remaining capacity, and the sign of it is the whole bound.
+
+    Written as `head_limit + len(head)` the head grows past its own cap and swallows what
+    should have gone to the tail -- and a single-chunk test cannot see it, because a head
+    that is still empty makes the two spellings agree.
+    """
+    buffer = StderrBuffer(head_limit=4, tail_limit=4)
+    buffer.extend(b"AB")
+    buffer.extend(b"CDEFGHIJKL")
+    assert buffer.text() == "ABCD\n... [4 bytes of stderr omitted] ...\nIJKL"
+    assert buffer.dropped == 4
+
+
+def test_one_byte_over_the_tail_cap_is_one_byte_dropped():
+    # The boundary the `excess > 0` guard is: at exactly one byte over, a `> 1` spelling
+    # keeps the whole overflowing tail and reports nothing dropped.
+    buffer = StderrBuffer(head_limit=4, tail_limit=4)
+    buffer.extend(b"ABCDEFGHI")
+    assert buffer.dropped == 1
+    assert buffer.text() == "ABCD\n... [1 bytes of stderr omitted] ...\nFGHI"
+
+
+def test_the_dropped_count_accumulates_across_separate_overflows():
+    """`self._dropped += excess`, where `=` reports only the most recent overflow.
+
+    A chatty child overflows continuously, so the difference between the two spellings is
+    the difference between "how much of your diagnostics is missing" and "how much went
+    missing in the last chunk" -- and every earlier test here overflows exactly once, which
+    is the one shape that cannot tell them apart.
+    """
+    buffer = StderrBuffer(head_limit=4, tail_limit=4)
+    buffer.extend(b"ABCDEFGHI")
+    assert buffer.dropped == 1
+    buffer.extend(b"JK")
+    assert buffer.dropped == 3
+    assert buffer.text() == "ABCD\n... [3 bytes of stderr omitted] ...\nHIJK"
 
 
 async def test_a_chatty_child_does_not_grow_the_transport_without_bound(tmp_path: Path):

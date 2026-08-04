@@ -235,7 +235,7 @@ class SubprocessTransport:
         if self._closed:
             raise self._connection_lost(_CLOSED_MESSAGE)
         stdin = self._process.stdin
-        if stdin is None:  # pragma: no cover -- always piped by the openers here
+        if stdin is None:
             raise self._connection_lost("transport has no stdin")
         try:
             await stdin.send(bytes(data))
@@ -253,7 +253,7 @@ class SubprocessTransport:
         if self._closed:
             raise self._connection_lost(_CLOSED_MESSAGE)
         stdout = self._process.stdout
-        if stdout is None:  # pragma: no cover -- always piped by the openers here
+        if stdout is None:
             raise self._connection_lost("transport has no stdout")
         try:
             return await stdout.receive(max_bytes)

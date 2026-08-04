@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import warnings
 from pathlib import Path
 
 import pytest
@@ -281,8 +282,41 @@ def test_a_newline_in_an_option_value_is_refused(char: str):
 
 @pytest.mark.parametrize("char", ["\x00", "\n", "\r"])
 def test_a_newline_in_an_option_name_is_refused(char: str):
-    with pytest.raises(ValueError):
-        build_ssh_argv("h", options={f"Compression{char}ProxyCommand id": "yes"})
+    """The same asymmetry the seventh mutation slice found in `_validate_user`, one field over.
+
+    This was a bare `pytest.raises(ValueError)` while the *value* case beside it read its
+    message -- so `what="ssh option name"` could become `None` or `"SSH OPTION NAME"` and the
+    only thing telling an operator which half of `-o` was malformed went unread.
+    """
+    name = f"Compression{char}ProxyCommand id"
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", options={name: "yes"})
+    assert exc.value.args[0] == f"ssh option name may not contain {char!r}: {name!r}"
+
+
+def test_an_empty_option_name_is_refused():
+    # The host, user and subsystem emptiness messages are each pinned below; this one had
+    # neither a test nor a message anybody read. `-o =value` is not an option ssh can parse.
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", options={"": "yes"})
+    assert exc.value.args[0] == "ssh option name may not be empty"
+
+
+@pytest.mark.parametrize("char", ["\x00", "\n", "\r"])
+@pytest.mark.parametrize("argument", ["subsystem", "config_file", "identity_file"])
+def test_control_characters_are_refused_in_the_path_arguments(argument: str, char: str):
+    """The three `_reject_control_characters` sites that no test had ever reached.
+
+    `host` and `user` each had a case; these three did not, so the whole refusal was
+    unexercised and its `what=` label -- the only thing naming *which* argument was
+    malformed -- could be dropped or mangled with the suite green. A newline in `-F` or `-i`
+    is the same class as one in `-o`: the value lands on an ssh command line, and anything
+    after the newline is a directive we did not intend to send.
+    """
+    value = f"safe{char}evil"
+    with pytest.raises(ValueError) as exc:
+        build_ssh_argv("h", **{argument: value})
+    assert exc.value.args[0] == f"{argument} may not contain {char!r}: {value!r}"
 
 
 def test_whitespace_in_an_option_name_is_refused():
@@ -579,3 +613,26 @@ def test_the_insecure_option_warning_is_attributed_to_the_caller():
 
     assert len(record) == 1
     assert record[0].filename == __file__, "the warning blamed a frame that is not the caller"
+
+
+def test_the_insecure_option_warning_asks_for_the_stacklevel_it_needs(monkeypatch):
+    """The argument, read where the trampoline cannot move it.
+
+    The test above proves 3 is the *right* number, by looking at which file the warning
+    blamed -- and that measurement is the one thing mutmut's instrumentation changes, so it
+    is skipped for the whole lane and the value goes unread there. Reading the argument
+    rather than the resulting frame does not depend on stack depth, so it holds in both.
+
+    **Both halves or neither**, which is `transport/_subprocess`'s lesson applied before the
+    lane could repeat it: this one catches `stacklevel=4` and a dropped `stacklevel=`, the
+    one above catches 3 being the wrong number to ask for. Neither is sufficient alone.
+    """
+    captured: list[tuple[type[Warning] | None, int]] = []
+
+    def spy(message, category=None, stacklevel=1, **kwargs):
+        captured.append((category, stacklevel))
+
+    monkeypatch.setattr(warnings, "warn", spy)
+    _ = build_ssh_argv("h", options={"StrictHostKeyChecking": "no"})
+
+    assert captured == [(InsecureOptionWarning, 3)]
