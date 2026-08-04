@@ -29,7 +29,7 @@ from gantry_sftp.session import (
     open_session,
     upload_handle,
 )
-from gantry_sftp.session._download import Span
+from gantry_sftp.session._download import Schedule, Span
 from gantry_sftp.session._upload import Source, _Uploader
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
@@ -422,9 +422,13 @@ async def drive(server: WritableServer, source: Source, *, span: Span, **kwargs)
                 HANDLE,
                 source,
                 span=span,
-                write_length=kwargs.pop("write_length", 64),
-                depth=kwargs.pop("depth", 4),
-                idle_timeout=kwargs.pop("idle_timeout", 5.0),
+                # The three that used to be three parameters. `drive` keeps taking them flat,
+                # so every caller below is unchanged and this is the only line that knows.
+                schedule=Schedule(
+                    kwargs.pop("write_length", 64),
+                    kwargs.pop("depth", 4),
+                    kwargs.pop("idle_timeout", 5.0),
+                ),
                 progress=kwargs.pop("progress", None),
                 remote_path=kwargs.pop("remote_path", None),
             )

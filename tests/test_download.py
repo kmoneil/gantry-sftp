@@ -9,6 +9,7 @@ for the other.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -51,7 +52,8 @@ from gantry_sftp.session import (
     download_handle,
     negotiate_transfer_sizes,
 )
-from gantry_sftp.session._download import DescriptorSink
+from gantry_sftp.session._download import DescriptorSink, Schedule
+from gantry_sftp.session._upload import Schedule as UploadSideSchedule
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -881,3 +883,34 @@ def test_a_short_pwrite_is_looped_until_the_whole_payload_lands(tmp_path: Path, 
     # Nothing was written outside the range asked for.
     assert target.read_bytes()[:10] == b"\x00" * 10
     assert target.read_bytes()[16:] == b"\x00" * 16
+
+
+def test_the_schedule_is_one_type_shared_by_both_directions():
+    """D-142. The anti-drift property, which is the whole reason this is a type.
+
+    `_Downloader` and `_Uploader` carried these three separately and *identically*, differing
+    only in spelling `read_length` against `write_length` -- one name for one thing, in two
+    places, which is how two places stop agreeing. Asserting the shared identity is cheap;
+    noticing that the upload side had grown a fourth pacing knob would not be.
+    """
+    assert Schedule is UploadSideSchedule
+
+    schedule = Schedule(request_length=64, depth=4, idle_timeout=5.0)
+    assert (schedule.request_length, schedule.depth, schedule.idle_timeout) == (64, 4, 5.0)
+    with pytest.raises(AttributeError):
+        schedule.depth = 8  # type: ignore[misc]  # frozen: a schedule is decided once
+
+
+def test_the_schedule_states_no_default_it_would_be_the_second_place_for():
+    """The defaults live on `download_handle` / `upload_handle`, which are what build these.
+
+    A default here would be unreachable -- both call sites pass all three every time -- so
+    nothing could fail on it having drifted from the real one. Kept as an assertion rather than
+    a comment because "unreachable" is exactly the claim that stops being true quietly.
+    """
+    defaulted = [
+        f.name
+        for f in dataclasses.fields(Schedule)
+        if f.default is not dataclasses.MISSING or f.default_factory is not dataclasses.MISSING
+    ]
+    assert not defaulted, f"Schedule restates a default for {defaulted}"

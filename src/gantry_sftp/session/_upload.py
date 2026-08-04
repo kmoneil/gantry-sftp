@@ -60,6 +60,7 @@ from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
     ProgressCallback,
+    Schedule,
     Span,
 )
 
@@ -150,9 +151,7 @@ class _Uploader:
         source: Source,
         *,
         span: Span,
-        write_length: int,
-        depth: int,
-        idle_timeout: float | None,
+        schedule: Schedule,
         progress: ProgressCallback | None,
         remote_path: bytes | None,
     ) -> None:
@@ -179,12 +178,14 @@ class _Uploader:
         can take -- which is what it was, and the mutation lane could not tell the difference.
         """
 
-        self._write_length = write_length
-        self._idle_timeout = idle_timeout
+        # Unpacked rather than held as a `Schedule`, so every read below stays a bare attribute
+        # and the bundling is a signature decision that does not reach the request loop.
+        self._write_length = schedule.request_length
+        self._idle_timeout = schedule.idle_timeout
         self._progress = progress
         self._remote_path = remote_path
 
-        self._window = anyio.Semaphore(depth)
+        self._window = anyio.Semaphore(schedule.depth)
         self._outstanding: dict[int, _Chunk] = {}
         self._acknowledged = 0
         self._all_sent = False
@@ -365,9 +366,7 @@ async def upload_handle(
                 handle,
                 DescriptorSource(fd),
                 span=Span(start_offset, size),
-                write_length=write_length,
-                depth=depth,
-                idle_timeout=idle_timeout,
+                schedule=Schedule(write_length, depth, idle_timeout),
                 progress=progress,
                 remote_path=remote_path,
             )
@@ -431,9 +430,7 @@ async def write_range_from(
             handle,
             BufferSource(payload, offset),
             span=Span(offset, offset + len(payload)),
-            write_length=write_length,
-            depth=depth,
-            idle_timeout=idle_timeout,
+            schedule=Schedule(write_length, depth, idle_timeout),
             progress=None,
             remote_path=remote_path,
         )

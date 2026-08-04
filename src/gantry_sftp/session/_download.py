@@ -69,6 +69,7 @@ __all__ = [
     "DescriptorSink",
     "DownloadResult",
     "ProgressCallback",
+    "Schedule",
     "Sink",
     "Span",
     "download_handle",
@@ -252,6 +253,42 @@ class Span:
     end: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class Schedule:
+    """How one transfer paces itself: request size, requests in flight, stall deadline.
+
+    The same move :class:`Span` records making, for the same reason and one field later. Both
+    constructors that take this had reached the project's ten-argument ceiling carrying these
+    three separately, **and carrying them identically** -- ``_Downloader`` and ``_Uploader``
+    differed only in spelling ``read_length`` against ``write_length``, which is one name for one
+    thing. Three parameters became one because they are one policy, not because three is too
+    many: a request size with no depth says nothing about how much is in flight, and a depth with
+    no idle timeout says nothing about what happens when the answers stop.
+
+    :class:`~gantry_sftp.session.SessionOptions` is the same shape one layer up -- the session's
+    ``request_timeout`` / ``idle_timeout`` / ``depth``, bundled for exactly this argument. This is
+    the per-transfer version, which is why ``request_length`` appears here and not there: the
+    session cannot know it, because it comes from ``limits@openssh.com`` after the handshake.
+
+    **No field has a default, deliberately.** :data:`DEFAULT_PIPELINE_DEPTH` and
+    :data:`DEFAULT_IDLE_TIMEOUT` are already the defaults of :func:`download_handle` and
+    :func:`upload_handle`, which are the only things that build one of these and which pass all
+    three every time. Repeating them here would state a default in a second place — and it would
+    be an *unreachable* second place, so no test could fail on it having drifted.
+
+    Attributes:
+        request_length: Payload bytes per request, from
+            :func:`~gantry_sftp.session.negotiate_transfer_sizes`. Named for what both directions
+            do rather than for what either one calls it.
+        depth: Requests in flight.
+        idle_timeout: Seconds without any response before giving up. ``None`` waits forever.
+    """
+
+    request_length: int
+    depth: int
+    idle_timeout: float | None
+
+
 class _Downloader:
     """Drives one file's worth of pipelined reads.
 
@@ -280,9 +317,7 @@ class _Downloader:
         sink: Sink,
         *,
         span: Span,
-        read_length: int,
-        depth: int,
-        idle_timeout: float | None,
+        schedule: Schedule,
         progress: ProgressCallback | None,
         remote_path: bytes | None,
     ) -> None:
@@ -291,9 +326,11 @@ class _Downloader:
         self._handle = handle
         self._sink = sink
         self._span = span
-        self._read_length = read_length
-        self._depth = depth
-        self._idle_timeout = idle_timeout
+        # Unpacked rather than held as a `Schedule`, so every read below stays a bare attribute
+        # and the bundling is a signature decision that does not reach the hot loop.
+        self._read_length = schedule.request_length
+        self._depth = schedule.depth
+        self._idle_timeout = schedule.idle_timeout
         self._progress = progress
         self._remote_path = remote_path
 
@@ -594,9 +631,7 @@ async def download_handle(
             handle,
             DescriptorSink(fd),
             span=Span(start_offset, size),
-            read_length=read_length,
-            depth=depth,
-            idle_timeout=idle_timeout,
+            schedule=Schedule(read_length, depth, idle_timeout),
             progress=progress,
             remote_path=remote_path,
         )
@@ -660,9 +695,7 @@ async def read_range_into(
             handle,
             BufferSink(buffer, offset),
             span=Span(offset, offset + len(buffer)),
-            read_length=read_length,
-            depth=depth,
-            idle_timeout=idle_timeout,
+            schedule=Schedule(read_length, depth, idle_timeout),
             progress=None,
             remote_path=remote_path,
         )
