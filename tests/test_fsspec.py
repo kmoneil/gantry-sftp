@@ -1971,11 +1971,13 @@ def test_reading_a_file_that_vanished_names_it(fs, drop: str, tree: Path):
     # `_read_handle`'s own `_translated(self._remote)`, which is a different call site from
     # `cat_file`'s: the file object opens lazily, so the failure arrives on the first *read*.
     handle = fs.open(f"{drop}/report.csv", "rb")
-    (tree / "incoming" / "report.csv").unlink()
-
-    with pytest.raises(FileNotFoundError) as exc:
-        _ = handle.read(4)
-    assert exc.value.args[0] == f"{drop}/report.csv"
+    try:
+        (tree / "incoming" / "report.csv").unlink()
+        with pytest.raises(FileNotFoundError) as exc:
+            _ = handle.read(4)
+        assert exc.value.args[0] == f"{drop}/report.csv"
+    finally:
+        handle.close()
 
 
 def test_a_path_like_local_object_is_accepted_and_becomes_a_path(fs, drop: str, tmp_path: Path):
@@ -1996,3 +1998,142 @@ def test_a_path_like_local_object_is_accepted_and_becomes_a_path(fs, drop: str, 
     destination = tmp_path / "via-fspath.csv"
     fs.get_file(f"{drop}/report.csv", Wrapped(destination))
     assert destination.read_bytes() == b"id,total\n1,42\n"
+
+
+def test_a_file_opened_without_saying_so_commits_on_close(fs, drop: str):
+    # `autocommit` defaults to `True`, and the test above passes `False` explicitly -- so the
+    # default itself is only read by a call that omits it. Defaulted the other way, an ordinary
+    # `fs.open(..., "wb")` would never publish what it wrote.
+    with fs.open(f"{drop}/committed.csv", "wb") as handle:
+        assert handle.autocommit is True
+        _ = handle.write(b"id\n1\n")
+    assert fs.cat_file(f"{drop}/committed.csv") == b"id\n1\n"
+
+
+def test_removing_an_empty_directory_removes_that_directory(fs, drop: str, tree: Path):
+    # `_rm`'s `rmdir(remote)` branch, which the symlink cases above deliberately avoid: they
+    # prove the *link* is unlinked, and this proves a real directory still reaches `rmdir`.
+    (tree / "incoming" / "spent").mkdir()
+    fs._rm(f"{drop}/spent")  # noqa: SLF001
+    assert not (tree / "incoming" / "spent").exists()
+
+
+def test_a_callback_that_is_not_fsspecs_is_declined_rather_than_called(fs, drop, tmp_path):
+    """`callback is None or not isinstance(callback, Callback)`, where `and` needs both.
+
+    fsspec's own `DEFAULT_CALLBACK` is a `Callback`, but the argument is whatever a caller
+    passed -- and with `and`, an object that merely looks callback-shaped goes through to
+    `set_size` and raises `AttributeError` from inside a transfer that was working.
+    """
+
+    class NotACallback:
+        pass
+
+    assert gantry_fsspec._bridge(NotACallback()) is None  # noqa: SLF001
+    assert gantry_fsspec._bridge(None) is None  # noqa: SLF001
+
+    source = tmp_path / "upload.csv"
+    _ = source.write_bytes(b"id\n1\n")
+    fs.put_file(source, f"{drop}/unwatched.csv", callback=NotACallback())
+    assert fs.cat_file(f"{drop}/unwatched.csv") == b"id\n1\n"
+
+
+def test_a_write_to_a_destination_that_vanished_names_it(fs, drop, tree, monkeypatch):
+    """`_upload_chunk`'s own `_translated(self._remote)` -- the fourth site in this class.
+
+    Each of `_initiate_upload`, `_read_handle`, `_fetch_range` and `_upload_chunk` wraps its
+    own call, and the path each carries is its own argument.
+    """
+
+    def vanish(_self, _handle, _offset, _data):
+        raise NoSuchFileError("gone", code=2)
+
+    monkeypatch.setattr(type(fs.sftp), "write_at", vanish)
+    with pytest.raises(FileNotFoundError) as exc, fs.open(f"{drop}/vanishing.csv", "wb") as h:
+        _ = h.write(b"id\n1\n")
+    assert exc.value.args[0] == f"{drop}/vanishing.csv"
+
+
+def test_a_file_whose_handle_the_server_forgot_still_closes(fs, drop: str, monkeypatch):
+    """`_suppress(SFTPError)` around the final `CLOSE`, which runs in a `finally`.
+
+    A server that has already dropped the handle answers `NO_SUCH_FILE` -- measured, and
+    recorded in this repository's notes as OpenSSH's answer to closing an unknown handle. That
+    must not turn leaving a `with` block into an error, because there is nothing left to do
+    about it and the caller's own exception would be replaced by ours.
+    """
+    handle = fs.open(f"{drop}/report.csv", "rb")
+    assert handle.read(2) == b"id"
+
+    def refuse(_self, _handle):
+        raise NoSuchFileError("no such handle", code=2)
+
+    monkeypatch.setattr(type(fs.sftp), "close", refuse)
+    handle.close()  # must not raise
+
+
+def test_opening_through_the_private_entry_point_commits_by_default(fs, drop: str):
+    # fsspec's own `open()` passes `autocommit` explicitly, so `_open`'s default is only read
+    # by a direct call -- which is what a subclass or an adapter of an adapter makes.
+    handle = fs._open(f"{drop}/report.csv")  # noqa: SLF001
+    try:
+        assert handle.autocommit is True
+        assert handle.mode == "rb"
+    finally:
+        handle.close()
+
+
+def test_removing_a_missing_directory_names_it(fs, drop: str):
+    # `rmdir`'s own `_translated`, which is a different call site from `_rm`'s.
+    with pytest.raises(FileNotFoundError) as exc:
+        fs.rmdir(f"{drop}/no-such-directory")
+    assert exc.value.args[0] == f"{drop}/no-such-directory"
+
+
+def test_a_range_read_of_a_file_that_vanished_names_it(fs, drop, tree, monkeypatch):
+    # `_fetch_range`'s own `_translated`, reached after the handle is already open, which is
+    # the state a block cache spends its life in.
+    handle = fs.open(f"{drop}/report.csv", "rb")
+    try:
+        assert handle.read(2) == b"id"
+
+        def vanish(_self, _handle, _offset, _length):
+            raise NoSuchFileError("gone", code=2)
+
+        monkeypatch.setattr(type(fs.sftp), "read_at", vanish)
+        with pytest.raises(FileNotFoundError) as exc:
+            _ = handle._fetch_range(0, 4)  # noqa: SLF001
+        assert exc.value.args[0] == f"{drop}/report.csv"
+    finally:
+        # Closed here rather than left to the collector: the fixture takes the portal down at
+        # teardown, and a handle finalised after that raises from inside a generator nobody is
+        # driving -- which surfaces as an unraisable warning against whatever test runs next.
+        monkeypatch.undo()
+        handle.close()
+
+
+def test_opening_a_destination_that_cannot_be_created_names_it(fs, drop, monkeypatch, tmp_path):
+    # `_initiate_upload`'s own `_translated`, which runs before a byte is buffered.
+    def refuse(_self, _path, _flags, **_kwargs):
+        raise NoSuchFileError("gone", code=2)
+
+    monkeypatch.setattr(type(fs.sftp), "open", refuse)
+    with pytest.raises(FileNotFoundError) as exc, fs.open(f"{drop}/nowhere.csv", "wb") as handle:
+        _ = handle.write(b"id\n1\n")
+    assert exc.value.args[0] == f"{drop}/nowhere.csv"
+
+
+def test_a_final_flush_with_nothing_buffered_sends_no_write(fs, drop: str):
+    """`payload.nbytes and self._handle is not None`, where `or` writes an empty payload.
+
+    fsspec calls `_upload_chunk(final=True)` on close whether or not anything is left in the
+    buffer, so the empty case is the common one rather than the odd one -- and an `or` there
+    spends a WRITE round trip per closed file to send nothing.
+    """
+    before = fs.sftp.requests_sent
+    with fs.open(f"{drop}/one-block.csv", "wb") as handle:
+        _ = handle.write(b"id\n1\n")
+    # OPEN, one WRITE for the buffered block, CLOSE -- and no second, empty WRITE on the
+    # final flush, which fsspec makes whether or not anything is left to send.
+    assert fs.sftp.requests_sent - before == 3
+    assert fs.cat_file(f"{drop}/one-block.csv") == b"id\n1\n"

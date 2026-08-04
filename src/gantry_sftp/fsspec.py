@@ -1205,12 +1205,20 @@ class GantrySFTPFile(AbstractBufferedFile):  # type: ignore[misc]  # fsspec ship
 
         ``write_at`` takes an explicit offset, so ordering is not something this has to
         maintain, and the payload reaches the wire without being copied.
+
+        **The view is released explicitly, and an exception is why.** ``getbuffer()`` exports a
+        ``memoryview`` of the underlying ``BytesIO``, and while any export is alive that buffer
+        cannot be resized. On the ordinary path the local dies with the frame and nothing
+        notices; on a *failed* write the frame is kept alive by the traceback, so the next
+        thing to touch the buffer raises ``BufferError: Existing exports of data`` — replacing
+        the real failure with one about our own bookkeeping. Found by D-135, where a test that
+        made ``write_at`` refuse produced the ``BufferError`` in an unrelated later test.
         """
-        payload = self.buffer.getbuffer()
-        if payload.nbytes and self._handle is not None:
-            with _translated(self._remote):
-                written = self._fs.sftp.write_at(self._handle, self._written, payload)
-            self._written += written
+        with self.buffer.getbuffer() as payload:
+            if payload.nbytes and self._handle is not None:
+                with _translated(self._remote):
+                    written = self._fs.sftp.write_at(self._handle, self._written, payload)
+                self._written += written
         return not final
 
     def close(self) -> None:
