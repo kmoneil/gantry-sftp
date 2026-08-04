@@ -24,6 +24,7 @@ going to read — in exactly the situation where somebody is asking why their co
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pwd
@@ -34,6 +35,7 @@ from pathlib import Path
 
 import pytest
 
+from gantry_sftp import __main__ as gantry_main
 from gantry_sftp import __version__
 from gantry_sftp import doctor as gantry_doctor
 from gantry_sftp.__main__ import build_parser, main, parse_options
@@ -338,8 +340,15 @@ def test_the_verb_is_required_so_a_second_one_could_not_change_an_invocation():
         (None, {}),
         (["BatchMode=yes"], {"BatchMode": "yes"}),
         (["A=1", "B=2"], {"A": "1", "B": "2"}),
-        # The value may itself contain `=`, which is why the split is on the first one only.
-        (["ProxyCommand=ssh -W %h:%p bastion"], {"ProxyCommand": "ssh -W %h:%p bastion"}),
+        # The value may itself contain `=`, which is why the split is on the first one only --
+        # and this case has to *contain* one to say so. It did not until D-135: the comment
+        # claimed the axis and the data did not vary along it, so `partition` could become
+        # `rpartition` with the suite green. `ProxyCommand` is exactly where this bites,
+        # because the command it names has options of its own.
+        (
+            ["ProxyCommand=ssh -o StrictHostKeyChecking=no -W %h:%p bastion"],
+            {"ProxyCommand": "ssh -o StrictHostKeyChecking=no -W %h:%p bastion"},
+        ),
         (["Empty="], {"Empty": ""}),
     ],
 )
@@ -964,3 +973,227 @@ def test_whether_the_config_file_is_there_is_a_boolean(tmp_path: Path):
     # then renders " (absent)" for a file that is right there.
     absent = local_diagnosis({"HOME": str(tmp_path)})
     assert absent.ssh_config_present in (True, False), "not a bool, so `is True` cannot be used"
+
+
+# --- the command line, pinned as a table -------------------------------------------------------
+#
+# 62 of `__main__.py`'s 82 survivors were in `build_parser`, and every one of them was a string
+# argparse holds rather than a branch: a flag's spelling, its `dest`, its `metavar`, its
+# `choices`, its help. None of it is reachable by running the program successfully, because a
+# renamed flag simply becomes a usage error in a test that never passes that flag.
+#
+# A table of the parser's own actions rather than a golden of `--help`: the help text is laid out
+# by argparse and its wrapping moves with the terminal width and the Python version, so pinning
+# the rendered form would pin somebody else's formatter. What this pins is what was *declared*.
+
+EXPECTED_ARGUMENTS = [
+    # option strings, dest, metavar, choices, nargs, type, action, help
+    ((), "command", None, ("doctor",), None, None, "_StoreAction", "the only command there is"),
+    ((), "host", None, None, "?", None, "_StoreAction", "a server to diagnose as well; optional"),
+    (
+        ("--user",),
+        "user",
+        None,
+        None,
+        None,
+        None,
+        "_StoreAction",
+        "log in as somebody other than the local account",
+    ),
+    (("--port",), "port", None, None, None, "int", "_StoreAction", "a non-default port"),
+    (
+        ("-i", "--identity-file"),
+        "identity_file",
+        None,
+        None,
+        None,
+        None,
+        "_StoreAction",
+        "a private key to offer, as ssh -i",
+    ),
+    (
+        ("--config-file",),
+        "config_file",
+        None,
+        None,
+        None,
+        None,
+        "_StoreAction",
+        "an ssh_config to use instead of your own",
+    ),
+    (
+        ("-o",),
+        "options",
+        "KEY=VALUE",
+        None,
+        None,
+        None,
+        "_AppendAction",
+        "an ssh -o option; repeat for more than one",
+    ),
+    (
+        ("--json",),
+        "json",
+        None,
+        None,
+        0,
+        None,
+        "_StoreTrueAction",
+        "emit the report as JSON rather than as text",
+    ),
+]
+
+
+def test_every_declared_argument_is_what_it_says_it_is():
+    """One row per flag, and each column is something a mutation can change on its own.
+
+    `-o` being `_AppendAction` with that `metavar` is the load-bearing one: a single `--option`
+    would make reproducing a two-option failure impossible, which is the case the flag exists
+    for. `--port`'s `type=int` is the other -- without it the port reaches `connect` as a string.
+    """
+    actions = [a for a in build_parser()._actions if a.dest != "help"]  # noqa: SLF001
+    described = [
+        (
+            tuple(a.option_strings),
+            a.dest,
+            a.metavar,
+            tuple(a.choices) if a.choices else a.choices,
+            a.nargs,
+            a.type.__name__ if a.type else None,
+            type(a).__name__,
+            a.help,
+        )
+        for a in actions
+    ]
+    assert described == EXPECTED_ARGUMENTS
+
+
+def test_the_parser_names_itself_and_says_what_it_is_for():
+    parser = build_parser()
+    assert parser.prog == "python -m gantry_sftp"
+    assert parser.description, "no description, so --help says nothing about the program"
+    assert parser.epilog, "no epilog, so --help shows no example"
+    # Raw, so the epilog's example command lines keep their line breaks rather than being
+    # rewrapped into one paragraph.
+    assert parser.formatter_class is argparse.RawDescriptionHelpFormatter
+
+
+def test_an_unknown_command_is_a_usage_error_that_lists_what_exists(capsys):
+    # `choices` rather than free text, so argparse writes the message and it cannot drift out
+    # of step with the commands that actually exist.
+    with pytest.raises(SystemExit) as exit_status:
+        build_parser().parse_args(["diagnose"])
+    assert exit_status.value.code == 2
+    assert "doctor" in capsys.readouterr().err
+
+
+# --- what `main` hands to the diagnosis --------------------------------------------------------
+
+
+def test_main_forwards_every_argument_to_the_server_diagnosis(monkeypatch, tmp_path, capsys):
+    """Six arguments, each droppable on its own, on the path that reproduces a real failure.
+
+    An operator diagnosing a connection passes the identity, the config and the options that
+    connection actually uses -- so an argument dropped here diagnoses a *different* connection
+    and reports that it worked.
+    """
+    seen: dict[str, object] = {}
+
+    def spy(host: str, **kwargs: object) -> ServerDiagnosis:
+        seen.update(kwargs, host=host)
+        return reachable()
+
+    monkeypatch.setattr(gantry_main, "server_diagnosis", spy)
+    status = gantry_main.main(
+        [
+            "doctor",
+            "example.com",
+            "--user",
+            "bob",
+            "--port",
+            "2222",
+            "-i",
+            str(tmp_path / "id_ed25519"),
+            "--config-file",
+            str(tmp_path / "ssh_config"),
+            "-o",
+            "Compression=yes",
+            "-o",
+            "ProxyCommand=ssh -W %h:%p bastion",
+        ]
+    )
+    _ = capsys.readouterr()
+
+    assert status == int(Exit.OK)
+    assert seen == {
+        "host": "example.com",
+        "user": "bob",
+        "port": 2222,
+        "identity_file": str(tmp_path / "id_ed25519"),
+        "config_file": str(tmp_path / "ssh_config"),
+        # Repeated `-o` accumulates, and the value keeps the `=` inside it.
+        "options": {"Compression": "yes", "ProxyCommand": "ssh -W %h:%p bastion"},
+    }
+
+
+def test_no_options_reaches_the_diagnosis_as_none_rather_than_an_empty_mapping(monkeypatch, capsys):
+    """`options or None`, where `and None` would send `{}`.
+
+    An empty mapping and "the caller said nothing" are different requests: `connect` layers its
+    own defaults under whatever it is given, and a caller who passed no `-o` is asking for
+    exactly those.
+    """
+    seen: dict[str, object] = {}
+
+    def spy(host: str, **kwargs: object) -> ServerDiagnosis:
+        seen.update(kwargs, host=host)
+        return reachable()
+
+    monkeypatch.setattr(gantry_main, "server_diagnosis", spy)
+    _ = gantry_main.main(["doctor", "example.com"])
+    _ = capsys.readouterr()
+
+    assert seen["options"] is None
+
+
+def test_no_host_means_no_connection_is_attempted(monkeypatch, capsys):
+    def refuse(*_a: object, **_k: object) -> ServerDiagnosis:  # pragma: no cover -- must not run
+        raise AssertionError("a connection was attempted with no host given")
+
+    monkeypatch.setattr(gantry_main, "server_diagnosis", refuse)
+    status = gantry_main.main(["doctor"])
+    assert status == int(Exit.OK)
+    assert "server" not in capsys.readouterr().out
+
+
+def test_a_malformed_option_is_refused_with_the_argument_that_was_wrong(capsys):
+    """`parser.error(str(malformed))`, where the message is the only thing an operator can act on.
+
+    Refused rather than ignored: a silently dropped `-o` would make the diagnosis a report
+    about a different connection from the one being asked about -- and the message has to name
+    the argument, because `-o` is repeatable and the operator passed several.
+    """
+    with pytest.raises(SystemExit) as exit_status:
+        gantry_main.main(["doctor", "-o", "Compression"])
+    assert exit_status.value.code == 2
+    assert "-o wants KEY=VALUE, got 'Compression'" in capsys.readouterr().err
+
+
+def test_the_printed_report_and_the_exit_status_both_include_the_server(monkeypatch, capsys):
+    """Three separate uses of `server` in four lines, and each is droppable on its own.
+
+    Dropped from `render`, the report says nothing about the host that was just contacted.
+    Dropped from `overall_status`, the process exits `0` for a host it could not reach -- and
+    a CI job that only checks the exit code then passes on a broken connection.
+    """
+    monkeypatch.setattr(
+        gantry_main,
+        "server_diagnosis",
+        lambda host, **_k: reachable(host=host, reached=False, error="refused", limits=None),
+    )
+    status = gantry_main.main(["doctor", "example.com"])
+    printed = capsys.readouterr().out
+
+    assert status == int(Exit.UNREACHABLE), "the exit status ignored the server"
+    assert "server example.com" in printed.splitlines()
+    assert "  NOT REACHED" in printed.splitlines()

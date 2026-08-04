@@ -44,6 +44,11 @@ from typing import Any
 import pytest
 
 from gantry_sftp.codec import OpenFlag
+from gantry_sftp.exceptions import (
+    DestinationCollisionError,
+    DestinationNotAllowedError,
+    ServerError,
+)
 from gantry_sftp.session import (
     CHECK_FILE_BLOCK_SIZE,
     DEFAULT_IDLE_TIMEOUT,
@@ -214,3 +219,47 @@ def test_the_table_covers_every_transfer_entry_point():
     assert transfers <= set(SESSION_DEFAULTS), (
         f"not in the defaults table: {sorted(transfers - set(SESSION_DEFAULTS))}"
     )
+
+
+# --- the defaults an exception carries, which are read by *constructing* it ---------------------
+#
+# The same shape as everything above, one layer along, and with the opposite outcome for this
+# file's own limitation. A signature-reading test cannot kill a default mutant -- that is the
+# finding in this module's docstring -- but an exception's defaults are reachable by simply
+# building one and looking at the attribute, because `__init__` runs and the default with it.
+#
+# These four are the last of `exceptions.py`'s mutants (D-135). Each is a field a caller reads
+# off a failure, and each default is what "the code did not say" looks like: an empty `stderr`,
+# an empty server `message`, zero files and zero bytes. Defaulted to anything else, an error
+# raised before any of them was known would report a number that was never measured.
+
+
+def test_a_server_error_defaults_to_carrying_no_server_message():
+    # `message` is the server's own bytes, and v3's FAILURE frequently carries none. Defaulted
+    # to anything but empty, a refusal that said nothing would quote text nobody sent.
+    failure = ServerError("refused", code=4)
+    assert failure.message == b""
+    assert failure.path is None
+
+
+def test_a_destination_refusal_defaults_to_carrying_no_stderr():
+    # Raised before `ssh` has run at all -- an allowlist refusal happens first -- so there is
+    # no captured output, and "" is the honest value for that.
+    refusal = DestinationNotAllowedError("not allowed", host="h", effective_host=None, layers=())
+    assert refusal.stderr == ""
+    assert refusal.argv == ()
+    assert refusal.returncode is None
+
+
+def test_a_collision_defaults_to_nothing_having_been_transferred():
+    """Zero files and zero bytes, because a collision is detected *before* the transfer runs.
+
+    Defaulted to one, a caller reading `transferred` to decide whether to retry or to clean up
+    is told a byte moved when none did -- on the error whose whole job is to say the operation
+    did not happen.
+    """
+    collision = DestinationCollisionError(
+        "two names, one file", collisions=(), destination="/incoming/out"
+    )
+    assert collision.files == 0
+    assert collision.transferred == 0
