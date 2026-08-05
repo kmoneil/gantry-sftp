@@ -1007,7 +1007,9 @@ async def test_readinto_at_hands_the_sessions_tunables_to_the_scheduler(
         captured.update(kwargs)
         return 3
 
-    monkeypatch.setattr("gantry_sftp.session._session.read_range_into", recording_read_range_into)
+    monkeypatch.setattr(
+        "gantry_sftp.session._operations.read_range_into", recording_read_range_into
+    )
     server = CursorServer(b"0123456789")
     async with open_session(server, depth=2, idle_timeout=9.5) as sftp:  # type: ignore[arg-type]
         buffer = bytearray(4)
@@ -1063,7 +1065,9 @@ async def test_write_at_hands_the_sessions_tunables_to_the_scheduler(
         captured.update(kwargs)
         return 7
 
-    monkeypatch.setattr("gantry_sftp.session._session.write_range_from", recording_write_range_from)
+    monkeypatch.setattr(
+        "gantry_sftp.session._operations.write_range_from", recording_write_range_from
+    )
     server = CursorServer(b"0123456789")
     async with open_session(server, depth=3, idle_timeout=11.5) as sftp:  # type: ignore[arg-type]
         assert await sftp.write_at(HANDLE, 4, b"payload") == 7

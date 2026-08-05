@@ -32,11 +32,10 @@ loop leaves the link idle for; passing it needs a second transport (DESIGN.md 5.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import tempfile
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,46 +47,18 @@ import anyio
 
 from gantry_sftp._logging import operation, session_logger
 from gantry_sftp.codec import (
-    EMPTY_ATTRS,
     EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
-    EXTENSION_LSETSTAT,
     EXTENSION_POSIX_RENAME,
     LIMITS_NAME,
     Attrs,
-    AttrsReply,
-    CheckFile,
-    CheckFileReply,
-    Close,
     Codec,
     CodecState,
     Completed,
     FSetStat,
-    FStat,
-    Fsync,
-    Handle,
-    LSetStat,
-    LStat,
-    MkDir,
-    Name,
-    Open,
-    OpenDir,
     OpenFlag,
-    Owner,
-    PosixRename,
-    ReadDir,
-    ReadLink,
-    RealPath,
-    Remove,
-    Rename,
-    Request,
-    Response,
-    RmDir,
     SetStat,
-    Stat,
-    Status,
     StatusCode,
-    SymLink,
     Times,
     render_field,
 )
@@ -101,15 +72,15 @@ from gantry_sftp.exceptions import (
     CapabilityError,
     NoSuchFileError,
     PathCollision,
-    PermissionDeniedError,
-    ProtocolError,
     ServerError,
     SFTPError,
     StateError,
     TransferError,
     TransferTimeoutError,
-    UnsupportedError,
     _flatten_exception_group,
+)
+from gantry_sftp.session._core import (
+    DEFAULT_REQUEST_TIMEOUT,
 )
 from gantry_sftp.session._dispatch import Dispatcher
 from gantry_sftp.session._download import (
@@ -118,14 +89,13 @@ from gantry_sftp.session._download import (
     DownloadResult,
     ProgressCallback,
     download_handle,
-    read_range_into,
 )
 from gantry_sftp.session._glob import (
     GlobRunner,
     split_pattern,
     validate_pattern,
 )
-from gantry_sftp.session._limits import ServerLimits, TransferSizes, negotiate_transfer_sizes
+from gantry_sftp.session._limits import ServerLimits
 from gantry_sftp.session._listing import (
     DOT_ENTRIES,
     DirEntry,
@@ -143,6 +113,7 @@ from gantry_sftp.session._mode import (
     local_mode,
     resolve_mode,
 )
+from gantry_sftp.session._operations import _SessionOperations
 from gantry_sftp.session._platform import NO_FOLLOW, require_local_io
 from gantry_sftp.session._policy import (
     _check_local_path,
@@ -156,7 +127,6 @@ from gantry_sftp.session._policy import (
     _download_mode,
     _download_resume_offset,
     _DownloadState,
-    _encode_path,
     _ensure_directory,
     _gate_as_content_check,
     _local_directory,
@@ -188,7 +158,6 @@ from gantry_sftp.session._publish import (
     staged_path,
     staging_token,
 )
-from gantry_sftp.session._quirks import ServerProfile, identify
 from gantry_sftp.session._recursive import (
     GlobMatch,
     Skipped,
@@ -197,7 +166,7 @@ from gantry_sftp.session._recursive import (
     WalkEntry,
     join_remote,
 )
-from gantry_sftp.session._upload import upload_handle, write_range_from
+from gantry_sftp.session._upload import upload_handle
 from gantry_sftp.session._verify import (
     CHECK_FILE_BLOCK_SIZE,
     ContentCheck,
@@ -217,17 +186,6 @@ __all__ = [
     "open_session",
 ]
 
-DEFAULT_REQUEST_TIMEOUT = 30.0
-"""Seconds a single round trip may take before it is abandoned.
-
-Covers the handshake and every one-shot request -- OPEN, STAT, CLOSE, REALPATH. Bulk
-transfers do **not** use this; they have their own idle timeout, because a large transfer is
-allowed to take as long as it takes so long as bytes keep arriving.
-
-The alternative is paramiko's, which is to wait forever. A connection that completes and
-then never answers a STAT is the exact shape of an unattended job that hangs until someone
-notices, which in a scheduled-transfer context can be days.
-"""
 
 LIMITS_EXTENSION = LIMITS_NAME
 """Kept as an alias rather than a second bytes literal.
@@ -236,11 +194,6 @@ One wire string, spelled once, in the same table the advertisement fixture is ch
 against. Two spellings of an extension name is how a client silently never negotiates it.
 """
 
-_STATUS_ERRORS = {
-    StatusCode.NO_SUCH_FILE: NoSuchFileError,
-    StatusCode.PERMISSION_DENIED: PermissionDeniedError,
-    StatusCode.OP_UNSUPPORTED: UnsupportedError,
-}
 
 _LOCAL_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
 """How a downloaded file is opened locally, before any safety flags are added."""
@@ -344,36 +297,6 @@ _FEATURE_ATOMIC_PUBLISH = "atomic publish"
 
 Same argument as :data:`_FEATURE_DURABLE_UPLOAD`, over the rootedness check and the two
 ``posix-rename`` refusals."""
-
-
-def raise_for_status(status: Status, *, path: bytes | None = None) -> None:
-    """Turn a non-OK STATUS into a typed exception.
-
-    ``OK`` and ``EOF`` return quietly: ``EOF`` is a normal terminating condition for READDIR
-    and for reads at the end of a file, not a failure.
-
-    Args:
-        status: The STATUS packet.
-        path: Path the request concerned, attached to the error for diagnosis.
-
-    Raises:
-        ServerError: Or the subclass matching the code.
-    """
-    if status.code in (StatusCode.OK, StatusCode.EOF):
-        return
-    error_class = _STATUS_ERRORS.get(status.code, ServerError)
-    detail = bytes(status.message).decode("utf-8", "replace").strip()
-    summary = f"server returned {status.code.name}"
-    if status.raw_code is not None:
-        # D-145. The code arrived as something v3 has no name for and was degraded to the
-        # catch-all so the connection survives. Reporting only `FAILURE` would throw away the
-        # single fact that distinguishes this from an ordinary refusal -- and it is the fact an
-        # operator needs, because it says the server is answering in a later dialect rather
-        # than saying no.
-        summary = f"{summary} (wire status {status.raw_code}, which filexfer v3 does not define)"
-    if detail:
-        summary = f"{summary}: {detail}"
-    raise error_class(summary, code=int(status.code), message=bytes(status.message), path=path)
 
 
 class _StagedIsTheOnlyCopyError(Exception):
@@ -817,7 +740,7 @@ class RemoteFile:
         await self._session.fsync(self._open_handle())
 
 
-class Session:
+class Session(_SessionOperations):
     """An SFTP conversation with one server.
 
     Built by :func:`open_session`, which owns the handshake, starts the reader task every
@@ -833,382 +756,13 @@ class Session:
         depth: Default requests in flight per transfer.
     """
 
-    def __init__(
-        self,
-        dispatcher: Dispatcher,
-        limits: ServerLimits,
-        *,
-        request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
-        idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
-        depth: int = DEFAULT_PIPELINE_DEPTH,
-    ) -> None:
-        self._dispatcher = dispatcher
-        self._codec = dispatcher.codec
-        self._limits = limits
-        self._request_timeout = request_timeout
-        self._idle_timeout = idle_timeout
-        self._depth = depth
-        self._profile = identify(dispatcher.codec.extensions)
-        """Which implementation we believe is at the other end.
-
-        Worked out once, from the extension list the handshake already carried, so it costs
-        no round trip. Diagnostic only -- see :mod:`gantry_sftp.session._quirks` on why a
-        fingerprint is deliberately not allowed to change behaviour."""
-
-        self._unsupported: set[bytes] = set()
-        """Extensions this server answered ``OP_UNSUPPORTED`` for, so we stop asking.
-
-        Only definitive answers go in here. A server that refuses for some other reason has
-        told us about one request, not about its capabilities."""
-
-        self._root: bytes | None = None
-        """This server's canonical form of ``.``, or ``None`` until something needed it.
-
-        Probed lazily and never at connect time, because most sessions never need it: an
-        operation given a ``/``-rooted path has its arithmetic defined by the draft and asks
-        nothing. See :meth:`_require_rooted_paths`.
-
-        **Distinct from :attr:`_cwd`, and it stays that way even after a ``chdir``**: this is
-        where the *server* put us, and the probe that reads it deliberately bypasses the
-        client-side prefix. A field that meant "the server's root, unless somebody moved"
-        would make :attr:`server_root` a lie at exactly the moment it became interesting."""
-
-        self._cwd: bytes | None = None
-        """The prefix :meth:`chdir` prepends to relative paths, or ``None`` for none.
-
-        Always absolute when set: :meth:`chdir` canonicalises through ``REALPATH`` and refuses
-        on a namespace that is not ``/``-rooted, which is what makes prefixing idempotent.
-        Resolving an already-absolute path is a no-op, so a path this library built by joining
-        onto a resolved root cannot be prefixed twice however many layers it passes through."""
-
-    @property
-    def limits(self) -> ServerLimits:
-        """What the server said it will accept, or all-``None`` if it said nothing."""
-        return self._limits
-
-    @property
-    def depth(self) -> int:
-        """Requests this session keeps in flight per transfer, unless a call overrides it.
-
-        Readable because it was previously visible only inside ``repr()``, which made
-        "did my tunable take effect" a question answerable by string-matching a diagnostic --
-        and :func:`~gantry_sftp.connect` gave callers a second way to set it, so there are now
-        two spellings whose agreement someone will want to check.
-        """
-        return self._depth
-
-    @property
-    def extensions(self) -> Mapping[bytes, bytes]:
-        """Extensions the server advertised. Frequently empty, which is not an error."""
-        return self._codec.extensions
-
-    @property
-    def server_version(self) -> int | None:
-        """Protocol version negotiated, which on a session that opened is always 3.
-
-        A constant, and reported anyway, because it is the *negotiated* value rather than a
-        library fact: what makes it constant is the handshake refusing anything else, and the
-        two are worth being able to tell apart when a connection did not open.
-        """
-        return self._codec.server_version
-
-    @property
-    def reaped(self) -> int:
-        """Handles this session has closed on behalf of an ``OPEN`` nobody was left to receive.
-
-        An ``OPEN`` abandoned by a timeout or a cancellation is still answered by the server,
-        which allocates a handle nothing here would otherwise close. They are cleaned up
-        automatically -- see :meth:`~gantry_sftp.session.Dispatcher.reap_orphans` -- and this
-        is the count, which is worth watching: a number that climbs is a caller giving up on
-        this server often enough to be worth knowing about, not a leak.
-        """
-        return self._dispatcher.reaped
-
-    @property
-    def requests_sent(self) -> int:
-        """Requests this session has written, cumulatively. Excludes the handshake.
-
-        Cumulative rather than instantaneous, which is the half that was missing: ``depth``
-        and ``outstanding`` say what is happening now, and only a total can answer "did the
-        retry loop actually retry?" or "how many round trips did that tree cost?".
-        """
-        return self._dispatcher.requests_sent
-
-    @property
-    def replies_received(self) -> int:
-        """Replies this session has routed, cumulatively, including unclaimed ones."""
-        return self._dispatcher.replies_received
-
-    @property
-    def bytes_sent(self) -> int:
-        """Bytes this session has written to the transport, framing included."""
-        return self._dispatcher.bytes_sent
-
-    @property
-    def bytes_received(self) -> int:
-        """Bytes this session has read from the transport, framing included.
-
-        Larger than the payload of a download by the framing, and larger again than the file
-        on disk if anything was re-read -- a resume gate verifying an adopted prefix moves
-        bytes that never reach the destination file.
-        """
-        return self._dispatcher.bytes_received
-
-    @property
-    def profile(self) -> ServerProfile:
-        """Which SFTP implementation this looks like, from what it advertised.
-
-        Identification only: nothing in the library changes behaviour based on it, and
-        :mod:`gantry_sftp.session._quirks` explains why that bound is deliberate. Useful for
-        a log line, a bug report, and for a caller who *does* want to special-case a server
-        and would otherwise fingerprint it themselves, worse.
-        """
-        return self._profile
-
-    @override
-    def __repr__(self) -> str:
-        """Report the tunables a slow transfer would make you want to check.
-
-        ``outstanding`` is here because a session is no longer one operation at a time: a
-        number that stays pinned at the pipeline depth while nothing finishes is a stalled
-        transfer, and one that is unexpectedly large is more concurrency than intended.
-
-        ``requests`` and ``bytes`` are the cumulative pair beside it. A gauge alone cannot
-        answer whether anything is *moving*: two reprs a second apart with the same
-        ``outstanding`` and different totals is a slow link, and with the same totals it is a
-        stall.
-
-        ``cwd`` is present only when :meth:`chdir` has been called, because it is the one
-        piece of state here that changes what a *path* in the caller's own code means.
-        """
-        # `cwd` appears only once set, and that is the point rather than brevity: it changes
-        # what every relative path in the program means, so its absence has to read as "no
-        # prefix" rather than as a field somebody skimmed past.
-        cwd = "" if self._cwd is None else f"cwd={self._cwd!r} "
-        return (
-            f"<Session server={self._profile.label} version={self._codec.server_version} "
-            f"extensions={len(self._codec.extensions)} {cwd}depth={self._depth} "
-            f"outstanding={self._codec.outstanding} "
-            f"requests={self._dispatcher.requests_sent}/{self._dispatcher.replies_received} "
-            f"bytes={self._dispatcher.bytes_sent}/{self._dispatcher.bytes_received} "
-            f"request_timeout={self._request_timeout} idle_timeout={self._idle_timeout}>"
-        )
-
-    def _server_note(self) -> str:
-        """One line naming the peer, for a capability refusal to carry.
-
-        "This server does not advertise X" is a complaint about a server the message does not
-        name. A user reading it in a log two days later has to work out which endpoint the
-        job was talking to; the connection already knew, and threw it away.
-        """
-        return (
-            f"the server identifies as {self._profile.label} ({self._profile.description}) "
-            f"and advertises {len(self._codec.extensions)} extension(s)"
-        )
-
-    def sizes_for(self, handle: bytes) -> TransferSizes:
-        """Payload size per request for a given handle.
-
-        The handle is part of every request header, so its length is part of the budget --
-        OpenSSH's are four bytes and nothing promises another server's are.
-        """
-        return negotiate_transfer_sizes(self._limits, handle_length=len(handle))
-
     # --- one round trip ------------------------------------------------------------------
-
-    async def request(self, request: Request) -> Response:
-        """Send a request and return its reply.
-
-        Safe to call from several tasks at once: each gets its own exchange, and the reader
-        routes each reply to the request it answers. The version of this that read the
-        transport itself had to hold a lock for exactly that reason -- it discarded every
-        reply that was not the one it was waiting for, which is fine alone and is theft with
-        company.
-
-        The deadline covers the whole round trip rather than each chunk of it. Per-chunk
-        would let a server dribble a byte at a time and never time out, which is a hang
-        wearing a timeout's clothes.
-
-        Raises:
-            TransferTimeoutError: If the reply does not arrive in ``request_timeout``.
-        """
-        if self._request_timeout is None:
-            return (await self._dispatcher.round_trip(request)).response
-        try:
-            with anyio.fail_after(self._request_timeout):
-                return (await self._dispatcher.round_trip(request)).response
-        except TimeoutError as exc:
-            raise TransferTimeoutError(
-                f"{type(request).__name__} was not answered within {self._request_timeout}s"
-            ) from exc
-
-    def _next(self) -> int:
-        return self._codec.allocate_request_id()
-
-    async def _expect_status(self, request: Request, *, path: bytes | None = None) -> None:
-        """Send a request whose only useful answer is a STATUS, and raise unless it said OK.
-
-        Raises:
-            ServerError: Or the subclass matching the code, for a non-OK STATUS.
-            ProtocolError: If the server answered with something other than a STATUS. Both
-                ``EXTENDED`` requests this library sends are specified to answer with one and
-                a real ``sftp-server`` does; a reply of another shape is a server we cannot
-                interpret rather than a refusal we can report.
-        """
-        reply = await self.request(request)
-        if isinstance(reply, Status):
-            raise_for_status(reply, path=path)
-            return
-        # No `path=` here, and its absence is the point: :func:`_unexpected` only reads it on
-        # its ``Status`` branch, and this line is reached only when the reply is *not* one --
-        # the branch above has already taken that case. Passing it looked like defence in
-        # depth and was dead by construction (D-105 slice 25). The call in ``_realpath_raw``
-        # does pass it, because a ``Status`` is one of the replies that is not a ``NAME``.
-        raise _unexpected(reply, expected="STATUS")
 
     # --- capabilities --------------------------------------------------------------------
 
-    def supports(self, extension: bytes | str) -> bool:
-        """Whether the server *advertised* an extension.
-
-        Advertisement only, and **absence here is not proof of absence**: endpoints implement
-        extensions they never list, which is most of DESIGN.md 4.2. So this is the cheap
-        question rather than the true one, and the library does not decide anything on it
-        alone -- ``posix-rename`` and ``fsync`` are attempted whether or not they appear here,
-        and what the server *answers* is what gets recorded (:meth:`refuses`).
-
-        Every name OpenSSH is known to advertise has an ``EXTENSION_*`` constant, including
-        the ones this library does not implement, so asking about one never means typing a
-        wire string by hand.
-
-        Args:
-            extension: Wire name, as ``bytes`` or as one of the ``EXTENSION_*`` constants.
-        """
-        name = extension.encode("ascii") if isinstance(extension, str) else extension
-        return name in self._codec.extensions
-
-    def refuses(self, extension: bytes | str) -> bool:
-        """Whether this server has answered ``OP_UNSUPPORTED`` for an extension, this session.
-
-        The *definitive* half of capability detection, and the reason it exists separately
-        from :meth:`supports`: an advertisement is a claim, and this is an answer. Only
-        ``OP_UNSUPPORTED`` lands here. A refusal for any other reason -- permissions, a
-        read-only directory, a file it does not like -- is a fact about one request rather
-        than about the server, and caching it would turn one bad path into a capability this
-        session never tries again.
-
-        Cached per session because there is nowhere else to put it: extensions are negotiated
-        per connection, and a new connection has to ask again.
-
-        Args:
-            extension: Wire name, as ``bytes`` or as one of the ``EXTENSION_*`` constants.
-        """
-        name = extension.encode("ascii") if isinstance(extension, str) else extension
-        return name in self._unsupported
-
-    async def _attempt_extension(
-        self, extension: str, attempt: Callable[[], Awaitable[object]]
-    ) -> bool:
-        """Send an extension request that has a fallback, and say whether it was performed.
-
-        **The one place an ``OP_UNSUPPORTED`` is recorded**, so that "we already asked" is a
-        property of the session rather than of whichever call site remembered to check. Before
-        this, the cache had exactly one reader and one writer, both inside the posix-rename
-        path, and ``fsync`` and ``check-file`` neither consulted nor populated it (D-51).
-
-        ``False`` means the server did not do it, for one of three reasons, and the difference
-        matters at the call site rather than here:
-
-        * it already answered ``OP_UNSUPPORTED`` this session -- no round trip is made;
-        * it answers ``OP_UNSUPPORTED`` now -- recorded, so the next call is free;
-        * it refused for some other reason **while not advertising** the extension -- in which
-          case we do not know what we just asked of it, so the fallback stands and nothing is
-          cached, because that answer was not definitive.
-
-        A refusal from a server that *did* advertise the extension propagates instead. It is
-        telling us about this operation -- the path, the permissions -- and falling through to
-        a fallback that will fail the same way only buries the explanation.
-
-        Args:
-            extension: Wire name of the extension being attempted.
-            attempt: Sends the request. Called at most once.
-
-        Returns:
-            Whether the server performed it.
-
-        Raises:
-            ServerError: For a non-``OP_UNSUPPORTED`` refusal of an advertised extension.
-        """
-        if self.refuses(extension):
-            return False
-        advertised = self.supports(extension)
-        try:
-            _ = await attempt()
-        except UnsupportedError:
-            self._unsupported.add(extension.encode("ascii"))
-            return False
-        except ServerError:
-            if advertised:
-                raise
-            return False
-        return True
-
     # --- operations ----------------------------------------------------------------------
 
-    async def stat(self, path: bytes | str) -> Attrs:
-        """Attributes of ``path``, following symlinks.
-
-        Raises:
-            NoSuchFileError: If the path does not exist.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(path)
-        reply = await self.request(Stat(self._next(), encoded))
-        if isinstance(reply, AttrsReply):
-            return reply.attrs
-        raise _unexpected(reply, expected="ATTRS", path=encoded)
-
-    async def lstat(self, path: bytes | str) -> Attrs:
-        """Attributes of ``path`` itself, **not** following symlinks.
-
-        The difference is not academic where this is used: ``stat`` on a symlink whose target
-        is gone reports ``NO_SUCH_FILE``, so it answers "is there a file at the end of this
-        name" while ``lstat`` answers "is this name taken". Publishing needs the second
-        question.
-
-        Raises:
-            NoSuchFileError: If the path does not exist.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(path)
-        reply = await self.request(LStat(self._next(), encoded))
-        if isinstance(reply, AttrsReply):
-            return reply.attrs
-        raise _unexpected(reply, expected="ATTRS", path=encoded)
-
     # --- the working directory, which this protocol does not have ---------------------------
-
-    def _resolve(self, path: bytes | str) -> bytes:
-        """Encode a caller's path and apply the working directory, if there is one.
-
-        **Every public path argument goes through here**, which is what makes ``chdir`` mean
-        the same thing to ``stat`` and to ``glob`` without either of them knowing it exists.
-        The alternative -- each method prepending for itself -- is a per-method decision
-        nobody re-reads, and the one that got forgotten would silently operate on a different
-        file from the one the caller named.
-
-        **Idempotent by construction, which is the property the recursive operations need.**
-        Only a *relative* path is prefixed, and :attr:`_cwd` is always absolute, so a resolved
-        path resolves to itself. ``walk`` resolves its root once and then joins child names
-        onto that absolute root; every child therefore passes through here again -- from the
-        walk, and again from whatever the caller does with it -- and is unchanged both times.
-        A prefix applied to whatever it was handed would double on exactly those paths, and
-        the resulting name would still be legal, so nothing would have failed.
-        """
-        encoded = _encode_path(path)
-        if self._cwd is None or encoded.startswith(b"/"):
-            return encoded
-        return join_remote(self._cwd, encoded)
 
     async def chdir(self, path: bytes | str) -> None:
         """Set the directory relative paths resolve against, for this session.
@@ -1563,392 +1117,6 @@ class Session:
         attributes = await (self.stat(path) if follow_symlinks else self.lstat(path))
         return modified_at(attributes)
 
-    async def _set_one_attribute(
-        self, path: bytes, attrs: Attrs, *, follow_symlinks: bool, operation: str
-    ) -> None:
-        """Apply one ATTRS field to a path, following the symlink or refusing to.
-
-        **One field per call is the caller's job and this method's assumption.** OpenSSH's
-        ``process_setstat`` and ``process_extended_lsetstat`` both walk the flags in sequence,
-        applying each and recording only the last failure in the single ``STATUS`` they send
-        back -- so a multi-field call that fails has already applied the fields before the
-        failing one and does not say which. Every public caller here sends exactly one flag,
-        which makes a refusal unambiguous and leaves nothing else moved.
-
-        ``follow_symlinks=False`` needs ``lsetstat@openssh.com`` and **refuses without it**,
-        rather than degrading to the following version. That is the opposite of what most
-        extension use does here, and the reason is that there is nothing to degrade *to*: v3
-        has no non-following spelling, so the fallback would be to perform a different
-        operation than the one asked for, on a target the caller was trying to avoid.
-
-        Attempted even where the server did not advertise the extension, since endpoints
-        implement extensions they never list -- and an ``OP_UNSUPPORTED`` is cached, so a
-        second call in the same session costs no round trip.
-
-        Raises:
-            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
-            NoSuchFileError: If the path does not exist.
-            PermissionDeniedError: If the server will not change it.
-            ServerError: For any other refusal.
-        """
-        if follow_symlinks:
-            await self._expect_status(SetStat(self._next(), path, attrs), path=path)
-            return
-        try:
-            performed = await self._attempt_extension(
-                EXTENSION_LSETSTAT,
-                lambda: self._expect_status(
-                    LSetStat(self._next(), path, attrs).to_extended(), path=path
-                ),
-            )
-        except ServerError as refusal:
-            # OpenSSH's FAILURE carries no message worth reading -- five distinct conditions
-            # all render as "Failure" -- and for this one flag there is a specific, common and
-            # unfixable cause that the bare status sends a reader looking in the wrong place.
-            if attrs.permissions is not None:
-                refusal.add_note(
-                    "the server may be refusing because it cannot do this at all: Linux has "
-                    "no lchmod, so fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP and OpenSSH "
-                    "maps that to a contentless FAILURE. A symlink's own permission bits are "
-                    "ignored by the Linux kernel and are always 0o777, so there is nothing to "
-                    "set. The times and owner of a symlink can be set there; the mode cannot. "
-                    "Pass follow_symlinks=True to change what the link points at, if that is "
-                    "what you meant."
-                )
-            raise
-        if not performed:
-            unavailable = CapabilityError(
-                f"follow_symlinks=False needs {EXTENSION_LSETSTAT}, which this server will "
-                f"not perform, and filexfer v3 has no other way to {operation} a symlink "
-                f"without following it. Passing follow_symlinks=True would {operation} "
-                f"whatever {path!r} points at, which is a different operation",
-                feature=f"{operation} without following a symlink",
-                missing=(EXTENSION_LSETSTAT,),
-                path=path,
-            )
-            unavailable.add_note(self._server_note())
-            raise unavailable
-
-    async def chmod(self, path: bytes | str, mode: int, *, follow_symlinks: bool = True) -> None:
-        """Set the permission bits of ``path``.
-
-        ``SETSTAT`` carrying **only** ``PERMISSIONS``, and the single flag is the decision
-        rather than an economy. OpenSSH's ``process_setstat`` walks the ATTRS flags in order --
-        ``SIZE`` to ``truncate``, ``PERMISSIONS`` to ``chmod``, ``ACMODTIME`` to ``utimes``,
-        ``UIDGID`` to ``chown`` -- applying each in turn and recording only the *last* failure
-        in the single ``STATUS`` it sends back. So a multi-field ``SETSTAT`` that fails has
-        already applied the fields before the failing one, and the answer does not say which
-        field it was. One field per call makes a refusal unambiguous and leaves nothing else
-        moved.
-
-        **It follows symlinks by default**, because ``SETSTAT`` is ``chmod(2)`` and that is what
-        ``chmod(2)`` does -- the same default as :func:`os.chmod`. Where the path may be a
-        symlink planted by someone else, that is a chmod of whatever it points at.
-        ``follow_symlinks=False`` uses ``lsetstat@openssh.com`` and **refuses** where the server
-        will not, rather than silently doing the following version: v3 has no other spelling, so
-        there is nothing to degrade to.
-
-        **On a Linux server that refusal is unconditional, and the extension being present does
-        not change it.** Linux has no ``lchmod``: ``fchmodat(AT_SYMLINK_NOFOLLOW)`` answers
-        ``ENOTSUP``, measured, so ``lsetstat``'s permissions branch cannot succeed there however
-        the server is configured. A symlink's own mode is meaningless to that kernel and always
-        reads ``0o777``. The refusal arrives as OpenSSH's contentless ``FAILURE`` and this
-        library attaches a note saying so. :meth:`utime` and :meth:`chown` *do* work on a link
-        there -- ``utimensat`` and ``fchownat`` accept the flag -- so this limit is the mode's
-        alone, not the extension's.
-
-        Args:
-            path: What to modify.
-            mode: Permission bits. Masked to ``0o7777``, which is what ``chmod(2)`` takes and
-                what OpenSSH applies (``a.perm & 07777``); the file-type bits an ``st_mode``
-                carries are not permissions and are dropped rather than sent.
-            follow_symlinks: Whether to act on the link's target. ``False`` needs
-                ``lsetstat@openssh.com`` -- advertised by OpenSSH and asyncssh, absent from
-                paramiko -- **and** a server platform with ``lchmod``, which Linux is not.
-
-        Raises:
-            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
-            NoSuchFileError: If the path does not exist.
-            PermissionDeniedError: If the server will not change it.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(path)
-        await self._set_one_attribute(
-            encoded,
-            Attrs(permissions=mode & PERMISSION_BITS),
-            follow_symlinks=follow_symlinks,
-            operation="chmod",
-        )
-
-    async def chown(
-        self, path: bytes | str, uid: int, gid: int, *, follow_symlinks: bool = True
-    ) -> None:
-        """Set the numeric owner and group of ``path``.
-
-        **Both together or neither**, because ``UIDGID`` is one flag covering two fields --
-        there is no way to send a uid without a gid, so "leave the group alone" has to be
-        spelled by reading the current gid back with :meth:`stat` and sending it unchanged.
-        That is the wire's shape rather than ours; :class:`~gantry_sftp.codec.Owner` exists to
-        make the pairing visible instead of leaving two loose integers.
-
-        **Numeric ids only.** Turning them into names needs
-        ``users-groups-by-id@openssh.com``, which is not implemented here, and the display
-        string in ``longname`` is not a source -- it is rendered by the server, in the server's
-        name resolution, for a human.
-
-        Args:
-            path: What to modify.
-            uid: Numeric user id.
-            gid: Numeric group id.
-            follow_symlinks: Whether to act on the link's target. ``False`` needs
-                ``lsetstat@openssh.com``.
-
-        Raises:
-            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
-            NoSuchFileError: If the path does not exist.
-            PermissionDeniedError: If the server will not change it -- which is the common
-                answer, since changing a file's owner is root's privilege on every ordinary
-                Unix server.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(path)
-        await self._set_one_attribute(
-            encoded,
-            Attrs(owner=Owner(uid=uid, gid=gid)),
-            follow_symlinks=follow_symlinks,
-            operation="chown",
-        )
-
-    async def utime(
-        self, path: bytes | str, atime: int, mtime: int, *, follow_symlinks: bool = True
-    ) -> None:
-        """Set the access and modification times of ``path``, in whole seconds.
-
-        **Both together or neither**, for the same reason :meth:`chown` pairs its two: they
-        share one ``ACMODTIME`` flag.
-
-        v3 carries ``uint32`` seconds, so sub-second precision does not exist here and a value
-        that does not fit is refused rather than truncated -- see
-        :data:`~gantry_sftp.codec.MAX_V3_TIMESTAMP`. Whether the *transfer* methods carry times
-        across is ``preserve_times=``; this is the standalone call, for a file already there.
-
-        Args:
-            path: What to modify.
-            atime: Access time, seconds since the epoch.
-            mtime: Modification time, seconds since the epoch.
-            follow_symlinks: Whether to act on the link's target. ``False`` needs
-                ``lsetstat@openssh.com``.
-
-        Raises:
-            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
-            NoSuchFileError: If the path does not exist.
-            PermissionDeniedError: If the server will not change it.
-            ServerError: For any other refusal.
-            ValueError: If either value does not fit filexfer v3's ``uint32`` seconds.
-        """
-        encoded = self._resolve(path)
-        await self._set_one_attribute(
-            encoded,
-            Attrs(times=Times(atime=atime, mtime=mtime)),
-            follow_symlinks=follow_symlinks,
-            operation="utime",
-        )
-
-    async def truncate(self, path: bytes | str, size: int) -> None:
-        """Set the length of ``path``, discarding anything past it or zero-filling to reach it.
-
-        ``SETSTAT`` carrying only ``SIZE``, which OpenSSH answers with ``truncate(2)``.
-
-        **There is no ``follow_symlinks=False`` here, and its absence is the server's decision
-        rather than an omission.** ``process_extended_lsetstat`` rejects ``SIZE`` outright --
-        ``BAD_MESSAGE``, with the comment ``/* nonsensical for links */`` -- so the extension
-        every other method on this page uses for the non-following case cannot carry a
-        truncation at all. A parameter that could only ever fail would be worse than not having
-        one.
-
-        Args:
-            path: What to modify. Followed if it is a symlink, necessarily.
-            size: The new length in bytes. Growing a file this way makes a hole rather than
-                writing zeroes, so the space is not reserved and a later write can still fail
-                with ``ENOSPC``.
-
-        Raises:
-            NoSuchFileError: If the path does not exist.
-            PermissionDeniedError: If the server will not change it.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(path)
-        await self._expect_status(SetStat(self._next(), encoded, Attrs(size=size)), path=encoded)
-
-    async def ftruncate(self, handle: bytes, size: int) -> None:
-        """Set the length of an **open file**, by handle rather than by path.
-
-        The handle-addressed :meth:`truncate`, and the difference is the same one :meth:`fstat`
-        exists for: a path can be replaced between the ``OPEN`` and the ``SETSTAT``, so a
-        writer that truncates by name can truncate a file it is not the one holding open. It
-        is also the only form available to a caller who has a handle and no usable path --
-        which is every caller of :meth:`open_file`.
-
-        ``FSETSTAT`` carrying only ``SIZE``. Growing a file this way makes a hole rather than
-        writing zeroes, so the space is not reserved and a later write can still fail with
-        ``ENOSPC``.
-
-        Args:
-            handle: An open file handle, opened for writing.
-            size: The new length in bytes.
-
-        Raises:
-            ValueError: If ``size`` is negative.
-            ServerError: If the server refuses. A read-only handle answers ``NO_SUCH_FILE``
-                here, the same misdirection a write on one gives.
-        """
-        if size < 0:
-            raise ValueError(f"size must not be negative, got {size}")
-        await self._expect_status(FSetStat(self._next(), handle, Attrs(size=size)))
-
-    async def fstat(self, handle: bytes) -> Attrs:
-        """Attributes of an open handle.
-
-        The handle-addressed :meth:`stat`, and the difference is worth the method: a path can
-        be replaced between the ``OPEN`` and the ``STAT``, so asking the handle is asking about
-        the file this session actually has open rather than about whatever currently answers to
-        that name.
-
-        Raises:
-            ServerError: If the server refuses -- which includes a handle it does not know, and
-                a server that does not implement ``FSTAT`` on a directory handle.
-        """
-        reply = await self.request(FStat(self._next(), handle))
-        if isinstance(reply, AttrsReply):
-            return reply.attrs
-        raise _unexpected(reply, expected="ATTRS")
-
-    async def readlink(self, path: bytes | str) -> bytes:
-        """Read the target of a symlink, without following it.
-
-        **The answer is attacker-controlled and is returned raw.** A link target is an
-        arbitrary byte string chosen by whoever created the link -- it may be absolute, may
-        climb with ``..``, may not be valid UTF-8, and may name something that does not exist.
-        Nothing is validated here because there is nothing to validate against: every one of
-        those is a legal symlink. **Do not join it onto a local path** without the containment
-        check :meth:`get_tree` uses; that is the zip-slip class, and this method is the
-        shortest route to it.
-
-        **A path that is not a symlink answers ``BAD_MESSAGE``**, not ``FAILURE`` and not
-        ``NO_SUCH_FILE``. That code reads as "the frame you sent was malformed" and here means
-        ``EINVAL`` -- OpenSSH maps ``EINVAL`` and ``ENAMETOOLONG`` onto it, so the status that
-        looks like a bug in this library is how ``readlink`` says "that is not a link".
-        Measured, and in DESIGN 13.
-
-        Returns:
-            The link target exactly as the server sent it.
-
-        Raises:
-            ProtocolError: If the server answers with something other than a NAME, or with a
-                NAME carrying any number of names other than one. Same strictness as
-                :meth:`realpath` and for the same reason: ``send_names`` sends exactly one, so
-                a different count is a server we do not understand rather than a choice to make.
-            NoSuchFileError: If the path does not exist.
-            ServerError: If the path is not a symlink (``BAD_MESSAGE``), or for any other
-                refusal.
-        """
-        encoded = self._resolve(path)
-        reply = await self.request(ReadLink(self._next(), encoded))
-        if not isinstance(reply, Name):
-            raise _unexpected(reply, expected="NAME", path=encoded)
-        if len(reply.entries) != 1:
-            raise ProtocolError(
-                f"READLINK of {encoded!r} answered with {len(reply.entries)} names, "
-                f"and a link has exactly one target",
-                request_id=reply.request_id,
-            )
-        return reply.entries[0].filename
-
-    async def symlink(self, target: bytes | str, link_path: bytes | str) -> None:
-        """Create a symlink at ``link_path`` pointing at ``target``.
-
-        Argument order matches :func:`os.symlink` -- target first, then the name being created
-        -- which is **not** the order these fields take on the wire. OpenSSH sends
-        ``targetpath`` then ``linkpath`` where ``draft-ietf-secsh-filexfer-02`` specifies the
-        reverse, and the reference implementation is what binds: sending the draft order
-        against a real ``sftp-server`` returns ``FAILURE`` and creates nothing. That reversal
-        lives in :class:`~gantry_sftp.codec.SymLink`'s encoder, checked against a server, and
-        not here.
-
-        ``target`` is not resolved, checked, or required to exist. A dangling symlink is a
-        legal thing to create and some deployments create one deliberately.
-
-        **That includes not resolving it against :meth:`chdir`'s working directory**, which is
-        the one place this library's prefix must not reach: ``target`` is a *string stored
-        inside the link*, interpreted by the server relative to the link's own directory, not
-        a path this client is about to operate on. Prefixing it would silently turn
-        ``symlink(b"data.csv", b"alias.csv")`` -- a relative link, which is what a shell makes
-        and what survives the directory being moved -- into an absolute one pointing at
-        wherever the session happened to be standing. Caught by the sweep that routed every
-        other path through the resolver: this docstring already said the rule, and the sweep
-        made it false.
-
-        Args:
-            target: What the link should point at.
-            link_path: The name to create.
-
-        Raises:
-            PermissionDeniedError: If the server will not create it.
-            ServerError: For any other refusal, including a name that is already taken.
-        """
-        encoded = self._resolve(link_path)
-        await self._expect_status(
-            SymLink(self._next(), targetpath=_encode_path(target), linkpath=encoded),
-            path=encoded,
-        )
-
-    async def realpath(self, path: bytes | str = b".") -> bytes:
-        """Canonicalise ``path`` on the server.
-
-        Servers disagree about what this does for a path that does not exist -- some
-        canonicalise anyway, some refuse. That disagreement belongs to the quirks layer and
-        is not smoothed over here.
-
-        **Exactly one name, and a count that is not one is an error rather than a guess.**
-        Unlike READDIR -- where the draft and OpenSSH's client disagree about strictness and
-        the client wins (see :meth:`readdir`) -- here they agree: the draft specifies a single
-        name, and ``sftp-client.c`` does ``if (count != 1) fatal("Got multiple names (%d)")``.
-        Where both are strict there is nothing for us to be lenient *towards*. Taking the
-        first of several would be picking one of the server's answers and calling it the
-        canonical path, which is the silently-wrong failure this layer exists to prevent.
-
-        **A relative argument resolves against :meth:`getcwd`**, like every other path this
-        session takes, so ``realpath(b".")`` after a :meth:`chdir` canonicalises the directory
-        you moved to rather than the one the server started you in. :attr:`server_root` is the
-        other question and keeps its own answer.
-
-        Raises:
-            ProtocolError: If the server answers with something other than a NAME, or with a
-                NAME carrying any number of names other than one.
-            NoSuchFileError: If the server refuses because the path does not exist.
-            ServerError: For any other refusal.
-        """
-        return await self._realpath_raw(self._resolve(path))
-
-    async def _realpath_raw(self, encoded: bytes) -> bytes:
-        """``REALPATH`` of an already-resolved path, with no working directory applied.
-
-        The split exists for one caller and it is load-bearing: the rootedness probe below
-        asks *the server* where its default directory is, and running that through the
-        client-side prefix would answer with wherever :meth:`chdir` last went. It would then
-        cache that as :attr:`server_root`, which is a different question with a public name.
-        """
-        reply = await self.request(RealPath(self._next(), encoded))
-        if not isinstance(reply, Name):
-            raise _unexpected(reply, expected="NAME", path=encoded)
-        if len(reply.entries) != 1:
-            raise ProtocolError(
-                f"REALPATH of {encoded!r} answered with {len(reply.entries)} names, "
-                f"and exactly one is the only useful answer",
-                request_id=reply.request_id,
-            )
-        return reply.entries[0].filename
-
     async def _require_rooted_paths(self, path: bytes, *, feature: str) -> None:
         """Refuse an operation whose path arithmetic this server's namespace does not fit.
 
@@ -1997,174 +1165,6 @@ class Session:
         refusal.add_note(self._server_note())
         raise refusal
 
-    @property
-    def server_root(self) -> bytes | None:
-        """This server's canonical form of ``.``, if anything has needed to ask.
-
-        ``None`` means the question never came up, **not** that the server has no root: the
-        probe is lazy because an operation given an absolute path never needs it.
-        """
-        return self._root
-
-    async def open(
-        self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None
-    ) -> bytes:
-        """Open a remote file and return its handle.
-
-        Args:
-            path: What to open.
-            pflags: Access and creation flags.
-            mode: Permission bits for a file this call **creates**, or ``None`` to leave it to
-                the server. Ignored by the server when the file already exists, exactly as
-                ``open(2)``'s mode argument is, so this is not a way to change an existing
-                file's permissions -- :meth:`chmod` is.
-
-                ``None`` is not neutral and it is worth knowing what it means: OpenSSH's
-                ``process_open`` reads this ATTRS for ``PERMISSIONS`` and nothing else,
-                defaulting to ``0666`` when the flag is absent, so a file created without it
-                arrives ``0666 & ~umask`` -- world-readable under the usual umask.
-
-        Raises:
-            NoSuchFileError: If the path does not exist and was not to be created.
-            PermissionDeniedError: If the server will not open it.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(path)
-        attrs = EMPTY_ATTRS if mode is None else Attrs(permissions=mode)
-        reply = await self.request(Open(self._next(), encoded, pflags, attrs))
-        if isinstance(reply, Handle):
-            return reply.handle
-        raise _unexpected(reply, expected="HANDLE", path=encoded)
-
-    async def readinto_at(self, handle: bytes, buffer: bytearray | memoryview, offset: int) -> int:
-        """Read ``len(buffer)`` bytes from ``offset`` into ``buffer``. The zero-copy primitive.
-
-        Pipelined: a range longer than one request becomes several in flight, exactly as a
-        ``get`` does, because a byte-range read that issues one ``READ`` and awaits it costs a
-        round trip per call. That is not a hypothetical -- it is the documented behaviour of
-        the incumbent's file object, which runs 25x slower than its own whole-file download
-        (``paramiko#2453``).
-
-        **Safe to call from several tasks at once**, on the same handle or on different ones:
-        the offset is an argument rather than a cursor, so there is no shared position for two
-        tasks to interleave. :meth:`open_file` is the cursor-bearing form and is not.
-
-        Args:
-            handle: An open remote file handle, opened for reading.
-            buffer: Writable destination, filled from its first byte. Its length is the range.
-            offset: Absolute offset in the remote file.
-
-        Returns:
-            Bytes read. Short of ``len(buffer)`` **only at end of file** -- a short ``DATA`` is
-            legal mid-file and is re-requested rather than returned, so a caller never has to
-            loop to fill a range. ``0`` means the offset was at or past the end.
-
-            The unfilled tail of ``buffer`` is left as it was rather than zeroed.
-
-        Raises:
-            ValueError: If ``offset`` is negative.
-            TransferError: If the server refuses the read -- **not** the typed status error
-                :meth:`open` would raise, because this is the transfer scheduler and a refusal
-                here carries how far the range got. The status name is in the message.
-
-                Two of those messages mislead and it is the server's doing rather than ours: a
-                handle opened write-only answers ``NO_SUCH_FILE``, and so does a handle that
-                has already been closed. OpenSSH's handle lookup checks the direction, so "No
-                such file" is what a perfectly good path reports when the handle is the wrong
-                kind.
-            TransferTimeoutError: If the server stops responding.
-        """
-        view = memoryview(buffer) if isinstance(buffer, bytearray) else buffer
-        return await read_range_into(
-            self._dispatcher,
-            handle,
-            view,
-            offset=offset,
-            read_length=self.sizes_for(handle).read_length,
-            depth=self._depth,
-            idle_timeout=self._idle_timeout,
-        )
-
-    async def read_at(self, handle: bytes, offset: int, length: int) -> bytes:
-        """Read up to ``length`` bytes from ``offset``, pipelined.
-
-        The ergonomic form of :meth:`readinto_at`, and the one copy in it is the return type:
-        handing back immutable ``bytes`` means copying out of the buffer that was filled.
-        Reach for ``readinto_at`` when that matters.
-
-        **A zero-length read is answered here rather than on the wire.** OpenSSH replies to a
-        zero-length ``READ`` with an empty ``DATA``, which is also exactly how a server making
-        no progress looks -- the transfer scheduler tolerates one and fails on the second, and
-        it is right to. Rather than teach it an exception for a case whose answer is already
-        known, this returns ``b""`` without asking.
-
-        Args:
-            handle: An open remote file handle, opened for reading.
-            offset: Absolute offset in the remote file.
-            length: Bytes to read. May exceed the server's ``max-read-length``; the range is
-                split across requests, so there is no ceiling a caller has to know about.
-
-        Returns:
-            The bytes read: exactly ``length`` of them unless end of file arrived first, and
-            ``b""`` at or past the end.
-
-        Raises:
-            ValueError: If ``offset`` or ``length`` is negative.
-        """
-        if length < 0:
-            raise ValueError(f"length must not be negative, got {length}")
-        if offset < 0:
-            raise ValueError(f"offset must not be negative, got {offset}")
-        if length == 0:
-            return b""
-        buffer = bytearray(length)
-        filled = await self.readinto_at(handle, buffer, offset)
-        del buffer[filled:]
-        return bytes(buffer)
-
-    async def write_at(self, handle: bytes, offset: int, data: bytes | memoryview) -> int:
-        """Write ``data`` at ``offset``, pipelined.
-
-        Longer than one request becomes several in flight, and the payload is not copied on
-        the way to the wire.
-
-        **Safe to call from several tasks at once on different ranges**; two tasks writing the
-        same range is a race this cannot arbitrate, exactly as with two processes and
-        ``pwrite``. Unlike a read, a write is **not idempotent** -- nothing here retries one,
-        and a caller reissuing a failed write has to know what the server already stored.
-
-        Writing past the end of the file is legal and leaves a hole, which reads back as
-        zeroes. Verified against ``sftp-server`` rather than assumed.
-
-        Args:
-            handle: An open remote file handle, opened for writing.
-            offset: Absolute offset in the remote file.
-            data: The bytes to write. Empty writes no bytes and costs no round trip.
-
-        Returns:
-            Bytes the server acknowledged, which is ``len(data)`` on success.
-
-        Raises:
-            ValueError: If ``offset`` is negative.
-            TransferError: If the server refuses the write, carrying how far it got. A handle
-                opened read-only answers ``NO_SUCH_FILE`` inside that message, for the same
-                reason a read on a write-only handle does.
-        """
-        if offset < 0:
-            raise ValueError(f"offset must not be negative, got {offset}")
-        payload = memoryview(data) if isinstance(data, bytes) else data
-        if not len(payload):
-            return 0
-        return await write_range_from(
-            self._dispatcher,
-            handle,
-            payload,
-            offset=offset,
-            write_length=self.sizes_for(handle).write_length,
-            depth=self._depth,
-            idle_timeout=self._idle_timeout,
-        )
-
     def open_file(
         self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None
     ) -> RemoteFile:
@@ -2201,72 +1201,6 @@ class Session:
             An unopened :class:`RemoteFile`. Nothing is sent until it is entered.
         """
         return RemoteFile(self, self._resolve(path), pflags, mode=mode)
-
-    async def opendir(self, path: bytes | str) -> bytes:
-        """Open a remote directory and return its handle.
-
-        Raises:
-            NoSuchFileError: If the path does not exist.
-            ServerError: If it is not a directory, or the server refuses.
-        """
-        encoded = self._resolve(path)
-        reply = await self.request(OpenDir(self._next(), encoded))
-        if isinstance(reply, Handle):
-            return reply.handle
-        raise _unexpected(reply, expected="HANDLE", path=encoded)
-
-    async def readdir(self, handle: bytes) -> tuple[DirEntry, ...] | None:
-        """Read one batch of entries, or ``None`` at the end of the directory.
-
-        One READDIR is **not** a whole directory: the server returns as many entries as it
-        feels like -- OpenSSH caps a batch at 100 -- and the caller keeps asking until this
-        answers ``None``. Treating the first batch as the listing is how a client silently
-        loses everything after the hundredth file.
-
-        ``.`` and ``..`` are **not** filtered here. This is the raw batch; the filtering
-        belongs to :meth:`listdir`, and keeping one place that shows what the server actually
-        sent is what makes that filtering testable.
-
-        **A NAME carrying zero names ends the directory too, and that is a decision.** The
-        draft is explicit that it should not happen -- SSH_FXP_READDIR is answered with "one
-        or more names", and end of directory is a ``STATUS`` of ``EOF`` -- and OpenSSH's
-        server never sends one: ``process_readdir`` is ``if (count > 0) send_names(...) else
-        send_status(id, SSH2_FX_EOF)``. So a zero-count NAME is a server bug whichever way we
-        read it, and the only question is which way to fail on it.
-
-        Treating it as an empty *batch* and asking again is what a literal reading gives, and
-        it is a **livelock**: a server that answers every READDIR that way pins the client at
-        100% CPU forever, in the operation every recursive transfer starts with. Refusing it
-        with a ``ProtocolError`` would be defensible from the draft alone, but it would make
-        this library **stricter than ``sftp(1)``** -- OpenSSH's own client reads the count and
-        does ``if (count == 0) break;``, on the line above its ``SSH2_FX_EOF`` check. Every
-        server in production has been tested against that client, which is what makes the
-        truncation risk here structural rather than merely unlikely: a server that sends an
-        empty NAME with entries still to come already silently truncates for every OpenSSH
-        user, so it does not survive to ship. A server that sends one *as* its end-of-listing
-        marker works fine with ``sftp(1)`` and therefore can and does exist.
-
-        So it ends the listing, matching the reference client. Sourced in DESIGN.md 7.
-
-        Returns:
-            The batch, or ``None`` once the directory is finished -- by ``EOF`` or by an empty
-            NAME, which are treated alike.
-
-        Raises:
-            ServerError: If the server refuses.
-        """
-        reply = await self.request(ReadDir(self._next(), handle))
-        if isinstance(reply, Name):
-            # An empty NAME is end of directory, not an empty batch. Returning `()` here is
-            # what made every batch-following loop in this file spin forever on one.
-            if not reply.entries:
-                return None
-            return tuple(DirEntry.from_name_entry(entry) for entry in reply.entries)
-        if isinstance(reply, Status):
-            if reply.code is StatusCode.EOF:
-                return None
-            raise_for_status(reply)
-        raise _unexpected(reply, expected="NAME")
 
     def scandir(self, path: bytes | str) -> DirectoryScan:
         """Stream a directory, one batch at a time, holding one handle open.
@@ -2323,34 +1257,6 @@ class Session:
         """
         async with self.scandir(path) as entries:
             return [entry async for entry in entries]
-
-    async def close(self, handle: bytes) -> None:
-        """Close a remote handle.
-
-        Not merely bookkeeping: some servers report a write failure here rather than on the
-        WRITE that caused it, so a CLOSE that returns an error is the transfer failing.
-        """
-        await self._expect_status(Close(self._next(), handle))
-
-    async def mkdir(self, path: bytes | str, *, exist_ok: bool = False) -> None:
-        """Create a directory.
-
-        ``exist_ok`` costs a round trip when it fires, and it has to: v3 answers a failed
-        MKDIR with ``FAILURE``, the catch-all that means nothing, so "it is already there" is
-        indistinguishable from "the parent is read-only" by status code. The only honest way
-        to tell them apart is to look, which is what this does -- and it checks the path is a
-        *directory*, since a file of the same name is a different problem wearing the same
-        status.
-
-        Raises:
-            ServerError: If the server refuses, and ``exist_ok`` does not excuse it.
-        """
-        encoded = self._resolve(path)
-        try:
-            await self._expect_status(MkDir(self._next(), encoded, EMPTY_ATTRS), path=encoded)
-        except ServerError:
-            if not exist_ok or not await self._is_directory(encoded):
-                raise
 
     async def makedirs(self, path: bytes | str, *, exist_ok: bool = False) -> None:
         """Create a directory and any missing ancestors of it.
@@ -2418,218 +1324,6 @@ class Session:
             f"{refusal.path!r} already exists and is a {kind.value}, not a directory, so "
             f"nothing can be created at that name until it is moved or removed"
         )
-
-    async def _is_directory(self, path: bytes) -> bool:
-        """Whether the server positively reports ``path`` as a directory.
-
-        ``LSTAT``, so a symlink is not mistaken for what it points at, and every failure --
-        including a server that sends no permissions at all -- answers ``False``. Used to
-        decide whether a refusal can be excused, and "the server would not say" is not an
-        excuse.
-
-        Distinct from :meth:`isdir`, which is the public question and raises where this
-        returns ``False``: here the caller is deciding whether to *excuse* a refusal it
-        already has, and an unexplained answer must not excuse anything.
-        """
-        try:
-            attributes = await self.lstat(path)
-        except ServerError:
-            return False
-        return entry_kind(attributes) is EntryKind.DIRECTORY
-
-    async def remove(self, path: bytes | str) -> None:
-        """Delete a file, a symlink, or any other non-directory entry.
-
-        ``REMOVE`` is ``unlink(2)``: it deletes the *name*, so a symlink is removed rather
-        than what it points at, and a directory is refused rather than emptied. That refusal
-        is load-bearing for :meth:`rmtree`, which is the only recursive delete here.
-
-        Raises:
-            NoSuchFileError: If the path is not there.
-            ServerError: For any other refusal, including the path being a directory.
-        """
-        encoded = self._resolve(path)
-        await self._expect_status(Remove(self._next(), encoded), path=encoded)
-
-    async def rmdir(self, path: bytes | str) -> None:
-        """Delete an **empty** directory.
-
-        ``RMDIR`` is ``rmdir(2)`` and does not recurse. A directory with anything left in it
-        is refused, which is what makes a bottom-up :meth:`rmtree` self-checking: if anything
-        was missed, the parent's removal fails rather than the tree quietly half-disappearing.
-
-        Raises:
-            NoSuchFileError: If the path is not there.
-            ServerError: For any other refusal, including the directory not being empty.
-        """
-        encoded = self._resolve(path)
-        await self._expect_status(RmDir(self._next(), encoded), path=encoded)
-
-    async def rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
-        """Rename with plain v3 ``RENAME``, which **cannot overwrite**.
-
-        Measured against OpenSSH 10.0p2: renaming onto a path that already exists answers
-        ``FAILURE`` and changes nothing. That is the specification's intent and it is why
-        :meth:`posix_rename` exists. Servers disagree here -- some overwrite, some silently
-        do nothing -- so a caller who needs replacement should ask for it rather than assume
-        this does it.
-
-        Raises:
-            ServerError: If the server refuses, which includes the target already existing.
-        """
-        encoded = self._resolve(new_path)
-        await self._expect_status(
-            Rename(self._next(), self._resolve(old_path), encoded), path=encoded
-        )
-
-    async def posix_rename(self, old_path: bytes | str, new_path: bytes | str) -> None:
-        """Rename with ``posix-rename@openssh.com``, which **does** overwrite, atomically.
-
-        Sent whether or not the server advertised the extension, because advertisement is
-        not the only evidence -- endpoints implement extensions they never list. A server
-        that does not have it answers ``OP_UNSUPPORTED`` and stays perfectly usable, which is
-        measured, not hoped: three unknown extension names in a row on a real ``sftp-server``
-        each returned ``OP_UNSUPPORTED`` and the session survived all three.
-
-        Raises:
-            UnsupportedError: If the server does not implement the extension.
-            ServerError: For any other refusal.
-        """
-        encoded = self._resolve(new_path)
-        request = PosixRename(self._next(), self._resolve(old_path), encoded)
-        await self._expect_status(request.to_extended(), path=encoded)
-
-    async def fsync(self, handle: bytes) -> None:
-        """Flush an open handle to stable storage with ``fsync@openssh.com``.
-
-        Must be sent **before** the ``CLOSE``, and that ordering is measured rather than
-        assumed: the same handle after a close answers ``NO_SUCH_FILE``.
-
-        This covers the file, not the directory entry. SFTP has no way to flush a directory,
-        so a rename that publishes the file is never itself durable -- a limitation to state
-        rather than to imply.
-
-        Raises:
-            UnsupportedError: If the server does not implement the extension.
-            ServerError: For any other refusal, including a handle it does not recognise.
-        """
-        await self._expect_status(Fsync(self._next(), handle).to_extended())
-
-    async def check_file(
-        self,
-        handle: bytes,
-        *,
-        algorithms: bytes = b"sha256,sha1,md5",
-        start_offset: int = 0,
-        length: int = 0,
-        block_size: int = CHECK_FILE_BLOCK_SIZE,
-    ) -> tuple[bytes, tuple[bytes, ...]]:
-        """Ask the server to hash a file it already has, without moving the bytes again.
-
-        Rung 1 of DESIGN.md 6's verification ladder, and the only rung that verifies
-        *content* rather than byte count. **Most servers do not have it** -- OpenSSH answers
-        ``OP_UNSUPPORTED`` under all three spellings, measured -- so a caller that needs
-        verification everywhere still falls back to rung 3, a size check, and is told so
-        rather than left to assume.
-
-        The handle must have been opened for **reading**. Paramiko hashes by reading through
-        it, so a WRITE-only handle -- the one an upload is holding -- answers ``FAILURE``
-        with ``"Unable to hash file"``. Verifying something being uploaded therefore costs a
-        second ``OPEN``, and cannot reuse the handle the bytes are going through.
-        The draft's path-taking sibling would remove that second ``OPEN``; it is permanently
-        not built, and :class:`~gantry_sftp.codec.CheckFile` is where the decision and its
-        evidence live.
-
-        The digest count is not on the wire: the server sends one digest per block,
-        concatenated, and how many that is follows from ``block_size`` and the digest size of
-        whichever algorithm it picked. That size comes from ``hashlib`` here, so an algorithm
-        this Python does not know is an error rather than a silently mis-split answer.
-
-        Args:
-            handle: An **open**, readable file handle, from :meth:`open`. Not a path --
-                paramiko's spelling of this extension takes a handle, and answers
-                ``BAD_MESSAGE`` for one it does not recognise.
-            algorithms: Preference order as a name-list. The server picks the first it
-                supports and names its choice in the reply.
-            start_offset: First byte to hash.
-            length: Bytes to hash, or ``0`` for the rest of the file.
-            block_size: Bytes per digest. Defaults to
-                :data:`~gantry_sftp.session.CHECK_FILE_BLOCK_SIZE`, which is 64 KiB and is the
-                largest block paramiko answers correctly.
-
-                ``0`` is the wire value for "one digest over the whole range" and it was this
-                parameter's default until 0.9. **Do not send it**, and do not send anything
-                above 64 KiB either: measured against paramiko, a block over 64 KiB returns
-                digests of the wrong bytes, and once its runaway offsets pass EOF the server
-                loops forever and answers nothing -- permanently, from our side as well as
-                its own. ``0`` also fails outright below 256 bytes, because paramiko rewrites
-                it to the range length and then rejects that as too small. The reasons are in
-                :data:`~gantry_sftp.session.CHECK_FILE_BLOCK_SIZE`.
-
-        Returns:
-            The algorithm the server chose, and one digest per block.
-
-        Raises:
-            UnsupportedError: If the server does not implement the extension. Raised without a
-                round trip once this server has answered that in this session -- verification
-                asks per file, and re-asking a settled question is a round trip per file for an
-                answer that cannot have changed.
-            ServerError: If it refuses -- including ``FAILURE`` when it supports none of the
-                algorithms offered, and ``BAD_MESSAGE`` for an unknown handle.
-            ProtocolError: If the reply is not a well-formed check-file answer, or names an
-                algorithm whose digest size does not divide the bytes it sent.
-        """
-        if self.refuses(EXTENSION_CHECK_FILE):
-            raise UnsupportedError(
-                f"this server has already answered OP_UNSUPPORTED for {EXTENSION_CHECK_FILE}",
-                code=StatusCode.OP_UNSUPPORTED,
-            )
-        request = CheckFile(
-            self._next(),
-            handle,
-            algorithms=algorithms,
-            start_offset=start_offset,
-            length=length,
-            block_size=block_size,
-        )
-        reply = await self.request(request.to_extended())
-        if isinstance(reply, Status) and reply.code is StatusCode.OP_UNSUPPORTED:
-            # Recorded here rather than by catching the exception `_unexpected` raises two
-            # lines down: the status is the definitive answer, and reading it where it arrives
-            # keeps the recording next to the fact rather than next to the error handling.
-            self._unsupported.add(EXTENSION_CHECK_FILE.encode("ascii"))
-        if not isinstance(reply, ExtendedReplyPacket):
-            raise _unexpected(reply, expected="EXTENDED_REPLY")
-
-        parsed = CheckFileReply.from_reply(reply)
-        try:
-            # `usedforsecurity=False` for the reason every other hashlib call in this package
-            # carries it, and this was the one site that did not: a FIPS-enabled build refuses
-            # `hashlib.new("md5")` outright, and paramiko -- the only server implementing this
-            # extension -- offers nothing but md5 and sha1. Without the flag, rung 1 against it
-            # failed on such a build with "which this Python cannot size", which names the
-            # algorithm as the problem when the problem is the policy. It is also true on its
-            # own terms: this digest is a transfer check, not an authentication one.
-            digest_size = hashlib.new(
-                parsed.algorithm.decode("ascii"), usedforsecurity=False
-            ).digest_size
-        except ValueError as unknown:
-            # One `except` for two failures, and the second is why this must not be narrowed to
-            # the hashlib one: `algorithm` is the *server's* bytes, so a non-ASCII name raises
-            # `UnicodeDecodeError` from the `decode` above -- and that **is** a `ValueError`,
-            # which is also why a test written as `pytest.raises(ValueError)` cannot tell the
-            # two apart. Both are the same answer to the caller: a name we cannot size.
-            raise ProtocolError(
-                f"server hashed with {parsed.algorithm!r}, which this Python cannot size, "
-                f"so its {len(parsed.digests)} digest bytes cannot be split",
-                request_id=reply.request_id,
-            ) from unknown
-        try:
-            return parsed.algorithm, parsed.split(digest_size)
-        except ValueError as misaligned:
-            raise ProtocolError(
-                str(misaligned), request_id=reply.request_id, raw_frame=reply.data
-            ) from misaligned
 
     # --- verification, rungs 1 and 2 of DESIGN.md 6 -----------------------------------------
 
@@ -5083,29 +3777,6 @@ async def _close_quietly(session: Session, handle: bytes) -> None:
     """
     with anyio.CancelScope(shield=True), suppress(Exception):
         await session.close(handle)
-
-
-def _unexpected(reply: Response, *, expected: str, path: bytes | None = None) -> SFTPError:
-    """Build the right error for a reply we cannot use.
-
-    Returned rather than raised so the call site reads ``raise _unexpected(...)``, which
-    both a reader and a static analyser can see terminates the function.
-
-    A non-OK STATUS is the server declining, and gets a :class:`ServerError` -- that path
-    raises from inside :func:`raise_for_status`. A STATUS of ``OK`` where a HANDLE or ATTRS
-    was due is a different thing entirely: the server claiming success while withholding the
-    result, which is a protocol violation rather than a refusal.
-    """
-    if isinstance(reply, Status):
-        raise_for_status(reply, path=path)
-        return ProtocolError(
-            f"server answered with STATUS {reply.code.name} where {expected} was expected",
-            request_id=reply.request_id,
-        )
-    return ProtocolError(
-        f"server answered with {type(reply).__name__} where {expected} was expected",
-        request_id=reply.request_id,
-    )
 
 
 async def _read_limits(transport: Transport, codec: Codec) -> ServerLimits:

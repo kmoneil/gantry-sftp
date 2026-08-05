@@ -369,8 +369,13 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 109
+SESSION_METHOD_CEILING = 59
 """What `Session` measures today, which is the whole of the rule.
+
+**Lowered from 109 to 59 by D-143**, which split the class into three layers: `_SessionCore`
+(state, the properties, and `request`), `_SessionOperations` (one round trip each), and this,
+the compositions. The ratchet did its job on contact -- it failed the split with a message
+naming the new number, so tightening it was not something anybody had to remember.
 
 **A ratchet, not a target, and not a round number.** D-128's finding was that `Session` holds the
 orchestration half of all seven responsibilities `session/` has a module for, while every gate
@@ -617,3 +622,90 @@ def test_the_hidden_method_scan_finds_the_shape_it_guards() -> None:
     # *annotations* with a one-line delegation for a body -- which is what the first draft of
     # this rule reported as a finding, twice.
     assert found == ["_d129_sample.py:Hidden.check (@dataclass)"]
+
+
+# --- the session's three layers (D-143) -------------------------------------------------------
+
+
+SESSION_LAYERS = ("_core.py", "_operations.py", "_session.py")
+"""Bottom to top. `_SessionCore` owns the state and `request`; `_SessionOperations` is one round
+trip per method; `Session` composes them into transfers."""
+
+
+def _class_in(module: str, name: str) -> ast.ClassDef:
+    source = (PACKAGE_ROOT / "session" / module).read_text(encoding="utf-8")
+    return next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.ClassDef) and node.name == name
+    )
+
+
+def _defines(node: ast.ClassDef) -> set[str]:
+    return {
+        member.name
+        for member in node.body
+        if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def _self_calls(node: ast.ClassDef) -> dict[str, set[str]]:
+    return {
+        member.name: {
+            attribute.attr
+            for attribute in ast.walk(member)
+            if isinstance(attribute, ast.Attribute)
+            and isinstance(attribute.value, ast.Name)
+            and attribute.value.id == "self"
+        }
+        for member in node.body
+        if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def test_the_session_layers_only_ever_call_downwards():
+    """Everything may call down. Nothing may call up.
+
+    The reason to assert it rather than intend it is that calling up always *works*: Python
+    resolves it through the MRO at runtime and no checker complains, because the attribute really
+    is there on the instance. A layer boundary that exists only in a docstring is one the next
+    feature crosses without noticing, which is the same argument `codec/` has an import rule for.
+
+    Parsed rather than imported, like everything else in this file: `dir()` on a subclass returns
+    what it inherited, so an import-based version of this check would be vacuous by construction.
+    """
+    core = _class_in("_core.py", "_SessionCore")
+    operations = _class_in("_operations.py", "_SessionOperations")
+    compositions = _class_in("_session.py", "Session")
+
+    upwards = _defines(operations) | _defines(compositions)
+    offending = {
+        method: sorted(used & upwards)
+        for method, used in _self_calls(core).items()
+        if used & upwards
+    }
+    assert not offending, f"_SessionCore calls upwards, so it is not the bottom layer: {offending}"
+
+    upwards = _defines(compositions)
+    offending = {
+        method: sorted(used & upwards)
+        for method, used in _self_calls(operations).items()
+        if used & upwards
+    }
+    assert not offending, (
+        f"_SessionOperations reaches into the compositions, so it is no longer one round trip "
+        f"per method: {offending}"
+    )
+
+
+def test_the_layers_partition_the_session_rather_than_overlapping_it():
+    # An override would be silent: the subclass wins and the base's version becomes dead code
+    # that still reads as live. Nothing in this hierarchy should be overriding anything.
+    core = _defines(_class_in("_core.py", "_SessionCore")) - {"__init__", "__repr__"}
+    operations = _defines(_class_in("_operations.py", "_SessionOperations"))
+    compositions = _defines(_class_in("_session.py", "Session"))
+    assert not core & operations, f"redefined in _SessionOperations: {sorted(core & operations)}"
+    assert not core & compositions, f"redefined in Session: {sorted(core & compositions)}"
+    assert not operations & compositions, (
+        f"redefined in Session: {sorted(operations & compositions)}"
+    )

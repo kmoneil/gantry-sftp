@@ -10,6 +10,7 @@ Async here means **anyio**, never bare ``asyncio``.
 
 from __future__ import annotations
 
+from gantry_sftp.session._core import raise_for_status
 from gantry_sftp.session._dispatch import Dispatcher, Exchange
 from gantry_sftp.session._download import (
     DEFAULT_IDLE_TIMEOUT,
@@ -108,7 +109,6 @@ from gantry_sftp.session._session import (
     Session,
     SessionOptions,
     open_session,
-    raise_for_status,
 )
 from gantry_sftp.session._upload import upload_handle, write_range_from
 from gantry_sftp.session._verify import (
