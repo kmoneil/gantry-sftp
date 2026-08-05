@@ -26,6 +26,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -98,6 +99,38 @@ class LocalGantryFS(GantrySFTPFileSystem):
         return session
 
 
+def _filesystem_holds_non_utf8_names() -> bool:
+    """Whether this machine's temporary filesystem can hold a name that is not valid UTF-8.
+
+    **Linux can; macOS cannot, and it is the filesystem refusing rather than Python.** APFS and
+    HFS+ validate that a name is UTF-8 and answer `OSError: [Errno 92] Illegal byte sequence`,
+    so the fixture below could not build its tree at all and 98 tests in this module errored on
+    the first CI run that included a macOS row.
+
+    Probed rather than keyed to `sys.platform`, which is this repository's rule everywhere else
+    it asks what the environment can do -- the netem lane, `sftp-server`, Docker. The property
+    belongs to the *filesystem*, not the operating system: a case-insensitive or UTF-8-enforcing
+    mount can appear under Linux too, and a macOS machine with a suitable mount would be wrongly
+    skipped by a platform check.
+    """
+    with tempfile.TemporaryDirectory() as probe:
+        try:
+            (Path(probe) / "\udce9").touch()
+        except OSError:
+            return False
+        return True
+
+
+HOLDS_NON_UTF8_NAMES = _filesystem_holds_non_utf8_names()
+"""Set once: building the tree per test would probe the filesystem ~98 times."""
+
+needs_non_utf8_names = pytest.mark.skipif(
+    not HOLDS_NON_UTF8_NAMES,
+    reason="this filesystem rejects names that are not valid UTF-8 (macOS APFS/HFS+ does)",
+)
+"""For the tests that assert *on* the odd name, as opposed to the ones that merely tolerate it."""
+
+
 @pytest.fixture
 def tree(tmp_path: Path) -> Path:
     """A directory with the shapes that make an adapter's rules visible."""
@@ -105,8 +138,11 @@ def tree(tmp_path: Path) -> Path:
     drop.mkdir()
     _ = (drop / "report.csv").write_bytes(b"id,total\n1,42\n")
     _ = (drop / "big.bin").write_bytes(bytes(range(256)) * 4096)
-    # Not valid UTF-8. Ordinary on Linux, and the axis a name-handling test has to vary.
-    _ = (drop / "caf\udce9.csv").write_bytes(b"\xe9")
+    # Not valid UTF-8. Ordinary on Linux, and the axis a name-handling test has to vary --
+    # conditional because macOS refuses to hold such a name at all, and the other ~98 tests
+    # that take this fixture are about something else and should still run there.
+    if HOLDS_NON_UTF8_NAMES:
+        _ = (drop / "caf\udce9.csv").write_bytes(b"\xe9")
     (drop / "latest.csv").symlink_to(drop / "report.csv")
     (drop / "dangling").symlink_to(tmp_path / "gone")
     (drop / "archive").mkdir()
@@ -745,6 +781,7 @@ def test_a_listing_names_every_entry_with_a_path_this_library_built(fs, drop: st
     assert all(name.startswith(f"{drop}/") for name in names)
 
 
+@needs_non_utf8_names
 def test_a_name_that_is_not_utf8_survives_listing_info_and_open(fs, drop: str, tree: Path):
     """The axis to vary, per DoD 1, and the one the incumbent has crashed on since 2015.
 
@@ -823,9 +860,13 @@ def test_a_listing_carries_the_attributes_the_server_volunteered(fs, drop: str):
 def test_the_base_class_walkers_work_on_top_of_ls(fs, drop: str):
     """``find`` / ``glob`` / ``du`` are fsspec's, and they are what a consumer actually calls."""
     assert f"{drop}/archive/old.csv" in fs.find(drop)
-    assert sorted(fs.glob(f"{drop}/*.csv")) == sorted(
-        [f"{drop}/report.csv", f"{drop}/caf\udce9.csv", f"{drop}/latest.csv"]
-    )
+    # Not skipped where the odd name cannot exist: this test is about fsspec's walkers, not
+    # about that name, so it drops the one entry the filesystem refused and still asserts the
+    # glob is exact. An `in` check would have passed on a glob that returned everything.
+    expected = [f"{drop}/report.csv", f"{drop}/latest.csv"]
+    if HOLDS_NON_UTF8_NAMES:
+        expected.append(f"{drop}/caf\udce9.csv")
+    assert sorted(fs.glob(f"{drop}/*.csv")) == sorted(expected)
     assert fs.du(f"{drop}/report.csv") == 14
 
 
@@ -1622,6 +1663,7 @@ def test_a_buffered_write_of_nothing_still_creates_the_file(fs, drop: str):
 # --- the last of it: names, ranges, and registration ------------------------------------------
 
 
+@needs_non_utf8_names
 def test_a_path_that_is_not_valid_utf8_survives_the_round_trip(fs, drop: str, tree: Path):
     """`surrogateescape` both ways, which is the only thing that makes such a name operable.
 
