@@ -767,27 +767,39 @@ def test_ssh_treats_a_dash_host_as_options_without_the_separator():
 
     Without ``--``, a hostname beginning with ``-`` is parsed as options and
     ``ProxyCommand`` executes. The marker in stderr is the proof.
+
+    **The failure message carries the evidence, and that is not decoration.** This assertion
+    fired for the first time on this project's first CI run -- passing against OpenSSH 10.0p2
+    locally and failing on the runner's older build -- and its message was a *conclusion*
+    ("ssh no longer executes ProxyCommand...") with nothing behind it. A characterisation test
+    that fails without saying what it saw cannot be diagnosed from a CI log, and this one gates
+    a security argument: whether ``--`` is still the defence D-120 says it is. So it reports the
+    version it ran against and what that version actually did. Reading the conclusion off a bare
+    assertion is how a stale threat model gets confirmed rather than checked.
     """
-    result = subprocess.run(
-        [
-            "/usr/bin/ssh",
-            "-F",
-            "/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-oProxyCommand=echo GANTRY_MARKER >&2",
-            "nonexistent.invalid",
-            "-s",
-            "sftp",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+    argv = [
+        "/usr/bin/ssh",
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-oProxyCommand=echo GANTRY_MARKER >&2",
+        "nonexistent.invalid",
+        "-s",
+        "sftp",
+    ]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+    version = subprocess.run(
+        ["/usr/bin/ssh", "-V"], capture_output=True, text=True, timeout=30, check=False
     )
     assert "GANTRY_MARKER" in result.stderr, (
-        "ssh no longer executes ProxyCommand from an option-shaped argument; "
-        "re-check whether `--` is still the right defence"
+        "ssh did not execute ProxyCommand from an option-shaped argument, so the behaviour "
+        "`--` defends against may have changed; re-check whether `--` is still the right "
+        f"defence.\n  ssh -V: {version.stderr.strip() or version.stdout.strip()!r}"
+        f"\n  argv:   {argv}"
+        f"\n  exit:   {result.returncode}"
+        f"\n  stderr: {result.stderr.strip()!r}"
+        f"\n  stdout: {result.stdout.strip()!r}"
     )
 
 

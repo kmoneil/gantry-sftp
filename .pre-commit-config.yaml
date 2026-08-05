@@ -88,9 +88,19 @@ repos:
         pass_filenames: false
         require_serial: true
 
+      # `UV_CACHE_DIR` is set because this repository's dev sandbox has a root-owned
+      # `~/.cache/uv` that `uv` cannot write to. It used to name `/workspace/.uv-cache`, an
+      # absolute path that exists only in that sandbox -- so the first CI run this project
+      # ever had failed here, on a runner with no `/workspace` at all, with
+      # `failed to create directory: Permission denied`. Same class as a docstring citing a
+      # gitignored `_plans/` path: an environment-specific fact baked into a committed file.
+      #
+      # Relative, so it resolves against whatever the repository root is -- pre-commit runs
+      # hooks from there. Writable in both places, gitignored, and never inside the sdist
+      # because hatchling excludes what git ignores.
       - id: uv-lock
         name: uv lock is in sync with pyproject
-        entry: env UV_CACHE_DIR=/workspace/.uv-cache uv lock --check
+        entry: env UV_CACHE_DIR=.uv-cache uv lock --check
         language: system
         files: ^(pyproject\.toml|uv\.lock)$
         pass_filenames: false

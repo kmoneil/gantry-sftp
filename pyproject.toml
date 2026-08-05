@@ -554,8 +554,17 @@ also_copy = ["examples/"]
 # `__mutmut_` marker, with the reasoning and the fails-loudly argument on `MUTMUT_MARKER`
 # there, plus a must-not-flag control test beside it. Ordinary runs are unchanged, because
 # outside the lane it is an identity filter.
+# `tests/test_audit_deps.py` is the fourth, with `test_lanes.py`'s root cause exactly: it
+# loads `scripts/audit_deps.py` by path from the repository root, `mutants/` holds only
+# `source_paths` plus the tests and `also_copy`, and collection dies on
+# `FileNotFoundError: mutants/scripts/audit_deps.py`. **Found by the first CI run rather than
+# locally**, because the file landed with D-140 after the last full lane run -- which is the
+# transferable half: a new test that reaches outside `src/` does not announce itself, it waits
+# for whoever runs the lane next. Not `also_copy` for the same reason as `test_lanes.py`: the
+# module imports no `gantry_sftp`, so copying it in would add wall-clock and kill no mutant.
 pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
     "--ignore=tests/test_lanes.py",
+    "--ignore=tests/test_audit_deps.py",
 ]

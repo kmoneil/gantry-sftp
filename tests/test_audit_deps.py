@@ -151,9 +151,29 @@ class Runs:
 
 
 @pytest.fixture
-def with_uv(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin `uv`'s location so no test depends on the developer's PATH (DoD 1)."""
+def with_audit_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin both prerequisites so no test depends on the developer's PATH or synced groups.
+
+    `uv`'s location was the original reason (DoD 1). **`pip-audit`'s presence is the second and
+    it was found by the first CI run this project ever had**: `pip-audit` lives in the `audit`
+    group, which is deliberately *not* installed by a default `uv sync` -- it costs 18 packages
+    for something one lane runs -- so on any machine that had not synced that group, `main()`
+    returned `EXIT_NO_TOOL` before building a single argument vector and twelve tests here
+    failed with `assert 0 == 2` and `assert 127 == 0`.
+
+    Faked rather than skipped, and the distinction matters. Nothing in this file runs the real
+    `pip-audit`: `subprocess.run` is a scripted seam in every test. What they assert is how the
+    argument vector is *built* -- `--frozen` on the export, `python -m pip_audit` rather than a
+    console script, no `shell=`. Those are the security-relevant claims in this lane, and
+    skipping them wherever the `audit` group is absent would have retired them from the default
+    lane on every machine and in CI, which is where they most need to run.
+
+    The one test that wants the real check -- `test_the_missing_tool_is_named_...` -- patches
+    `find_spec` back to `None` itself, and its own `monkeypatch` is applied after this one.
+    """
     monkeypatch.setattr(audit_deps.shutil, "which", lambda tool: f"/usr/local/bin/{tool}")
+    # Truthy and not a real `ModuleSpec`: nothing reads it, the script only asks `is None`.
+    monkeypatch.setattr(audit_deps.importlib.util, "find_spec", lambda name: object())
 
 
 def drive(runs: Runs, monkeypatch: pytest.MonkeyPatch, argv: list[str] | None = None) -> int:
@@ -194,7 +214,7 @@ def test_the_toolchain_scope_covers_every_group() -> None:
 
 
 def test_the_export_is_frozen_so_the_audit_cannot_be_of_a_resolution_nobody_installed(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Without `--frozen`, `uv export` may re-resolve when the lock and pyproject disagree.
 
@@ -211,7 +231,7 @@ def test_the_export_is_frozen_so_the_audit_cannot_be_of_a_resolution_nobody_inst
 
 
 def test_pip_audit_runs_through_this_interpreter_and_not_a_console_script(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`python -m pip_audit` is what makes the answering pip-audit provably the locked one."""
     runs = Runs()
@@ -225,7 +245,9 @@ def test_pip_audit_runs_through_this_interpreter_and_not_a_console_script(
         assert call[call.index("--format") + 1] == "json"
 
 
-def test_nothing_is_run_through_a_shell(with_uv: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_nothing_is_run_through_a_shell(
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     seen: list[dict[str, object]] = []
 
     def fake_run(argv, **kwargs):
@@ -247,7 +269,7 @@ def test_nothing_is_run_through_a_shell(with_uv: None, monkeypatch: pytest.Monke
 
 
 def test_a_clean_lock_exits_zero(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert drive(Runs(), monkeypatch) == 0
     out = capsys.readouterr().out
@@ -256,7 +278,7 @@ def test_a_clean_lock_exits_zero(
 
 
 def test_an_advisory_in_the_shipped_scope_fails_and_names_what_to_do(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     runs = Runs(reports={"shipped": VULNERABLE_REPORT})
 
@@ -272,7 +294,7 @@ def test_an_advisory_in_the_shipped_scope_fails_and_names_what_to_do(
 
 
 def test_an_advisory_in_only_the_toolchain_scope_is_reported_and_changes_nothing(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The decoy, and the case that actually happened.
 
@@ -310,7 +332,7 @@ def test_a_finding_with_no_fix_yet_says_so_rather_than_printing_an_empty_list() 
 
 
 def test_a_package_pip_audit_skipped_is_not_counted_as_clean(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A skip is the service answering and one package going unchecked. In the gate that fails."""
     runs = Runs(reports={"shipped": SKIPPED_REPORT})
@@ -325,13 +347,13 @@ def test_a_package_pip_audit_skipped_is_not_counted_as_clean(
 
 
 def test_a_skipped_package_in_the_reporting_scope_does_not_fail(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert drive(Runs(reports={"toolchain": SKIPPED_REPORT}), monkeypatch) == 0
 
 
 def test_an_unreachable_service_is_never_reported_as_clean(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The defect this whole script exists for.
 
@@ -354,7 +376,7 @@ def test_an_unreachable_service_is_never_reported_as_clean(
 
 
 def test_an_unreachable_service_in_the_reporting_scope_alone_does_not_fail(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     runs = Runs(audit_failures={"toolchain": UNREACHABLE_STDERR})
 
@@ -382,7 +404,7 @@ def test_a_report_that_is_not_an_object_is_a_failure_rather_than_an_empty_result
 
 
 def test_a_failed_export_carries_uvs_own_error(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     runs = Runs(export_failures={"shipped": "error: the lock file is not up to date"})
 
@@ -510,7 +532,7 @@ def test_the_table_says_which_scope_gates_so_a_reader_need_not_read_the_source()
 
 
 def test_a_single_scope_can_be_audited(
-    with_uv: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    with_audit_tools: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     runs = Runs()
     assert drive(runs, monkeypatch, ["--scope", "shipped"]) == 0

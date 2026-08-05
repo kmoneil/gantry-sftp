@@ -230,9 +230,16 @@ def test_work_linear_in_the_bytes_never_rises_at_any_tolerance(per_mib, fixed, t
 
 
 def baseline(**overrides) -> Baseline:
+    # **Both defaults track the machine rather than naming one** -- vary the axis under test,
+    # and hold every other axis at whatever this interpreter actually is. Hardcoding them made
+    # `test_a_baseline_from_another_machine_says_so_instead_of_applying` fail on the first CI
+    # run: it overrides `architecture` to force *that* mismatch, and on a runner the frozen
+    # `python` string mismatched too, so `mismatch()` reported the interpreter difference it
+    # found first and the test read as a reworded message rather than as a second axis moving.
+    # A test that overrides one field must be able to rely on the others agreeing.
     fields = {
-        "architecture": "aarch64",
-        "python": "3.13.14",
+        "architecture": platform.machine(),
+        "python": platform.python_version(),
         "control": 487_878_037,
         "ladders": {"download": {mib * MIB: cost for mib, cost in HEALTHY_DOWNLOAD.items()}},
     }
@@ -258,14 +265,24 @@ def test_a_baseline_from_another_machine_says_so_instead_of_applying():
 
     A gate keyed to an architecture it is not running on must say which one it wanted, in the
     words that would make it run, rather than quietly passing.
+
+    **Both halves name a value that cannot be this machine's, and read the other half back from
+    the machine.** Spelling either side as a literal ties the test to whoever wrote it: the
+    first CI run was on `x86_64` and on CPython 3.14, so a hardcoded `"x86_64"` baseline was no
+    longer a *foreign* one and a hardcoded `"this is aarch64"` was no longer true. Neither
+    sentinel below is a real architecture or a real version, which is the point -- the test is
+    that a mismatch is *reported*, not that any particular pair of machines mismatch.
     """
-    assert baseline(architecture="x86_64").mismatch() == (
-        "baseline was taken on x86_64 and this is aarch64; instruction counts do not cross "
-        "instruction sets"
+    machine = platform.machine()
+    version = platform.python_version()
+
+    assert baseline(architecture="not-a-real-arch").mismatch() == (
+        f"baseline was taken on not-a-real-arch and this is {machine}; instruction counts do "
+        "not cross instruction sets"
     )
-    assert baseline(python="3.14.0").mismatch() == (
-        "baseline was taken on CPython 3.14.0 and this is 3.13.14; a patch release moves every "
-        "count here"
+    assert baseline(python="0.0.0").mismatch() == (
+        f"baseline was taken on CPython 0.0.0 and this is {version}; a patch release moves "
+        "every count here"
     )
     assert baseline().mismatch() is None
 

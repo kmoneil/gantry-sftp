@@ -588,13 +588,21 @@ async def test_an_agent_holding_the_right_key_cannot_rescue_the_wrong_one(
     from succeeding through some key in a real ``~/.ssh`` -- which ``ssh`` would otherwise
     reach regardless of ``HOME``.
     """
-    # PerSourcePenalties is probed and silently dropped when an sshd will not take it, and
-    # this lane spends six deliberate authentication failures per run. Asserted here rather
-    # than assumed, because its absence does not surface here: it surfaces as a connection
-    # reset during key exchange in whatever unrelated test happens to run next.
-    assert "PerSourcePenalties no" in ssh_server.applied_directives, (
-        f"sshd dropped the directive that keeps deliberate auth failures from locking out "
-        f"the source address; it applied {ssh_server.applied_directives}"
+    # PerSourcePenalties is probed and silently dropped when an sshd will not take it, and this
+    # lane spends six deliberate authentication failures per run. Checked here rather than
+    # assumed, because its absence does not surface here: it surfaces as a connection reset
+    # during key exchange in whatever unrelated test happens to run next.
+    #
+    # **Dropped is not a failure, and reading it as one is what broke the first CI run.** The
+    # directive arrived in OpenSSH 9.8 and `sshd -t` is what drops it, so an sshd that refused
+    # it is an sshd older than 9.8 -- which has no penalty feature to suppress. The hazard and
+    # the directive are absent for the same reason and by the same version boundary, so the
+    # lane is safe either way and the subject of this test still runs. What must not happen is
+    # the third state: sshd took the directive and then did not apply it.
+    penalties = ssh_server.applied_directives
+    assert penalties in (OPTIONAL_DIRECTIVES, ()), (
+        f"sshd applied a directive set this suite does not know how to reason about: "
+        f"{penalties}. Expected either the full optional set or nothing at all"
     )
 
     monkeypatch.setenv("SSH_AUTH_SOCK", agent_holding_the_right_key["SSH_AUTH_SOCK"])
