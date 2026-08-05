@@ -50,6 +50,33 @@ pytestmark = pytest.mark.anyio
 KNOWN_MTIME = 1_600_000_000
 KNOWN_ATIME = 1_600_000_007
 
+SERVER_CANNOT_CHMOD_A_SYMLINK = os.chmod not in os.supports_follow_symlinks
+"""Whether the machine running `sftp-server` refuses `chmod` on a link because it cannot do it.
+
+**Linux cannot; macOS can, and two tests below asserted the refusal as though it were SFTP's.**
+`os.supports_follow_symlinks` is the platform's own answer -- the documented capability set,
+rather than a `sys.platform` string or a `try`/`except` that would also swallow a real error.
+On Linux `os.chmod` is absent from it and `chmod(..., follow_symlinks=False)` raises
+`NotImplementedError`; on macOS it is present and the call works, which is why `lsetstat`'s
+permissions branch succeeds there and `DID NOT RAISE` was the first CI failure on the macOS job.
+
+**The local platform is the right proxy here because the server *is* local**: these tests drive
+`sftp-server` on this machine. It would be the wrong proxy for a remote server, and that is
+exactly the gap D-151 is filed on -- a Linux client talking to a macOS server hits the same
+difference, and `docs/paths.md` and DESIGN's attribute table currently state the refusal without
+naming the condition.
+"""
+
+needs_a_server_that_cannot_chmod_a_symlink = pytest.mark.skipif(
+    not SERVER_CANNOT_CHMOD_A_SYMLINK,
+    reason=(
+        "this platform supports chmod without following a symlink (macOS does), so the refusal "
+        "these assert is not this server's behaviour -- what it does instead is D-151's open "
+        "question, and skipping is a placeholder for that answer rather than a decision"
+    ),
+)
+"""For the two tests whose subject is the *refusal* rather than the operation."""
+
 LCHMOD_NOTE = (
     "the server may be refusing because it cannot do this at all: Linux has no lchmod, so "
     "fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP and OpenSSH maps that to a contentless "
@@ -374,6 +401,7 @@ async def test_by_default_these_follow_a_symlink(tmp_path: Path):
     assert bits(link) == 0o777
 
 
+@needs_a_server_that_cannot_chmod_a_symlink
 async def test_chmod_of_a_symlink_is_impossible_on_a_linux_server(tmp_path: Path):
     """Found by writing this test expecting it to pass. **Linux has no `lchmod`.**
 
@@ -653,6 +681,7 @@ async def test_the_capability_refusal_names_the_operation_the_caller_asked_for(
     assert refusal.value.missing == (EXTENSION_LSETSTAT,)
 
 
+@needs_a_server_that_cannot_chmod_a_symlink
 async def test_the_non_following_refusal_also_names_the_path(tmp_path: Path):
     """The other branch of the same helper, and it needs its own test.
 

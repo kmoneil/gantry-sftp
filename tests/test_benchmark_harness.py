@@ -14,7 +14,6 @@ publish a number that says the thesis is free.
 
 from __future__ import annotations
 
-import resource
 import shutil
 import subprocess
 import sys
@@ -25,6 +24,13 @@ import anyio
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+
+# POSIX-only, and the whole module is: what it tests is a harness that measures CPU through
+# `getrusage`, which has no Windows equivalent. Fetched here rather than imported at the top,
+# because a module-scope `import resource` aborted *collection* on the first CI run with a
+# Windows job -- 4352 tests collected and none executed, this file being one of three that did
+# it. `benchmarks/` is not shipped and does not run on Windows in any case.
+resource = pytest.importorskip("resource", reason="getrusage is POSIX-only; see benchmarks/")
 
 _ROOT = Path(__file__).resolve().parent.parent
 _BENCHMARKS = _ROOT / "benchmarks"

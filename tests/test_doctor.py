@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pwd
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -190,7 +189,18 @@ def test_the_ssh_config_is_resolved_the_way_ssh_resolves_it(monkeypatch: pytest.
     Redirecting `HOME` must not move the answer. A report built on `Path.home()` would name a
     file `ssh` is not going to read, and would do it precisely when somebody is trying to work
     out why their config is being ignored.
+
+    **`pwd` is imported here rather than at module scope, and that is what lets the rest of this
+    file run on Windows.** It is a POSIX-only module, and importing it at the top aborted
+    collection of all of `test_doctor.py` on the first CI run with a Windows job — 4352 tests
+    collected, none executed. `doctor` is precisely the surface a Windows run is worth having
+    for: it is what reports whether `ssh.exe` was found, which is D-7's whole question. Losing
+    the module to one POSIX assertion would have been the wrong trade.
+
+    The claim itself is POSIX by construction: Windows has no passwd database and `ssh` resolves
+    the config differently there, so this is a skip rather than something to make portable.
     """
+    pwd = pytest.importorskip("pwd", reason="POSIX-only; Windows has no passwd database")
     account_home = pwd.getpwuid(os.getuid()).pw_dir
     monkeypatch.setenv("HOME", "/somewhere/else")
 

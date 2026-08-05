@@ -29,6 +29,12 @@ for _extra in (_ROOT / "benchmarks", _ROOT / "live-tests"):
         # else is called `_instructions`, and the front of the path could shadow a real module.
         sys.path.append(str(_extra))
 
+# `benchmarks/_harness.py` imports `resource` at module scope, so this import chain cannot even
+# be *collected* on Windows -- one of the three files that aborted the first CI run with a
+# Windows job before a single test ran. POSIX-only by nature: the harness measures CPU through
+# `getrusage`, and `benchmarks/` neither ships nor runs on Windows.
+_ = pytest.importorskip("resource", reason="benchmarks/ measures CPU via getrusage (POSIX-only)")
+
 import _instructions  # noqa: E402  # imported as a module so `measure` can be monkeypatched
 from _harness import SizePoint, SizeSweep  # noqa: E402
 from _instructions import (  # noqa: E402

@@ -23,6 +23,11 @@ for _extra in (_ROOT / "benchmarks", _ROOT / "live-tests"):
     if str(_extra) not in sys.path:
         sys.path.append(str(_extra))
 
+# Same chain and same reason as `test_instruction_harness.py`: `benchmarks/` reaches `resource`,
+# which does not exist on Windows, and a module-scope import there aborts collection rather than
+# failing a test.
+_ = pytest.importorskip("resource", reason="benchmarks/ measures CPU via getrusage (POSIX-only)")
+
 import _memory  # noqa: E402  # imported as a module so `subprocess` can be monkeypatched
 from _instructions import MIB  # noqa: E402
 from _memory import (  # noqa: E402
