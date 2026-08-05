@@ -87,6 +87,22 @@ def _no_leaked_resources(request: pytest.FixtureRequest):
 
     before = settle()
     yield
+    # **Drop pytest's own reference to every fixture value before measuring.** A yield-fixture
+    # that hands back a session is torn down before this finalizer runs -- its `with` blocks
+    # have exited and the session is closed -- but `item.funcargs` still holds the yielded
+    # object, and pytest does not clear that until after this fixture is finished. So the
+    # object is closed, unreachable by anything that matters, and still counted: every test in
+    # `test_sync_forwarding.py` reported `Dispatcher +1, Process +2, Session +1,
+    # SubprocessTransport +1`, 140 of them, none of which had leaked anything. Reproduced down
+    # to a twelve-line file whose only content was a fixture yielding a session.
+    #
+    # **Cleared rather than excluded, and the difference is the whole point.** Skipping objects
+    # that appear in `funcargs` would also skip a fixture that genuinely failed to close one.
+    # Removing only *pytest's* reference leaves every other reference intact, so a real leak --
+    # something still holding the object for its own reasons -- still counts. That is what
+    # keeps `test_it_catches_an_abandoned_async_generator_chain` working: the chain it abandons
+    # holds a *closed* transport, which is exactly the shape this check must keep reporting.
+    request.node.funcargs.clear()
     after = settle()
 
     grown = after.growth_since(before)
