@@ -8,6 +8,7 @@ packages installed is a test that reports the machine, not the code.
 from __future__ import annotations
 
 import os
+import resource
 import shutil
 import tempfile
 from collections.abc import AsyncGenerator
@@ -227,3 +228,50 @@ def give_one_file_a_second_name(first: Path, second: Path) -> None:
     if second.exists():
         return
     os.link(first, second)
+
+
+MUTANT_MEMORY_CEILING = 4 * 1024**3
+"""Address space one mutant's test run may use before it is killed as a mutant (D-154).
+
+**A mutation runner has to assume its mutants misbehave, because that is what a mutant is.** The
+lane already assumes one can *hang* -- mutmut's per-mutant timeout reports that as a kill and moves
+on. Unbounded allocation is the same class of misbehaviour and had no equivalent guard, so instead
+of killing the mutant it killed the machine: the CI job died four times at mutants 4350, 4350, 4363
+and ~4348, and the self-measuring run showed why. Memory sat flat near 14 GB for ten minutes and
+then went to 167 MB in thirty seconds. One mutant, deterministically the same one, allocating until
+the kernel took the VM.
+
+Four gibibytes because the suite does not come close: it runs in a few hundred megabytes, and the
+whole of `tests/` passes under this ceiling with the same 4451 results as without it -- measured
+before this was committed rather than assumed. What the ceiling costs is nothing; what it buys is
+that the bomb raises `MemoryError`, its test fails, and mutmut records a **kill** -- which is the
+correct verdict and exactly what the timeout already produces for the sibling failure mode.
+
+Armed only under the lane. `MUTANT_UNDER_TEST` is set per mutant by mutmut, so an ordinary run --
+and the editable install this repository develops against -- is untouched.
+"""
+
+
+def _cap_mutant_memory() -> None:
+    """Bound this process's address space when it is running one mutant's tests.
+
+    `RLIMIT_AS` rather than `RLIMIT_DATA`: the allocation to stop is a Python object graph, which
+    `RLIMIT_DATA` on Linux does not bound at all once glibc serves it from `mmap`. Guarded for
+    platforms without the limit rather than assumed present, which is this repository's rule for
+    anything the environment might not have.
+    """
+    if not os.environ.get("MUTANT_UNDER_TEST"):
+        return
+    limit = getattr(resource, "RLIMIT_AS", None)
+    if limit is None:  # pragma: no cover  # every platform this lane runs on has it
+        return
+    _, hard = resource.getrlimit(limit)
+    ceiling = (
+        MUTANT_MEMORY_CEILING
+        if hard in (resource.RLIM_INFINITY, -1)
+        else min(MUTANT_MEMORY_CEILING, hard)
+    )
+    resource.setrlimit(limit, (ceiling, hard))
+
+
+_cap_mutant_memory()
