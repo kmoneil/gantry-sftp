@@ -282,10 +282,15 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # A starved job and a hung one produce the same message without this, which is most of why
-    # D-154 took three runs to characterise. 30 minutes is above the ~23 the full run
-    # extrapolates to and well above the ~12 it has been dying at, so a timeout here means
-    # something new rather than the known failure.
-    timeout-minutes: 30
+    # D-154 took three runs to characterise.
+    #
+    # **45 rather than the 30 this started at, and the first value was wrong for an instructive
+    # reason.** 30 was derived by extrapolating from the rate before the run died -- but the run
+    # died at the memory bomb, and every mutant after it was unmeasured. With the ceiling in
+    # place the lane reached 8065 of 8548 in 30 minutes and hit this instead, so the real figure
+    # is ~32 and the extrapolation was reading half a curve. 45 leaves room for a slower runner
+    # without leaving a hang to sit for an hour.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0

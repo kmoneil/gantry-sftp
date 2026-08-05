@@ -307,9 +307,13 @@ def _fake_transport(process: _FakeProcess) -> SubprocessTransport:
 
 
 @pytest.mark.parametrize(
-    "error", [anyio.BrokenResourceError(), anyio.ClosedResourceError()], ids=["broken", "closed"]
+    "error_type",
+    [anyio.BrokenResourceError, anyio.ClosedResourceError],
+    ids=["broken", "closed"],
 )
-async def test_closing_a_pipe_the_peer_already_broke_is_not_an_error(error: BaseException):
+async def test_closing_a_pipe_the_peer_already_broke_is_not_an_error(
+    error_type: type[BaseException],
+):
     """Both members of both `suppress` tuples, which nothing had ever raised at.
 
     `_close_stdin` and `_release_pipes` each suppress exactly two exception types, and a
@@ -318,6 +322,15 @@ async def test_closing_a_pipe_the_peer_already_broke_is_not_an_error(error: Base
     has nothing left to do about it. Both types, both methods: dropping either member from
     either tuple fails one of the four cases.
     """
+    # **Built here rather than in the `parametrize` list, and that is a real leak rather than a
+    # style preference.** A parametrized value is constructed once at collection and reused for
+    # every run, so a module-lived exception instance accumulates a `__traceback__` on each raise
+    # -- and a traceback pins its frames, and those frames hold `self`. Two `SubprocessTransport`
+    # objects stayed alive per run because of it, which the leak lane reported as
+    # `SubprocessTransport +2` on every CI run since it first completed (D-153).
+    #
+    # The detector was right and the chain was ours. A fresh instance per run dies with the test.
+    error = error_type()
     stdin_fails = _FakeProcess(stdin=_FakeStream(close_error=error))
     await _fake_transport(stdin_fails).aclose()
     assert stdin_fails.stdin is not None
