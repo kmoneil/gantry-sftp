@@ -453,6 +453,27 @@ def test_secret_is_importable_from_the_package_the_docstrings_name():
 # --- the same rule, derived rather than restated ---------------------------------------------
 
 
+MUTMUT_MARKER = "__mutmut_"
+"""Same constant and same reason as `tests/test_sync_facade.py`, which D-131 fixed this way.
+
+Reading the *imported* package is deliberate (see below) and it has a consequence under the
+mutation lane: `mutants/gantry_sftp/` holds a mutated copy where every instrumented function has
+become a trampoline plus one `..._mutmut_N` variant per mutation. This enumerator then reported
+`_connect.py:connect__mutmut_12` and friends as new entry points taking a password, and the
+derived-set assertion below failed with hundreds of imaginary functions -- which is how the
+`mutation` job failed on this project's first CI runs.
+
+**Fixed at the source rather than by ignoring the file**, because D-131 established what that
+ignore costs: `test_sync_facade.py` was excluded from the lane for this exact shape, and the
+module it existed to prove correct was the one thereby left unjudged. Outside the lane there are
+no such names and this is an identity filter.
+
+The filter cannot over-apply silently. The derived-set test below asserts this enumerator *equals*
+the hand-written set, so dropping a real entry fails there by name. That is the control D-131 asks
+for, already present rather than added beside it.
+"""
+
+
 def functions_taking_a_password() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
     """Every function in the shipped source that declares a `password` parameter.
 
@@ -478,6 +499,10 @@ def functions_taking_a_password() -> dict[str, ast.FunctionDef | ast.AsyncFuncti
                 continue
             owner = owners.get(node)
             qualified = f"{owner.name}.{node.name}" if owner is not None else node.name
+            # One check covers both halves: mutmut marks a method as
+            # `xǁClassǁmethod__mutmut_1`, so the marker lands in the qualified name either way.
+            if MUTMUT_MARKER in qualified:
+                continue
             found[f"{module.relative_to(root).as_posix()}:{qualified}"] = node
     return found
 
