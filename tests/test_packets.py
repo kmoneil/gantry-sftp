@@ -377,12 +377,44 @@ def test_status_with_a_message_but_no_language_tag_decodes():
     assert status.language == b""
 
 
-def test_status_rejects_a_code_outside_the_defined_range():
+def test_status_degrades_a_code_outside_the_defined_range_to_the_catch_all():
+    # D-145. This used to raise, and `Codec.receive` latches a ProtocolError as terminal -- so a
+    # number with no name in our enum cost the whole connection. It is not a mis-parse: the
+    # length, the type, the id and the code field are all well-formed and the codec knows exactly
+    # where the frame ends. `FAILURE` is the v3 catch-all and this is what it is for.
     wire = b"\x00\x00\x00\x09\x65\x00\x00\x00\x01\x00\x00\x00\x63"
-    with pytest.raises(ProtocolError) as exc:
-        decode_frame(wire)
-    assert exc.value.args[0] == ("STATUS carries undefined status code 99; filexfer v3 defines 0-8")
-    assert exc.value.request_id == 1
+    status = decode_frame(wire)
+    assert status.code is StatusCode.FAILURE
+    assert status.raw_code == 99
+    assert status.request_id == 1
+
+
+def test_a_degraded_status_re_encodes_to_the_bytes_it_arrived_as():
+    # The degradation must not be lossy on the wire. Re-encoding 99 as 4 would make the round
+    # trip a rewrite, and this codec's whole claim is that it is not one.
+    #
+    # A *full* frame, tail included, because decode is permissive and encode is canonical --
+    # see `test_encoding_a_status_is_canonical_even_when_the_decoded_one_was_terse`. A terse
+    # frame legitimately does not survive a round trip, and using one here would have tested
+    # that rule instead of this one.
+    body = (
+        b"\x00\x00\x00\x01"  # request id
+        b"\x00\x00\x00\x63"  # code 99, which v3 cannot name
+        b"\x00\x00\x00\x02"
+        b"no"  # message
+        b"\x00\x00\x00\x00"  # language
+    )
+    wire = b"\x00\x00\x00\x13\x65" + body
+    assert encode(decode_frame(wire)) == wire
+
+
+def test_an_ordinary_status_carries_no_raw_code():
+    # The field is the exception's evidence, not a second copy of the code. Setting it on every
+    # status would make "did this arrive degraded?" unanswerable.
+    wire = b"\x00\x00\x00\x09\x65\x00\x00\x00\x01\x00\x00\x00\x04"
+    status = decode_frame(wire)
+    assert status.code is StatusCode.FAILURE
+    assert status.raw_code is None
 
 
 def test_encoding_a_status_is_canonical_even_when_the_decoded_one_was_terse():

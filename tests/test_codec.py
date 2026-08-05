@@ -584,43 +584,44 @@ def test_replies_are_reassembled_whatever_the_chunking(chunk_size: int):
     assert codec.outstanding == 0
 
 
-def test_a_conformant_v6_era_status_over_v3_costs_the_whole_connection():
-    """D-145. The trap split out of D-119, pinned so the decision is visible as a change.
+def test_a_conformant_v6_era_status_over_v3_no_longer_kills_the_connection():
+    """D-145, decided: degrade to the catch-all, keep the number, stay connected.
 
-    Distinct from `test_the_codec_is_terminal_after_a_protocol_error`, which uses an arbitrary
-    undefined code and asks "does garbage latch". This asks the harder question: **24 is not
-    garbage.** It is `SSH_FX_FILE_IS_A_DIRECTORY` from filexfer-13 9.1, and
-    `draft-ietf-secsh-filexfer-extensions-00` 3 says a `check-file-name` naming a directory
-    SHOULD be answered with exactly it. A conformant server, behaving conformantly, answering an
-    extension we asked for, costs us the connection rather than the request.
+    24 is `SSH_FX_FILE_IS_A_DIRECTORY` from filexfer-13 9.1, and
+    `draft-ietf-secsh-filexfer-extensions-00` 3 says a hashing request naming a directory SHOULD
+    be answered with exactly it. So this is a *conformant* server answering a v6-era extension
+    inside the v3 envelope we negotiated -- not a broken one.
 
-    Nothing here is malformed and the refusal is correct -- we asked a v6-era extension to answer
-    inside a v3 envelope and it did. That is why D-145 is a decision about extension replies
-    rather than a patch to this branch, and why this test pins the behaviour instead of asserting
-    it is right.
+    This test was committed one commit earlier asserting the opposite, which is what the card
+    asked for: pin the behaviour so whichever answer is chosen shows up as a change. It did.
 
-    Dormant today only because this library issues none of the three same-draft extensions it
-    holds constants for (`copy-data`, `home-directory`, `expand-path@openssh.com`) -- all three of
-    which the OpenSSH server advertises. It arms the day one of them is built.
+    Distinct from `test_the_codec_is_terminal_after_a_protocol_error`, which asks whether a
+    genuinely malformed frame latches. That one still must, and still does: the latch is for a
+    desynchronised stream, and a value with no name in an enum desynchronises nothing.
     """
     v6_era_but_real = 24
+    codec = negotiated_codec()
+    request = Stat(codec.allocate_request_id(), b"/some/directory")
+    codec.send(request)
+
     frame = (
         struct.pack(">B", int(PacketType.STATUS))
-        + struct.pack(">I", 7)
+        + struct.pack(">I", request.request_id)
         + struct.pack(">I", v6_era_but_real)
         + struct.pack(">I", len(b"is a directory"))
         + b"is a directory"
         + struct.pack(">I", 0)
     )
-    codec = negotiated_codec()
-    with pytest.raises(ProtocolError) as refusal:
-        codec.receive(struct.pack(">I", len(frame)) + frame)
-    assert refusal.value.args[0] == (
-        f"STATUS carries undefined status code {v6_era_but_real}; filexfer v3 defines 0-8"
-    )
+    (event,) = codec.receive(struct.pack(">I", len(frame)) + frame)
 
-    # The half that makes it a connection problem rather than a request problem.
-    assert codec.state is CodecState.FAILED
-    with pytest.raises(ProtocolError) as after:
-        codec.receive(encode(Status(1, StatusCode.OK)))
-    assert after.value.args[0] == "codec is in a failed state; the connection is not recoverable"
+    assert codec.state is not CodecState.FAILED, "an unnameable status must not be terminal"
+    assert isinstance(event, Completed)
+    assert event.response.code is StatusCode.FAILURE
+    assert event.response.raw_code == v6_era_but_real
+    assert event.response.message == b"is a directory"
+
+    # And the session stays usable, which is the entire point.
+    second = Stat(codec.allocate_request_id(), b"/x")
+    codec.send(second)
+    codec.receive(encode(Status(second.request_id, StatusCode.OK)))
+    assert codec.state is CodecState.READY

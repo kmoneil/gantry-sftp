@@ -51,6 +51,15 @@ transient: v3's catch-all is what a permission problem, a full disk, a name coll
 momentary appliance hiccup all arrive as, so retrying it would turn every fast clear failure
 into three slow ones. That changes when the quirks layer can match a server's message text.
 
+**A status code v3 has no name for also arrives as `FAILURE`**, and that is a decision rather
+than a coincidence. A server answering an extension from the v6-era draft may legally reply with
+a v6-era code — `SSH_FX_FILE_IS_A_DIRECTORY` is 24, and filexfer v3 stops at 8. Some servers map
+those down themselves and keep the detail in the message; asyncssh is one. Others send the number
+as-is. This client now produces the same thing either way: `FAILURE`, with the number kept on
+`Status.raw_code` and named in the error text, so you never have to know which kind of server you
+are talking to. It used to raise instead, and because a protocol error is terminal, a conformant
+server answering conformantly dropped the connection.
+
 **And against OpenSSH it cannot change, at any layer.** That is worth stating plainly rather
 than reading as a to-do: a transient `FAILURE` mid-transfer kills the transfer, and no amount
 of work here fixes it for the reference server. OpenSSH's `STATUS` message is a constant

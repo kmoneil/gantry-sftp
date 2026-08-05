@@ -547,6 +547,34 @@ class Status:
 
     ``FAILURE`` is a v3 catch-all meaning nothing more than "no". Making it actionable
     means reading ``message``, which is exactly the field a server is free not to send.
+
+    **A code v3 cannot name arrives as ``FAILURE`` with the number kept** (D-145). v6-era
+    extensions carried over a v3 session are entitled to answer with v6-era codes --
+    ``draft-ietf-secsh-filexfer-extensions-00`` 3 says a hashing request naming a directory
+    SHOULD be answered with ``SSH_FX_FILE_IS_A_DIRECTORY``, which is 24 and which filexfer-13
+    defines while ``filexfer-02`` does not. Refusing that used to raise, and
+    :meth:`~gantry_sftp.codec.Codec.receive` latches a ``ProtocolError`` as terminal, so a
+    conformant server answering conformantly cost the whole connection.
+
+    The refusal was the wrong shape rather than too strict. **Nothing about such a frame is
+    mis-parsed**: the length is right, the type is right, the request id and the code field are
+    well-formed uint32s, the tail parses, and the codec knows exactly where this frame ends and
+    the next begins. The latch exists for the cases where that is *not* true -- a truncated
+    frame, a length past the maximum, a reply matching no outstanding request -- because there
+    the stream is desynchronised and nothing after it can be trusted. A value with no name in
+    our enum desynchronises nothing.
+
+    So it degrades to the v3 catch-all, which is what ``FAILURE`` means and all it means, and
+    :attr:`raw_code` keeps what the wire actually said. That also **converges the two halves of
+    this seam**: asyncssh already maps everything above the v3 range down to ``FAILURE`` while
+    keeping ``reason``, so a server that flattens and a server that does not now produce the
+    same thing on this side, and a caller does not have to know which kind it is talking to.
+
+    Attributes:
+        raw_code: What the wire carried, when that was not a code v3 defines. ``None`` on every
+            ordinary status, so :meth:`encode_body` reproduces the frame it decoded rather than
+            re-writing 24 as 4 -- the round trip stays byte-exact, which a lossy degradation
+            would break.
     """
 
     packet_type: ClassVar[PacketType] = PacketType.STATUS
@@ -555,11 +583,12 @@ class Status:
     code: StatusCode
     message: bytes = b""
     language: bytes = b""
+    raw_code: int | None = None
 
     def encode_body(self, writer: WireWriter) -> None:
         """Append this packet's body, excluding the type byte."""
         writer.write_uint32(self.request_id)
-        writer.write_uint32(self.code)
+        writer.write_uint32(_status_wire_code(self.code, self.raw_code))
         writer.write_string(self.message)
         writer.write_string(self.language)
 
@@ -571,17 +600,46 @@ class Status:
         raw_code = reader.read_uint32()
         try:
             code = StatusCode(raw_code)
-        except ValueError as exc:
-            raise ProtocolError(
-                f"STATUS carries undefined status code {raw_code}; filexfer v3 defines 0-8",
-                packet_type=int(PacketType.STATUS),
-                request_id=request_id,
-            ) from exc
+        except ValueError:
+            # D-145. Not an error: see the class docstring for why a value with no name in this
+            # enum desynchronises nothing, and why killing the connection over one made a
+            # conformant server unusable. `FAILURE` is the v3 catch-all and this is exactly the
+            # case it is for; the number itself is kept rather than discarded.
+            code = StatusCode.FAILURE
+            unnameable: int | None = raw_code
+        else:
+            unnameable = None
 
         # The tail is optional in practice. Absent means terse, not malformed.
         message = bytes(reader.read_string()) if not reader.at_end else b""
         language = bytes(reader.read_string()) if not reader.at_end else b""
-        return cls(request_id=request_id, code=code, message=message, language=language)
+        return cls(
+            request_id=request_id,
+            code=code,
+            message=message,
+            language=language,
+            raw_code=unnameable,
+        )
+
+
+def _status_wire_code(code: StatusCode, raw_code: int | None) -> int:
+    """The number a STATUS writes for its code.
+
+    A module-level function rather than an expression inside ``Status.encode_body``, and the
+    reason is D-129 rather than style: mutmut does not instrument a method of a decorated
+    class, so a conditional living in the body of a ``@dataclass`` generates no mutants.
+    ``encode_body`` was four bare writes and reached no rule; adding the D-145 degradation to
+    it would have hidden the one branch in this packet worth mutating. Here it is visible.
+
+    Args:
+        code: The v3 code this status degraded to, or the real one.
+        raw_code: What the wire carried when v3 had no name for it, else ``None``.
+
+    Returns:
+        ``raw_code`` when there is one, so a status decoded from an unnameable code re-encodes
+        to the bytes it arrived as rather than to the catch-all it was reported as.
+    """
+    return code if raw_code is None else raw_code
 
 
 @dataclass(frozen=True, slots=True)

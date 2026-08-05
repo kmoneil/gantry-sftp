@@ -364,6 +364,13 @@ def raise_for_status(status: Status, *, path: bytes | None = None) -> None:
     error_class = _STATUS_ERRORS.get(status.code, ServerError)
     detail = bytes(status.message).decode("utf-8", "replace").strip()
     summary = f"server returned {status.code.name}"
+    if status.raw_code is not None:
+        # D-145. The code arrived as something v3 has no name for and was degraded to the
+        # catch-all so the connection survives. Reporting only `FAILURE` would throw away the
+        # single fact that distinguishes this from an ordinary refusal -- and it is the fact an
+        # operator needs, because it says the server is answering in a later dialect rather
+        # than saying no.
+        summary = f"{summary} (wire status {status.raw_code}, which filexfer v3 does not define)"
     if detail:
         summary = f"{summary}: {detail}"
     raise error_class(summary, code=int(status.code), message=bytes(status.message), path=path)
