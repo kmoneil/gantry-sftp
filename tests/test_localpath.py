@@ -20,6 +20,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from conftest import give_one_file_a_second_name
 from gantry_sftp.codec import Times
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session import (
@@ -296,7 +297,7 @@ def test_two_names_for_one_file_share_an_identity(tmp_path: Path):
     first = tmp_path / "README.md"
     first.write_text("first")
     second = tmp_path / "readme.md"
-    os.link(first, second)
+    give_one_file_a_second_name(first, second)
 
     assert identity(first) == identity(second)
 
@@ -321,7 +322,7 @@ def test_a_claimed_file_names_the_remote_path_that_holds_it(tmp_path: Path):
     ledger.claim(written, b"/root/README.md")
 
     other_name = tmp_path / "readme.md"
-    os.link(written, other_name)
+    give_one_file_a_second_name(written, other_name)
 
     assert ledger.collides_with(other_name) == b"/root/README.md"
 

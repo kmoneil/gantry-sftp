@@ -13,11 +13,11 @@ because what it exercises is the concurrency.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import pytest
 
+from conftest import give_one_file_a_second_name
 from gantry_sftp._logging import record_fields
 from gantry_sftp.codec import Read
 from gantry_sftp.exceptions import DestinationCollisionError
@@ -199,7 +199,7 @@ async def test_two_names_for_one_local_file_are_still_caught_when_workers_overla
     destination.mkdir()
     first = destination / "README.md"
     first.write_text("placeholder")
-    os.link(first, destination / "readme.md")
+    give_one_file_a_second_name(first, destination / "readme.md")
 
     server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
     async with open_session(server) as sftp:  # type: ignore[arg-type]

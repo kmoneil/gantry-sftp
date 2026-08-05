@@ -17,7 +17,7 @@ from pathlib import Path
 import anyio
 import pytest
 
-from conftest import HOLDS_NON_UTF8_NAMES
+from conftest import HOLDS_NON_UTF8_NAMES, give_one_file_a_second_name
 from gantry_sftp.codec import (
     Attrs,
     AttrsReply,
@@ -1277,7 +1277,7 @@ async def test_a_second_name_for_one_local_file_is_refused_not_overwritten(tmp_p
     destination.mkdir()
     first = destination / "README.md"
     first.write_text("placeholder")
-    os.link(first, destination / "readme.md")
+    give_one_file_a_second_name(first, destination / "readme.md")
 
     server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
     async with open_session(server) as sftp:  # type: ignore[arg-type]
@@ -1307,7 +1307,7 @@ async def test_everything_transferable_still_transfers_before_the_error(tmp_path
     destination.mkdir()
     first = destination / "README.md"
     first.write_text("placeholder")
-    os.link(first, destination / "readme.md")
+    give_one_file_a_second_name(first, destination / "readme.md")
 
     tree = {
         b"/root": (
@@ -1438,7 +1438,7 @@ async def test_the_refused_entry_is_reported_in_the_skip_list(tmp_path: Path):
     destination.mkdir()
     first = destination / "README.md"
     first.write_text("placeholder")
-    os.link(first, destination / "readme.md")
+    give_one_file_a_second_name(first, destination / "readme.md")
 
     server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
     async with open_session(server) as sftp:  # type: ignore[arg-type]
@@ -1575,7 +1575,7 @@ async def test_two_collisions_are_reported_in_the_plural(tmp_path: Path):
     for lower, upper in ((b"readme.md", b"README.md"), (b"notes.txt", b"NOTES.txt")):
         first = destination / upper.decode()
         first.write_text("placeholder")
-        os.link(first, destination / lower.decode())
+        give_one_file_a_second_name(first, destination / lower.decode())
 
     tree = {
         b"/root": (

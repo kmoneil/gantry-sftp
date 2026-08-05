@@ -7,6 +7,7 @@ packages installed is a test that reports the machine, not the code.
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from collections.abc import AsyncGenerator
@@ -204,3 +205,25 @@ needs_non_utf8_names = pytest.mark.skipif(
     reason="this filesystem rejects names that are not valid UTF-8 (macOS APFS/HFS+ does)",
 )
 """For tests asserting *on* such a name, as opposed to those that merely tolerate one."""
+
+
+def give_one_file_a_second_name(first: Path, second: Path) -> None:
+    """Make ``second`` another name for ``first``, however this filesystem gets there.
+
+    **A hard link is the stand-in for case folding, and the stand-in breaks where the real thing
+    lives.** On a case-sensitive filesystem `README.md` and `readme.md` are two entries, so a
+    link is what produces the two-names-one-inode condition the destination-collision checks are
+    about. On APFS or NTFS the filesystem already folds them together -- `second` *is* `first` --
+    and `os.link` answers `FileExistsError` rather than obliging.
+
+    That is not hypothetical: seven call sites and one example failed exactly this way on the
+    first macOS CI run, with `[Errno 17] File exists: '.../README.md' -> '.../readme.md'`. The
+    hazard was present and the simulation of it was what broke.
+
+    So the fold is used where it exists and reproduced where it does not, and neither branch is
+    a skip: the property under test -- two names, one file -- holds on both, which is the whole
+    reason these tests can run anywhere.
+    """
+    if second.exists():
+        return
+    os.link(first, second)
