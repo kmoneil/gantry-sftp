@@ -493,6 +493,24 @@ def test_an_operation_field_renders_a_path_without_its_class_name(
     assert message_names_path(caplog.records[0].getMessage(), "local", tmp_path / "out.csv")
 
 
+def capped_like(value: str) -> str:
+    """What `_capped` makes of `value`, spelled from the documented rule rather than imported.
+
+    The cut is in the **middle** (D-157): head, then `+<dropped>`, then a tail, with the marker
+    inside the same budget so the result is never longer than the head-cut version was. Written
+    out here for the reason this file already writes out `LCHMOD_NOTE`'s sibling -- a test that
+    imports the function it checks agrees with any mutation of it.
+    """
+    if len(value) <= MAX_VALUE_CHARS:
+        return value
+    marker = f"+{len(value) - MAX_VALUE_CHARS}"
+    tail = (MAX_VALUE_CHARS - len(marker)) // 3
+    if tail < 8:
+        return f"{value[:MAX_VALUE_CHARS]}{marker}"
+    head = MAX_VALUE_CHARS - len(marker) - tail
+    return f"{value[:head]}{marker}{value[-tail:]}"
+
+
 def test_an_untrusted_field_is_escaped_and_capped(caplog: pytest.LogCaptureFixture):
     """The same two rules as the dumper, applied where a *server-supplied path* becomes a field.
 
@@ -511,7 +529,11 @@ def test_an_untrusted_field_is_escaped_and_capped(caplog: pytest.LogCaptureFixtu
     assert "\x1b" not in message
     # The cap is on the *rendered* length, which is what lands in the file -- and escaping
     # grows it, since `\x1b` is four characters once written down.
-    assert message.endswith(f"+{len(repr(hostile_path)) - MAX_VALUE_CHARS}")
+    # The marker is now in the middle, so the record ends with the *tail* of the name -- which
+    # is the half that identifies it. Asserted through the rule rather than by shape.
+    # The *message* keeps `repr`'s quotes -- `_value` does not unquote, which is the
+    # difference between this surface and the structured field asserted elsewhere.
+    assert capped_like(repr(hostile_path)) in message
     assert len(message) < len(repr(hostile_path))
 
 
@@ -833,7 +855,7 @@ def test_a_scalar_inside_a_collection_is_still_escaped_and_capped():
     # The cap counts the *unquoted* rendering, since that is what the field carries -- the
     # three characters of `b'` and the closing quote are framing this surface does not keep.
     unquoted = repr(b"x" * 400)[2:-1]
-    assert fields["argv"][0] == unquoted[:MAX_VALUE_CHARS] + f"+{len(unquoted) - MAX_VALUE_CHARS}"
+    assert fields["argv"][0] == capped_like(unquoted)
     assert list(fields["steering"]) == ["A\\nB"]
 
 
@@ -867,7 +889,12 @@ def test_a_field_at_exactly_the_cap_is_not_truncated_either():
     """
     at_cap = "a" * MAX_VALUE_CHARS
     assert fields_of(remote=at_cap)["gantry"]["remote"] == at_cap
-    assert fields_of(remote=at_cap + "a")["gantry"]["remote"] == at_cap + "+1"
+    # One past the cap still says how many it dropped; where the marker sits is `capped_like`'s
+    # business, and the boundary this test exists for is the `<=` above it.
+    one_past = fields_of(remote=at_cap + "a")["gantry"]["remote"]
+    assert one_past == capped_like(at_cap + "a")
+    assert "+1" in one_past
+    assert one_past != at_cap + "a"
 
 
 @pytest.mark.parametrize("value", ["Kevin's.csv", b"Kevin's.csv"], ids=["str", "bytes"])
@@ -953,7 +980,7 @@ def test_summarise_puts_a_multi_line_error_on_one_line():
 
 def test_summarise_caps_a_long_message():
     error = ConnectError("x" * 500)
-    assert summarise(error).endswith(f"+{500 + 2 - MAX_VALUE_CHARS}")
+    assert capped_like(repr("x" * 500)) in summarise(error)
 
 
 # --- the library is silent until an application asks -------------------------------------

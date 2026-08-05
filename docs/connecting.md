@@ -105,6 +105,14 @@ an absent one:
 When no policy is active nothing is spawned and nothing is checked, so an unrestricted caller
 pays no process and no latency for the feature existing.
 
+> **Known defect: this does not work on Windows.** The `ssh -G` probe cannot be executed there —
+> the spawn fails with `ERROR_BAD_EXE_FORMAT` — so the check can never reach an answer. It fails
+> *closed*, which is the correct direction and means there is no hole here: what happens is that
+> **every** connection is refused while a policy is active, with a message about the destination.
+> This is listed separately from the three above because it is a bug rather than a scope decision.
+> Transfers refuse on Windows by design in any case, so the surface affected is the remote-only
+> operations. There is no workaround beyond not activating a policy there.
+
 ### Passwords
 
 A large fraction of enterprise SFTP endpoints, including MOVEit, GoAnywhere, Cleo and Sterling,

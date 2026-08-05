@@ -82,6 +82,13 @@ MASKED = "<redacted>"
 _SHORTEST_LITERAL = 2
 """Length of the shortest quoted ``repr`` there is: two quote characters and nothing between."""
 
+_SHORTEST_USEFUL_TAIL = 8
+"""Below this, a tail identifies nothing and the value degrades to a plain head cut.
+
+Eight characters is about a short filename with an extension -- ``data.csv`` is exactly eight.
+Spending the budget on a shorter fragment than that would cost the head without buying a name,
+which is the trade this middle cut exists to make in the other direction."""
+
 MAX_VALUE_CHARS = 96
 """Characters of one rendered field a record will carry before it says how many it dropped.
 
@@ -458,7 +465,27 @@ def _capped(rendered: str) -> str:
     rather than an import of it: the codec may not import :mod:`logging`, and this module is
     imported by ``transport/``, which has no business depending on the codec. Four lines is the
     price of keeping both of those true -- do not "consolidate" them.
+
+    **The cut is in the middle, and the bound is unchanged** (D-157). Taking the head kept the
+    part every path shares and dropped the filename, which is the part that identifies the
+    record: on macOS a temporary directory is past 96 characters before the name begins, so a
+    `get` record read ``local='/private/var/folders/df/…+28'`` and named nothing. That is not a
+    macOS problem -- any deep tree does it, and it was only invisible because ``/tmp`` is short.
+
+    The reasoning for the *bound* was always sound and is untouched: a server chooses how long
+    its names are, and a record per file is a per-file decision about the operator's disk. What
+    was wrong is that the reasoning was applied to one side of the transfer and the rule to
+    both. Keeping both ends costs nothing and makes the survivor useful.
     """
     if len(rendered) <= MAX_VALUE_CHARS:
         return rendered
-    return f"{rendered[:MAX_VALUE_CHARS]}+{len(rendered) - MAX_VALUE_CHARS}"
+    dropped = len(rendered) - MAX_VALUE_CHARS
+    marker = f"+{dropped}"
+    # The marker is part of the budget, so the result is never longer than the head-cut version
+    # was. A tail this short cannot identify anything, so degrade to the old shape rather than
+    # spend the whole allowance on punctuation.
+    tail = (MAX_VALUE_CHARS - len(marker)) // 3
+    if tail < _SHORTEST_USEFUL_TAIL:
+        return f"{rendered[:MAX_VALUE_CHARS]}{marker}"
+    head = MAX_VALUE_CHARS - len(marker) - tail
+    return f"{rendered[:head]}{marker}{rendered[-tail:]}"

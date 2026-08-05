@@ -50,6 +50,13 @@ rendered with `repr`, which escapes both and every non-printable codepoint besid
 capped at 96 bytes with the dropped count stated, because a 64 KiB filename is legal and a log
 line per frame is a disk to fill.
 
+**The cut is in the middle**, so a long value keeps both ends:
+`/private/var/folders/df/…+28…/data.csv`. The bound applies to *local* paths as well as remote
+ones, and taking the head dropped the filename — the part that identifies the record — while
+keeping the prefix every path in the run shares. That is not a remote-name problem: any deep
+local tree reaches 96 characters, and a macOS temporary directory does so before the filename
+begins.
+
 `gantry_sftp.codec.describe(packet)` is the renderer, and it is public and pure: pass it any
 packet and get the same line back, with no logging configured and no session running.
 
