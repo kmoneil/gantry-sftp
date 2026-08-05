@@ -562,9 +562,24 @@ also_copy = ["examples/"]
 # transferable half: a new test that reaches outside `src/` does not announce itself, it waits
 # for whoever runs the lane next. Not `also_copy` for the same reason as `test_lanes.py`: the
 # module imports no `gantry_sftp`, so copying it in would add wall-clock and kill no mutant.
+# `tests/test_instruction_harness.py` and `tests/test_memory_harness.py` are the fifth and
+# sixth, and the *pair* is the finding rather than either one. Ignoring `test_audit_deps.py`
+# moved the lane's collection error one file along -- which is what an ignore list assembled
+# one symptom at a time always does, since only the first failure is ever visible. Both import
+# `_harness` / `_memory` / `_instructions` from `benchmarks/`, `also_copy` names `examples/`
+# alone, so `mutants/` holds no such module. Their sibling `test_benchmark_harness.py` has been
+# in this list from the start for exactly that reason and nobody had asked what else reached
+# into `benchmarks/`.
+#
+# So the list was completed by *enumeration* rather than by another round trip through CI:
+# every test importing from `benchmarks/` or loading a `scripts/` module by path is here.
+# `tests/test_round_trips.py`, `tests/conftest.py` and `tests/test_packaging.py` also name
+# `benchmarks/`, in prose only -- checked rather than assumed.
 pytest_add_cli_args = [
     "--ignore=tests/test_benchmark_harness.py",
     "--ignore=tests/test_packaging.py",
     "--ignore=tests/test_lanes.py",
     "--ignore=tests/test_audit_deps.py",
+    "--ignore=tests/test_instruction_harness.py",
+    "--ignore=tests/test_memory_harness.py",
 ]

@@ -762,28 +762,36 @@ async def test_a_hostile_host_is_refused_before_anything_is_spawned():
 
 
 @pytest.mark.skipif(not Path("/usr/bin/ssh").exists(), reason="ssh not installed")
-def test_ssh_treats_a_dash_host_as_options_without_the_separator():
+def test_ssh_treats_a_dash_host_as_options_without_the_separator(tmp_path: Path):
     """Characterisation of ssh(1), not of us. It is why `--` is not optional.
 
     Without ``--``, a hostname beginning with ``-`` is parsed as options and
-    ``ProxyCommand`` executes. The marker in stderr is the proof.
+    ``ProxyCommand`` executes. A file the command writes is the proof.
 
-    **The failure message carries the evidence, and that is not decoration.** This assertion
-    fired for the first time on this project's first CI run -- passing against OpenSSH 10.0p2
-    locally and failing on the runner's older build -- and its message was a *conclusion*
-    ("ssh no longer executes ProxyCommand...") with nothing behind it. A characterisation test
-    that fails without saying what it saw cannot be diagnosed from a CI log, and this one gates
-    a security argument: whether ``--`` is still the defence D-120 says it is. So it reports the
-    version it ran against and what that version actually did. Reading the conclusion off a bare
-    assertion is how a stale threat model gets confirmed rather than checked.
+    **This is the positive control for the test below, and the marker is a file rather than a
+    line on stderr because the stderr spelling silently stopped working.** It failed on this
+    project's first CI run against the runner's OpenSSH 9.6p1 while passing against 10.0p2
+    locally -- and the evidence said the opposite of what its own message concluded: exit 255
+    with ``Connection closed by UNKNOWN port 65535``, which is ssh's rendering of a *proxied*
+    connection. ProxyCommand had run. Had it not, ssh would have failed to resolve
+    ``nonexistent.invalid`` and said so. All that differed was whether the child's stderr
+    reached ours.
+
+    That distinction is the whole value of this test, because the sibling below asserts the
+    marker is **absent**. On any OpenSSH where the marker never appears at all, that assertion
+    passes for free -- a guard that cannot fail, standing in front of the argument-injection
+    defence D-120 exists for. Weakening this control to match 9.6, or deleting it as a flake,
+    would have left the pair looking green and proving nothing. A file written by the command
+    is observable however ssh wires up its child's streams.
     """
+    marker = tmp_path / "proxy-ran"
     argv = [
         "/usr/bin/ssh",
         "-F",
         "/dev/null",
         "-o",
         "BatchMode=yes",
-        "-oProxyCommand=echo GANTRY_MARKER >&2",
+        f"-oProxyCommand=echo ran > {marker}",
         "nonexistent.invalid",
         "-s",
         "sftp",
@@ -792,10 +800,11 @@ def test_ssh_treats_a_dash_host_as_options_without_the_separator():
     version = subprocess.run(
         ["/usr/bin/ssh", "-V"], capture_output=True, text=True, timeout=30, check=False
     )
-    assert "GANTRY_MARKER" in result.stderr, (
+    assert marker.exists(), (
         "ssh did not execute ProxyCommand from an option-shaped argument, so the behaviour "
-        "`--` defends against may have changed; re-check whether `--` is still the right "
-        f"defence.\n  ssh -V: {version.stderr.strip() or version.stdout.strip()!r}"
+        "`--` defends against may have changed -- and the sibling test asserting the command "
+        "does NOT run can no longer fail. Re-check whether `--` is still the right defence."
+        f"\n  ssh -V: {version.stderr.strip() or version.stdout.strip()!r}"
         f"\n  argv:   {argv}"
         f"\n  exit:   {result.returncode}"
         f"\n  stderr: {result.stderr.strip()!r}"
@@ -804,12 +813,18 @@ def test_ssh_treats_a_dash_host_as_options_without_the_separator():
 
 
 @pytest.mark.skipif(not Path("/usr/bin/ssh").exists(), reason="ssh not installed")
-def test_the_separator_stops_ssh_parsing_a_dash_host_as_options():
+def test_the_separator_stops_ssh_parsing_a_dash_host_as_options(tmp_path: Path):
     """The other half: with ``--``, the same string is refused as a hostname.
 
     If a future OpenSSH ever stopped honouring ``--`` here, this failing is how we would
     find out -- rather than by shipping a client that executes attacker-chosen commands.
+
+    The marker is a **file**, matching the control above, and it is what makes this assertion
+    capable of failing at all: the previous spelling looked for a line on ``stderr`` that
+    OpenSSH 9.6p1 does not surface even when the command *does* run, so on that version this
+    test passed whether ``--`` worked or not.
     """
+    marker = tmp_path / "proxy-ran"
     result = subprocess.run(
         [
             "/usr/bin/ssh",
@@ -819,7 +834,7 @@ def test_the_separator_stops_ssh_parsing_a_dash_host_as_options():
             "BatchMode=yes",
             "-s",
             "--",
-            "-oProxyCommand=echo GANTRY_MARKER >&2",
+            f"-oProxyCommand=echo ran > {marker}",
             "sftp",
         ],
         capture_output=True,
@@ -827,7 +842,11 @@ def test_the_separator_stops_ssh_parsing_a_dash_host_as_options():
         timeout=30,
         check=False,
     )
-    assert "GANTRY_MARKER" not in result.stderr
+    assert not marker.exists(), (
+        f"`--` did not stop ssh parsing an option-shaped hostname as options: ProxyCommand "
+        f"ran. This is the argument-injection defence D-120 rests on.\n  stderr: "
+        f"{result.stderr.strip()!r}"
+    )
     assert result.returncode != 0
 
 
