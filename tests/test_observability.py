@@ -490,7 +490,7 @@ def test_an_operation_field_renders_a_path_without_its_class_name(
     ):
         pass
 
-    assert f"local='{tmp_path / 'out.csv'}'" in caplog.records[0].getMessage()
+    assert message_names_path(caplog.records[0].getMessage(), "local", tmp_path / "out.csv")
 
 
 def test_an_untrusted_field_is_escaped_and_capped(caplog: pytest.LogCaptureFixture):
@@ -992,6 +992,24 @@ def names_path(field: object, path: Path) -> bool:
     return dropped > 0 and field == f"{rendered[:MAX_VALUE_CHARS]}+{dropped}"
 
 
+def message_names_path(message: str, key: str, path: Path) -> bool:
+    """The same check against a rendered *message* rather than a structured field.
+
+    A separate function because the cap lands in a different place. `_render` writes
+    ``key=<value>`` where the value has already been through `repr`, so the bound applies to the
+    **quoted** rendering -- and a path long enough to be cut loses its closing quote with
+    everything else. `local='/private/var/…+28` is what that looks like, and it is why an
+    assertion looking for ``local='<path>'`` cannot simply be made tolerant by trimming.
+    """
+    if f"{key}='{path}'" in message:
+        return True
+    rendered = repr(str(path))
+    dropped = len(rendered) - MAX_VALUE_CHARS
+    if dropped <= 0:
+        return False
+    return f"{key}={rendered[:MAX_VALUE_CHARS]}+{dropped}" in message
+
+
 def requires_sftp_server() -> None:
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
@@ -1411,8 +1429,8 @@ async def test_a_download_records_both_ends_and_a_resumed_one_records_what_it_ad
 
     first = record_fields(finished[0])
     assert first["operation"] == "get"
-    assert first["remote"] == str(source)
-    assert first["local"] == str(destination)
+    assert names_path(first["remote"], source)
+    assert names_path(first["local"], destination)
     assert first["bytes"] == 512
 
     resumed = record_fields(finished[1])
