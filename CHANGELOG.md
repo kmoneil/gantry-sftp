@@ -3,13 +3,17 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## Unreleased
+## 0.1.0 — 2026-08-05
 
-**Nothing has been released yet.** No `v*` tag exists, `git describe --tags` returns a bare sha,
-and the distribution is not on PyPI — so there is no version out there to diff against and every
-entry below is part of what the first release will say. The heading gets a number and a date when
-a tag is cut, not before: a dated heading for a release nobody can install is the kind of claim
-this project asks its own docs not to make.
+**The first public release**, so there is nothing to diff against and everything below is new.
+Read [Known limitations](#known-limitations-stated-rather-than-left-to-be-discovered) before the
+feature list: `ssh` is a system dependency this package cannot install for you, and transfers
+refuse on Windows by design.
+
+This heading carried `## Unreleased` until the tag was cut, which is what
+`tests/test_packaging.py` and `release.yml` between them insist on — a dated heading for a
+release nobody can install is the kind of claim this project asks its own docs not to make, and
+tagging is the only moment that stops being true.
 
 ### What it is
 
