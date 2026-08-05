@@ -46,10 +46,23 @@ def build_remote(root: Path) -> None:
 
 
 def make_destination_fold(destination: Path) -> None:
-    """Give the destination two names for one file, as APFS and NTFS would."""
+    """Give the destination two names for one file, as APFS and NTFS would.
+
+    **On a filesystem that already folds case there is nothing to simulate**, and trying to
+    anyway is an error: `os.link` answers `FileExistsError` because `readme.md` *is*
+    `README.md` there. That is what this example failed with on macOS the first time CI ran it
+    -- the stand-in for the hazard breaking on the one platform where the hazard is real.
+
+    So the fold is detected rather than assumed absent. Where it exists the destination already
+    has the property this example is about, and the hard link is skipped; where it does not, the
+    link reproduces the identical condition -- two names, one inode -- which is what makes this
+    runnable on Linux at all.
+    """
     destination.mkdir()
     placeholder = destination / "README.md"
     _ = placeholder.write_bytes(b"placeholder\n")
+    if (destination / "readme.md").exists():
+        return
     os.link(placeholder, destination / "readme.md")
 
 

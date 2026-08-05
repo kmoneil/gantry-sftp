@@ -24,7 +24,7 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
-from conftest import HOLDS_NON_UTF8_NAMES
+from conftest import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names
 from gantry_sftp.codec import OpenDir
 from gantry_sftp.exceptions import (
     CapabilityError,
@@ -1567,6 +1567,7 @@ def build_class_tree(root: Path) -> None:
     (root / os.fsdecode(b"\xff.log")).write_bytes(b"not utf-8")
 
 
+@needs_non_utf8_names
 async def test_a_character_class_is_ascii_only_against_names_a_real_server_listed(
     tmp_path: Path,
 ):

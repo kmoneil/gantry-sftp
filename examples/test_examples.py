@@ -19,6 +19,14 @@ import pytest
 
 from gantry_sftp.transport import find_sftp_server
 
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tests"))
+from conftest import HOLDS_NON_UTF8_NAMES  # one probe, shared with tests/
+
+# The examples that put a non-UTF-8 filename on disk to demonstrate this library handling one.
+# macOS refuses such a name outright (`OSError: [Errno 92] Illegal byte sequence`), so these
+# cannot run there -- the *example* is correct and the filesystem will not hold its subject.
+NEEDS_NON_UTF8_NAMES = frozenset({"listing", "glob_patterns", "fsspec_urls", "paths"})
+
 EXAMPLES = sorted(p for p in Path(__file__).parent.glob("*.py") if p.name != Path(__file__).name)
 
 
@@ -53,6 +61,8 @@ def run_example(example: Path) -> tuple[int, str, str]:
 def test_an_example_runs_clean(example: Path):
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
+    if example.stem in NEEDS_NON_UTF8_NAMES and not HOLDS_NON_UTF8_NAMES:
+        pytest.skip(f"{example.stem} writes a non-UTF-8 filename; this filesystem refuses one")
 
     returncode, stdout, stderr = run_example(example)
     assert returncode == 0, f"{example.name} failed:\n{stderr}"
@@ -76,6 +86,14 @@ def test_the_publish_example_reports_the_mechanism_it_used():
     assert "mechanism=in-place" in stdout
 
 
+needs_non_utf8_names = pytest.mark.skipif(
+    not HOLDS_NON_UTF8_NAMES,
+    reason="this filesystem rejects names that are not valid UTF-8 (macOS APFS/HFS+ does)",
+)
+"""For the two tests whose subject *is* the odd name rather than the example around it."""
+
+
+@needs_non_utf8_names
 def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
     # The example is only worth having if it demonstrates the awkward case. A directory of
     # tidy ASCII names would prove nothing that a docstring could not claim.
@@ -208,6 +226,7 @@ def test_the_verification_example_shows_corruption_slipping_past_the_size_check(
     assert "cannot resume:" in stdout
 
 
+@needs_non_utf8_names
 def test_the_paths_example_demonstrates_both_refusals_and_the_awkward_name():
     """Three claims, and each is a decision the class could have made the other way.
 

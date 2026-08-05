@@ -16,6 +16,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+from conftest import needs_non_utf8_names
 from gantry_sftp.codec import (
     Attrs,
     Close,
@@ -754,6 +755,7 @@ async def test_a_real_directory_larger_than_one_batch(tmp_path: Path):
     assert {item.name for item in listing} == expected
 
 
+@needs_non_utf8_names
 async def test_a_real_server_reports_a_name_that_is_not_valid_utf8(tmp_path: Path):
     """The axis that actually bites, varied rather than assumed away.
 
@@ -893,6 +895,7 @@ async def test_a_real_server_tolerates_a_scan_abandoned_mid_directory(tmp_path: 
         assert len(await sftp.listdir(str(tmp_path))) == 150
 
 
+@needs_non_utf8_names
 async def test_a_real_server_reports_a_non_utf8_name_through_a_scan_too(tmp_path: Path):
     # The axis that bites, varied on the streaming path as well: a name is bytes on both.
     if find_sftp_server() is None:

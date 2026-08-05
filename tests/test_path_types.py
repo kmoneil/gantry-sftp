@@ -32,6 +32,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
+from conftest import needs_non_utf8_names
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
@@ -285,6 +286,7 @@ async def test_the_local_path_still_takes_both_of_the_types_it_declares(tmp_path
     assert (tmp_path / "as-str.txt").read_bytes() == b"payload"
 
 
+@needs_non_utf8_names
 async def test_a_str_remote_path_still_round_trips_a_hostile_name(tmp_path: Path):
     """The other guard: the `str` branch is what carries a surrogateescaped name back.
 

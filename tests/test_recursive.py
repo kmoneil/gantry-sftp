@@ -17,6 +17,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+from conftest import HOLDS_NON_UTF8_NAMES
 from gantry_sftp.codec import (
     Attrs,
     AttrsReply,
@@ -62,6 +63,11 @@ from gantry_sftp.session import (
     remote_component_reason,
 )
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+
+# `build_tree` adds the non-UTF-8 name only where the filesystem will hold it, so every
+# count and byte total over that tree has to move with it rather than being a literal.
+ODD_NAMES_IN_TREE = 1 if HOLDS_NON_UTF8_NAMES else 0
+ODD_BYTES_IN_TREE = 2 if HOLDS_NON_UTF8_NAMES else 0
 
 pytestmark = pytest.mark.anyio
 
@@ -939,8 +945,10 @@ def build_tree(root: Path) -> None:
     (root / "sub" / "deeper").mkdir()
     (root / "sub" / "deeper" / "leaf.txt").write_bytes(b"leaf")
     (root / "sub" / "link.csv").symlink_to(root / "top.csv")
-    # A name that is not valid UTF-8, which is ordinary on Linux.
-    (root / os.fsdecode(b"caf\xe9.bin")).write_bytes(b"\xe9\xe9")
+    # A name that is not valid UTF-8, which is ordinary on Linux -- conditional because macOS
+    # refuses to hold one at all. See `conftest.HOLDS_NON_UTF8_NAMES`.
+    if HOLDS_NON_UTF8_NAMES:
+        (root / os.fsdecode(b"caf\xe9.bin")).write_bytes(b"\xe9\xe9")
 
 
 async def test_downloading_a_real_tree(tmp_path: Path):
@@ -963,9 +971,10 @@ async def test_downloading_a_real_tree(tmp_path: Path):
         source / "sub" / "nested.bin"
     ).read_bytes()
     assert (destination / "sub" / "deeper" / "leaf.txt").read_bytes() == b"leaf"
-    assert (destination / os.fsdecode(b"caf\xe9.bin")).read_bytes() == b"\xe9\xe9"
+    if HOLDS_NON_UTF8_NAMES:
+        assert (destination / os.fsdecode(b"caf\xe9.bin")).read_bytes() == b"\xe9\xe9"
 
-    assert result.files == 4
+    assert result.files == 3 + ODD_NAMES_IN_TREE
     assert result.directories == 2
     # The symlink is reported rather than copied or followed.
     assert [Path(os.fsdecode(skip.path)).name for skip in result.skipped] == ["link.csv"]
@@ -1061,11 +1070,12 @@ async def test_uploading_a_real_tree(tmp_path: Path):
         source / "sub" / "nested.bin"
     ).read_bytes()
     assert (destination / "sub" / "deeper" / "leaf.txt").read_bytes() == b"leaf"
-    assert (destination / os.fsdecode(b"caf\xe9.bin")).read_bytes() == b"\xe9\xe9"
+    if HOLDS_NON_UTF8_NAMES:
+        assert (destination / os.fsdecode(b"caf\xe9.bin")).read_bytes() == b"\xe9\xe9"
 
-    assert result.files == 4
+    assert result.files == 3 + ODD_NAMES_IN_TREE
     assert result.directories == 2
-    assert result.transferred == 200_000 + len(b"top") + len(b"leaf") + 2
+    assert result.transferred == 200_000 + len(b"top") + len(b"leaf") + ODD_BYTES_IN_TREE
     # The symlink is reported rather than followed and copied -- the exfiltration shape,
     # going this way: a link to /etc/shadow would otherwise arrive under an innocent name.
     assert [Path(os.fsdecode(skip.path)).name for skip in result.skipped] == ["link.csv"]
@@ -1162,7 +1172,7 @@ async def test_a_real_round_trip_up_then_down_is_byte_identical(tmp_path: Path):
         "top.csv",
         "sub/nested.bin",
         "sub/deeper/leaf.txt",
-        os.fsdecode(b"caf\xe9.bin"),
+        *([os.fsdecode(b"caf\xe9.bin")] if HOLDS_NON_UTF8_NAMES else []),
     ):
         assert (tmp_path / "back" / relative).read_bytes() == (source / relative).read_bytes()
 
@@ -1189,7 +1199,7 @@ async def test_removing_a_real_tree(tmp_path: Path):
     assert not doomed.exists()
     assert outside.read_bytes() == b"untouched", "rmtree followed a link out of the tree"
     assert result.directories == 3
-    assert result.files == 6
+    assert result.files == 5 + ODD_NAMES_IN_TREE
     assert result.transferred == 0
 
 

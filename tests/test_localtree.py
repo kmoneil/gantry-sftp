@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import HOLDS_NON_UTF8_NAMES
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session import (
     EntryKind,
@@ -33,8 +34,14 @@ def build(root: Path) -> None:
     (root / "sub" / "deeper" / "leaf.txt").write_bytes(b"leaf")
     (root / "link.txt").symlink_to(root / "a.txt")
     (root / "dirlink").symlink_to(root / "sub", target_is_directory=True)
-    # Not valid UTF-8, and perfectly ordinary on Linux.
-    (root / os.fsdecode(b"caf\xe9.bin")).write_bytes(b"\xe9\xe9")
+    # Not valid UTF-8, and perfectly ordinary on Linux -- conditional because macOS refuses
+    # to hold such a name at all. See `conftest.HOLDS_NON_UTF8_NAMES`.
+    if HOLDS_NON_UTF8_NAMES:
+        (root / os.fsdecode(b"caf\xe9.bin")).write_bytes(b"\xe9\xe9")
+
+
+ODD_NAME: tuple[bytes, ...] = (b"caf\xe9.bin",) if HOLDS_NON_UTF8_NAMES else ()
+"""Spliced into the expected listings, empty where the filesystem will not hold it."""
 
 
 def entries(root: Path, **kwargs) -> dict[tuple[bytes, ...], LocalWalkEntry]:
@@ -93,7 +100,7 @@ def test_files_and_directories_are_sorted_by_name(tmp_path: Path):
     # changes between runs makes a report impossible to diff.
     build(tmp_path)
     root = entries(tmp_path)[()]
-    assert root.files == (b"a.txt", b"b.txt", b"caf\xe9.bin")
+    assert root.files == (b"a.txt", b"b.txt", *ODD_NAME)
     assert root.directories == (b"sub",)
 
 
@@ -157,7 +164,7 @@ def test_max_depth_zero_lists_the_root_and_nothing_else(tmp_path: Path):
     build(tmp_path)
     (root,) = list(walk_local(tmp_path, max_depth=0))
     assert root.directories == ()
-    assert root.files == (b"a.txt", b"b.txt", b"caf\xe9.bin")
+    assert root.files == (b"a.txt", b"b.txt", *ODD_NAME)
     assert [item.reason for item in root.skipped].count(SkipReason.TOO_DEEP) == 1
 
 
