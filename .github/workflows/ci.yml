@@ -258,8 +258,17 @@ jobs:
       - run: uv sync --frozen
       - run: uv run --frozen python scripts/lanes.py netem
 
+  # **Weekly and on demand, not per change** (D-159). ~29 minutes, and what it produces is a
+  # report in the gitignored `_reports/` -- D-94's rule is that a figure exists only for the run
+  # that just made it, so there is nothing here a push needs to know. The two shape assertions
+  # that *do* gate -- throughput must not fall as the file grows -- are a property of the data
+  # path, and a change to the data path is exactly when somebody should run this deliberately.
+  #
+  # `release.yml` runs it before publishing, which is where it genuinely matters: a version on
+  # PyPI cannot be taken back, and this lane found a bug that had been live for two releases
+  # (D-152) the first time it was ever allowed to finish.
   benchmarks:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -279,7 +288,9 @@ jobs:
   # a human can do the diff until there is.
   # ---------------------------------------------------------------------------
   mutation:
-    if: github.event_name != 'pull_request'
+    # The comment above has said "weekly and on demand" since this file was written; the
+    # condition said `!= 'pull_request'`, which is every push. Now it matches (D-159).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # A starved job and a hung one produce the same message without this, which is most of why
     # D-154 took three runs to characterise.

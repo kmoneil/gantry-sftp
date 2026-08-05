@@ -75,6 +75,21 @@ jobs:
       - run: uv run --frozen python scripts/lanes.py fast
       - run: uv run --frozen python scripts/lanes.py audit
 
+      # **The long lanes run here rather than per push** (D-159). `ci.yml` moved `benchmarks`
+      # to the weekly schedule because a ~29 minute job whose output is a gitignored report is
+      # not a question any single push needs answered -- but a release is the one step that
+      # cannot be taken back, and this lane found a bug that had been live for two releases
+      # (D-152) the first time it was ever allowed to finish. `iproute2` is for the shaped-link
+      # rows; without it they skip with a reason rather than failing.
+      #
+      # `mutation` is deliberately **not** here. It takes over 45 minutes, has never once run to
+      # completion (D-154), and cannot gate anyway: `mutmut run` exits 0 whether or not mutants
+      # survive, and the register it would be diffed against lives in the gitignored `_plans/`.
+      # Adding it would put an unbounded, non-gating job in front of the one irreversible step.
+      - run: sudo apt-get install -y --no-install-recommends iproute2
+      - run: uv sync --frozen --all-extras --group audit --group bench
+      - run: uv run --frozen python scripts/lanes.py benchmarks
+
   # ---------------------------------------------------------------------------
   # Build once, publish that artifact. Building separately in the publish job
   # would upload something no test has seen.
