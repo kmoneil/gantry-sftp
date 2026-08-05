@@ -26,7 +26,6 @@ import io
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -42,6 +41,7 @@ from fsspec.registry import (
     registry,
 )
 
+from conftest import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names
 from gantry_sftp import fsspec as gantry_fsspec
 from gantry_sftp.codec import Attrs
 from gantry_sftp.exceptions import CapabilityError, NoSuchFileError, ServerError
@@ -97,38 +97,6 @@ class LocalGantryFS(GantrySFTPFileSystem):
         self._stack = stack
         self._owner_pid = os.getpid()
         return session
-
-
-def _filesystem_holds_non_utf8_names() -> bool:
-    """Whether this machine's temporary filesystem can hold a name that is not valid UTF-8.
-
-    **Linux can; macOS cannot, and it is the filesystem refusing rather than Python.** APFS and
-    HFS+ validate that a name is UTF-8 and answer `OSError: [Errno 92] Illegal byte sequence`,
-    so the fixture below could not build its tree at all and 98 tests in this module errored on
-    the first CI run that included a macOS row.
-
-    Probed rather than keyed to `sys.platform`, which is this repository's rule everywhere else
-    it asks what the environment can do -- the netem lane, `sftp-server`, Docker. The property
-    belongs to the *filesystem*, not the operating system: a case-insensitive or UTF-8-enforcing
-    mount can appear under Linux too, and a macOS machine with a suitable mount would be wrongly
-    skipped by a platform check.
-    """
-    with tempfile.TemporaryDirectory() as probe:
-        try:
-            (Path(probe) / "\udce9").touch()
-        except OSError:
-            return False
-        return True
-
-
-HOLDS_NON_UTF8_NAMES = _filesystem_holds_non_utf8_names()
-"""Set once: building the tree per test would probe the filesystem ~98 times."""
-
-needs_non_utf8_names = pytest.mark.skipif(
-    not HOLDS_NON_UTF8_NAMES,
-    reason="this filesystem rejects names that are not valid UTF-8 (macOS APFS/HFS+ does)",
-)
-"""For the tests that assert *on* the odd name, as opposed to the ones that merely tolerate it."""
 
 
 @pytest.fixture

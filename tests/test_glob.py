@@ -24,6 +24,7 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
+from conftest import HOLDS_NON_UTF8_NAMES
 from gantry_sftp.codec import OpenDir
 from gantry_sftp.exceptions import (
     CapabilityError,
@@ -1364,8 +1365,10 @@ def build_glob_tree(root: Path) -> None:
     (root / ".hidden.csv").write_bytes(b"hhh")
     (root / "REPORT.CSV").write_bytes(b"rrr")
     # Not valid UTF-8, and legal on ext4. The axis the card named: a lossy decode makes two
-    # distinct names match one pattern, so the match has to run on the bytes.
-    (root / os.fsdecode(b"odd-\xff\xfe.csv")).write_bytes(b"ooo")
+    # distinct names match one pattern, so the match has to run on the bytes. Conditional
+    # because macOS refuses to hold such a name at all -- see `conftest.HOLDS_NON_UTF8_NAMES`.
+    if HOLDS_NON_UTF8_NAMES:
+        (root / os.fsdecode(b"odd-\xff\xfe.csv")).write_bytes(b"ooo")
     sub = root / "sub"
     sub.mkdir()
     (sub / "c.csv").write_bytes(b"ccc")
@@ -1396,15 +1399,18 @@ async def test_globbing_a_real_server(tmp_path: Path):
 
     # Sorted, because a real server's READDIR order is its own business -- the fake's order is
     # the only place this suite may assert on sequence.
-    assert sorted(top) == [prefix + b"/a.csv", prefix + b"/odd-\xff\xfe.csv"]
+    odd = [prefix + b"/odd-\xff\xfe.csv"] if HOLDS_NON_UTF8_NAMES else []
+    assert sorted(top) == sorted([prefix + b"/a.csv", *odd])
     assert hidden == [prefix + b"/.hidden.csv"]
     assert one_level == [prefix + b"/sub/c.csv"]
-    assert sorted(every_level) == [
-        prefix + b"/a.csv",
-        prefix + b"/odd-\xff\xfe.csv",
-        prefix + b"/sub/c.csv",
-        prefix + b"/sub/deeper/d.csv",
-    ]
+    assert sorted(every_level) == sorted(
+        [
+            prefix + b"/a.csv",
+            *odd,
+            prefix + b"/sub/c.csv",
+            prefix + b"/sub/deeper/d.csv",
+        ]
+    )
     assert directories == [prefix + b"/sub"]
     # A genuinely case-folding *server* is not in any lane here -- ext4 does not fold -- so
     # what this proves is our folding against a real listing, which is the half we own. The
@@ -1465,12 +1471,10 @@ async def test_a_real_server_listing_feeds_get_without_the_caller_joining_anythi
         async for match in found:
             _ = await sftp.get(match.path, destination / os.fsdecode(match.name))
 
-    assert sorted(p.name for p in destination.iterdir()) == [
-        "a.csv",
-        "c.csv",
-        "d.csv",
-        os.fsdecode(b"odd-\xff\xfe.csv"),
-    ]
+    expected = ["a.csv", "c.csv", "d.csv"]
+    if HOLDS_NON_UTF8_NAMES:
+        expected.append(os.fsdecode(b"odd-\xff\xfe.csv"))
+    assert sorted(p.name for p in destination.iterdir()) == sorted(expected)
     assert (destination / "d.csv").read_bytes() == b"ddd"
 
 
