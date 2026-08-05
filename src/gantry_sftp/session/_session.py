@@ -2529,9 +2529,9 @@ class Session:
         it, so a WRITE-only handle -- the one an upload is holding -- answers ``FAILURE``
         with ``"Unable to hash file"``. Verifying something being uploaded therefore costs a
         second ``OPEN``, and cannot reuse the handle the bytes are going through.
-        ``draft-ietf-secsh-filexfer-extensions-00`` 3 defines a ``check-file-name`` taking a
-        *path* that would remove that second ``OPEN``; nothing this project can reach
-        implements it, so it is named rather than built (D-118).
+        The draft's path-taking sibling would remove that second ``OPEN``; it is permanently
+        not built, and :class:`~gantry_sftp.codec.CheckFile` is where the decision and its
+        evidence live.
 
         The digest count is not on the wire: the server sends one digest per block,
         concatenated, and how many that is follows from ``block_size`` and the digest size of

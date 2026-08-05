@@ -300,10 +300,29 @@ class CheckFile:
     ``check-file`` is the name both are advertised under. Paramiko implements one request
     called ``check-file`` that takes a handle, which is the shape here.
 
-    The path-taking sibling is worth knowing about rather than merely noting: it is the answer
-    to verifying an upload without a second ``OPEN``, since the handle a ``put`` is holding is
-    write-only and cannot be hashed. Nothing implements it that this project can reach, so it
-    is not built -- see :class:`CheckFileReply` for the rule that decides that.
+    **The path-taking sibling is permanently not built, and this is the one place that says so**
+    (D-119, closed 2026-08-05). It is the answer to verifying an upload without a second
+    ``OPEN`` -- the handle a ``put`` is holding is write-only and cannot be hashed -- so the
+    saving would be two round trips per verified file, and on a ``put_tree`` with
+    ``verify=Verify.HASH`` it would be 2N. That is a real saving and it is still not worth
+    building, because there is nothing to build it against:
+
+    * OpenSSH answers ``OP_UNSUPPORTED`` to ``check-file``, ``check-file-handle``,
+      ``check-file-name`` and ``check-file@openssh.com`` alike -- measured on 10.0p2, twice,
+      most recently 2026-08-05.
+    * asyncssh does not contain the string at all.
+    * paramiko implements one handle-taking request, and went on doing so across the 5.0.0
+      major release. Its own source asks, beside the algorithm table, whether the extension "is
+      actually supported anymore".
+
+    The advertisement cannot settle it either, which is why no probe helps: the draft advertises
+    **both** requests under the single name ``check-file``, exactly as paramiko advertises its
+    one. Nothing short of sending the request distinguishes them, and sending it costs a round
+    trip per session to ask a question no reachable server answers yes to.
+
+    So building it would mean a branch whose only witness is a fixture we wrote from the draft,
+    which is what the fakes rule refuses. If a reachable implementation ever appears, this
+    paragraph is the specification and :class:`CheckFileReply` carries the reply half.
 
     Body layout, from that draft and from the frames paramiko produced::
 

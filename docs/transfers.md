@@ -342,12 +342,13 @@ implementation of this extension it can actually reach. A server sending the dra
 refused with a message naming both shapes, rather than parsed on a guess. Both directions are
 committed as golden fixtures with a live test that re-runs the capture.
 
-Two more things the draft settles that this README previously credited to paramiko. The 256-byte
+One more thing the draft settles that this page previously credited to paramiko: the 256-byte
 floor under `block_size` is the specification's (`MUST NOT be smaller than 256 bytes`), so every
-implementation refuses below it. And the draft defines a second request, `check-file-name`, that
-takes a **path** instead of a handle — which is what would remove the extra `OPEN` that verifying
-an upload costs, since the handle a `put` holds is write-only and cannot be hashed. Nothing this
-project can reach implements it, so it is named here and not built.
+implementation refuses below it.
+
+The draft also defines a path-taking sibling that would remove the extra `OPEN` an upload's
+verification costs. It is permanently not built — the decision and the measurements behind it are
+in `gantry_sftp.codec.CheckFile`'s docstring, which is the one place that carries them.
 
 `examples/server_capabilities.py` runs this with no arguments, and shows the path you will
 almost certainly take: OpenSSH answers `OP_UNSUPPORTED`, and the example falls to the size
