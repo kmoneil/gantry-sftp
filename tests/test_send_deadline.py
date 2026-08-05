@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 from pathlib import Path
 
 import anyio
@@ -389,6 +390,13 @@ async def test_a_timed_out_send_ends_the_connection_rather_than_the_operation(tm
     assert second.value is first.value
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason=(
+        "the teardown of this row is shielded and therefore uncancellable; it relies on the "
+        "stalled peer resuming, which is not guaranteed off Linux -- see D-160"
+    ),
+)
 async def test_no_send_timeout_means_no_bound_at_all(tmp_path: Path):
     """``request_timeout=None`` is a legitimate thing to ask for and is never the default.
 
@@ -404,6 +412,14 @@ async def test_no_send_timeout_means_no_bound_at_all(tmp_path: Path):
     asserted here: a test proving it would have to hang to do so. This row's subject is the
     absence of a bound on the *transfer*, which the recovering server proves without wedging
     the suite.
+
+    **And "recovering" turned out to be a Linux fact** (D-160). On macOS this hung the whole
+    lane for 45 minutes and left an orphaned `sftp-server` behind: the peer did not drain the
+    way it does here, so the shielded `CLOSE` took exactly the no-deadline branch this docstring
+    warns about. Nothing in-process can rescue that -- `move_on_after` cannot cancel a shield,
+    which is the property that makes the shield worth having -- so the only bound is the CI
+    job's own `timeout-minutes`. Skipped by platform rather than by probe because there is no
+    probe for "will this fake drain here", and inventing one would be pretending.
     """
     server = StallingServer(stall_on=Read, stall_after=2, wedge=False)
     with anyio.move_on_after(1.0) as scope:

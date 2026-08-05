@@ -51,6 +51,7 @@ jobs:
   # platform-dependent -- `src` has no `sys.platform` branch that narrows a type.
   # ---------------------------------------------------------------------------
   gates:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,6 +86,7 @@ jobs:
   # mean PyPI is down. That is the intended behaviour and the output says which it was.
   # ---------------------------------------------------------------------------
   audit:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,6 +111,7 @@ jobs:
   # a hard link standing in for it. Both were found here on the first run.
   # ---------------------------------------------------------------------------
   fast:
+    timeout-minutes: 20
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -146,6 +149,7 @@ jobs:
   # ---------------------------------------------------------------------------
   fast-windows:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 25
     runs-on: windows-latest
     continue-on-error: true
     steps:
@@ -163,6 +167,7 @@ jobs:
   # more as the heap grows and the gating lane should stay under a minute.
   # ---------------------------------------------------------------------------
   leaks:
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -181,6 +186,7 @@ jobs:
   # remote to run it on.
   # ---------------------------------------------------------------------------
   live:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -199,6 +205,7 @@ jobs:
   # no-cryptography claim harder to check than it should be. Hence its own job.
   # ---------------------------------------------------------------------------
   server-matrix:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -224,6 +231,7 @@ jobs:
   # which of the two ran, so a lane that could not compare says so instead of passing quietly.
   # ---------------------------------------------------------------------------
   cost:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -247,6 +255,7 @@ jobs:
   # ---------------------------------------------------------------------------
   netem:
     if: github.event_name != 'pull_request'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -269,6 +278,7 @@ jobs:
   # (D-152) the first time it was ever allowed to finish.
   benchmarks:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
