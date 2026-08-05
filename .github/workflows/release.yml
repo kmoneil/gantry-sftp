@@ -65,7 +65,13 @@ jobs:
           enable-cache: true
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-client openssh-server
       - run: uv sync --frozen --all-extras --group audit
+        # Skipped for the reason `ci.yml` gives at length: the parked-worktree hook asks about
+        # worktrees a background session left on a developer's machine, and a runner's fresh
+        # checkout can never have one. Set in both workflows so the two spellings of "run the
+        # gates" do not disagree about which hooks that means.
       - run: uv run --frozen python scripts/lanes.py gates
+        env:
+          SKIP: parked-worktrees
       - run: uv run --frozen python scripts/lanes.py fast
       - run: uv run --frozen python scripts/lanes.py audit
 

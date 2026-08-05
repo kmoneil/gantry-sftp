@@ -92,11 +92,25 @@ packages = ["src/gantry_sftp"]
 # installed. `.gitignore` is *not* in the list because hatchling force-includes it whatever the
 # excludes say -- tried both spellings and measured the tarball -- and a line that does nothing
 # is worse than an absent one.
+#
+# **The two pre-commit hook scripts go with the config that calls them, and they were shipping
+# without it.** `.pre-commit-config.yaml` is excluded above and is the *only* thing that invokes
+# `warn_parked_worktrees.sh` and `forbid_exec_bit.sh`, so both were arriving in the sdist as
+# orphans -- present, unreferenced and unrunnable. Same class as the `.complexipy_cache/` this
+# list was written for, and the same rule: what describes how the project is developed is not
+# what a user installs. `tests/test_packaging.py` pins it.
+#
+# `scripts/lanes.py` and `scripts/audit_deps.py` deliberately stay. `tests/` is in the sdist for
+# downstream packagers who rebuild and run the suite, and those two are how the suite and its
+# advisory lane are run -- excluding them would ship the tests with no supported way to invoke
+# them, which is the over-application this rule invites.
 [tool.hatch.build.targets.sdist]
 exclude = [
   "benchmarks",
   ".github",
   ".pre-commit-config.yaml",
+  "scripts/warn_parked_worktrees.sh",
+  "scripts/forbid_exec_bit.sh",
   "pyrightconfig.deprecations.json",
   ".complexipy_cache",
   ".hypothesis",

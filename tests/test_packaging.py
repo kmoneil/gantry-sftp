@@ -313,6 +313,37 @@ def test_the_sdist_carries_the_licence_too(distribution: tuple[Path, Path]):
 
 
 @pytest.mark.slow
+def test_the_sdist_does_not_carry_a_hook_script_its_config_cannot_reach(
+    distribution: tuple[Path, Path],
+):
+    """A script whose only caller is excluded is an orphan, and orphans ship silently.
+
+    `.pre-commit-config.yaml` is out of the sdist -- it describes how this project is developed
+    -- and it is the only thing that invokes `warn_parked_worktrees.sh` or
+    `forbid_exec_bit.sh`. Both were arriving in the distribution anyway: present, unreferenced,
+    and unrunnable. Nothing failed, which is the point; this is the class of defect this module
+    exists for, and the same one that let a `.complexipy_cache/` ship unnoticed.
+
+    `lanes.py` is asserted **present** in the same breath, because the risk of a rule like this
+    is over-applying it: `tests/` is in the sdist for downstream packagers who rebuild and run
+    the suite, and `lanes.py` is how the suite is run. Excluding it would ship the tests with no
+    supported way to invoke them, so the two halves are pinned together rather than the
+    exclusion alone.
+    """
+    _, sdist = distribution
+    with tarfile.open(sdist) as archive:
+        scripts = sorted(
+            PurePosixPath(name).name for name in archive.getnames() if "/scripts/" in name
+        )
+    assert "warn_parked_worktrees.sh" not in scripts, scripts
+    assert "forbid_exec_bit.sh" not in scripts, scripts
+    assert "lanes.py" in scripts, (
+        f"lanes.py stopped shipping; the sdist carries tests/ for downstream packagers and "
+        f"this is how they run them: {scripts}"
+    )
+
+
+@pytest.mark.slow
 def test_the_built_version_comes_from_the_package(distribution: tuple[Path, Path]):
     """The single-sourcing, proven at the one moment it matters: what the artifact is called."""
     wheel, sdist = distribution

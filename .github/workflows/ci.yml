@@ -56,7 +56,14 @@ jobs:
           enable-cache: true
       - run: uv python install
       - run: uv sync --frozen
+        # `SKIP` is pre-commit's own mechanism, read from the environment. The parked-worktree
+        # hook looks for worktrees left under `.claude/worktrees/` by a background session on a
+        # developer's machine; a runner checks out a fresh tree and can never have one, so the
+        # hook is asking a question whose answer here is always "none". It is the one hook in
+        # the config that is about the *developer's* workflow rather than about the code.
       - run: uv run --frozen python scripts/lanes.py gates
+        env:
+          SKIP: parked-worktrees
 
   # ---------------------------------------------------------------------------
   # Known advisories against the versions `uv.lock` pins. Two scopes with two verdicts --
