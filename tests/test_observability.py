@@ -1008,33 +1008,32 @@ def names_path(field: object, path: Path) -> bool:
     before the filename, so an ordinary *local* path is truncated too. See D-157.
 
     So these assertions check that the field names the file, not that the value happens to fit.
-    The capped spelling is written out here rather than taken from `_capped`, for the reason
-    this repository states elsewhere: an expectation computed with the code under test moves
-    with it.
+
+    **One helper owns the cap's spelling, and this delegates to it.** These two were written a
+    few hours apart -- this one when the cap still cut the head off, `capped_like` when D-157
+    moved the cut into the middle -- and only `capped_like` was updated. Nothing failed here,
+    because on Linux a temporary path is under 96 characters and the equality branch above
+    answers first; macOS is where the second branch runs, so macOS is where it broke. Two copies
+    of one rule, and the copy that was wrong was the one this machine could not reach.
     """
-    rendered = str(path)
-    if field == rendered:
-        return True
-    dropped = len(rendered) - MAX_VALUE_CHARS
-    return dropped > 0 and field == f"{rendered[:MAX_VALUE_CHARS]}+{dropped}"
+    return field == capped_like(str(path))
 
 
 def message_names_path(message: str, key: str, path: Path) -> bool:
     """The same check against a rendered *message* rather than a structured field.
 
-    A separate function because the cap lands in a different place. `_render` writes
-    ``key=<value>`` where the value has already been through `repr`, so the bound applies to the
-    **quoted** rendering -- and a path long enough to be cut loses its closing quote with
-    everything else. `local='/private/var/…+28` is what that looks like, and it is why an
-    assertion looking for ``local='<path>'`` cannot simply be made tolerant by trimming.
+    A separate function because the cap lands in a different place, not because it knows a
+    different rule. `_render` writes ``key=<value>`` where the value has already been through
+    `repr`, so the bound applies to the **quoted** rendering -- and a path long enough to be cut
+    loses its closing quote with everything else, which is why an assertion looking for
+    ``local='<path>'`` cannot be made tolerant by trimming.
+
+    **The spelling comes from `capped_like` rather than being written out again.** This was the
+    third copy of one rule in this file, all three written head-cut and only one updated when
+    D-157 moved the cut into the middle. Two of them broke, and only on macOS, because a Linux
+    temporary path is short enough that the copies are never reached.
     """
-    if f"{key}='{path}'" in message:
-        return True
-    rendered = repr(str(path))
-    dropped = len(rendered) - MAX_VALUE_CHARS
-    if dropped <= 0:
-        return False
-    return f"{key}={rendered[:MAX_VALUE_CHARS]}+{dropped}" in message
+    return f"{key}={capped_like(repr(str(path)))}" in message
 
 
 def requires_sftp_server() -> None:
