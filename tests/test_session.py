@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from contextlib import suppress
 from pathlib import Path
@@ -732,3 +733,106 @@ def test_session_is_constructible_without_the_context_manager():
     session = Session(Dispatcher(FakeServer(), Codec()), ServerLimits.unknown())  # type: ignore[arg-type]
     assert session.limits == ServerLimits.unknown()
     assert session.sizes_for(b"\x00\x00\x00\x00").read_length > 0
+
+
+# --- D-142: the argument ceiling, decided rather than waited for -----------------------------
+
+TRANSFER_KEYWORDS = {
+    "get": (
+        "progress",
+        "depth",
+        "no_follow",
+        "resume",
+        "verify_size",
+        "verify",
+        "preserve_times",
+        "mode",
+    ),
+    "put": (
+        "publish",
+        "resume",
+        "preserve_times",
+        "mode",
+        "verify",
+        "progress",
+        "depth",
+    ),
+    "get_tree": (
+        "max_depth",
+        "progress",
+        "preserve_times",
+        "mode",
+        "resume",
+        "concurrency",
+    ),
+    "put_tree": (
+        "max_depth",
+        "publish",
+        "preserve_times",
+        "mode",
+        "progress",
+        "resume",
+        "concurrency",
+    ),
+}
+"""The four transfer signatures, pinned so an addition is a decision rather than a surprise.
+
+D-142 was filed because fourteen functions sat at exactly ten arguments and none at eleven -- a
+ceiling with nothing under it and nothing over it, where the next feature that needs an argument
+decides the shape of a parameter object under deadline pressure.
+
+**Two things the recon found that change what to do about it.** `ruff`'s `max-args = 10` is an
+*enforced gate*, in pre-commit and in `lanes.py gates`, so an eleventh argument cannot land
+quietly -- the commit is refused. And nothing in the backlog would add one to any of these four.
+So the risk is not that the wall is hit silently; it is that the decision made *when* it is hit
+is a bad one, and the fix for that is a decision written down, not an object built early.
+
+**The decision, made now so it is not made later under pressure.** When an eleventh is needed:
+
+- `preserve_times` and `mode` become one `preserve` argument. They are the only pair shared by
+  all four of these, identically, and they are one concept -- what the destination inherits from
+  the source. It is also where a third axis would go: preserving *ownership* is the plausible
+  next feature, `Session.chown` already exists, and `preserve_owner` is exactly the argument that
+  would hit the wall.
+- `verify_size` and `verify` become one `checks` argument, on `get` and `put` only.
+- `no_follow` joins neither and stays flat.
+
+**And why the two obvious bundles are the wrong ones**, recorded so they are not re-proposed:
+`verify_size` + `verify` is *not* four-way shared -- `put` has only `verify` and neither tree has
+either -- and a `Verification` type sitting beside the existing `Verify` enum is two similar names
+for different things. `no_follow` is `get`-only and is forced on internally for every file in a
+recursive download, so it is not a policy a caller sets for a tree at all.
+"""
+
+
+@pytest.mark.parametrize("method", sorted(TRANSFER_KEYWORDS))
+def test_a_transfer_signature_does_not_change_without_the_decision_being_revisited(method: str):
+    signature = inspect.signature(getattr(Session, method))
+    keywords = tuple(
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert keywords == TRANSFER_KEYWORDS[method], (
+        f"Session.{method}'s keyword arguments changed. If this is an addition, read "
+        f"TRANSFER_KEYWORDS' docstring first -- D-142 already decided where the next one goes, "
+        f"so that the shape is not invented under deadline pressure."
+    )
+
+
+def test_the_transfer_surface_still_has_the_headroom_the_decision_assumes():
+    # The gate is ruff's and it fails the build at eleven; this asserts the *distance* to it,
+    # which ruff cannot, so "get is one argument from the wall" is a fact a reader can see here
+    # rather than a thing they discover by adding one.
+    ceiling = 10
+    for method, keywords in TRANSFER_KEYWORDS.items():
+        positional = [
+            name
+            for name, parameter in inspect.signature(getattr(Session, method)).parameters.items()
+            if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD and name != "self"
+        ]
+        assert len(positional) + len(keywords) <= ceiling, f"Session.{method} is over the ceiling"
+    assert len(TRANSFER_KEYWORDS["get"]) + 2 == ceiling, (
+        "get() is no longer exactly at the ceiling; D-142's premise was that it is, and the "
+        "decision recorded above was sized against that"
+    )
