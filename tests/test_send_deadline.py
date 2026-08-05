@@ -61,7 +61,35 @@ from gantry_sftp.exceptions import TransferTimeoutError
 from gantry_sftp.session import Dispatcher, Publish, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
-pytestmark = pytest.mark.anyio
+pytestmark = [
+    pytest.mark.anyio,
+    # **The whole module, off Linux, and the earlier per-test skip was the wrong shape** (D-160).
+    #
+    # Every row here opens a session against a peer that has stopped reading, which is the point.
+    # Teardown then sends a *shielded* `CLOSE`, and a shield is by construction uncancellable --
+    # `move_on_after` cannot end it, and neither can the `fail_after(WATCHDOG)` these tests carry,
+    # which is why a watchdog per row is not the protection it looks like. Whether that `CLOSE`
+    # completes comes down to whether the peer's buffer has room, and on Linux it always has.
+    #
+    # On macOS it does not. The first row in the file hangs, the job runs until the runner's own
+    # timeout, and an orphaned `sftp-server` is left behind. Skipping one row -- the one whose
+    # docstring described the hazard -- fixed nothing, because the hazard belongs to the fake and
+    # every row uses it.
+    #
+    # The real fix is in `StallingServer`: a peer that drains on close would make the shielded
+    # write complete everywhere, and that is D-160's open half. This is a skip rather than that
+    # fix because the fix cannot be verified from here -- there is no macOS to run it on, and an
+    # unverified change to the one helper this whole file depends on is worse than a skip that
+    # says why.
+    pytest.mark.skipif(
+        sys.platform != "linux",
+        reason=(
+            "these rows wedge a peer on purpose and their teardown is a shielded, uncancellable "
+            "write; whether it completes is the peer's buffering, which only Linux is known to "
+            "make safe here -- see D-160"
+        ),
+    ),
+]
 
 SEND_TIMEOUT = 0.5
 """Short, because every test here waits it out. The shipped default is `request_timeout`."""
@@ -390,13 +418,6 @@ async def test_a_timed_out_send_ends_the_connection_rather_than_the_operation(tm
     assert second.value is first.value
 
 
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason=(
-        "the teardown of this row is shielded and therefore uncancellable; it relies on the "
-        "stalled peer resuming, which is not guaranteed off Linux -- see D-160"
-    ),
-)
 async def test_no_send_timeout_means_no_bound_at_all(tmp_path: Path):
     """``request_timeout=None`` is a legitimate thing to ask for and is never the default.
 
