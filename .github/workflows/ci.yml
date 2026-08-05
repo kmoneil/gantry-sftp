@@ -1,12 +1,15 @@
 # Continuous integration for gantry-sftp.
 #
-# THIS FILE HAS NEVER RUN. There is no git remote -- Repo Rules forbid one for now -- so
-# GitHub has never seen this repository and nothing here has ever been executed. It is
-# committed anyway for two reasons. Every lane DESIGN.md 10 calls load-bearing runs today
-# only when a human types the command, on one aarch64 Linux box; writing down which lane runs
-# where, on which platforms, and what it needs is most of the work, and it is work that does
-# not need a remote. And the Windows job is the entire stated closure condition of the card
-# about `ssh.exe` resolution, which cannot close while nothing creates the CI.
+# **It ran for the first time on 2026-08-05**, and the first run was worth the wait: it found a
+# benchmark lane broken for two releases by a signature change nothing type-checked (D-152), a
+# leak detector blaming 140 tests that had not leaked (D-153), two hook scripts shipping to PyPI
+# without the config that invokes them, a filesystem that will not hold the filenames a whole
+# test axis is built on (D-150), and a security control dead on Windows (D-156). None of it was
+# visible to any gate that runs on a developer's machine.
+#
+# This header used to say the file had never run and explain why it was committed anyway. That
+# argument held -- writing down which lane runs where is most of the work and needed no remote --
+# and it is kept only as the reason the first run had this much to say.
 #
 # Every lane below is invoked through `scripts/lanes.py`, never by spelling out a pytest
 # command here. Two spellings of "how this project runs its tests" is how the netem lane ends
@@ -93,17 +96,17 @@ jobs:
       - run: uv run --frozen python scripts/lanes.py audit
 
   # ---------------------------------------------------------------------------
-  # The fast lane on all three platforms. This is the job that pays: `resolve_ssh_executable`
-  # implements a SysNative-before-System32 probe for Windows OpenSSH that has never executed
-  # on Windows, and `tests/test_argv.py` covers it only with injected inputs.
+  # The fast lane on the two platforms this library supports. Both gate.
   #
-  # Windows does not gate, and the reason is not caution. Transfers are POSIX-only: the data
-  # path needs `os.pread`/`os.pwrite` and `preserve_times` needs `os.utime` on a descriptor,
-  # all three Unix-only, so `get`/`get_tree`/`put`/`put_tree` refuse there by design (see
-  # `session/_platform.py`). Every test that moves bytes therefore fails on Windows, and a
-  # job known to fail for a known reason should report rather than block. Making it gate
-  # means marking the out-of-scope rows, and doing that before a single Windows run would be
-  # guessing at which ones they are -- which is what this job exists to stop being a guess.
+  # Windows was the third row here until D-158 moved it to `fast-windows` below, on the weekly
+  # schedule. The short version: transfers are POSIX-only by design, so the platform gets the
+  # codec, the transport and the remote-only operations and none of the four things anybody
+  # installs this for. The long version is in that job's own block.
+  #
+  # macOS gates and is worth the minute. It differs from Linux in two ways this library cares
+  # about and neither is exotic: APFS refuses a filename that is not valid UTF-8 (D-150), and it
+  # folds case, so the destination-collision checks D-37 built meet the real hazard rather than
+  # a hard link standing in for it. Both were found here on the first run.
   # ---------------------------------------------------------------------------
   fast:
     runs-on: ${{ matrix.os }}
@@ -278,6 +281,11 @@ jobs:
   mutation:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # A starved job and a hung one produce the same message without this, which is most of why
+    # D-154 took three runs to characterise. 30 minutes is above the ~23 the full run
+    # extrapolates to and well above the ~12 it has been dying at, so a timeout here means
+    # something new rather than the known failure.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -285,5 +293,29 @@ jobs:
           enable-cache: true
       - run: uv python install
       - run: uv sync --frozen
-      - run: uv run --frozen python scripts/lanes.py mutation
+      # **The lane has never produced a verdict here** (D-154). Three runs died at 4350, 4350
+      # and 4363 of 8548 mutants -- within thirteen of each other, about half the workload,
+      # ~11-12 minutes in -- always with `The runner has received a shutdown signal`, which is
+      # what a dead VM looks like from inside the job. That tightness rules out random
+      # infrastructure reclaim; something crosses a threshold at a repeatable point.
+      #
+      # Two candidates measured and ruled out before adding this: the log is 13502 lines and
+      # 923 KB, which is nothing, and `mutants/` is 44 MB against ~14 GB free. That leaves
+      # memory, which cannot be measured from outside the runner -- so the job measures itself.
+      #
+      # The sampler writes to **stdout** rather than a file on purpose. If the VM is killed the
+      # file dies with it, and the evidence we want is the last reading before the kill; a
+      # streamed line is already in GitHub's log by then. Prefixed so it can be grepped out of
+      # mutmut's own progress.
+      - name: mutation lane, sampling memory as it goes
+        run: |
+          ( while sleep 15; do
+              printf 'D154-USAGE %s mem_avail_mb=%s disk_avail_mb=%s\n' \
+                "$(date -u +%H:%M:%S)" \
+                "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)" \
+                "$(df -m --output=avail / | tail -1 | tr -d ' ')"
+            done ) &
+          sampler=$!
+          trap 'kill "$sampler" 2>/dev/null || true' EXIT
+          uv run --frozen python scripts/lanes.py mutation
       - run: uv run --frozen mutmut results
