@@ -86,6 +86,15 @@ is a protocol codec, a request scheduler and an ergonomics layer.
   rather than a ratio. No published figure has a regression test behind it, which is why no
   committed file carries one.
 
+### Reporting a vulnerability
+
+[`SECURITY.md`](SECURITY.md) carries the disclosure policy: a private advisory channel, an email
+fallback for reporters who will not use GitHub, the supported-version window, and the scope. The
+scope is the part worth reading before reporting — this package contains no cryptography and does
+not implement SSH, so a finding about ciphers, key exchange or host-key algorithms belongs to
+OpenSSH. What is in scope is everything a hostile server can send us, how the `ssh` argument
+vector is built, and where a credential can end up.
+
 ### Requirements
 
 Python 3.13+, an `ssh` binary on `PATH`, and a POSIX host for transfers.

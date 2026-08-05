@@ -149,6 +149,85 @@ def test_the_project_urls_are_declared_absolute_and_share_one_host():
     )
 
 
+POLICY = ROOT / "SECURITY.md"
+"""The disclosure policy (D-147).
+
+Asserted here rather than in a security test module because it is a *release surface*: it is the
+file a stranger reads before deciding whether to report something privately, and like the licence
+text it is invisible to every other test in this suite.
+"""
+
+
+def test_the_security_policy_exists_and_offers_two_private_channels():
+    """A policy naming one channel is a policy with one way to fail.
+
+    The fallback is not decoration. A reporter who will not open a GitHub account -- or who is
+    reporting from a machine where they would rather not sign in -- is exactly the reporter worth
+    hearing from, so both spellings are asserted.
+    """
+    assert POLICY.is_file(), "SECURITY.md is missing; a reporter's only options are a public issue"
+    text = POLICY.read_text(encoding="utf-8")
+    assert "security/advisories/new" in text, "SECURITY.md offers no private advisory channel"
+    # An address that is not part of the advisory URL. Written as a search rather than as
+    # `"@" in text`, which the URL alone would satisfy -- the fallback has to be its own channel.
+    assert re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text.replace("security/advisories/new", "")), (
+        "SECURITY.md names no email fallback, so a reporter without a GitHub account has none"
+    )
+
+
+def test_the_security_contact_is_the_maintainer_pyproject_declares():
+    """**Derived from the declaration, not restated beside it.**
+
+    A security policy fails silently in exactly one way: the address in it stops being read. It
+    cannot fail loudly, because nobody finds out until a report goes unanswered -- and by then the
+    reporter has usually gone public or given up. So the contact is checked against
+    `[project.authors]`, which means changing maintainer breaks this test rather than the channel.
+    """
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = {author["email"] for author in pyproject["project"]["authors"] if "email" in author}
+    assert declared, "[project.authors] declares no email, so nothing pins the security contact"
+    text = POLICY.read_text(encoding="utf-8")
+    reachable = [address for address in declared if address in text]
+    assert reachable, (
+        f"SECURITY.md names none of the maintainer addresses in [project.authors]: {declared}"
+    )
+
+
+def test_the_advisory_link_points_at_the_repository_pyproject_declares():
+    """The other half of the same drift: a renamed repository leaves a dead advisory link.
+
+    GitHub serves the advisory form per repository, so the URL embeds the owner and the name. A
+    rename updates `[project.urls]` -- PyPI renders those, so somebody notices -- and leaves this
+    file pointing into a namespace that no longer exists.
+    """
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    home = pyproject["project"]["urls"]["Homepage"].rstrip("/")
+    text = POLICY.read_text(encoding="utf-8")
+    assert f"{home}/security/advisories/new" in text, (
+        f"SECURITY.md's advisory link does not sit under the declared Homepage {home!r}"
+    )
+
+
+def test_the_security_policy_states_the_scope_decisions_a_reviewer_gets_wrong():
+    """Three non-goals that are unusual enough to be misread as oversights.
+
+    The whole reason this project needs a written scope is that its architecture moves a boundary
+    most libraries do not move. A reviewer who assumes the ordinary answer concludes that the SSH
+    layer is unreviewed rather than delegated, that an approved host is a trusted one, or that the
+    allowlist pins an address. Each is asserted by the thing that would have to survive a rewrite
+    of the surrounding prose, not by a sentence.
+    """
+    text = POLICY.read_text(encoding="utf-8")
+    assert "openssh.com/report.html" in text, (
+        "the policy does not redirect SSH-layer findings to OpenSSH, so it reads as if this "
+        "project audits a transport it does not implement"
+    )
+    assert "Supported versions" in text, "the policy states no supported-version window"
+    assert "allowed_hosts()" in text, (
+        "the policy does not state the allowlist's limit, so its known DNS gap reads as a bug"
+    )
+
+
 def test_pyproject_declares_the_licence_file():
     """A `license-files` entry is what puts `License-File:` in METADATA. Without it the build
     is happy, the metadata is wrong, and nothing fails."""
@@ -310,7 +389,15 @@ def heading_slugs(page: Path) -> set[str]:
 
 
 def markdown_documents() -> list[Path]:
-    return [ROOT / "README.md", *sorted(DOCS.glob("*.md")), ROOT / "examples" / "README.md"]
+    # `SECURITY.md` joins the link check rather than sitting outside it (D-147): it is the one
+    # page whose links a reader follows while trying to report something, so a dead one there
+    # costs more than a dead one in a guide.
+    return [
+        ROOT / "README.md",
+        ROOT / "SECURITY.md",
+        *sorted(DOCS.glob("*.md")),
+        ROOT / "examples" / "README.md",
+    ]
 
 
 @pytest.mark.parametrize("page", markdown_documents(), ids=lambda p: f"{p.parent.name}/{p.name}")

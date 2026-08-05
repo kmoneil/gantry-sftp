@@ -263,6 +263,17 @@ uv sync --all-extras
 environment every security assertion depends on, and the four lanes that run longer than a commit
 hook: leak detection, `tc netem` link shaping, benchmarks, and mutation testing.
 
+## Security
+
+**Found something? Please report it privately** — [open a security
+advisory](https://github.com/kmoneil/gantry-sftp/security/advisories/new), or email
+kevin@oneil.xyz if you would rather not use GitHub.
+
+[`SECURITY.md`](SECURITY.md) has the scope, and the scope is worth reading before you start: this
+library contains no cryptography and does not implement SSH, so a finding about ciphers or
+host-key algorithms belongs to OpenSSH rather than here. What *is* ours is everything a hostile
+server can send us, how we build the `ssh` argument vector, and where a credential can end up.
+
 ## License
 
 Apache-2.0.
