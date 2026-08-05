@@ -19,6 +19,7 @@ The rest is shaped by task rather than by module.
 | [Tunables, and what things cost](tuning.md) | Every knob and its default, round trips per operation, memory per transfer |
 | [Why this exists](architecture.md) | The design argument, the failures it prevents, and where this library is behind |
 | [Development](development.md) | The suite, the lanes, and what each one exists to catch |
+| [The security model](security.md) | The trust boundary, what is deliberately not defended, and where each control is proved |
 
 ## The other half is runnable
 

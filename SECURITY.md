@@ -19,6 +19,8 @@ enough to demonstrate anything in scope below.
 
 ## What is in scope
 
+[`docs/security.md`](docs/security.md) is the full model — the trust boundary, every control and where it is proved. This section is the short form.
+
 Everything under `src/gantry_sftp/`. Concretely, the classes of bug this project considers its own:
 
 - **A hostile or compromised server.** Every filename from `READDIR`, `READLINK` and `REALPATH` is

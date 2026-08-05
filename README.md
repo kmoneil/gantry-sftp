@@ -139,6 +139,7 @@ task rather than by module:
 | [Tunables, and what things cost](docs/tuning.md) | Every knob and its default, round trips per operation, memory per transfer |
 | [Why this exists](docs/architecture.md) | The design argument, the failures it prevents, and where this library is behind |
 | [Development](docs/development.md) | The suite, the lanes, and what each one exists to catch |
+| [The security model](docs/security.md) | The trust boundary, what is deliberately not defended, and where each control is proved |
 
 **[`examples/`](examples/README.md) is the other half of the documentation**, and it is executed
 rather than described: one runnable example per user-facing feature, each of which works with **no
@@ -269,7 +270,9 @@ hook: leak detection, `tc netem` link shaping, benchmarks, and mutation testing.
 advisory](https://github.com/kmoneil/gantry-sftp/security/advisories/new), or email
 kevin@oneil.xyz if you would rather not use GitHub.
 
-[`SECURITY.md`](SECURITY.md) has the scope, and the scope is worth reading before you start: this
+[`SECURITY.md`](SECURITY.md) has the reporting scope and
+[the security model](docs/security.md) has the trust boundary in full. The scope is worth
+reading before you start: this
 library contains no cryptography and does not implement SSH, so a finding about ciphers or
 host-key algorithms belongs to OpenSSH rather than here. What *is* ours is everything a hostile
 server can send us, how we build the `ssh` argument vector, and where a credential can end up.
