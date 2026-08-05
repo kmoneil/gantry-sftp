@@ -1254,6 +1254,16 @@ COLLIDING_TREE = {
 }
 COLLIDING_FILES = {b"/root/README.md": b"AAA", b"/root/readme.md": b"bbbbb"}
 
+# The same two-file shape with names that do *not* fold together, for the tests that need a
+# small tree and are not about collisions at all. `COLLIDING_TREE` was doing both jobs, and on
+# macOS -- where the destination folds for real -- the incidental users started failing with a
+# perfectly correct `DestinationCollisionError`. That refusal is the library working; these
+# tests are about file mode and intermediate directories and should never have been asking.
+DISTINCT_TREE = {
+    b"/root": (named(b"first.md", REGULAR, 3), named(b"second.md", REGULAR, 5)),
+}
+DISTINCT_FILES = {b"/root/first.md": b"AAA", b"/root/second.md": b"bbbbb"}
+
 
 def bits(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
@@ -1615,13 +1625,13 @@ async def test_a_tree_download_creates_its_files_private(tmp_path: Path):
     covers.
     """
     destination = tmp_path / "out"
-    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    server = TreeServer(tree=DISTINCT_TREE, files=DISTINCT_FILES)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         _ = await sftp.get_tree(b"/root", destination)
 
-    assert bits(destination / "README.md") == 0o600
-    assert bits(destination / "readme.md") == 0o600
+    assert bits(destination / "first.md") == 0o600
+    assert bits(destination / "second.md") == 0o600
 
 
 async def test_a_symlink_in_the_destination_is_refused_rather_than_written_through(
@@ -1730,7 +1740,7 @@ async def test_a_tree_download_creates_the_intermediate_directories_of_its_desti
     uses. Nothing had asked for more than one missing level.
     """
     destination = tmp_path / "runs" / "2026-08-02" / "out"
-    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    server = TreeServer(tree=DISTINCT_TREE, files=DISTINCT_FILES)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         result = await sftp.get_tree(b"/root", destination)

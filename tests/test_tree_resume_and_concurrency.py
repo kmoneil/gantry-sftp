@@ -23,6 +23,7 @@ from gantry_sftp.codec import Read
 from gantry_sftp.exceptions import DestinationCollisionError
 from gantry_sftp.session import Publish, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from test_observability import names_path
 from test_recursive import (
     DIRECTORY,
     REGULAR,
@@ -464,5 +465,5 @@ async def test_the_put_tree_record_carries_its_fields_as_data(
     start = record_fields(records[0])
     assert start["operation"] == "put_tree"
     assert start["event"] == "start"
-    assert start["local"] == str(source)
-    assert start["remote"] == str(destination)
+    assert names_path(start["local"], source)
+    assert names_path(start["remote"], destination)

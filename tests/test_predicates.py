@@ -740,5 +740,15 @@ async def test_makedirs_stops_at_the_root_rather_than_walking_past_it(tmp_path: 
         with pytest.raises(ServerError) as refused:
             await sftp.makedirs(b"/gantry-sftp-should-not-be-able-to-create-this")
 
-    assert refused.value.code == int(StatusCode.PERMISSION_DENIED)
+    # **Which refusal the server gives is the server platform's, and this test is not about
+    # that.** Linux answers `EACCES` and OpenSSH maps it to `PERMISSION_DENIED`; macOS keeps `/`
+    # read-only under System Integrity Protection, so the errno differs and the same `mkdir`
+    # arrives as the catch-all `FAILURE` -- which is what the first macOS CI run reported, as
+    # `assert 4 == 3`. What this test exists to prove is the *terminating condition*: the guard
+    # re-raises the server's own answer, naming the path the caller actually used, rather than
+    # recursing toward an empty one. Both codes satisfy that; neither is a walk past the root.
+    assert refused.value.code in {
+        int(StatusCode.PERMISSION_DENIED),
+        int(StatusCode.FAILURE),
+    }, f"expected the server's own refusal, got {refused.value.code}"
     assert refused.value.path == b"/gantry-sftp-should-not-be-able-to-create-this"

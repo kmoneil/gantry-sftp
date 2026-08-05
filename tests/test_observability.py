@@ -970,6 +970,28 @@ def test_the_package_logger_has_a_null_handler():
 # --- against a real server ----------------------------------------------------------------
 
 
+def names_path(field: object, path: Path) -> bool:
+    """Whether a record field names ``path``, allowing for the documented cap.
+
+    **The cap is not a test problem, it is the shipped behaviour** -- `MAX_VALUE_CHARS` bounds
+    every rendered field because a remote name is chosen by the server, and a record per file is
+    a per-file decision about how much of an operator's disk this fills. What the first macOS CI
+    run showed is that the bound was reasoned about one side of the path only: a macOS temporary
+    directory (`/private/var/folders/df/<random>/T/pytest-of-runner/...`) is past 96 characters
+    before the filename, so an ordinary *local* path is truncated too. See D-157.
+
+    So these assertions check that the field names the file, not that the value happens to fit.
+    The capped spelling is written out here rather than taken from `_capped`, for the reason
+    this repository states elsewhere: an expectation computed with the code under test moves
+    with it.
+    """
+    rendered = str(path)
+    if field == rendered:
+        return True
+    dropped = len(rendered) - MAX_VALUE_CHARS
+    return dropped > 0 and field == f"{rendered[:MAX_VALUE_CHARS]}+{dropped}"
+
+
 def requires_sftp_server() -> None:
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
@@ -1098,8 +1120,8 @@ async def test_an_upload_records_the_publish_mechanism(
     record = next(r for r in caplog.records if r.getMessage().startswith("put ok "))
     fields = record_fields(record)
     assert fields["operation"] == "put"
-    assert fields["local"] == str(source)
-    assert fields["remote"] == str(tmp_path / "published.csv")
+    assert names_path(fields["local"], source)
+    assert names_path(fields["remote"], tmp_path / "published.csv")
     assert fields["mechanism"] == "POSIX_RENAME"
 
 
@@ -1128,8 +1150,8 @@ async def test_a_tree_download_records_its_counts(caplog: pytest.LogCaptureFixtu
     fields = record_fields(
         next(r for r in caplog.records if r.getMessage().startswith("get_tree ok "))
     )
-    assert fields["remote"] == str(source)
-    assert fields["local"] == str(tmp_path / "copy")
+    assert names_path(fields["remote"], source)
+    assert names_path(fields["local"], tmp_path / "copy")
 
 
 # --- the credential, through every surface at once ----------------------------------------
@@ -1355,7 +1377,7 @@ async def test_a_tree_removal_records_what_it_removed(
     record = next(r for r in caplog.records if r.getMessage().startswith("rmtree ok "))
     fields = record_fields(record)
     assert fields["operation"] == "rmtree"
-    assert fields["remote"] == str(victim)
+    assert names_path(fields["remote"], victim)
     assert fields["files"] == 2
     assert fields["directories"] == 2
 
