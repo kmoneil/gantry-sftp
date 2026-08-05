@@ -354,7 +354,14 @@ class GantryClient(Client):
 
             async def fetch(remote: Path) -> None:
                 async with limit:
-                    got = await sftp.get(str(remote), into / remote.name)
+                    # `.transferred`, like every other call site in this file. This one was the
+                    # single site D-99 missed when `get` started returning a `DownloadResult`
+                    # instead of a byte count, and nothing caught it for two releases: `sum()`
+                    # raised `TypeError: unsupported operand type(s) for +: 'int' and
+                    # 'DownloadResult'` -- but only in the one lane that needs the `bench` group
+                    # and a shaped link, so it is excluded from the default run, from mypy and
+                    # from ty. It failed on the first CI run that let `benchmarks` finish.
+                    got = (await sftp.get(str(remote), into / remote.name)).transferred
                 # Appended, not `total += await ...`. Augmented assignment loads the target
                 # *before* evaluating the right-hand side, so with the await on that side every
                 # concurrent task adds to a value it read before the others finished -- a lost
