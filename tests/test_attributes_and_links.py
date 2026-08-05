@@ -389,6 +389,14 @@ async def test_by_default_these_follow_a_symlink(tmp_path: Path):
     target.chmod(0o644)
     link = tmp_path / "alias.txt"
     link.symlink_to(target)
+    # **Read before, compared after, rather than spelled as a constant.** This used to assert
+    # `0o777`, which is a Linux fact stated as a universal one: a symlink's permission bits are
+    # meaningless to the Linux kernel and permanently `0o777`, so there was nothing to capture.
+    # On macOS they are real -- which is *why* it has `lchmod` and Linux does not -- and a fresh
+    # link gets `0o777 & ~umask`, so the first macOS CI run read `0o755` and reported
+    # `assert 493 == 511`. The claim being made here is that the operation followed the link and
+    # did not touch the link, and that is what a before-and-after comparison says on either.
+    before = bits(link)
 
     async with (
         open_local_server_transport(cwd=tmp_path) as transport,
@@ -397,8 +405,7 @@ async def test_by_default_these_follow_a_symlink(tmp_path: Path):
         await sftp.chmod(str(link).encode(), 0o600)
 
     assert bits(target) == 0o600
-    # The link's own mode is untouched, and on Linux it is 0o777 and always was.
-    assert bits(link) == 0o777
+    assert bits(link) == before, "chmod touched the link's own mode instead of its target's"
 
 
 @needs_a_server_that_cannot_chmod_a_symlink

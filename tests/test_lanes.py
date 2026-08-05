@@ -389,12 +389,28 @@ def test_the_workflow_asks_for_no_more_than_read_access() -> None:
     assert "permissions:\n  contents: read\n" in WORKFLOW_TEXT
 
 
-def test_the_windows_job_reports_rather_than_gates() -> None:
-    # Transfers are POSIX-only by decision, not by omission (see session/_platform.py), so
-    # every row that moves bytes fails on Windows. When the out-of-scope rows are marked --
-    # or a fallback lands -- this assertion is the thing that says the job may now block a
-    # change, and it has to be edited deliberately for that to happen.
-    assert "continue-on-error: ${{ matrix.os == 'windows-latest' }}" in WORKFLOW_TEXT
+def test_the_windows_job_is_weekly_and_reports_rather_than_gates() -> None:
+    """D-158. Windows is not a supported platform today, and the workflow has to say so.
+
+    Transfers are POSIX-only by decision rather than by omission (`session/_platform.py`), so
+    what works on Windows is the codec, the transport and the remote-only operations -- for a
+    file-transfer library, the product minus the product. The job therefore runs on the weekly
+    `schedule:` rather than per change: the evidence is worth having (the first completed
+    Windows run is what found D-156) and a red row on every commit is D-152's pathology.
+
+    Three assertions because the arrangement has three parts and any one of them silently
+    reverting would put a permanently-red job back in front of every push. Read from the
+    *uncommented* workflow: the block above the job quotes these spellings to argue about them.
+    """
+    runs = _uncommented(WORKFLOW_TEXT)
+    assert "os: [ubuntu-latest, macos-latest]" in runs, "Windows is back in the gating matrix"
+    assert "fast-windows:" in runs, "the weekly Windows job is gone rather than deferred"
+    assert (
+        "if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'" in runs
+    ), "the Windows job runs per change again"
+    # Flipping this is D-158's closure condition, not a tidy-up: it says Windows may block a
+    # change, which is a claim about the platform being supported.
+    assert "continue-on-error: true" in runs
 
 
 # ---------------------------------------------------------------------------
