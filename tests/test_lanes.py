@@ -182,6 +182,39 @@ def test_the_consumer_gate_cannot_weaken_the_gate_over_shipped_code() -> None:
     assert "strict" not in CONSUMER_CONFIG.read_text(encoding="utf-8").split("[mypy]", 1)[1]
 
 
+def test_each_waived_package_is_waived_hard_enough_to_survive_a_bench_sync() -> None:
+    """The gate must answer the same with and without `--group bench`, and one flag is not enough.
+
+    `ignore_missing_imports` speaks only to the *import statement*. A package that is installed
+    **and ships `py.typed`** is still read for real types, so everything downstream is checked
+    against them -- and asyncssh ships one while paramiko does not. `matrix.py`'s `asyncssh = None`
+    fallback was therefore a genuine `assignment` error on a machine with the bench group and an
+    *unused* ignore on a runner without it. It passed here, failed `release.yml`'s verify job, and
+    stopped the 0.1.1 publish before anything irreversible ran.
+
+    `follow_imports = skip` is what makes the module `Any` either way. Asserted per section rather
+    than per file, because the next package added to this list will have the same two halves and
+    only one of them is obvious.
+
+    **Comments are stripped first, and the first version of this test was vacuous without that.**
+    The prose above each section quotes the settings it argues about, so a section's text carries
+    the words `follow_imports = skip` whether or not the section *sets* it -- and the run that was
+    supposed to prove this test works passed against the exact config that had just failed a
+    release. Same reason `_uncommented` exists for the workflows, found the same way.
+    """
+    text = CONSUMER_CONFIG.read_text(encoding="utf-8")
+    settings = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    sections = re.split(r"^\[mypy-", settings, flags=re.M)[1:]
+    assert sections, "the waiver sections are gone, not merely weakened"
+    for section in sections:
+        name = section.split(",", 1)[0]
+        assert "ignore_missing_imports = True" in section, name
+        assert "follow_imports = skip" in section, (
+            f"{name} is waived for its import and then read for real types wherever it happens "
+            "to be installed, which is a gate whose verdict depends on the last `uv sync`"
+        )
+
+
 def test_the_consumer_gate_waives_exactly_the_three_packages_it_documents() -> None:
     """An `ignore_missing_imports` section is a hole, and a fourth one added quietly is how
     this gate stops being one.

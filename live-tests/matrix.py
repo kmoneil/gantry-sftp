@@ -51,7 +51,7 @@ import sshd
 try:
     import asyncssh
 except ImportError:  # pragma: no cover -- exercised by not installing the group
-    asyncssh = None  # type: ignore[assignment]
+    asyncssh = None
 
 try:
     import paramiko
