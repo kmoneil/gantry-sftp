@@ -161,7 +161,21 @@ jobs:
         with:
           name: distribution
           path: dist/
+      # `attestations: true` restates this action's own default, which is normally noise -- and
+      # here it is the one line a documented decision rests on (D-149). `docs/security.md`
+      # declines to ship an SBOM, and its argument is that for "was this artifact built by the
+      # project it claims to come from" a signed PEP 740 attestation is the stronger answer and
+      # is already uploaded. That reasoning is only sound while the attestation is actually
+      # produced.
+      #
+      # Two things make the default too thin to rest on. The action labels the input
+      # `[EXPERIMENTAL]` in its own `action.yml` -- read at the pinned SHA, not recalled -- and
+      # an experimental default is one that can move. And a default nobody wrote down is one a
+      # future edit can turn off without anything reading as changed. Written out, `tests/
+      # test_lanes.py` can pin it, so removing it fails a test that names the page it breaks.
       - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        with:
+          attestations: true
 
   # ---------------------------------------------------------------------------
   # The GitHub release, after the upload rather than before it. A release object

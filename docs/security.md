@@ -83,6 +83,40 @@ debugger, and replace `ssh` on your `PATH`.
 on cannot execute. Transfers refuse on Windows by design in any case — see
 [Requirements](../README.md#what-it-needs-read-this-before-you-install-it).
 
+## Supply chain, and why no SBOM ships
+
+**Deliberate, not an oversight.** OWASP's 2025 list moved Software Supply Chain Failures to A03 and
+names maintaining an SBOM as prevention, so the absence of one here is a decision that has to be
+written down rather than left to be rediscovered.
+
+What this project does ship, on the three axes an SBOM is not:
+
+| Question | Answer here |
+| --- | --- |
+| Are the dependencies known-vulnerable? | `scripts/audit_deps.py`, in two scopes — what a user installs gates, what a developer installs reports — with a three-state exit that keeps "could not check" apart from "checked and clean" |
+| Is what I install what you locked? | `uv.lock` carries a hash per artifact and every `uv` call in both workflows takes `--frozen`; `uv` verifies those hashes even from a warm cache |
+| Did *you* build what I downloaded? | Trusted publishing over OIDC, no long-lived token, third-party actions pinned to commit SHAs, the build backend installed from the lock with `--no-build-isolation`, and a signed **PEP 740 attestation** uploaded with every release |
+
+**The inventory itself is what is missing, and the case for producing one is weak here.** The
+declared runtime dependency is `anyio` and nothing else; installed, that resolves to three
+packages — `anyio`, `idna`, `typing_extensions` — and `fsspec` only if you asked for the extra.
+A CycloneDX document over that restates one `pip install` in a second format, and becomes a second
+place to keep in sync. **An SBOM that exists but is stale is worse than none, because it is read as
+current.**
+
+**And for the question the 2025 rescope is actually about — was this artifact built by the project
+it claims to come from — an attestation is the stronger answer.** It is a signed statement binding
+the file to the workflow and repository that produced it, verifiable by the index. An SBOM is an
+unsigned self-report of what went in. One can be checked without trusting us; the other cannot.
+
+Two honest caveats, because a decision resting on unstated things is not a decision. PyPI's
+attestation support is still labelled experimental by the publishing action that generates it — so
+`release.yml` sets `attestations: true` explicitly rather than inheriting the default, and a test
+pins that line, since this paragraph depends on it. And if you are here because a procurement
+process requires an SBOM regardless of dependency count, that is a fair reason to want one: open an
+issue, because "a consumer actually needs this" is the evidence that would change the answer, and
+nothing else on this page is waiting for it.
+
 ## How each control is proved
 
 Documentation is not evidence, so every control above has a test, and the test is the thing to read

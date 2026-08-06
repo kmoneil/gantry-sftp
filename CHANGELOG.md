@@ -7,6 +7,15 @@ and while the major version is `0` the minor version is where a breaking change 
 
 ### Changed
 
+- **No SBOM ships, and `docs/security.md` now says so with the reasoning.** OWASP 2025 moved
+  supply-chain failures to A03 and names an SBOM as prevention, so the absence is recorded as a
+  decision rather than left to be rediscovered. The declared runtime dependency is `anyio` alone
+  and installs as three packages, so an inventory restates one `pip install` in a second format
+  and becomes a second thing to keep current — and for the question that rescope is about, a
+  signed PEP 740 attestation is a stronger answer than an unsigned self-report. The release
+  workflow now asks for that attestation explicitly rather than inheriting a default the page's
+  argument depends on. **If a procurement process needs an SBOM regardless, open an issue** —
+  that is the evidence that would change the answer.
 - **The maturity claim moves from alpha to beta**, in the three places that state it: the
   `Development Status` classifier, README's Status section and `SECURITY.md`'s support window.
   PyPI's rungs are about feature completeness rather than release count — the protocol layer

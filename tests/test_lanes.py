@@ -527,6 +527,27 @@ def test_the_release_is_gated_on_the_audit_lane() -> None:
     assert "lanes.py audit" in RELEASE_TEXT
 
 
+def test_the_attestation_the_sbom_decision_rests_on_is_asked_for_explicitly() -> None:
+    """`docs/security.md` declines to ship an SBOM, and this is what it declines in favour of.
+
+    The argument there is that for "was this artifact built by the project it claims to come
+    from" a signed PEP 740 attestation beats an unsigned inventory -- which holds only while one
+    is actually produced. Two reasons the action's default is too thin to rest a documented
+    decision on: it labels the input `[EXPERIMENTAL]` in its own `action.yml`, and an
+    experimental default can move; and a default nobody wrote down is one an edit can turn off
+    with nothing reading as changed (D-149).
+
+    Asserted over the uncommented text, because the comment above that line quotes the spelling
+    it is arguing about.
+    """
+    runs = _uncommented(RELEASE_TEXT)
+    assert "pypa/gh-action-pypi-publish@" in runs
+    assert "attestations: true" in runs, (
+        "docs/security.md declines an SBOM on the grounds that a signed attestation is uploaded "
+        "instead; without this line that argument rests on a third-party default"
+    )
+
+
 def test_only_the_publishing_job_may_mint_a_token() -> None:
     """`id-token: write` is what trusted publishing exchanges for an upload credential.
 
