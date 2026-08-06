@@ -16,6 +16,13 @@ A **remote** path is `bytes` or `str`. It goes on the wire as bytes, and a `str`
 `surrogateescape` so a name the server sent, which is frequently not valid UTF-8, can be sent
 straight back. A **local** path is a `Path` or a `str`, because it is opened by this process.
 
+> **The remote half of that holds everywhere; the local half is the filesystem's call.** APFS and
+> HFS+ validate that a filename is valid UTF-8 and refuse one that is not, so a name this library
+> carries byte-exactly to a Linux disk cannot be written to a Mac's at all. `get` refuses with a
+> `TransferError` naming both paths and `get_tree` records the entry in `result.skipped` and
+> carries on — see
+> [A name the local filesystem will not accept at all](transfers.md#a-name-the-local-filesystem-will-not-accept-at-all).
+
 **A `Path` for the remote side is refused, and that is deliberate rather than unimplemented.**
 `pathlib` normalises, and a remote name has to survive byte for byte:
 

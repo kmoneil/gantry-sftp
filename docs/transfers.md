@@ -582,6 +582,48 @@ the contents transfer and the report says the structure is not faithful.
 
 `examples/destination_collision.py` runs it.
 
+### A name the local filesystem will not accept at all
+
+The sibling of the refusal above, and the same shape: a rule belonging to the **destination**
+filesystem that no amount of care with the remote name can satisfy.
+
+A remote name is bytes — any bytes but `/` and NUL — and this library carries them byte for byte.
+Linux stores them just as happily. **APFS and HFS+ do not**: they validate that a filename is
+valid UTF-8 and reject one that is not, with `Illegal byte sequence`. So a file that downloads
+correctly on Linux cannot be placed on a Mac's disk under its own name, and no flag changes that.
+
+The two entry points answer differently, on purpose:
+
+```python
+# One file: a refusal that names both paths.
+try:
+    await sftp.get(b"/incoming/caf\xe9.csv", "downloads/caf\xe9.csv")
+except TransferError as error:
+    print(error.remote_path, error.local_path)
+
+# A tree: the other files still transfer, and the report says which one did not.
+result = await sftp.get_tree("/incoming", "downloads/")
+result.complete                       # False
+[(s.path, s.reason) for s in result.skipped]
+```
+
+A single `get` names one file the caller chose, so refusing is the whole answer. A `get_tree` of
+two hundred files must not lose a hundred and ninety-nine to one unlucky name, so the entry is
+recorded in `result.skipped` and the walk continues — the same call `walk()` makes for a symlink
+and `get_tree` makes for a collision.
+
+**The refusal is by errno, not by name inspection**, which matters in both directions. This
+library does not try to predict which names a filesystem will take — that would be
+reimplementing three filesystems' rules in Python and getting them subtly wrong, the same
+argument the collision check above makes. It asks, and the answer is the `open` failing. And it
+is narrow: a full disk or a denied directory still aborts the tree, because reporting either of
+those as "bad name" would let a real failure look like a quirk of one entry.
+
+**Renaming the file is not on the table.** Transliterating `caf\xe9.csv` to `cafe.csv` would let
+two distinct remote names become one local file, which is exactly the silent data loss the
+collision check exists to prevent. If you need these files on a Mac, download them somewhere
+that will hold them, or fetch them by an explicit local name of your own.
+
 ### Servers whose namespace is not rooted at `/`
 
 Every remote path this library _builds_, whether joining a child onto a directory or splitting a

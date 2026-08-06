@@ -144,6 +144,7 @@ from gantry_sftp.session._policy import (
     _touch_destination,
     _TreeDownload,
     _TreeUpload,
+    refuses_the_name,
 )
 from gantry_sftp.session._pool import for_each_bounded
 from gantry_sftp.session._publish import (
@@ -1973,7 +1974,23 @@ class Session(_SessionOperations):
         ``if os.path.exists`` reads that as a download that happened.
         """
         flags = _LOCAL_WRITE_FLAGS if not start_offset else _LOCAL_RESUME_FLAGS
-        fd = os.open(local_path, flags | (NO_FOLLOW if no_follow else 0), 0o600)
+        try:
+            fd = os.open(local_path, flags | (NO_FOLLOW if no_follow else 0), 0o600)
+        except OSError as refusal:
+            # The one local error that is about the *name* rather than about the I/O (D-150).
+            # A bare `OSError` escaping `get` is outside this library's hierarchy entirely, so
+            # `except SFTPError` does not catch it and nothing carries the remote path -- and on
+            # a tree of two hundred files the local path is a name the caller never chose. Every
+            # other errno keeps propagating as it did; see `refuses_the_name`.
+            if not refuses_the_name(refusal):
+                raise
+            raise TransferError(
+                f"the local filesystem will not accept the name {Path(local_path).name!r}: "
+                f"{refusal.strerror}. The remote name is bytes and this filesystem requires "
+                f"valid UTF-8, so this file cannot be written here under its own name",
+                remote_path=remote_path,
+                local_path=str(local_path),
+            ) from refusal
         try:
             transferred = await download_handle(
                 self._dispatcher,
@@ -2515,13 +2532,31 @@ class Session(_SessionOperations):
                     state=state,
                 )
                 for child in entry.files:
-                    item, collision = self._claim_download(
-                        destination=destination,
-                        local_directory=local_directory,
-                        entry=entry,
-                        child=child,
-                        ledger=state.ledger,
-                    )
+                    try:
+                        item, collision = self._claim_download(
+                            destination=destination,
+                            local_directory=local_directory,
+                            entry=entry,
+                            child=child,
+                            ledger=state.ledger,
+                        )
+                    except OSError as refusal:
+                        # The destination filesystem refusing the *name* (D-150), which on a Mac
+                        # is any name that is not UTF-8. Reported like a collision rather than
+                        # raised, for the reason `SkipReason` exists: one unlucky filename must
+                        # not cost every file after it in the walk. Narrow by errno -- a full
+                        # disk or a denied directory still aborts, and reporting either of those
+                        # as "bad name" is the failure a wide `except OSError` here would have.
+                        if not refuses_the_name(refusal):
+                            raise
+                        state.skipped.append(
+                            Skipped(
+                                join_remote(entry.path, child.filename),
+                                child,
+                                SkipReason.DESTINATION_REFUSED_THE_NAME,
+                            )
+                        )
+                        continue
                     if collision is not None:
                         state.collisions.append(collision)
                         state.skipped.append(

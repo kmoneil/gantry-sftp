@@ -144,6 +144,16 @@ class SkipReason:
     TOO_DEEP = "deeper than max_depth"
     DESTINATION_COLLISION = "the destination filesystem does not tell it apart from an earlier name"
 
+    DESTINATION_REFUSED_THE_NAME = "the destination filesystem will not accept these name bytes"
+    """A local rule the remote name breaks, which no test over remote names can see (D-150).
+
+    APFS and HFS+ validate that a filename is UTF-8 and reject one that is not, so a name this
+    library carries byte-exactly on Linux **cannot be placed on a Mac's disk at all**. The sibling
+    above is the same class of fact -- the destination filesystem's rules, not the server's -- and
+    both are reported rather than raised for the reason the whole of this class exists: one
+    unlucky filename in a two-hundred-file tree must not cost the other hundred and ninety-nine.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class Skipped:

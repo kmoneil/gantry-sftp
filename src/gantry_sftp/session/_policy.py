@@ -23,6 +23,7 @@ boundary, not the name. ``exceptions._flatten_exception_group`` is the same arra
 
 from __future__ import annotations
 
+import errno
 import os
 from collections.abc import Sequence
 from contextlib import suppress
@@ -709,6 +710,29 @@ def _touch_destination(target: Path) -> None:
     than being left to the transfer's own ``open``.
     """
     os.close(os.open(target, os.O_CREAT | os.O_WRONLY | NO_FOLLOW, 0o600))
+
+
+def refuses_the_name(error: OSError) -> bool:
+    """Is this the local filesystem saying the *name* cannot exist here, rather than an I/O error?
+
+    ``EILSEQ`` is APFS and HFS+ rejecting a filename that is not valid UTF-8 (D-150). A remote
+    name is bytes -- any bytes but ``/`` and NUL -- and Linux stores it happily, so a file this
+    library downloads correctly here **cannot be placed on a Mac's disk at all**. It is the same
+    shape as the case folding D-37 refuses: a property of the destination filesystem, invisible
+    to every test that varies the *remote* name.
+
+    **Narrow on purpose, and this is the whole care in it.** The two callers turn a true answer
+    into a skip or a named refusal, and a wide ``except OSError`` there would report a full disk
+    or a denied directory as "bad name" -- the failure mode a predicate that swallows a
+    superclass always has. Every other errno keeps propagating exactly as it did.
+
+    Args:
+        error: The error the local ``open`` raised.
+
+    Returns:
+        Whether the filesystem refused the name itself.
+    """
+    return error.errno == errno.EILSEQ
 
 
 def _check_tree_concurrency(

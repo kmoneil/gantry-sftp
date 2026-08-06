@@ -3,6 +3,21 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## Unreleased
+
+### Fixed
+
+- **`get_tree` no longer abandons the rest of a tree when the local filesystem refuses one
+  name.** A remote name is bytes; APFS and HFS+ require valid UTF-8 and reject anything else. One
+  such name used to raise a bare `OSError` out of the walk, so every file after it in walk order
+  was never fetched and the caller got an errno with no remote path. The entry is now recorded in
+  `result.skipped` with the new `SkipReason.DESTINATION_REFUSED_THE_NAME` and the walk continues,
+  which is what the sibling refusal for colliding names already did.
+- **`get` of such a name raises `TransferError` instead of a bare `OSError`.** It carries the
+  remote path and the local path, so `except SFTPError` catches it and the message says which
+  file and why. Both changes are narrow by errno: a full disk or a denied directory still aborts,
+  because reporting either as "bad name" would make a real failure look like a quirk of one entry.
+
 ## 0.1.0 — 2026-08-05
 
 **The first public release**, so there is nothing to diff against and everything below is new.

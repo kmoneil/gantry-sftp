@@ -49,6 +49,7 @@ from gantry_sftp.exceptions import (
     DestinationCollisionError,
     NoSuchFileError,
     ServerError,
+    TransferError,
     UnsafePathError,
 )
 from gantry_sftp.session import (
@@ -1834,3 +1835,132 @@ async def test_a_directory_the_server_lists_twice_is_refused_rather_than_merged(
     ]
     assert [item.remote for item in directory_collisions] == [b"/root/docs"]
     assert directory_collisions[0].first == b"/root/docs"
+
+
+# --- a name the local filesystem will not take (D-150) -------------------------------------------
+
+
+ODD_LOCAL_NAME = "caf\udce9.csv"
+"""A name macOS refuses and Linux stores, spelled the way `tests/test_fsspec.py` spells it.
+
+The bytes matter rather than the characters: `\udce9` is `surrogateescape`'s stand-in for a lone
+`0xe9`, which is what a Latin-1 server sends and what APFS will not hold.
+"""
+
+
+def refuse_odd_names(monkeypatch: pytest.MonkeyPatch, *, errno_value: int = errno.EILSEQ) -> None:
+    """Make the local `open` answer the way APFS does, for that one name and nothing else.
+
+    **This does not pretend to be macOS**, which is the distinction D-160 paid for: faking a
+    platform lies as soon as anything else reads it, and `sys.platform = "darwin"` does not even
+    survive an import. What is injected here is one errno at one call, which is the *input* to
+    the behaviour under test -- how this library answers a filesystem that refuses a name.
+
+    `errno_value` exists so the same setup can prove the narrowness: `ENOSPC` through the same
+    site must not be reported as a bad name.
+    """
+    real_open = os.open
+
+    def refusing(path, flags, mode=0o777, *, dir_fd=None):
+        text = os.fsdecode(path) if not isinstance(path, int) else ""
+        try:
+            _ = text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise OSError(errno_value, os.strerror(errno_value), str(path)) from None
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", refusing)
+
+
+async def test_a_name_the_local_filesystem_refuses_raises_and_names_both_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A bare `OSError` escaping `get` is outside this library's hierarchy entirely (D-150).
+
+    `except SFTPError` did not catch it, nothing carried the remote path, and on a tree the
+    local path is a name the caller never chose. The errno is the filesystem's; the class, the
+    message and the carried state are ours.
+    """
+    refuse_odd_names(monkeypatch)
+    server = TreeServer(tree={b"/root": ()}, files={b"/root/odd.csv": b"payload"})
+    target = tmp_path / ODD_LOCAL_NAME
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(TransferError) as caught:
+            _ = await sftp.get(b"/root/odd.csv", target)
+
+    assert caught.value.args[0] == (
+        f"the local filesystem will not accept the name {ODD_LOCAL_NAME!r}: "
+        f"{os.strerror(errno.EILSEQ)}. The remote name is bytes and this filesystem requires "
+        f"valid UTF-8, so this file cannot be written here under its own name"
+    )
+    assert caught.value.remote_path == b"/root/odd.csv"
+    assert caught.value.local_path == str(target)
+    assert not target.exists(), "nothing was created, so there is no partial to report"
+    assert not server.open_handles, "the remote handle is closed even though the local open failed"
+
+
+async def test_a_tree_skips_that_name_and_keeps_going(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The half that costs data: before D-150 the walk aborted on the first such entry.
+
+    One unlucky filename took every file after it in walk order -- `good-two.csv` here never
+    transferred at all, and the caller got an errno rather than a report. `SkipReason` exists
+    for exactly this and the collision check next door already used it.
+    """
+    refuse_odd_names(monkeypatch)
+    odd = os.fsencode(ODD_LOCAL_NAME)
+    tree = {
+        b"/root": (
+            named(b"good-one.csv", REGULAR, 3),
+            named(odd, REGULAR, 7),
+            named(b"sub", DIRECTORY),
+        ),
+        b"/root/sub": (named(b"good-two.csv", REGULAR, 5),),
+    }
+    files = {
+        b"/root/good-one.csv": b"aaa",
+        b"/root/" + odd: b"payload",
+        b"/root/sub/good-two.csv": b"bbbbb",
+    }
+    out = tmp_path / "out"
+
+    async with open_session(TreeServer(tree=tree, files=files)) as sftp:  # type: ignore[arg-type]
+        result = await sftp.get_tree(b"/root", out)
+
+    assert result.files == 2
+    assert result.transferred == 8
+    assert not result.complete
+    assert (out / "good-one.csv").read_bytes() == b"aaa"
+    assert (out / "sub" / "good-two.csv").read_bytes() == b"bbbbb", (
+        "the file after the refused one is what a walk that aborts loses"
+    )
+    assert [skip.path for skip in result.skipped] == [b"/root/" + odd]
+    assert result.skipped[0].reason == SkipReason.DESTINATION_REFUSED_THE_NAME
+
+    # The reason string is the one a human reads in a report, so it is pinned like the rest.
+    assert SkipReason.DESTINATION_REFUSED_THE_NAME == (
+        "the destination filesystem will not accept these name bytes"
+    )
+
+
+async def test_a_full_disk_is_not_reported_as_a_bad_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The decoy, and the reason the predicate is one errno rather than `except OSError`.
+
+    A tree that answered "this name is unacceptable" to a full disk would skip every remaining
+    file, report `complete=False` with a list of names, and look like a server quirk. The
+    failure has to keep aborting.
+    """
+    refuse_odd_names(monkeypatch, errno_value=errno.ENOSPC)
+    odd = os.fsencode(ODD_LOCAL_NAME)
+    tree = {b"/root": (named(odd, REGULAR, 7),)}
+
+    async with open_session(TreeServer(tree=tree, files={b"/root/" + odd: b"payload"})) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(OSError) as caught:
+            _ = await sftp.get_tree(b"/root", tmp_path / "out")
+
+    assert caught.value.errno == errno.ENOSPC
+    assert not isinstance(caught.value, TransferError), "a full disk is not a naming problem"
