@@ -60,6 +60,33 @@ repos:
         pass_filenames: false
         require_serial: true
 
+      # `benchmarks/` and `live-tests/` are consumers of the public API -- they call `get`,
+      # `put`, `open_session` and `connect` exactly as a downstream program does -- so a
+      # signature change that breaks them breaks users. They were outside every type gate
+      # until D-152, and a `DownloadResult` summed into a `list[int]` sat in `benchmarks/`
+      # for two releases because the only thing that could see it was a 25-minute job.
+      # Weaker than the `src` gate and separately configured so the weakening cannot reach
+      # `src/`; the reasoning is in `mypy.consumers.ini`.
+      #
+      # Two hooks rather than one invocation over both: each directory has a `conftest.py`,
+      # and two files claiming the module name `conftest` is an error before any checking
+      # happens. Separate names also mean a red hook says which lane.
+      - id: mypy-benchmarks
+        name: mypy (benchmarks - API consumer)
+        entry: env MYPYPATH=live-tests .venv/bin/mypy --config-file=mypy.consumers.ini benchmarks
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
+      - id: mypy-live-tests
+        name: mypy (live-tests - API consumer)
+        entry: env MYPYPATH=tests .venv/bin/mypy --config-file=mypy.consumers.ini live-tests
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
       - id: complexipy
         name: complexipy (cognitive complexity <= 15)
         entry: .venv/bin/complexipy

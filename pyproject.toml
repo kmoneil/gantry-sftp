@@ -112,6 +112,7 @@ exclude = [
   "scripts/warn_parked_worktrees.sh",
   "scripts/forbid_exec_bit.sh",
   "pyrightconfig.deprecations.json",
+  "mypy.consumers.ini",
   ".complexipy_cache",
   ".hypothesis",
   ".pytest_cache",

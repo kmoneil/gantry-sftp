@@ -101,8 +101,10 @@ async def running_dispatcher(transport: Transport, codec: Codec) -> AsyncGenerat
     dispatcher = Dispatcher(transport, codec)
     try:
         async with anyio.create_task_group() as reader:
-            reader.start_soon(dispatcher.run)
-            reader.start_soon(dispatcher.reap_orphans)
+            # `_ =` for the same reason every `start_soon` in `src/` carries one: anyio
+            # returns a task handle and `unused-awaitable` flags discarding it.
+            _ = reader.start_soon(dispatcher.run)
+            _ = reader.start_soon(dispatcher.reap_orphans)
             try:
                 yield dispatcher
             finally:

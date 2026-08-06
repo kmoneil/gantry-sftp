@@ -22,6 +22,7 @@ from conftest import connect, negotiate
 from gantry_sftp.codec import (
     Close,
     Codec,
+    Completed,
     Data,
     Handle,
     Open,
@@ -43,6 +44,10 @@ async def exchange(transport, codec: Codec, request):
     while True:
         events = codec.receive(await transport.receive())
         if events:
+            # `receive()` yields `Negotiated | Completed`, and only the second carries a
+            # reply. After the handshake nothing here produces the first, so narrowing is
+            # what says that rather than assuming it.
+            assert isinstance(events[0], Completed), events[0]
             return events[0].response
 
 
@@ -123,7 +128,9 @@ async def test_pipelined_reads_over_a_real_ssh_connection(ssh_server, tmp_path: 
         received = 0
         while received < len(offsets):
             for event in codec.receive(await transport.receive()):
+                assert isinstance(event, Completed), event
                 assert isinstance(event.response, Data), event.response
+                assert isinstance(event.request, Read), event.request
                 start = event.request.offset
                 block = bytes(event.response.data)
                 reassembled[start : start + len(block)] = block

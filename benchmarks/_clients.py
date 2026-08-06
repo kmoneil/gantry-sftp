@@ -46,7 +46,7 @@ import anyio
 from sshd import SSHServer, connect_kwargs
 
 from gantry_sftp.session import Publish, open_session
-from gantry_sftp.transport import open_ssh_transport
+from gantry_sftp.transport import SubprocessTransport, open_ssh_transport
 
 
 def _username() -> str:
@@ -182,7 +182,7 @@ class GantryClient(Client):
     name = "gantry-sftp"
     module = "gantry_sftp"
 
-    def _transport(self) -> AbstractAsyncContextManager[object]:
+    def _transport(self) -> AbstractAsyncContextManager[SubprocessTransport]:
         return open_ssh_transport("127.0.0.1", **connect_kwargs(self.server))
 
     async def connect_and_close(self) -> tuple[float, int]:
@@ -372,7 +372,9 @@ class GantryClient(Client):
             started = time.perf_counter()
             async with anyio.create_task_group() as group:
                 for remote in remotes:
-                    group.start_soon(fetch, remote)
+                    # `_ =` for the same reason every `start_soon` in `src/` carries one:
+                    # anyio returns a task handle and `unused-awaitable` flags discarding it.
+                    _ = group.start_soon(fetch, remote)
             elapsed = time.perf_counter() - started
         return elapsed, sum(moved)
 

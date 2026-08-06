@@ -27,6 +27,7 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict, Unpack
 
 SSHD_CANDIDATES = ("/usr/sbin/sshd", "/usr/local/sbin/sshd")
 SFTP_SERVER_CANDIDATES = (
@@ -195,9 +196,44 @@ class SSHServer:
         }
 
 
+class ClientKwargs(TypedDict, total=False):
+    """The keyword arguments this suite splats into ``open_ssh_transport`` and ``connect``.
+
+    Both helpers below returned ``dict[str, object]`` until D-152, and that return type
+    defeats the checker at every one of their call sites: splatting such a dict into a
+    function with typed keyword parameters is one ``arg-type`` error *per parameter*, so the
+    sites either carried an ignore or sat outside the gate. The value being ``object`` is
+    what does it -- the key names were never the problem.
+
+    ``total=False`` because :func:`connect_kwargs` merges caller overrides over these defaults
+    and nothing here is mandatory at the splat; ``open_ssh_transport`` has its own default for
+    every one. No value is ``| None`` even though every parameter it feeds accepts ``None``:
+    absent and ``None`` are the same instruction to those functions, this suite only ever uses
+    the first, and carrying the second costs every reader of a key a narrowing step for a state
+    nothing produces.
+
+    The keys are the **intersection** of what :func:`~gantry_sftp.connect` and
+    :func:`~gantry_sftp.transport.open_ssh_transport` accept, because the same dict is
+    splatted into both and a key only one of them takes is an error at the other. That is not
+    a hypothetical: ``subsystem`` was in this list for one revision, no caller ever passed it,
+    and it failed seven ``connect(...)`` sites immediately. Adding a key here is what makes it
+    passable, which is the point -- an override this class does not name now fails at the call
+    rather than at the server.
+    """
+
+    port: int
+    identity_file: str | os.PathLike[str]
+    config_file: str | os.PathLike[str]
+    env: Mapping[str, str]
+    options: Mapping[str, str]
+    user: str
+    password: str
+    ssh_executable: str
+
+
 def client_kwargs(
     *, port: int, identity_file: str | Path, options: Mapping[str, str]
-) -> dict[str, object]:
+) -> ClientKwargs:
     """The connection arguments every suite here must use, assembled in one place.
 
     Three call sites need these -- :func:`connect_kwargs` for the OpenSSH server, and the
@@ -230,7 +266,7 @@ def client_kwargs(
     }
 
 
-def connect_kwargs(server: SSHServer, **overrides: object) -> dict[str, object]:
+def connect_kwargs(server: SSHServer, **overrides: Unpack[ClientKwargs]) -> ClientKwargs:
     """Keyword arguments for :func:`~gantry_sftp.transport.open_ssh_transport`.
 
     Defaults are merged rather than passed alongside the overrides, so a caller can say
@@ -240,9 +276,7 @@ def connect_kwargs(server: SSHServer, **overrides: object) -> dict[str, object]:
         Arguments ready to splat, with ``options`` already merged.
     """
     options = server.connect_options()
-    supplied = overrides.pop("options", {})
-    assert isinstance(supplied, dict)
-    options.update(supplied)
+    options.update(overrides.pop("options", {}))
     kwargs = client_kwargs(port=server.port, identity_file=server.identity_file, options=options)
     kwargs.update(overrides)
     return kwargs

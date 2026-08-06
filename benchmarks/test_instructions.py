@@ -188,7 +188,8 @@ def _baseline_findings(
     if mismatch is not None:
         return [], [f"The baseline did not apply and no figure was gated: {mismatch}."]
 
-    failures, notes = [], []
+    failures: list[str] = []
+    notes: list[str] = []
     for ladder in ladders:
         for drift in baseline.drifts(ladder, band=BASELINE_BAND):
             (failures if drift.costlier else notes).append(drift.describe())

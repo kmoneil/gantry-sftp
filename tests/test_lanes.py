@@ -134,6 +134,69 @@ def test_the_deprecation_lane_covers_every_directory_of_python_in_the_repository
 
 
 # ---------------------------------------------------------------------------
+# The API-consumer type gate (D-152)
+# ---------------------------------------------------------------------------
+
+CONSUMER_CONFIG = REPO_ROOT / "mypy.consumers.ini"
+
+CONSUMER_LANES = {"benchmarks": "live-tests", "live-tests": "tests"}
+"""Each API-consuming directory and the `MYPYPATH` its own imports need.
+
+`benchmarks/` imports `sshd` and `netem` out of `live-tests/`; `live-tests/` imports
+`server_contract` out of `tests/`. Without the path mypy reports `import-not-found` on a
+sibling helper instead of checking the file, which is a gate failing for the wrong reason.
+"""
+
+
+@pytest.mark.parametrize("directory", sorted(CONSUMER_LANES))
+def test_each_api_consuming_directory_has_a_type_gate(directory: str) -> None:
+    """`benchmarks/` and `live-tests/` call the public API the way a user does.
+
+    Until D-152 neither was inside any type gate, and a `DownloadResult` appended to a
+    `list[int]` sat in `benchmarks/` for two releases -- reachable only by a 25-minute job that
+    three consecutive pushes had cancelled before it could report. mypy names it in two
+    seconds. A hook per directory rather than one over both, because each has a `conftest.py`
+    and two files claiming that module name is an error before any checking starts.
+    """
+    block = _hook_block(f"mypy-{directory}")
+    entry = next(line for line in block.splitlines() if line.lstrip().startswith("entry:"))
+    assert f"--config-file={CONSUMER_CONFIG.name}" in entry
+    # The directory is the last argument, so a hook checking a *different* one -- or checking
+    # nothing, which is what mypy does with no path and no `files` -- fails here.
+    assert entry.split()[-1] == directory
+    assert f"MYPYPATH={CONSUMER_LANES[directory]}" in entry
+
+
+def test_the_consumer_gate_cannot_weaken_the_gate_over_shipped_code() -> None:
+    """The whole reason this is a second config file rather than more keys in pyproject.
+
+    The settings for the consumer lanes are deliberately weaker than `src`'s -- no `strict`,
+    so `no-untyped-def` on a test function is not a failure. One table holding both is one
+    edit away from that weakening reaching shipped code, and nothing would look wrong.
+    """
+    assert CONSUMER_CONFIG.is_file()
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    mypy_table = pyproject.split("[tool.mypy]", 1)[1].split("\n[", 1)[0]
+    assert "strict = true" in mypy_table
+    assert 'files = ["src"]' in mypy_table
+    assert "strict" not in CONSUMER_CONFIG.read_text(encoding="utf-8").split("[mypy]", 1)[1]
+
+
+def test_the_consumer_gate_waives_exactly_the_three_packages_it_documents() -> None:
+    """An `ignore_missing_imports` section is a hole, and a fourth one added quietly is how
+    this gate stops being one.
+
+    paramiko and asyncssh are the competitor stack, present only under `--group bench`, so
+    without a waiver the gate's verdict would depend on which group somebody last synced --
+    `import-not-found` when absent, `import-untyped` when present, neither about our code.
+    fsspec is the same call already taken for `src` in pyproject, for the same reason: no
+    `py.typed`, and the fix is upstream.
+    """
+    sections = re.findall(r"^\[mypy-([a-z_]+),", CONSUMER_CONFIG.read_text(encoding="utf-8"), re.M)
+    assert set(sections) == {"paramiko", "asyncssh", "fsspec"}
+
+
+# ---------------------------------------------------------------------------
 # The parked-worktree warning
 # ---------------------------------------------------------------------------
 

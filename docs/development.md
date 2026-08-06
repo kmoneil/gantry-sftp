@@ -22,7 +22,7 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 
 | lane                  | what it proves                                                                                  | needs, beyond `uv sync`        |
 | --------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------ |
-| `lanes.py gates`      | ruff, mypy `--strict`, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit, the secrets scan | nothing; POSIX only            |
+| `lanes.py gates`      | ruff, mypy `--strict` over `src` and a weaker mypy over the two API-consuming directories, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit, the secrets scan | nothing; POSIX only            |
 | `lanes.py audit`      | known advisories against the versions `uv.lock` pins                                           | `uv sync --group audit`, network |
 | `lanes.py fast`       | unit tests, the real `sftp-server` rows, every example as a subprocess                          | `openssh-server` for some rows |
 | `lanes.py leaks`      | the unit tests again, failing the one that left a transport, session or child process alive     | `openssh-server` for some rows |
@@ -64,6 +64,18 @@ because across `posix_spawn` it reports the *parent's* peak (D-138).
 
 Type checking is deliberately two-tool: mypy is stricter and catches gaps ty misses. A
 finding gets fixed at the source, never silenced with an ignore.
+
+It runs at **two strengths over three scopes**. `src/` gets mypy `--strict` and ty, configured in
+`pyproject.toml`. `benchmarks/` and `live-tests/` get a second, weaker mypy pass configured in
+`mypy.consumers.ini` — they are consumers of the public API, calling `get`, `put`, `open_session`
+and `connect` exactly as a downstream program does, so a signature change that breaks them is one
+that breaks users. `tests/` is outside both, deliberately: it asserts against internals and is a
+different argument. The weaker level is measured rather than assumed — `--strict` reports
+hundreds of `no-untyped-def` and missing-`@override` findings on test functions, which is house
+style for assertion code and not a contract break, while the default level plus a few error codes
+reports the ones that matter. It is a separate file rather than more keys in `pyproject.toml` so
+that the weakening cannot reach shipped code by one edit, and it runs once per directory because
+each has a `conftest.py` and two files cannot both claim that module name.
 
 Calling a deprecated API is a gate of its own, over the whole repository rather than over `src`
 alone — a deprecated spelling taught in an example is one that gets copied into shipped code.

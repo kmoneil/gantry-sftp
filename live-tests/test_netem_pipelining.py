@@ -48,7 +48,7 @@ from netem import LOOPBACK as LOOPBACK_INTERFACE
 from netem import measure_rtt_ms, shape
 
 from conftest import connect, negotiate, running_dispatcher
-from gantry_sftp.codec import Close, Codec, Handle, Open, OpenFlag
+from gantry_sftp.codec import Close, Codec, Completed, Handle, Open, OpenFlag
 from gantry_sftp.session import (
     DEFAULT_PIPELINE_DEPTH,
     PREFERRED_READ_LENGTH,
@@ -159,6 +159,9 @@ async def opened_source(server, source: Path):
         opened = None
         while opened is None:
             for event in codec.receive(await transport.receive()):
+                # `receive()` yields `Negotiated | Completed`; only the second has a reply,
+                # and the handshake is already done by the time this loop runs.
+                assert isinstance(event, Completed), event
                 opened = event.response
         assert isinstance(opened, Handle), opened
 

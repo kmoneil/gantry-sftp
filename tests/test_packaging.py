@@ -827,6 +827,7 @@ WITHHELD = (
     ".github",
     ".pre-commit-config.yaml",
     "pyrightconfig.deprecations.json",
+    "mypy.consumers.ini",
     ".complexipy_cache",
 )
 """Top-level entries an sdist must **not** carry, and each one is a decision.
@@ -842,7 +843,9 @@ this module was written for. A lint cache in a distribution is not a style quest
 
 `pyrightconfig.deprecations.json` goes with `.pre-commit-config.yaml` for the same reason it sits
 beside it: it is the config for a hook, and the hook is not shipped either. A user who receives
-the sdist gets no `basedpyright` to read it.
+the sdist gets no `basedpyright` to read it. `mypy.consumers.ini` is the third of that set, and
+the most clearly useless of them in a distribution: it configures a check over `benchmarks/` and
+`live-tests/`, and `benchmarks/` is on this list two entries above.
 
 `.gitignore` is deliberately absent from both lists: hatchling force-includes it whatever the
 excludes say, measured on a real build, so asserting either way would be asserting about

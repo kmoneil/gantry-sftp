@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover -- exercised by not installing the group
 try:
     import paramiko
 except ImportError:  # pragma: no cover
-    paramiko = None  # type: ignore[assignment]
+    paramiko = None
 
 SERVER_NAMES = ("openssh", "asyncssh", "paramiko")
 """Every implementation the matrix knows how to start, in reference-first order."""

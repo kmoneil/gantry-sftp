@@ -20,6 +20,7 @@ import pytest
 from sshd import SSHServer, connect_kwargs
 
 from gantry_sftp import ConnectError, SessionOptions, connect
+from gantry_sftp.transport import SubprocessTransport
 
 pytestmark = pytest.mark.anyio
 
@@ -43,7 +44,7 @@ async def test_connect_moves_a_file_over_a_real_connection(ssh_server: SSHServer
     remote = tmp_path / "uploaded.bin"
     back = tmp_path / "back.bin"
 
-    async with connect("127.0.0.1", **connect_kwargs(ssh_server)) as sftp:  # type: ignore[arg-type]
+    async with connect("127.0.0.1", **connect_kwargs(ssh_server)) as sftp:
         result = await sftp.put(source, str(remote).encode())
         assert result.transferred == len(payload)
         assert (await sftp.get(str(remote).encode(), back)).transferred == len(payload)
@@ -61,7 +62,7 @@ async def test_the_session_options_reach_the_session(ssh_server: SSHServer):
     """
     async with connect(
         "127.0.0.1",
-        **connect_kwargs(ssh_server),  # type: ignore[arg-type]
+        **connect_kwargs(ssh_server),
         session=SessionOptions(depth=8, request_timeout=11.0),
     ) as sftp:
         assert sftp.depth == 8
@@ -79,12 +80,16 @@ async def test_the_connection_and_the_session_both_close(ssh_server: SSHServer, 
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
 
-    async with connect("127.0.0.1", **connect_kwargs(ssh_server)) as sftp:  # type: ignore[arg-type]
+    async with connect("127.0.0.1", **connect_kwargs(ssh_server)) as sftp:
         await sftp.put(source, str(tmp_path / "uploaded.bin").encode())
         # Reached through the dispatcher because `connect()` deliberately does not hand the
         # transport back -- which is the whole reason this leak would be invisible from
         # outside, and therefore the reason the test reaches in.
         transport = sftp._dispatcher._transport  # noqa: SLF001
+        # `Dispatcher` holds the `Transport` protocol, which has no `returncode` -- that is a
+        # subprocess fact and this test is about the `ssh` child specifically, so it narrows
+        # rather than reading the attribute through a type that does not promise it.
+        assert isinstance(transport, SubprocessTransport)
 
     assert transport.returncode is not None, "the ssh child was not reaped when the block exited"
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -695,7 +696,11 @@ async def _scenario_file_object(
                 continue
             measurements.append(
                 await take_samples(
-                    lambda c=client, b=block: c.read_in_blocks(remote, block_size=b),
+                    # `partial` rather than `lambda c=client, b=block:`, which is the spelling
+                    # that silences ruff's B023 and then defeats mypy -- a lambda with defaults
+                    # has no inferable signature against `Callable[[], Awaitable[...]]`. `partial`
+                    # binds both loop variables eagerly, so B023 has nothing to say either.
+                    partial(client.read_in_blocks, remote, block_size=block),
                     scenario=scenario,
                     client=f"{client.name} (read {block // 1024} KiB blocks)",
                     repeats=REPEATS,

@@ -26,6 +26,7 @@ import hashlib
 import logging
 import os
 from collections.abc import Iterator
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,11 @@ from matrix import MatrixServer, password_server_unavailable_reason, running_pas
 from gantry_sftp._logging import MASKED
 from gantry_sftp.exceptions import AuthenticationError, ConnectError
 from gantry_sftp.session import open_session
-from gantry_sftp.transport import ASKPASS_ARMING_VARIABLES, open_ssh_transport
+from gantry_sftp.transport import (
+    ASKPASS_ARMING_VARIABLES,
+    SubprocessTransport,
+    open_ssh_transport,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -58,13 +63,21 @@ def password_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Matrix
         yield server
 
 
-def connect(server: MatrixServer, **overrides: object) -> object:
-    """Open a transport to the password server, with any argument replaceable."""
+def connect(
+    server: MatrixServer, **overrides: object
+) -> AbstractAsyncContextManager[SubprocessTransport]:
+    """Open a transport to the password server, with any argument replaceable.
+
+    The return type is spelled out rather than left as ``object`` (D-152): every caller uses
+    it as an ``async with``, and ``object`` has no ``__aenter__`` -- so the checker had
+    nothing to say about seven live call sites, including whether the thing being opened is a
+    transport at all.
+    """
     kwargs = dict(server.connect)
     kwargs.update(overrides)
     host = kwargs.pop("host")
     assert isinstance(host, str)
-    return open_ssh_transport(host, **kwargs)  # type: ignore[arg-type]
+    return open_ssh_transport(host, **kwargs)
 
 
 # --- the recipe works -----------------------------------------------------------------------
