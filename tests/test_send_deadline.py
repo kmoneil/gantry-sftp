@@ -19,6 +19,7 @@ pipe, and the peer's next parse reads a length prefix out of the middle of our p
 
 from __future__ import annotations
 
+import ast
 import os
 import signal
 import sys
@@ -61,35 +62,40 @@ from gantry_sftp.exceptions import TransferTimeoutError
 from gantry_sftp.session import Dispatcher, Publish, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
-pytestmark = [
-    pytest.mark.anyio,
-    # **The whole module, off Linux, and the earlier per-test skip was the wrong shape** (D-160).
-    #
-    # Every row here opens a session against a peer that has stopped reading, which is the point.
-    # Teardown then sends a *shielded* `CLOSE`, and a shield is by construction uncancellable --
-    # `move_on_after` cannot end it, and neither can the `fail_after(WATCHDOG)` these tests carry,
-    # which is why a watchdog per row is not the protection it looks like. Whether that `CLOSE`
-    # completes comes down to whether the peer's buffer has room, and on Linux it always has.
-    #
-    # On macOS it does not. The first row in the file hangs, the job runs until the runner's own
-    # timeout, and an orphaned `sftp-server` is left behind. Skipping one row -- the one whose
-    # docstring described the hazard -- fixed nothing, because the hazard belongs to the fake and
-    # every row uses it.
-    #
-    # The real fix is in `StallingServer`: a peer that drains on close would make the shielded
-    # write complete everywhere, and that is D-160's open half. This is a skip rather than that
-    # fix because the fix cannot be verified from here -- there is no macOS to run it on, and an
-    # unverified change to the one helper this whole file depends on is worse than a skip that
-    # says why.
-    pytest.mark.skipif(
-        sys.platform != "linux",
-        reason=(
-            "these rows wedge a peer on purpose and their teardown is a shielded, uncancellable "
-            "write; whether it completes is the peer's buffering, which only Linux is known to "
-            "make safe here -- see D-160"
-        ),
+pytestmark = [pytest.mark.anyio]
+
+needs_a_real_pipe = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason=(
+        "these two rows spawn a real `sftp-server` and push a payload sized against a pipe's "
+        "capacity, which is a platform constant; what a SIGCONTed server does with the "
+        "half-written frame left behind is not known off Linux -- see D-160"
     ),
-]
+)
+"""The two rows that spawn a process, and the whole of what D-160 leaves unproven off Linux.
+
+**This replaced a skip over the entire module, whose stated reason was wrong** (D-160). That
+reason was that every row wedges a peer, that teardown then makes a shielded uncancellable write,
+and that whether it completes "comes down to whether the peer's buffer has room". `StallingServer`
+has no buffer: it is an in-process object whose `send` either sleeps forever or appends to an
+unbounded `bytearray`, with no pipe, no socket and no child anywhere in it. Nothing in it can
+differ by platform, and `os.kill`, `signal` and `open_local_server_transport` appear in this module
+**only** inside the two rows below.
+
+The evidence in the original report says the same thing and was read past: the hung macOS job left
+an orphaned `sftp-server`, and these two rows are the only place one is spawned. The inference that
+sent the skip module-wide -- that pytest never printing the file's name meant it stalled on the
+file's *first* row -- does not hold either, because that name is written without a newline and sits
+in a block-buffered stream until something flushes it.
+
+So fourteen rows are back on every platform and two are not, which is the scope the evidence
+supports. What stays open is *why* these two hang there, and that needs a macOS run to answer.
+
+**Both rows carry it, including the control, which does not stop anything and could not hang the
+same way.** A control that runs where its subject is skipped is worse than no control: it goes
+green, and green from a control reads as a claim having been checked. The pair moves together or
+it stops meaning anything.
+"""
 
 SEND_TIMEOUT = 0.5
 """Short, because every test here waits it out. The shipped default is `request_timeout`."""
@@ -496,9 +502,48 @@ async def test_cancelling_a_blocked_send_from_outside_still_unwinds(tmp_path: Pa
     assert anyio.current_time() - started < WATCHDOG / 2
 
 
+def test_only_the_marked_rows_reach_for_a_real_process():
+    """The premise the platform skip rests on, asserted rather than believed.
+
+    `needs_a_real_pipe` is narrow because `StallingServer` owns no operating-system object --
+    it cannot fill a pipe, stop a child or behave differently on another platform. That is a
+    claim about *this file*, and a claim about a file rots the moment somebody adds a row. A
+    single unmarked row that spawns an `sftp-server` puts the macOS hang back, and it would
+    come back as a twenty-minute job with no failing assertion anywhere.
+
+    So the file checks its own shape, in the spirit of `test_layer_discipline.py`: anything
+    naming a process, a signal or the local-server transport has to carry the marker. Names are
+    matched as source identifiers rather than imported, which is why this row can list them
+    without listing itself.
+    """
+    spawning = {"open_local_server_transport", "find_sftp_server", "kill", "signal"}
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    unmarked: list[str] = []
+    for node in module.body:
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        marked = any(
+            isinstance(decorator, ast.Name) and decorator.id == "needs_a_real_pipe"
+            for decorator in node.decorator_list
+        )
+        names = {
+            child.id if isinstance(child, ast.Name) else child.attr
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name | ast.Attribute)
+        }
+        if names & spawning and not marked:
+            unmarked.append(node.name)
+
+    assert unmarked == [], (
+        f"these rows reach for a real process without `@needs_a_real_pipe`: {unmarked}. "
+        "Either mark them or they will hang the macOS lane the way D-160 did."
+    )
+
+
 # --- a real pipe, genuinely full ------------------------------------------------------------
 
 
+@needs_a_real_pipe
 async def test_a_stopped_server_fills_the_pipe_and_the_deadline_reports_it(tmp_path: Path):
     """The fake above decides not to return. This one cannot return.
 
@@ -551,6 +596,7 @@ async def test_a_stopped_server_fills_the_pipe_and_the_deadline_reports_it(tmp_p
     )
 
 
+@needs_a_real_pipe
 async def test_a_running_server_accepts_the_same_write(tmp_path: Path):
     """The control, and it is not a formality.
 
