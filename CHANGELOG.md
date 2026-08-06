@@ -5,6 +5,15 @@ and while the major version is `0` the minor version is where a breaking change 
 
 ## Unreleased
 
+### Changed
+
+- **The maturity claim moves from alpha to beta**, in the three places that state it: the
+  `Development Status` classifier, README's Status section and `SECURITY.md`'s support window.
+  PyPI's rungs are about feature completeness rather than release count — the protocol layer
+  covers all 27 filexfer v3 packet types, the ergonomics and fsspec surfaces are built, and what
+  is left open is scope decided against rather than work half-done. Not `5 - Production/Stable`:
+  that claims a settled API, and a `0` major version says the opposite.
+
 ### Fixed
 
 - **`get_tree` no longer abandons the rest of a tree when the local filesystem refuses one

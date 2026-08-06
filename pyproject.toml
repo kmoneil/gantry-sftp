@@ -21,7 +21,14 @@ keywords = ["sftp", "ssh", "filexfer", "openssh", "file-transfer"]
 # Windows and refuse there rather than crashing. The `ssh` transport and every remote-only
 # operation are platform-independent; see README "Requirements" and `session/_platform.py`.
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  # Beta rather than Alpha as of 0.1.0's follow-up. The distinction PyPI's list draws is
+  # feature completeness rather than release count: the protocol layer covers all 27 filexfer
+  # v3 packet types, the ergonomics and fsspec surfaces are built, and what remains open is
+  # scope decided against (Windows transfers) rather than work half-done. **Not** 5 -
+  # Production/Stable, which would claim a settled API, and the major version being `0` says
+  # the opposite. Stated in three places -- here, README "Status" and `SECURITY.md`'s support
+  # window -- so all three move together.
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Operating System :: POSIX",
   "Programming Language :: Python :: 3 :: Only",

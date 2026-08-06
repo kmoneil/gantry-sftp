@@ -176,9 +176,9 @@ performance, and it writes its figures to a report rather than to this file.
 
 ## Status
 
-**0.1.0, the first public release. Alpha, and honest about it: the API can still change**, and
-while the major version is `0` a breaking change lands in the minor version. Two already have,
-deliberately, in the releases leading to this one.
+**0.1.0, the first public release, and beta rather than alpha: the feature set is complete and
+the API can still change.** While the major version is `0` a breaking change lands in the minor
+version. Two already have, deliberately, in the releases leading to this one.
 
 The protocol layer is complete: all 27 filexfer v3 packet types, encoded and decoded, each with a
 byte-level fixture asserted in **both** directions, checked against `draft-ietf-secsh-filexfer-02`

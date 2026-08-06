@@ -77,7 +77,8 @@ reviewer who assumes the ordinary answer will get them wrong.
 
 While the major version is `0`, a fix ships in a new minor or patch release and there are no
 backports to earlier ones. Stating a support window this narrow is the honest answer for a
-single-maintainer alpha project; implying an LTS that does not exist would be worse than saying so.
+single-maintainer project at `0.x`; implying an LTS that does not exist would be worse than saying
+so.
 
 ## What to expect
 
