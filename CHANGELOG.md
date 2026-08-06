@@ -3,7 +3,16 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## Unreleased
+## 0.1.1 — 2026-08-06
+
+A patch rather than a minor, and the one judgement call in that is stated rather than left to be
+inferred. `get` of a name the local filesystem refuses used to raise a bare `OSError` and now
+raises `TransferError`, which is **not** an `OSError` subclass — so an `except OSError` around
+`get` written for it would stop matching. That is treated as the fix it is filed as rather than as
+a break: the behaviour was undocumented, unreachable on Linux, and the leak of an errno with no
+path out of an API whose whole claim is that its errors say what failed and where. The new
+`SkipReason` member is an addition, which under this project's `0.x` rule — the minor version is
+where a breaking change lands — belongs in a patch.
 
 ### Changed
 
