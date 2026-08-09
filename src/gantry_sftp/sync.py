@@ -586,6 +586,54 @@ class SyncSession:
         """Write ``data`` at ``offset``, pipelined."""
         return self._run(partial(self._session.write_at, handle, offset, data))
 
+    def download_into(
+        self,
+        handle: bytes,
+        fd: int,
+        *,
+        size: int | None,
+        depth: int | None = None,
+        progress: ProgressCallback | None = None,
+        remote_path: bytes | None = None,
+        start_offset: int = 0,
+    ) -> int:
+        """Fill a local descriptor from an open remote handle, pipelined."""
+        return self._run(
+            partial(
+                self._session.download_into,
+                handle,
+                fd,
+                size=size,
+                depth=depth,
+                progress=progress,
+                remote_path=remote_path,
+                start_offset=start_offset,
+            )
+        )
+
+    def upload_from(
+        self,
+        handle: bytes,
+        source: Path | str,
+        *,
+        depth: int | None = None,
+        progress: ProgressCallback | None = None,
+        remote_path: bytes | None = None,
+        start_offset: int = 0,
+    ) -> int:
+        """Push a local file through an open remote handle, pipelined."""
+        return self._run(
+            partial(
+                self._session.upload_from,
+                handle,
+                source,
+                depth=depth,
+                progress=progress,
+                remote_path=remote_path,
+                start_offset=start_offset,
+            )
+        )
+
     def ftruncate(self, handle: bytes, size: int) -> None:
         """Set the length of an open file, by handle rather than by path."""
         return self._run(partial(self._session.ftruncate, handle, size))

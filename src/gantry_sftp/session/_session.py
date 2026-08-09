@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -47,7 +46,6 @@ import anyio
 
 from gantry_sftp._logging import operation, session_logger
 from gantry_sftp.codec import (
-    EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
     EXTENSION_POSIX_RENAME,
     LIMITS_NAME,
@@ -88,13 +86,13 @@ from gantry_sftp.session._download import (
     DEFAULT_PIPELINE_DEPTH,
     DownloadResult,
     ProgressCallback,
-    download_handle,
 )
 from gantry_sftp.session._glob import (
     GlobRunner,
     split_pattern,
     validate_pattern,
 )
+from gantry_sftp.session._handles import close_quietly
 from gantry_sftp.session._limits import ServerLimits
 from gantry_sftp.session._listing import (
     DOT_ENTRIES,
@@ -116,11 +114,11 @@ from gantry_sftp.session._mode import (
 from gantry_sftp.session._operations import _SessionOperations
 from gantry_sftp.session._platform import NO_FOLLOW, require_local_io
 from gantry_sftp.session._policy import (
+    _already_complete,
     _check_local_path,
     _check_publish_flags,
     _check_tree_concurrency,
     _check_tree_publish,
-    _chmod_local,
     _chmod_local_directories,
     _collision_error,
     _confirm_download_size,
@@ -128,7 +126,6 @@ from gantry_sftp.session._policy import (
     _download_resume_offset,
     _DownloadState,
     _ensure_directory,
-    _gate_as_content_check,
     _local_directory,
     _local_size,
     _local_times,
@@ -139,7 +136,6 @@ from gantry_sftp.session._policy import (
     _settle_directory,
     _settle_remote_directory,
     _skip_reason,
-    _stamp_local,
     _stamp_local_directories,
     _touch_destination,
     _TreeDownload,
@@ -167,14 +163,11 @@ from gantry_sftp.session._recursive import (
     WalkEntry,
     join_remote,
 )
-from gantry_sftp.session._upload import upload_handle
 from gantry_sftp.session._verify import (
-    CHECK_FILE_BLOCK_SIZE,
-    ContentCheck,
-    ResumeCheck,
     Verify,
-    local_block_digests,
-    ranges_equal,
+    gate_resume,
+    verify_content,
+    verify_downloaded_content,
 )
 from gantry_sftp.transport import Transport
 
@@ -435,7 +428,7 @@ class DirectoryScan:
         if exc_type is None:
             await self._session.close(handle)
         else:
-            await _close_quietly(self._session, handle)
+            await close_quietly(self._session, handle)
 
     def __aiter__(self) -> DirectoryScan:
         """Iterate the entries.
@@ -595,7 +588,7 @@ class RemoteFile:
         if exc is None:
             await self._session.close(handle)
             return
-        await _close_quietly(self._session, handle)
+        await close_quietly(self._session, handle)
 
     def tell(self) -> int:
         """The cursor, without asking the server.
@@ -1326,181 +1319,12 @@ class Session(_SessionOperations):
             f"nothing can be created at that name until it is moved or removed"
         )
 
-    # --- verification, rungs 1 and 2 of DESIGN.md 6 -----------------------------------------
-
-    async def _hashes_agree(
-        self, path: bytes, local_path: Path | str, *, start: int, length: int
-    ) -> bool | None:
-        """Rung 1 over one range: does the server's hash of it match the local file's?
-
-        ``None`` is the third state and it is the *common* one -- the extension is absent, or
-        advertised and then refused. It says the question could not be asked, which is a
-        different fact from the answer being "no" and must never collapse into it: one is
-        "unverified", the other is "corrupt".
-
-        Costs its own ``OPEN`` and ``CLOSE``. ``check-file`` hashes by reading through the
-        handle, so the WRITE-only one an upload is holding answers ``FAILURE`` -- measured
-        against paramiko, which is the only server that implements this at all.
-
-        An **empty range short-circuits and never reaches the wire**, because ``length=0`` on
-        the wire means "to the end of the file" rather than "nothing". Sending it would hash
-        the whole file and compare it against no local blocks at all.
-        """
-        if self.refuses(EXTENSION_CHECK_FILE):
-            # Asked once per session, not once per file. Advertisement is not consulted here
-            # any more (D-51): the endpoints most likely to under-advertise are the ones where
-            # rung 1 is worth having, and the cost of finding out is one exchange for the whole
-            # session -- against the OPEN and CLOSE below, which this pays per file anyway.
-            return None
-        if length == 0:
-            return True
-        handle = await self.open(path, OpenFlag.READ)
-        try:
-            algorithm, theirs = await self.check_file(
-                handle, start_offset=start, length=length, block_size=CHECK_FILE_BLOCK_SIZE
-            )
-        except ServerError:
-            # Advertised and unusable -- no algorithm in common, a handle it will not read,
-            # a range it will not hash. Rung 1 is unavailable here, which is exactly what an
-            # unadvertised extension also means, so the two collapse to the same answer.
-            return None
-        finally:
-            # Quietly, and on the success path too: this handle exists only to ask a question,
-            # and failing a transfer because the *probe's* CLOSE was refused would be
-            # housekeeping replacing the diagnosis.
-            await _close_quietly(self, handle)
-        try:
-            mine = await local_block_digests(local_path, algorithm, start=start, length=length)
-        except ValueError:
-            # The server hashed with something this Python cannot compute. There is nothing to
-            # compare against, so the rung is unavailable rather than failed.
-            return None
-        return theirs == mine
-
-    async def _reread_agrees(
-        self, path: bytes, local_path: Path | str, *, start: int, length: int
-    ) -> bool:
-        """Rung 2 over one range: read the bytes back off the server and compare them.
-
-        Works against **any** server, because it asks for nothing but ``READ``. That is the
-        whole point of the rung: ``check-file`` is absent from nearly every endpoint in the
-        field, so without this there is no content verification available at all off a
-        paramiko-backed server.
-
-        The bytes land in a temporary file and are compared from there, rather than being
-        compared as they arrive. Two reasons, and the second is the load-bearing one: replies
-        arrive out of order, so a streaming comparison would have to reassemble them, which is
-        the scheduler this library already has exactly one of; and writing to a descriptor is
-        what :func:`~gantry_sftp.session.download_handle` does, so the re-read runs at the
-        pipelined speed of an ordinary download instead of one round trip per block. **The
-        cost is temporary local disk equal to the range**, in ``$TMPDIR``, and that is stated
-        rather than hidden -- it is the reason this rung is opt-in.
-        """
-        if length == 0:
-            return True
-        handle = await self.open(path, OpenFlag.READ)
-        try:
-            with tempfile.NamedTemporaryFile(prefix="gantry-verify-") as scratch:
-                await download_handle(
-                    self._dispatcher,
-                    handle,
-                    scratch.fileno(),
-                    size=start + length,
-                    read_length=self.sizes_for(handle).read_length,
-                    depth=self._depth,
-                    idle_timeout=self._idle_timeout,
-                    remote_path=path,
-                    start_offset=start,
-                )
-                return await ranges_equal(scratch.fileno(), local_path, start=start, length=length)
-        finally:
-            await _close_quietly(self, handle)
-
-    async def _gate_resume(
-        self, path: bytes, local_path: Path | str, adopted: int, verify: Verify
-    ) -> ResumeCheck:
-        """Gate the adopted prefix on a rung, which is what DESIGN.md 6 asks for in as many words.
-
-        The offset was established from the size the server reported, and a size match proves
-        only that the byte count agrees. What it cannot refuse is the case that matters most --
-        a remote partial of the *right* length from the *wrong* source, which this completes,
-        publishes, and passes rung 3 on, because the finished length is correct.
-
-        **Rung 1 runs by default and rung 2 does not**, and the asymmetry is the decision.
-        Rung 1 moves no bytes, so gating on it where it exists is free correctness and there
-        is no case for making a caller ask. Rung 2 re-reads the whole adopted prefix, which is
-        most of what resume set out to avoid; making *that* automatic would silently turn a
-        bandwidth optimisation into a bandwidth cost. It is worth asking for on an asymmetric
-        link, where reading back is cheaper than sending again -- but that is the caller's fact
-        about their link, not ours.
-
-        Raises:
-            TransferError: If the adopted prefix is provably not a prefix of the local file.
-                Before a single byte is sent, so nothing is published and the partial is left
-                exactly as it was found -- it may be somebody else's, and it is the only
-                evidence of what went wrong.
-        """
-        if adopted == 0:
-            return ResumeCheck.SKIPPED
-        if verify is Verify.REREAD:
-            agreed: bool | None = await self._reread_agrees(
-                path, local_path, start=0, length=adopted
-            )
-        else:
-            agreed = await self._hashes_agree(path, local_path, start=0, length=adopted)
-        if agreed is None:
-            return ResumeCheck.UNAVAILABLE
-        if not agreed:
-            raise TransferError(
-                f"cannot resume: the {adopted} bytes already at {path!r} are not a prefix of "
-                f"{local_path} -- the partial is from a different source file or a different "
-                f"run, and continuing would publish a file of the right length and the wrong "
-                f"contents. Upload without resume=True to replace it",
-                transferred=0,
-                offset=adopted,
-                remote_path=path,
-                local_path=str(local_path),
-            )
-        return ResumeCheck.MATCHED
-
-    async def _verify_content(
-        self, path: bytes, local_path: Path | str, expected: int, verify: Verify
-    ) -> ContentCheck:
-        """Check what the server now holds against the local file, at the rung asked for.
-
-        Args:
-            path: What to read back. On the atomic path this is the **staging file**, checked
-                before the rename, for the same reason rung 3 is: content that fails belongs
-                to a file no consumer has ever been able to see.
-            local_path: The source of truth.
-            expected: Bytes the file should hold -- the local file's length, not what this run
-                moved, which differs under ``resume``.
-            verify: Which rung to try.
-
-        Raises:
-            TransferError: If the content disagrees.
-        """
-        if verify is Verify.SIZE:
-            return ContentCheck.SKIPPED
-        if verify is Verify.HASH:
-            agreed = await self._hashes_agree(path, local_path, start=0, length=expected)
-            if agreed is None:
-                return ContentCheck.UNAVAILABLE
-            reached = ContentCheck.HASHED
-        else:
-            agreed = await self._reread_agrees(path, local_path, start=0, length=expected)
-            reached = ContentCheck.REREAD
-        if not agreed:
-            raise TransferError(
-                f"{path!r} does not hold the contents of {local_path}: it is {expected} bytes "
-                f"long, as it should be, and the bytes differ. The upload is corrupt rather "
-                f"than short, which is the failure a size check cannot see",
-                transferred=expected,
-                offset=0,
-                remote_path=path,
-                local_path=str(local_path),
-            )
-        return reached
+    # --- get, and the two round trips it opens with -------------------------------------------
+    #
+    # This banner used to read "verification, rungs 1 and 2 of DESIGN.md 6" and the rungs are no
+    # longer here: D-146 moved them to `session/_verify.py` as functions taking a session, and
+    # what is left is the download they were reached from. A section banner naming a concern the
+    # section no longer holds is worse than none -- it is what a reader greps for.
 
     async def _stat_and_open_for_download(
         self, path: bytes, *, together: bool
@@ -1563,7 +1387,7 @@ class Session(_SessionOperations):
             # did arrive is ours, and it is closed here rather than at the call site because this
             # is the only frame that still has it.
             if opened:
-                await _close_quietly(self, opened[0])
+                await close_quietly(self, opened[0])
             raise _flatten_exception_group(group) from None
 
         return described[0], opened[0]
@@ -1754,14 +1578,14 @@ class Session(_SessionOperations):
                 # source is the same corruption as on the upload side, and it is caught here before
                 # the first READ. It refused but could not report until D-99 gave `get` somewhere
                 # to say so -- see D-38 for the refusal.
-                resume_check = await self._gate_resume(encoded, local_path, start, wanted)
+                resume_check = await gate_resume(self, encoded, local_path, start, wanted)
                 times_result = _preservation(preserve_times, attributes.times)
                 if resume and start == attributes.size:
                     # Already complete: nothing to open and nothing to move. Deliberately *after*
                     # the gate rather than before it -- this is the case that adopts the entire file
                     # and returns success having verified nothing, which makes it the one most worth
                     # gating, not the one to skip for a round trip.
-                    return self._already_complete(
+                    return _already_complete(
                         encoded,
                         local_path,
                         record,
@@ -1796,7 +1620,7 @@ class Session(_SessionOperations):
                     # is invisible from this side until the server starts refusing to open anything.
                     # It must not replace the transfer's error with one about the close, though --
                     # the first error is the diagnosis and the second is housekeeping.
-                    await _close_quietly(self, handle)
+                    await close_quietly(self, handle)
                     raise
                 await self.close(handle)
                 record["bytes"] = transferred
@@ -1807,8 +1631,8 @@ class Session(_SessionOperations):
                     announced=attributes.size,
                     asked=verify_size,
                 )
-                content_check = await self._verify_downloaded_content(
-                    encoded, local_path, start + transferred, wanted
+                content_check = await verify_downloaded_content(
+                    self, encoded, local_path, start + transferred, wanted
                 )
                 return DownloadResult(
                     transferred,
@@ -1827,104 +1651,6 @@ class Session(_SessionOperations):
             # construction rather than by anybody remembering to pass it.
             _name_the_local_file(failure, local_path)
             raise
-
-    def _already_complete(
-        self,
-        remote_path: bytes,
-        local_path: Path | str,
-        record: dict[str, object],
-        *,
-        adopted: int,
-        mode: int | None,
-        no_follow: bool,
-        times: Times | None,
-        times_result: TimePreservation,
-        resume_check: ResumeCheck,
-        verify: Verify,
-    ) -> DownloadResult:
-        """Finish a resume that found the local file already whole, without opening anything.
-
-        **The metadata is still applied, and skipping it is the silent wrong answer this whole
-        path exists to avoid**: the destination the caller named exists, they said what
-        permissions and timestamps it should have, and "it was already there" is not an answer
-        to that. The partial was not necessarily left by this library, so neither its mode nor
-        its times are necessarily anything in particular -- its mtime is the moment the
-        *interrupted* run last wrote to it, which is exactly the fabricated-but-plausible
-        timestamp D-79 is about.
-
-        The times half of that was missing until D-99, and it was missing invisibly: ``get``
-        returned a byte count, so a caller who passed ``preserve_times=True`` and resumed a
-        complete file got a plausible wrong mtime and no way to notice. Building the result
-        type is what surfaced it, which is the argument for result types.
-
-        Both go on a fresh ``O_NOFOLLOW`` descriptor rather than on the path, for the reason
-        :func:`_chmod_local` gives: the containment check is old by now.
-
-        Returns:
-            The result, with ``content_check`` derived from the gate rather than from a second
-            comparison. A resume that adopts the whole file has just had the whole file
-            compared against the remote one at the rung ``verify`` names, so re-running it
-            would be a duplicate -- and for
-            :data:`~gantry_sftp.session.Verify.REREAD` a duplicate is a second full download.
-        """
-        if mode is not None:
-            _chmod_local(local_path, mode, no_follow=no_follow)
-        if times is not None:
-            _stamp_local(local_path, times, no_follow=no_follow)
-        record["bytes"] = 0
-        record["adopted"] = adopted
-        return DownloadResult(
-            0,
-            remote_path,
-            Path(local_path),
-            SizeCheck.MATCHED,
-            times=times_result,
-            content_check=_gate_as_content_check(resume_check, verify),
-            resume_check=resume_check,
-            adopted=adopted,
-            mode=mode,
-        )
-
-    async def _verify_downloaded_content(
-        self, path: bytes, local_path: Path | str, expected: int, verify: Verify
-    ) -> ContentCheck:
-        """Check the file that was just written against what the server holds, at ``verify``.
-
-        The mirror of :meth:`_verify_content`, and separate from it only for the message: the
-        comparison is identical -- a remote range against a local one -- but "the upload is
-        corrupt" is the wrong sentence to hand somebody whose download it was.
-
-        Args:
-            path: What was read.
-            local_path: What was written, and what is being checked.
-            expected: Bytes the local file should hold. ``adopted + transferred``, not what
-                this call moved, which differs under ``resume``.
-            verify: Which rung to try.
-
-        Raises:
-            TransferError: If the content disagrees.
-        """
-        if verify is Verify.SIZE:
-            return ContentCheck.SKIPPED
-        if verify is Verify.HASH:
-            agreed = await self._hashes_agree(path, local_path, start=0, length=expected)
-            if agreed is None:
-                return ContentCheck.UNAVAILABLE
-            reached = ContentCheck.HASHED
-        else:
-            agreed = await self._reread_agrees(path, local_path, start=0, length=expected)
-            reached = ContentCheck.REREAD
-        if not agreed:
-            raise TransferError(
-                f"{local_path} does not hold the contents of {path!r}: it is {expected} bytes "
-                f"long, as it should be, and the bytes differ. The download is corrupt rather "
-                f"than short, which is the failure a size check cannot see",
-                transferred=expected,
-                offset=0,
-                remote_path=path,
-                local_path=str(local_path),
-            )
-        return reached
 
     async def _download_into(
         self,
@@ -1992,14 +1718,11 @@ class Session(_SessionOperations):
                 local_path=str(local_path),
             ) from refusal
         try:
-            transferred = await download_handle(
-                self._dispatcher,
+            transferred = await self.download_into(
                 handle,
                 fd,
                 size=size,
-                read_length=self.sizes_for(handle).read_length,
-                depth=self._depth if depth is None else depth,
-                idle_timeout=self._idle_timeout,
+                depth=depth,
                 progress=progress,
                 remote_path=remote_path,
                 start_offset=start_offset,
@@ -2917,7 +2640,7 @@ class Session(_SessionOperations):
         # Before the OPEN, so a refused prefix leaves the destination exactly as it was found.
         # The sibling refusals in `_upload_resume_offset` are at this same point for the same
         # reason, and a gate that first truncates what it is about to reject is not a gate.
-        resume_check = await self._gate_resume(target, upload.local_path, start, upload.verify)
+        resume_check = await gate_resume(self, target, upload.local_path, start, upload.verify)
         handle = await self.open(
             target,
             _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS,
@@ -2941,8 +2664,8 @@ class Session(_SessionOperations):
         # the staging file instead.
         expected = _local_size(upload.local_path)
         size_check = await self._confirm_size(target, expected)
-        content_check = await self._verify_content(
-            target, upload.local_path, expected, upload.verify
+        content_check = await verify_content(
+            self, target, upload.local_path, expected, upload.verify
         )
         return UploadResult(
             transferred,
@@ -2978,7 +2701,7 @@ class Session(_SessionOperations):
         # rejected prefix inside it would reach `_discard` and delete the staging file -- which
         # is the caller's named file under `resume=`, is possibly another publisher's, and is
         # the only evidence of what went wrong. Refusing must not also destroy.
-        resume_check = await self._gate_resume(staged, upload.local_path, start, upload.verify)
+        resume_check = await gate_resume(self, staged, upload.local_path, start, upload.verify)
         handle = await self._open_staging_file(
             staged, target, resume=upload.resume, mode=create_bits(upload.mode)
         )
@@ -3008,8 +2731,8 @@ class Session(_SessionOperations):
             # becomes the destination is a failed upload, and corrupt content that does is a
             # consumer reading it. This one is inside the try on purpose -- unlike the resume
             # gate, the staging file it would discard is one we just wrote and know is wrong.
-            content_check = await self._verify_content(
-                staged, upload.local_path, expected, upload.verify
+            content_check = await verify_content(
+                self, staged, upload.local_path, expected, upload.verify
             )
             mechanism = await self._publish(staged, target, require_atomic=require_atomic)
         except _StagedIsTheOnlyCopyError as lost:
@@ -3164,13 +2887,10 @@ class Session(_SessionOperations):
         times are set before the rename that publishes it.
         """
         try:
-            transferred = await upload_handle(
-                self._dispatcher,
+            transferred = await self.upload_from(
                 handle,
                 upload.local_path,
-                write_length=self.sizes_for(handle).write_length,
-                depth=self._depth if upload.depth is None else upload.depth,
-                idle_timeout=self._idle_timeout,
+                depth=upload.depth,
                 progress=upload.progress,
                 remote_path=path,
                 start_offset=start_offset,
@@ -3183,7 +2903,7 @@ class Session(_SessionOperations):
             # Closing is not optional -- a leaked handle counts against max-open-handles and
             # is invisible from this side until the server refuses to open anything. But it
             # must not replace the error that got us here with one about the close.
-            await _close_quietly(self, handle)
+            await close_quietly(self, handle)
             raise
         await self.close(handle)
         return transferred, durability, times, upload.mode
@@ -3787,31 +3507,11 @@ class Session(_SessionOperations):
         with anyio.CancelScope(shield=True):
             try:
                 await self.remove(staged)
-            except Exception as cleanup_failure:  # see _close_quietly on the breadth
+            except Exception as cleanup_failure:  # see close_quietly on the breadth
                 error.add_note(
                     f"the staging file {staged!r} was left on the server: "
                     f"removing it also failed ({cleanup_failure!r})"
                 )
-
-
-async def _close_quietly(session: Session, handle: bytes) -> None:
-    """Close a handle during failure handling, shielded and without raising.
-
-    ``Exception`` rather than a precise tuple on purpose. This runs while another error is
-    already on its way up, and *anything* raised here replaces the diagnosis with a
-    housekeeping complaint. Cancellation is not caught -- it derives from ``BaseException``
-    -- and cannot arrive anyway inside the shield.
-
-    The shield is half of what makes this work and the reader outliving the same cancellation
-    is the other half: this sends a ``CLOSE`` and waits for its ``STATUS``, so with the reader
-    gone it waits out ``request_timeout`` and, with no timeout set, forever. See
-    :meth:`~gantry_sftp.session.Dispatcher.run`.
-
-    A free function rather than a method because :class:`DirectoryScan` needs it too, and
-    two copies of a cleanup path is how one of them ends up not fixed.
-    """
-    with anyio.CancelScope(shield=True), suppress(Exception):
-        await session.close(handle)
 
 
 async def _read_limits(transport: Transport, codec: Codec) -> ServerLimits:

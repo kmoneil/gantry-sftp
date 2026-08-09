@@ -1,9 +1,17 @@
-"""The verification ladder of DESIGN.md 6, and the arithmetic its rungs share.
+"""The verification ladder of DESIGN.md 6: the rungs, and the arithmetic they share.
 
 Three rungs, strongest first: a server-side hash (``check-file``, rung 1), a full re-read of
 what we just wrote (rung 2), and a length comparison (rung 3, which always runs and has no
-flag). This module holds the vocabulary and the pure part; the round trips live in
-:mod:`gantry_sftp.session._session`, which is the layer allowed to make them.
+flag). Rung 3 is not here -- it is a length against a length, and it lives in
+:mod:`gantry_sftp.session._policy` with the rest of what a transfer decides without the wire.
+
+**The ladder itself moved here under D-146**, out of `Session`, as functions taking a session
+rather than methods on one. Nothing about the split is inheritance: these are one of the seven
+concerns that class composes, not a layer beneath it, and the module is the boundary in the
+same way :mod:`gantry_sftp.session._policy` is. What made it possible is that a caller no
+longer needs the session's wire state to re-read a range --
+:meth:`~gantry_sftp.session.Session.download_into` schedules it from inside the class that owns
+the dispatcher, so nothing here reaches for a private.
 
 **Everything here is blocked out at 64 KiB and that number is not a tuning choice.** It is the
 largest block paramiko's ``check-file`` answers correctly, and paramiko is the only
@@ -14,10 +22,19 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from anyio.to_thread import run_sync
+
+from gantry_sftp.codec import EXTENSION_CHECK_FILE, OpenFlag
+from gantry_sftp.exceptions import ServerError, TransferError
+from gantry_sftp.session._handles import close_quietly
+
+if TYPE_CHECKING:
+    from gantry_sftp.session._operations import _SessionOperations
 
 __all__ = [
     "CHECK_FILE_BLOCK_SIZE",
@@ -25,8 +42,13 @@ __all__ = [
     "ResumeCheck",
     "Verify",
     "block_bounds",
+    "gate_resume",
+    "hashes_agree",
     "local_block_digests",
     "ranges_equal",
+    "reread_agrees",
+    "verify_content",
+    "verify_downloaded_content",
 ]
 
 CHECK_FILE_BLOCK_SIZE = 65536
@@ -298,3 +320,236 @@ def _digest_block(fd: int, name: str, offset: int, length: int) -> bytes:
         digest.update(chunk)
         remaining -= len(chunk)
     return digest.digest()
+
+
+# --- the rungs, which are the only things here that reach the wire ----------------------------
+
+
+async def hashes_agree(
+    session: _SessionOperations, path: bytes, local_path: Path | str, *, start: int, length: int
+) -> bool | None:
+    """Rung 1 over one range: does the server's hash of it match the local file's?
+
+    ``None`` is the third state and it is the *common* one -- the extension is absent, or
+    advertised and then refused. It says the question could not be asked, which is a
+    different fact from the answer being "no" and must never collapse into it: one is
+    "unverified", the other is "corrupt".
+
+    Costs its own ``OPEN`` and ``CLOSE``. ``check-file`` hashes by reading through the
+    handle, so the WRITE-only one an upload is holding answers ``FAILURE`` -- measured
+    against paramiko, which is the only server that implements this at all.
+
+    An **empty range short-circuits and never reaches the wire**, because ``length=0`` on
+    the wire means "to the end of the file" rather than "nothing". Sending it would hash
+    the whole file and compare it against no local blocks at all.
+    """
+    if session.refuses(EXTENSION_CHECK_FILE):
+        # Asked once per session, not once per file. Advertisement is not consulted here
+        # any more (D-51): the endpoints most likely to under-advertise are the ones where
+        # rung 1 is worth having, and the cost of finding out is one exchange for the whole
+        # session -- against the OPEN and CLOSE below, which this pays per file anyway.
+        return None
+    if length == 0:
+        return True
+    handle = await session.open(path, OpenFlag.READ)
+    try:
+        algorithm, theirs = await session.check_file(
+            handle, start_offset=start, length=length, block_size=CHECK_FILE_BLOCK_SIZE
+        )
+    except ServerError:
+        # Advertised and unusable -- no algorithm in common, a handle it will not read,
+        # a range it will not hash. Rung 1 is unavailable here, which is exactly what an
+        # unadvertised extension also means, so the two collapse to the same answer.
+        return None
+    finally:
+        # Quietly, and on the success path too: this handle exists only to ask a question,
+        # and failing a transfer because the *probe's* CLOSE was refused would be
+        # housekeeping replacing the diagnosis.
+        await close_quietly(session, handle)
+    try:
+        mine = await local_block_digests(local_path, algorithm, start=start, length=length)
+    except ValueError:
+        # The server hashed with something this Python cannot compute. There is nothing to
+        # compare against, so the rung is unavailable rather than failed.
+        return None
+    return theirs == mine
+
+
+async def reread_agrees(
+    session: _SessionOperations, path: bytes, local_path: Path | str, *, start: int, length: int
+) -> bool:
+    """Rung 2 over one range: read the bytes back off the server and compare them.
+
+    Works against **any** server, because it asks for nothing but ``READ``. That is the
+    whole point of the rung: ``check-file`` is absent from nearly every endpoint in the
+    field, so without this there is no content verification available at all off a
+    paramiko-backed server.
+
+    The bytes land in a temporary file and are compared from there, rather than being
+    compared as they arrive. Two reasons, and the second is the load-bearing one: replies
+    arrive out of order, so a streaming comparison would have to reassemble them, which is
+    the scheduler this library already has exactly one of; and writing to a descriptor is
+    what :meth:`~gantry_sftp.session.Session.download_into` does, so the re-read runs at the
+    pipelined speed of an ordinary download instead of one round trip per block. **The cost is
+    temporary local disk equal to the range**, in ``$TMPDIR``, and that is stated rather than
+    hidden -- it is the reason this rung is opt-in.
+    """
+    if length == 0:
+        return True
+    handle = await session.open(path, OpenFlag.READ)
+    try:
+        with tempfile.NamedTemporaryFile(prefix="gantry-verify-") as scratch:
+            _ = await session.download_into(
+                handle,
+                scratch.fileno(),
+                size=start + length,
+                remote_path=path,
+                start_offset=start,
+            )
+            return await ranges_equal(scratch.fileno(), local_path, start=start, length=length)
+    finally:
+        await close_quietly(session, handle)
+
+
+async def gate_resume(
+    session: _SessionOperations,
+    path: bytes,
+    local_path: Path | str,
+    adopted: int,
+    verify: Verify,
+) -> ResumeCheck:
+    """Gate the adopted prefix on a rung, which is what DESIGN.md 6 asks for in as many words.
+
+    The offset was established from the size the server reported, and a size match proves
+    only that the byte count agrees. What it cannot refuse is the case that matters most --
+    a remote partial of the *right* length from the *wrong* source, which this completes,
+    publishes, and passes rung 3 on, because the finished length is correct.
+
+    **Rung 1 runs by default and rung 2 does not**, and the asymmetry is the decision.
+    Rung 1 moves no bytes, so gating on it where it exists is free correctness and there
+    is no case for making a caller ask. Rung 2 re-reads the whole adopted prefix, which is
+    most of what resume set out to avoid; making *that* automatic would silently turn a
+    bandwidth optimisation into a bandwidth cost. It is worth asking for on an asymmetric
+    link, where reading back is cheaper than sending again -- but that is the caller's fact
+    about their link, not ours.
+
+    Raises:
+        TransferError: If the adopted prefix is provably not a prefix of the local file.
+            Before a single byte is sent, so nothing is published and the partial is left
+            exactly as it was found -- it may be somebody else's, and it is the only
+            evidence of what went wrong.
+    """
+    if adopted == 0:
+        return ResumeCheck.SKIPPED
+    if verify is Verify.REREAD:
+        agreed: bool | None = await reread_agrees(
+            session, path, local_path, start=0, length=adopted
+        )
+    else:
+        agreed = await hashes_agree(session, path, local_path, start=0, length=adopted)
+    if agreed is None:
+        return ResumeCheck.UNAVAILABLE
+    if not agreed:
+        raise TransferError(
+            f"cannot resume: the {adopted} bytes already at {path!r} are not a prefix of "
+            f"{local_path} -- the partial is from a different source file or a different "
+            f"run, and continuing would publish a file of the right length and the wrong "
+            f"contents. Upload without resume=True to replace it",
+            transferred=0,
+            offset=adopted,
+            remote_path=path,
+            local_path=str(local_path),
+        )
+    return ResumeCheck.MATCHED
+
+
+async def verify_content(
+    session: _SessionOperations,
+    path: bytes,
+    local_path: Path | str,
+    expected: int,
+    verify: Verify,
+) -> ContentCheck:
+    """Check what the server now holds against the local file, at the rung asked for.
+
+    Args:
+        session: The session to ask.
+        path: What to read back. On the atomic path this is the **staging file**, checked
+            before the rename, for the same reason rung 3 is: content that fails belongs
+            to a file no consumer has ever been able to see.
+        local_path: The source of truth.
+        expected: Bytes the file should hold -- the local file's length, not what this run
+            moved, which differs under ``resume``.
+        verify: Which rung to try.
+
+    Raises:
+        TransferError: If the content disagrees.
+    """
+    if verify is Verify.SIZE:
+        return ContentCheck.SKIPPED
+    if verify is Verify.HASH:
+        agreed = await hashes_agree(session, path, local_path, start=0, length=expected)
+        if agreed is None:
+            return ContentCheck.UNAVAILABLE
+        reached = ContentCheck.HASHED
+    else:
+        agreed = await reread_agrees(session, path, local_path, start=0, length=expected)
+        reached = ContentCheck.REREAD
+    if not agreed:
+        raise TransferError(
+            f"{path!r} does not hold the contents of {local_path}: it is {expected} bytes "
+            f"long, as it should be, and the bytes differ. The upload is corrupt rather "
+            f"than short, which is the failure a size check cannot see",
+            transferred=expected,
+            offset=0,
+            remote_path=path,
+            local_path=str(local_path),
+        )
+    return reached
+
+
+async def verify_downloaded_content(
+    session: _SessionOperations,
+    path: bytes,
+    local_path: Path | str,
+    expected: int,
+    verify: Verify,
+) -> ContentCheck:
+    """Check the file that was just written against what the server holds, at ``verify``.
+
+    The mirror of :func:`verify_content`, and separate from it only for the message: the
+    comparison is identical -- a remote range against a local one -- but "the upload is
+    corrupt" is the wrong sentence to hand somebody whose download it was.
+
+    Args:
+        session: The session to ask.
+        path: What was read.
+        local_path: What was written, and what is being checked.
+        expected: Bytes the local file should hold. ``adopted + transferred``, not what
+            this call moved, which differs under ``resume``.
+        verify: Which rung to try.
+
+    Raises:
+        TransferError: If the content disagrees.
+    """
+    if verify is Verify.SIZE:
+        return ContentCheck.SKIPPED
+    if verify is Verify.HASH:
+        agreed = await hashes_agree(session, path, local_path, start=0, length=expected)
+        if agreed is None:
+            return ContentCheck.UNAVAILABLE
+        reached = ContentCheck.HASHED
+    else:
+        agreed = await reread_agrees(session, path, local_path, start=0, length=expected)
+        reached = ContentCheck.REREAD
+    if not agreed:
+        raise TransferError(
+            f"{local_path} does not hold the contents of {path!r}: it is {expected} bytes "
+            f"long, as it should be, and the bytes differ. The download is corrupt rather "
+            f"than short, which is the failure a size check cannot see",
+            transferred=expected,
+            offset=0,
+            remote_path=path,
+            local_path=str(local_path),
+        )
+    return reached

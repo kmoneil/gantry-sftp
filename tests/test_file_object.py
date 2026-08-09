@@ -64,7 +64,13 @@ from gantry_sftp.exceptions import (
     TransferError,
     TransferTimeoutError,
 )
-from gantry_sftp.session import open_session, read_range_into, write_range_from
+from gantry_sftp.session import (
+    ServerLimits,
+    Session,
+    open_session,
+    read_range_into,
+    write_range_from,
+)
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -1210,3 +1216,172 @@ async def test_a_stalled_range_write_is_bounded_by_the_idle_timeout_it_was_given
     with anyio.fail_after(5):
         with pytest.raises(TransferTimeoutError):
             _ = await write_range(server, 0, b"payload", idle_timeout=0.05)
+
+
+# --- the descriptor-shaped pair, which is how a transfer is scheduled from outside (D-146) ----
+
+
+async def test_download_into_fills_a_descriptor_from_an_open_handle(tmp_path: Path):
+    """The whole point of the method: a download whose destination is an fd nobody named.
+
+    `read_at` and `readinto_at` both hand back the range in memory, which is not a download of
+    a large file -- so before D-146 the only pipelined path to a descriptor was `get`, and it
+    insists on opening the destination itself. `_verify.reread_agrees` needed exactly this over
+    a temporary file, and reached three attributes into the session to get it.
+    """
+    needs_real_server()
+    payload = bytes(range(256)) * 40
+    (tmp_path / "data.bin").write_bytes(payload)
+    destination = tmp_path / "out.bin"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(tmp_path / "data.bin").encode())
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            written = await sftp.download_into(handle, fd, size=len(payload))
+        finally:
+            os.close(fd)
+            await sftp.close(handle)
+
+    assert written == len(payload)
+    assert destination.read_bytes() == payload
+
+
+async def test_download_into_starts_where_it_is_told_and_leaves_the_prefix_alone(tmp_path: Path):
+    """`start_offset` writes at absolute offsets, which is what makes a resume a resume.
+
+    The bytes below the offset are the caller's -- adopted from a previous run, or somebody
+    else's entirely -- and a scheduler that rewrote them from zero would be a restart wearing a
+    resume's name. Asserted by filling the prefix with a byte the remote file does not carry
+    anywhere, so a rewrite from zero is visible rather than inferred.
+    """
+    needs_real_server()
+    payload = b"".join(bytes([n]) * 64 for n in range(1, 9))
+    (tmp_path / "data.bin").write_bytes(payload)
+    destination = tmp_path / "out.bin"
+    _ = destination.write_bytes(b"\x00" * 256)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(tmp_path / "data.bin").encode())
+        fd = os.open(destination, os.O_WRONLY)
+        try:
+            written = await sftp.download_into(handle, fd, size=len(payload), start_offset=256)
+        finally:
+            os.close(fd)
+            await sftp.close(handle)
+
+    assert written == len(payload) - 256
+    assert destination.read_bytes()[:256] == b"\x00" * 256
+    assert destination.read_bytes()[256:] == payload[256:]
+
+
+async def test_upload_from_pushes_a_local_file_through_an_open_handle(tmp_path: Path):
+    """The sending half, and it takes a path rather than a descriptor deliberately.
+
+    Several requests are in flight at once, each reading its own range with `os.pread`, so a
+    descriptor carrying a shared cursor is the one thing that cannot serve as the source.
+    """
+    needs_real_server()
+    payload = bytes(range(256)) * 40
+    source = tmp_path / "source.bin"
+    _ = source.write_bytes(payload)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(
+            str(tmp_path / "uploaded.bin").encode(),
+            OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC,
+            mode=0o600,
+        )
+        try:
+            written = await sftp.upload_from(handle, source)
+        finally:
+            await sftp.close(handle)
+
+    assert written == len(payload)
+    assert (tmp_path / "uploaded.bin").read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("method", "arguments"),
+    [
+        ("download_into", {"size": 64}),
+        ("upload_from", {}),
+    ],
+)
+async def test_the_pair_forwards_its_own_depth_rather_than_the_session_s(
+    tmp_path: Path, method: str, arguments: dict[str, object]
+):
+    """`depth=None` means "this session's" and any other value must arrive unchanged.
+
+    The reason to pin it here rather than trust the forwarding is that `None` and the session's
+    own value are the same behaviour, so a method that ignored the argument entirely would pass
+    every test written with the default (D-146). An invalid depth is the cheapest thing that
+    tells "the call's arrived" apart from "the session's did", and it is refused by the
+    scheduler before a byte reaches the wire -- which is why a server answering nothing at all
+    is enough of a server for this.
+    """
+    source = tmp_path / "source.bin"
+    _ = source.write_bytes(b"payload " * 8)
+    destination = os.open(tmp_path / "out.bin", os.O_WRONLY | os.O_CREAT, 0o600)
+
+    server = RangeServer(b"payload " * 8)
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    try:
+        async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+            session = Session(dispatcher, ServerLimits.unknown(), depth=8)
+            target = source if method == "upload_from" else destination
+            with pytest.raises(ValueError) as refusal:
+                _ = await getattr(session, method)(HANDLE, target, depth=0, **arguments)
+    finally:
+        os.close(destination)
+
+    assert refusal.value.args[0] == "depth must be at least 1, got 0"
+
+
+@pytest.mark.parametrize(
+    ("method", "arguments"),
+    [
+        ("download_into", {"size": 64}),
+        ("upload_from", {}),
+    ],
+)
+async def test_the_pair_runs_at_the_session_s_depth_when_it_is_not_overridden(
+    tmp_path: Path, method: str, arguments: dict[str, object]
+):
+    """The other half of the same claim: an omitted `depth=` is the *session's*, not a default.
+
+    Two things could satisfy the test above and be wrong here, and both are one edit away: a
+    method that dropped the argument and let `download_handle`'s own default stand, and one
+    that hard-coded a number. So the session is built with a depth the scheduler refuses and
+    the call omits the argument -- if what arrives is anything but the session's, nothing
+    raises.
+
+    The first version of this test asserted the *shape* of the reads at depth 1 instead, and
+    was vacuous: 256 bytes is one request at any depth, so it passed identically at 1 and at 8.
+    A pacing test needs a payload the pacing can be seen on, or a value that cannot run at all.
+    """
+    source = tmp_path / "source.bin"
+    _ = source.write_bytes(b"payload " * 8)
+    destination = os.open(tmp_path / "out.bin", os.O_WRONLY | os.O_CREAT, 0o600)
+
+    server = RangeServer(b"payload " * 8)
+    codec = await negotiate(server)  # type: ignore[arg-type]
+    try:
+        async with running_dispatcher(server, codec) as dispatcher:  # type: ignore[arg-type]
+            session = Session(dispatcher, ServerLimits.unknown(), depth=0)
+            target = source if method == "upload_from" else destination
+            with pytest.raises(ValueError) as refusal:
+                _ = await getattr(session, method)(HANDLE, target, **arguments)
+    finally:
+        os.close(destination)
+
+    assert refusal.value.args[0] == "depth must be at least 1, got 0"

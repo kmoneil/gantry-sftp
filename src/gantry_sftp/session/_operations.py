@@ -1,9 +1,16 @@
 """One request, one answer: the protocol operations.
 
-The middle of the three layers `Session` is built from, split out under D-143. Every public
-method here is one round trip -- `STAT`, `OPEN`, `MKDIR`, `RENAME` -- plus the path resolution
-they share. Nothing here composes another operation into a sequence; that is the layer above,
-and `tests/test_layer_discipline.py` asserts the direction.
+The middle of the three layers `Session` is built from, split out under D-143. Most of what is
+here is one round trip -- `STAT`, `OPEN`, `MKDIR`, `RENAME` -- plus the path resolution they
+share. Nothing here composes another *operation* into a sequence; that is the layer above, and
+`tests/test_layer_discipline.py` asserts the direction.
+
+**The byte movers are the exception and were from the start**, which D-146 made worth stating:
+`readinto_at`, `write_at`, `download_into` and `upload_from` each drive the transfer scheduler
+over *one handle somebody else opened*, which is many round trips and still no composition --
+they open nothing, close nothing, and decide nothing about where a file may live. The line the
+layer is really drawn on is that one: a method here needs a handle or a path and produces an
+answer, and never sequences two operations to get one.
 
 The split is by **what the code needs**, computed rather than eyeballed: the closure of these
 methods over `self.<method>` calls is disjoint from the compositions', and the call graph across
@@ -14,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from gantry_sftp.codec import (
     EMPTY_ATTRS,
@@ -66,6 +74,8 @@ from gantry_sftp.session._core import (
     raise_for_status,
 )
 from gantry_sftp.session._download import (
+    ProgressCallback,
+    download_handle,
     read_range_into,
 )
 from gantry_sftp.session._listing import (
@@ -82,7 +92,7 @@ from gantry_sftp.session._policy import (
 from gantry_sftp.session._recursive import (
     join_remote,
 )
-from gantry_sftp.session._upload import write_range_from
+from gantry_sftp.session._upload import upload_handle, write_range_from
 from gantry_sftp.session._verify import (
     CHECK_FILE_BLOCK_SIZE,
 )
@@ -770,6 +780,127 @@ class _SessionOperations(_SessionCore):
             write_length=self.sizes_for(handle).write_length,
             depth=self._depth,
             idle_timeout=self._idle_timeout,
+        )
+
+    async def download_into(
+        self,
+        handle: bytes,
+        fd: int,
+        *,
+        size: int | None,
+        depth: int | None = None,
+        progress: ProgressCallback | None = None,
+        remote_path: bytes | None = None,
+        start_offset: int = 0,
+    ) -> int:
+        """Fill a local descriptor from an open remote handle, pipelined.
+
+        The descriptor-shaped sibling of :meth:`readinto_at`, and the whole file rather than a
+        range: a download that has to fit in memory is not a download of a nine-gigabyte file.
+        Written at explicit offsets and never seeked, so the destination may be a file, a
+        temporary one nobody named, or anything else ``pwrite`` accepts.
+
+        **Why this is a method rather than three attributes a caller assembles** (D-146). The
+        scheduler needs the dispatcher, this session's depth, its idle timeout and the request
+        size for *this handle* -- and the last of those is only knowable once the handle exists,
+        so no caller can build the schedule in advance. Handing those four out would put a
+        session's wire state in every caller's hands to reassemble identically; asking the
+        session to schedule keeps them where they are owned. That is what lets the verification
+        ladder live outside :class:`~gantry_sftp.session.Session` in
+        :mod:`gantry_sftp.session._verify` and still re-read at a download's speed.
+
+        Neither end is opened or closed here: the handle is the caller's and so is the
+        descriptor. Opening the destination is a *safety* decision -- ``O_NOFOLLOW`` and the
+        creation mode -- and it belongs with the layer that knows where the file is allowed to
+        be, which is why :meth:`~gantry_sftp.session.Session.get` keeps it.
+
+        Args:
+            handle: An open remote file handle, opened for reading.
+            fd: Writable file descriptor. Not closed here.
+            size: Expected size, from a stat. ``None`` reads until EOF, which costs one extra
+                round trip at the end and is the only option when the server will not say.
+            depth: Requests in flight, or ``None`` for this session's :attr:`depth`.
+            progress: Called with ``(transferred, total)`` as data arrives, reporting the
+                *absolute* position so a resumed transfer starts where it left off.
+            remote_path: Carried on errors for diagnosis.
+            start_offset: Byte to begin at. Non-zero resumes: reads start there and the
+                descriptor is written at absolute offsets, so whatever is already below that
+                point is left alone. Whether it is *right* is not knowable from here.
+
+        Returns:
+            Bytes written by this call, which is the file's size only when ``start_offset``
+            is 0.
+
+        Raises:
+            TransferError: If the server refuses a read.
+            TransferTimeoutError: If the server stops responding.
+            ValueError: If ``start_offset`` is negative or past the end of the file.
+        """
+        return await download_handle(
+            self._dispatcher,
+            handle,
+            fd,
+            size=size,
+            read_length=self.sizes_for(handle).read_length,
+            depth=self._depth if depth is None else depth,
+            idle_timeout=self._idle_timeout,
+            progress=progress,
+            remote_path=remote_path,
+            start_offset=start_offset,
+        )
+
+    async def upload_from(
+        self,
+        handle: bytes,
+        source: Path | str,
+        *,
+        depth: int | None = None,
+        progress: ProgressCallback | None = None,
+        remote_path: bytes | None = None,
+        start_offset: int = 0,
+    ) -> int:
+        """Push a local file through an open remote handle, pipelined.
+
+        The sending half of :meth:`download_into`, with the same argument for being here: the
+        request size comes from the handle, so the schedule cannot be built before the handle
+        exists. See that method on why the session does the scheduling.
+
+        Takes a path rather than a descriptor because the sending side reads at explicit
+        offsets from several requests in flight, and a descriptor with a shared cursor is the
+        one thing that cannot serve. Nothing here opens or closes the remote handle.
+
+        Args:
+            handle: An open remote file handle, writable.
+            source: Local file to read.
+            depth: Requests in flight, or ``None`` for this session's :attr:`depth`. Each one
+                holds a request's worth of payload, so this multiplies into real memory in a
+                way the download side does not.
+            progress: Called with ``(transferred, total)`` as writes are acknowledged.
+            remote_path: Carried on errors for diagnosis.
+            start_offset: Byte of the local file to begin at. Non-zero resumes, and the writes
+                go to the same absolute offsets on the server -- so the remote file must
+                already hold exactly the first ``start_offset`` bytes of this source. Nothing
+                here can check that; it is the caller's claim, made from a stat, and a weak one.
+
+        Returns:
+            Bytes the server acknowledged in this call, which is the file's size only when
+            ``start_offset`` is 0.
+
+        Raises:
+            TransferError: If the server refuses a write.
+            TransferTimeoutError: If the server stops responding.
+            ValueError: If ``start_offset`` is negative or past the end of the local file.
+        """
+        return await upload_handle(
+            self._dispatcher,
+            handle,
+            source,
+            write_length=self.sizes_for(handle).write_length,
+            depth=self._depth if depth is None else depth,
+            idle_timeout=self._idle_timeout,
+            progress=progress,
+            remote_path=remote_path,
+            start_offset=start_offset,
         )
 
     async def opendir(self, path: bytes | str) -> bytes:

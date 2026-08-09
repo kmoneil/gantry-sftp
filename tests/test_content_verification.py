@@ -76,7 +76,14 @@ from gantry_sftp.session import (
     Verify,
     open_session,
 )
-from gantry_sftp.session._verify import block_bounds, local_block_digests, ranges_equal
+from gantry_sftp.session._verify import (
+    block_bounds,
+    hashes_agree,
+    local_block_digests,
+    ranges_equal,
+    reread_agrees,
+    verify_downloaded_content,
+)
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
@@ -1366,7 +1373,7 @@ async def test_hashing_a_range_asks_the_server_about_the_range_it_was_given(tmp_
     source.write_bytes(payload)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        agreed = await sftp._hashes_agree(b"/remote.bin", source, start=64, length=64)  # noqa: SLF001
+        agreed = await hashes_agree(sftp, b"/remote.bin", source, start=64, length=64)
 
     assert agreed is True
     assert server.checks[0].start_offset == 64
@@ -1443,7 +1450,7 @@ async def test_a_reread_runs_at_the_session_s_pipeline_depth(tmp_path: Path):
 
     async with open_session(server, depth=0) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ValueError) as refusal:
-            _ = await sftp._reread_agrees(b"/remote.bin", source, start=0, length=len(payload))  # noqa: SLF001
+            _ = await reread_agrees(sftp, b"/remote.bin", source, start=0, length=len(payload))
 
     assert refusal.value.args[0] == "depth must be at least 1, got 0"
 
@@ -1470,7 +1477,7 @@ async def test_a_stalled_reread_is_bounded_by_the_session_s_idle_timeout(tmp_pat
 
     async with open_session(server, idle_timeout=0.05) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferTimeoutError):
-            _ = await sftp._reread_agrees(b"/remote.bin", source, start=0, length=len(payload))  # noqa: SLF001
+            _ = await reread_agrees(sftp, b"/remote.bin", source, start=0, length=len(payload))
 
 
 async def test_the_scratch_file_a_reread_writes_is_named_after_this_library(
@@ -1555,7 +1562,7 @@ async def test_a_reread_reads_back_the_range_and_not_the_file_under_it(tmp_path:
     source.write_bytes(payload)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
-        agreed = await sftp._reread_agrees(b"/remote.bin", source, start=64, length=64)  # noqa: SLF001
+        agreed = await reread_agrees(sftp, b"/remote.bin", source, start=64, length=64)
 
     assert agreed is True
     assert server.reads, "the rung read nothing at all"
@@ -1578,8 +1585,8 @@ async def test_the_first_byte_of_a_downloaded_file_is_inside_a_reread_too(tmp_pa
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(TransferError) as refusal:
-            _ = await sftp._verify_downloaded_content(  # noqa: SLF001
-                b"/remote.bin", local, len(served), Verify.REREAD
+            _ = await verify_downloaded_content(
+                sftp, b"/remote.bin", local, len(served), Verify.REREAD
             )
 
     assert refusal.value.offset == 0

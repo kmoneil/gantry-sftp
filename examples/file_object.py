@@ -13,7 +13,10 @@ Two shapes, and the difference matters more than it looks:
   is one task**, because a cursor is shared mutable state and two tasks reading it interleave
   their positions.
 * ``read_at`` / ``write_at`` / ``readinto_at`` take the offset as an argument, so they are safe
-  to fan out. That is what the last section here does.
+  to fan out. That is what the fan-out section here does.
+* ``download_into`` / ``upload_from`` move a *whole* file through a handle you opened, into or
+  out of a descriptor rather than a path -- the last section. Reach for them when the
+  destination is not something ``get()`` can open for you.
 
 **Block size is the one performance decision this surface hands you.** A read is pipelined
 *within* the range it was asked for, so ``read(1 << 20)`` is several requests in flight and
@@ -94,6 +97,22 @@ async def demonstrate(sftp: Session, directory: bytes) -> None:
         buffer = bytearray(48)
         filled = await sftp.readinto_at(handle, buffer, 0)
         print(f"readinto_at filled {filled} of {len(buffer)} bytes: {bytes(buffer[:16])!r}")
+    finally:
+        await sftp.close(handle)
+
+    # --- a whole file through a descriptor you opened -----------------------------------------
+    # The three calls above hand the range back in memory, which is fine for a header and wrong
+    # for a large file. `download_into` fills a descriptor at this session's pipeline depth --
+    # the same scheduler `get` uses -- and never opens or closes either end. The destination here
+    # is an unnamed temporary file, which is the case `get` cannot serve: it opens the path it is
+    # given, and there isn't one.
+    handle = await sftp.open(log)
+    try:
+        size = (await sftp.fstat(handle)).size
+        with tempfile.TemporaryFile() as scratch:
+            moved = await sftp.download_into(handle, scratch.fileno(), size=size)
+            _ = scratch.seek(0)
+            print(f"download_into moved {moved} bytes into an unnamed file: {scratch.read(16)!r}")
     finally:
         await sftp.close(handle)
 

@@ -3,6 +3,26 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## Unreleased
+
+### Added
+
+- **`Session.download_into(handle, fd, size=...)` and `Session.upload_from(handle, path)`**, with
+  blocking forms on `SyncSession`. They move a whole file through a handle you opened, into or out
+  of a *descriptor* rather than a path, at this session's pipeline depth — the same scheduler
+  `get()` and `put()` use. Neither opens or closes either end, both write at explicit offsets so
+  `start_offset=` resumes rather than restarts, and `depth=` overrides the session's for one
+  transfer. Reach for them when the destination is not something `get()` can open for you: a pipe,
+  an unnamed temporary file, a descriptor you already hold. `get()` and `put()` remain the ordinary
+  way in and add what these deliberately do not — `O_NOFOLLOW`, the creation mode, size and content
+  verification, resume gating and the atomic publish. Documented under
+  [Concurrency](docs/concurrency.md) and demonstrated in `examples/file_object.py`.
+
+  They exist because the alternative was worse. Before this, the only pipelined path to a
+  descriptor was `get()`, which insists on opening the destination itself — so the verification
+  ladder's re-read rung reached into the session for its dispatcher, its depth and its idle
+  timeout, and three call sites assembled the same eight-argument scheduler call by hand.
+
 ## 0.1.1 — 2026-08-06
 
 A patch rather than a minor, and the one judgement call in that is stated rather than left to be

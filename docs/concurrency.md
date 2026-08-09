@@ -148,6 +148,32 @@ and safe to fan out. Writes are not
 retried and never will be blindly, because two tasks writing the same range is a race no client can
 arbitrate, exactly as with two processes and `pwrite`.
 
+### Moving a whole file through a handle you opened
+
+The three above hand the range back in memory, which is not what you want for a large file. The
+descriptor-shaped pair is:
+
+```python
+handle = await sftp.open("/data/big.iso")
+fd = os.open("big.iso", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    moved = await sftp.download_into(handle, fd, size=(await sftp.fstat(handle)).size)
+finally:
+    os.close(fd)
+    await sftp.close(handle)
+```
+
+`download_into(handle, fd, size=...)` fills a descriptor; `upload_from(handle, path)` sends a local
+file the other way. Both run at this session's `depth` unless you pass one, both write at explicit
+offsets so `start_offset=` resumes rather than restarts, and neither opens or closes either end —
+the handle and the descriptor stay yours.
+
+Reach for these when the destination is not a file you want `get()` to open: a pipe, a temporary
+file nobody named, a descriptor you already hold. `get()` and `put()` are the ordinary way in, and
+they add what these deliberately do not — `O_NOFOLLOW`, the creation mode, the size and content
+checks, resume gating, and the atomic publish. `size=None` reads to EOF and costs one extra round
+trip at the end; pass the size from a `stat` when you have one.
+
 ### Read in big blocks
 
 **This is the one performance decision the surface hands you, and it is arithmetic rather than

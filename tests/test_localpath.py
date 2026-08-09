@@ -33,7 +33,7 @@ from gantry_sftp.session import (
     unsafe_reason,
 )
 from gantry_sftp.session import _localpath as localpath
-from gantry_sftp.session._session import (
+from gantry_sftp.session._policy import (
     _chmod_local,
     _chmod_local_directories,
     _stamp_local,

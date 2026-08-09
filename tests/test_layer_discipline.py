@@ -369,13 +369,18 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 59
+SESSION_METHOD_CEILING = 53
 """What `Session` measures today, which is the whole of the rule.
 
 **Lowered from 109 to 59 by D-143**, which split the class into three layers: `_SessionCore`
 (state, the properties, and `request`), `_SessionOperations` (one round trip each), and this,
 the compositions. The ratchet did its job on contact -- it failed the split with a message
 naming the new number, so tightening it was not something anybody had to remember.
+
+**59 to 53 by D-146**, which cut on the other axis: the verification ladder left as functions
+taking a session (`session/_verify.py`) and `_already_complete` joined `session/_policy.py`,
+which it had qualified for since the day it was written. D-143's cut was by depth and reached
+what depth could; this one is by concern, and it is the axis the mass was actually on.
 
 **A ratchet, not a target, and not a round number.** D-128's finding was that `Session` holds the
 orchestration half of all seven responsibilities `session/` has a module for, while every gate
@@ -708,4 +713,74 @@ def test_the_layers_partition_the_session_rather_than_overlapping_it():
     assert not core & compositions, f"redefined in Session: {sorted(core & compositions)}"
     assert not operations & compositions, (
         f"redefined in Session: {sorted(operations & compositions)}"
+    )
+
+
+# --- one way to the transfer scheduler (D-146) ------------------------------------------------
+
+
+SESSION_ROOT = PACKAGE_ROOT / "session"
+
+TRANSFER_SCHEDULERS = ("download_handle", "upload_handle", "read_range_into", "write_range_from")
+"""The four entry points into `_download.py` / `_upload.py` that move bytes over a handle."""
+
+SCHEDULER_HOME = {"_download.py", "_upload.py", "_operations.py"}
+"""Where a call to one may appear: the two modules that define them, and the one layer that owns
+the state they need -- the dispatcher, the pipeline depth, the idle timeout, and the request size
+`sizes_for` derives from the handle."""
+
+
+def test_only_the_operations_layer_reaches_the_transfer_schedulers() -> None:
+    """The decision D-146 turned on, asserted rather than remembered.
+
+    Every one of these takes a `Dispatcher` and a pacing triple, so a caller outside the class
+    that owns them has to reach for `session._dispatcher`, `session._depth` and
+    `session._idle_timeout` -- which is what stopped the verification ladder moving out of
+    `Session` when it was first tried. `download_into` and `upload_from` exist so the answer is
+    "ask the session to schedule" rather than "hand the session's wire state around", and a
+    fifth call site assembled by hand would quietly restore the coupling.
+
+    Ruff's `SLF001` catches the private access itself. What it cannot see is the shape one step
+    earlier: a *method* on `Session` doing this is perfectly legal to it, and that is exactly
+    where the three duplicated argument lists lived.
+    """
+    offending: dict[str, list[str]] = {}
+    for module in sorted(SESSION_ROOT.glob("*.py")):
+        if module.name in SCHEDULER_HOME:
+            continue
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        called = sorted(
+            {
+                node.func.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in TRANSFER_SCHEDULERS
+            }
+        )
+        if called:
+            offending[module.name] = called
+    assert not offending, (
+        f"a transfer scheduler is called outside {sorted(SCHEDULER_HOME)}: {offending}. Reach it "
+        f"through Session.download_into / upload_from / readinto_at / write_at, which supply the "
+        f"dispatcher and this session's pacing from inside the class that owns them"
+    )
+
+
+def test_the_scheduler_scan_finds_the_calls_it_guards() -> None:
+    """A scan that matched nothing would pass on an empty package.
+
+    The positive half is that `_operations.py` really does call all four -- if a rename made the
+    names above stale, the guard above would go quiet rather than fail, which is the failure mode
+    every structural test in this file is written against.
+    """
+    tree = ast.parse((SESSION_ROOT / "_operations.py").read_text(encoding="utf-8"))
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert set(TRANSFER_SCHEDULERS) <= called, (
+        f"the operations layer no longer calls {sorted(set(TRANSFER_SCHEDULERS) - called)}, so "
+        f"the guard above is scanning for a name that has moved"
     )

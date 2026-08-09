@@ -150,6 +150,47 @@ async def test_a_file_round_trips_through_every_server(server: MatrixServer, tmp
     assert local.read_bytes() == payload
 
 
+async def test_the_descriptor_pair_round_trips_through_every_server(
+    server: MatrixServer, tmp_path: Path
+):
+    """`download_into` / `upload_from` against three implementations rather than one (D-146).
+
+    They are the seam `get` and `put` reach their scheduler through, so the transfers above
+    already exercise the code. What those cannot show is the *public* spelling driving a real
+    server directly -- a handle the caller opened, a descriptor the library never chose, and no
+    stat, resume gate or publish policy anywhere near it.
+
+    Byte-identical rather than same-length, for the reason the round-trip above gives: an
+    offset or reassembly bug against a server whose batching differs produces a file of exactly
+    the right size.
+    """
+    payload = bytes(range(256)) * 300
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+    remote = server.root / "through-a-handle.bin"
+    local = tmp_path / "back.bin"
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(
+            str(remote), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC, mode=0o600
+        )
+        try:
+            assert await sftp.upload_from(handle, source) == len(payload)
+        finally:
+            await sftp.close(handle)
+
+        handle = await sftp.open(str(remote))
+        fd = os.open(local, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            assert await sftp.download_into(handle, fd, size=len(payload)) == len(payload)
+        finally:
+            os.close(fd)
+            await sftp.close(handle)
+
+    assert remote.read_bytes() == payload
+    assert local.read_bytes() == payload
+
+
 async def test_rung_3_is_satisfied_by_every_server(server: MatrixServer, tmp_path: Path):
     """DESIGN.md 6's size check, against three implementations instead of one.
 

@@ -7,11 +7,16 @@ create a file with, whether a resume may adopt the bytes already on disk, whethe
 arrived matches the size that was announced, which entries a tree walk skips and why -- plus the
 local-side effects those decisions produce, like stamping timestamps onto a descriptor.
 
-**The split is by what the code needs, not by what it is about.** ``_session.py`` keeps
-everything that holds a session or awaits a reply, including ``_close_quietly``, which takes one,
-and ``_unexpected``, which belongs beside :func:`~gantry_sftp.session.raise_for_status` because
-both turn a *reply* into an exception rather than deciding anything about a transfer. Splitting
-those out too would have cost an import cycle for no gain.
+**The split is by what the code needs, not by what it is about.** Anything holding a session or
+awaiting a reply stays out: ``close_quietly`` takes one and lives in
+:mod:`gantry_sftp.session._handles`, and ``_unexpected`` belongs beside
+:func:`~gantry_sftp.session.raise_for_status` because both turn a *reply* into an exception
+rather than deciding anything about a transfer.
+
+**That rule is a membership test and D-146 used it as one.** Splitting `Session` by concern
+asks of each member "what does this need?", and `_already_complete` needed nothing -- it awaits
+nothing and never referenced the session it was declared on, so it belonged here from the day it
+was written and nobody had asked.
 
 What it buys is a testable seam: these can be exercised with a ``Path`` and an
 :class:`~gantry_sftp.codec.Attrs` and no server, no subprocess and no event loop, which is what
@@ -32,7 +37,7 @@ from pathlib import Path, PurePath
 
 from gantry_sftp.codec import Attrs, Times
 from gantry_sftp.exceptions import DestinationCollisionError, PathCollision, TransferError
-from gantry_sftp.session._download import ProgressCallback
+from gantry_sftp.session._download import DownloadResult, ProgressCallback
 from gantry_sftp.session._listing import EntryKind
 from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
 from gantry_sftp.session._localtree import LocalWalkEntry, remote_component
@@ -46,6 +51,7 @@ __all__ = [
     "_DownloadState",
     "_TreeDownload",
     "_TreeUpload",
+    "_already_complete",
     "_check_local_path",
     "_check_publish_flags",
     "_check_tree_concurrency",
@@ -340,6 +346,67 @@ def _gate_as_content_check(resume_check: ResumeCheck, verify: Verify) -> Content
     if resume_check is ResumeCheck.MATCHED:
         return ContentCheck.HASHED if verify is Verify.HASH else ContentCheck.REREAD
     return ContentCheck.UNAVAILABLE
+
+
+def _already_complete(
+    remote_path: bytes,
+    local_path: Path | str,
+    record: dict[str, object],
+    *,
+    adopted: int,
+    mode: int | None,
+    no_follow: bool,
+    times: Times | None,
+    times_result: TimePreservation,
+    resume_check: ResumeCheck,
+    verify: Verify,
+) -> DownloadResult:
+    """Finish a resume that found the local file already whole, without opening anything.
+
+    A function rather than a method since D-146, and it always could have been: it awaits
+    nothing, sends nothing and never touched the session it was declared on -- which is this
+    module's whole membership rule, and is why the move cost no argument.
+
+    **The metadata is still applied, and skipping it is the silent wrong answer this whole
+    path exists to avoid**: the destination the caller named exists, they said what
+    permissions and timestamps it should have, and "it was already there" is not an answer
+    to that. The partial was not necessarily left by this library, so neither its mode nor
+    its times are necessarily anything in particular -- its mtime is the moment the
+    *interrupted* run last wrote to it, which is exactly the fabricated-but-plausible
+    timestamp D-79 is about.
+
+    The times half of that was missing until D-99, and it was missing invisibly: ``get``
+    returned a byte count, so a caller who passed ``preserve_times=True`` and resumed a
+    complete file got a plausible wrong mtime and no way to notice. Building the result
+    type is what surfaced it, which is the argument for result types.
+
+    Both go on a fresh ``O_NOFOLLOW`` descriptor rather than on the path, for the reason
+    :func:`_chmod_local` gives: the containment check is old by now.
+
+    Returns:
+        The result, with ``content_check`` derived from the gate rather than from a second
+        comparison. A resume that adopts the whole file has just had the whole file
+        compared against the remote one at the rung ``verify`` names, so re-running it
+        would be a duplicate -- and for
+        :data:`~gantry_sftp.session.Verify.REREAD` a duplicate is a second full download.
+    """
+    if mode is not None:
+        _chmod_local(local_path, mode, no_follow=no_follow)
+    if times is not None:
+        _stamp_local(local_path, times, no_follow=no_follow)
+    record["bytes"] = 0
+    record["adopted"] = adopted
+    return DownloadResult(
+        0,
+        remote_path,
+        Path(local_path),
+        SizeCheck.MATCHED,
+        times=times_result,
+        content_check=_gate_as_content_check(resume_check, verify),
+        resume_check=resume_check,
+        adopted=adopted,
+        mode=mode,
+    )
 
 
 def _name_the_local_file(failure: TransferError, local_path: Path | str) -> None:

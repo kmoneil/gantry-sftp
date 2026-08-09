@@ -425,6 +425,7 @@ def test_an_omitted_argument_arrives_as_the_async_default(
     monkeypatch.setattr(target, name, record_into(record, original))
 
     args: list[Any] = []
+    keywords: dict[str, Any] = {}
     expected: dict[str, Any] = {}
     for parameter_name, parameter in inspect.signature(original).parameters.items():
         if parameter_name == "self":
@@ -436,13 +437,21 @@ def test_an_omitted_argument_arrives_as_the_async_default(
             continue
         if parameter.default is inspect.Parameter.empty:
             sentinel = _Sentinel(parameter_name)
-            args.append(sentinel)
+            # A *required keyword-only* parameter cannot be passed positionally, and this loop
+            # used to try (D-146). Nothing had one until `download_into`'s `size`, so the
+            # derivation looked complete for as long as the shape did not exist -- and the
+            # failure it produced was a `TypeError` about argument counts, which reads as a bug
+            # in the facade rather than in the test that was checking it.
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                keywords[parameter_name] = sentinel
+            else:
+                args.append(sentinel)
             expected[parameter_name] = sentinel
         else:
             expected[parameter_name] = parameter.default
 
     try:
-        getattr(blocking, name)(*args)
+        getattr(blocking, name)(*args, **keywords)
     except Exception:
         if "arrived" not in record:
             raise
