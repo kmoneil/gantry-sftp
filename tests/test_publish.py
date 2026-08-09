@@ -919,6 +919,14 @@ async def test_require_atomic_refuses_before_moving_any_bytes(source: Path):
     assert exc.value.feature == "atomic publish"
     assert exc.value.missing == (EXTENSION_POSIX_RENAME,)
     assert exc.value.path == TARGET
+    # The note names the peer, and **the count is part of it** -- "this server does not
+    # advertise X" is a complaint about a server the message does not otherwise identify, and
+    # zero is the number worth reporting rather than an omission. Nothing pinned the count
+    # until a mutation run replaced it with `None` and every test still passed (D-146).
+    assert exc.value.__notes__ == [
+        "the server identifies as unknown (an SFTP server this library has no fingerprint "
+        "for) and advertises 0 extension(s)"
+    ]
     assert "Write" not in server.kinds(), "bytes were moved before the refusal"
     assert bytes(server.files[TARGET]) == b"yesterday"
 
@@ -1111,6 +1119,12 @@ async def test_require_fsync_probes_before_the_bytes_and_refuses_on_the_answer(s
     # field is filled with the file the probe actually touched.
     assert exc.value.path is not None
     assert exc.value.path != TARGET
+    # The same note, against a server advertising *one* extension rather than none -- a count
+    # asserted only at zero is a count an off-by-one would survive.
+    assert exc.value.__notes__ == [
+        "the server identifies as unknown (an SFTP server this library has no fingerprint "
+        "for) and advertises 1 extension(s)"
+    ]
     assert "Write" not in server.kinds(), "bytes were moved before the refusal"
     assert not server.files, "the staging file was left behind"
 

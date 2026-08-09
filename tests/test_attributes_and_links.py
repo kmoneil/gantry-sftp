@@ -530,6 +530,16 @@ async def test_a_server_without_lsetstat_refuses_rather_than_following(tmp_path:
 
     assert refusal.value.missing == (EXTENSION_LSETSTAT,)
     assert "filexfer v3 has no other way to chmod a symlink" in refusal.value.args[0]
+    # The note names the peer, **including how many extensions it advertised**, and the count
+    # was unpinned everywhere until a mutation run replaced it with `None` (D-146). `sftp-server`
+    # advertises a known set, so the number is a fact about the server rather than about this
+    # test -- read off the session, and compared against the count the fixture list carries.
+    note = "\n".join(refusal.value.__notes__)
+    assert note == (
+        f"the server identifies as openssh (OpenSSH sftp-server) and advertises "
+        f"{len(sftp.extensions)} extension(s)"
+    )
+    assert len(sftp.extensions) >= 6, "a count asserted against zero would pin nothing"
     # And the point of refusing: the target was not touched.
     assert bits(target) == 0o644
 
@@ -1014,19 +1024,30 @@ class _ScriptedServer:
         return
 
 
-async def test_fchmod_names_the_path_it_was_given_when_the_server_refuses():
+@pytest.mark.parametrize(
+    ("call", "arguments"),
+    [("fchmod", (0o600,)), ("futime", (KNOWN_ATIME, KNOWN_MTIME))],
+)
+async def test_the_handle_forms_name_the_path_they_were_given_when_the_server_refuses(
+    call: str, arguments: tuple[int, ...]
+):
     """A handle is meaningless in an error message, so the caller supplies the name for it.
 
     Load-bearing on the atomic publish path, where the name that *would* be printed by default
     is the destination -- a file nothing was ever published under. Driven against a scripted
     server because a real one accepts the call.
+
+    **Parametrised over both forms because the first version of this covered only `fchmod`**,
+    and a mutation run then found `futime`'s `path=` replaceable with `None` with the suite
+    green (D-146). The two carry the same argument for the same reason and were written in the
+    same change; testing one of a symmetric pair is how the other keeps its hole.
     """
     server = _ScriptedServer(
         lambda packet: encode(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"nope"))
     )
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         with pytest.raises(ServerError) as refusal:
-            await sftp.fchmod(b"\x00\x00\x00\x00", 0o600, path=b"/staging.tmp.9f")
+            await getattr(sftp, call)(b"\x00\x00\x00\x00", *arguments, path=b"/staging.tmp.9f")
 
     assert refusal.value.path == b"/staging.tmp.9f"
 

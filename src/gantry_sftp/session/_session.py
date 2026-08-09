@@ -151,7 +151,6 @@ from gantry_sftp.session._put import (
     _set_directory_times,
     _Upload,
 )
-from gantry_sftp.session._quirks import server_note
 from gantry_sftp.session._recursive import (
     GlobMatch,
     Skipped,
@@ -1064,7 +1063,7 @@ class Session(_SessionOperations):
             feature=feature,
             path=path,
         )
-        refusal.add_note(server_note(self.profile, len(self.extensions)))
+        refusal.add_note(self._server_note())
         raise refusal
 
     def open_file(
@@ -2430,7 +2429,7 @@ class Session(_SessionOperations):
                 missing=(EXTENSION_FSYNC,),
                 path=target,
             )
-            refusal.add_note(server_note(self.profile, len(self.extensions)))
+            refusal.add_note(self._server_note())
             raise refusal
 
         upload = _Upload(
