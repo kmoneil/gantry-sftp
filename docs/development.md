@@ -270,6 +270,12 @@ and +100, so a threshold clearing the noise misses the leak. Counting the resour
 types instead needs no threshold at all — one survivor is a failure — and across those same
 294 tests it grew zero times. It also names what leaked, which is what the last one needed.
 
+**The descriptor column needs a directory listing this process's own fds**, and it tries
+`/proc/self/fd` then `/dev/fd` — the second is what makes the count work on macOS, which has no
+`/proc` at all and reported every fd reading as unmeasured until then. When neither can be listed
+the count is `None` and no descriptor growth is reported: a zero from a counter that cannot see is
+proof of absence manufactured from an absence of proof.
+
 `tests/test_leakcheck.py` leaks on purpose in both shapes and asserts the detector reports
 them, because a detector nobody has watched fail is a decoration. Adding a new transport means
 adding it to `WATCHED_TYPES`; a test asserts that list covers every `Transport` the package

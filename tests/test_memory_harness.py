@@ -235,6 +235,26 @@ def test_the_lane_is_available_on_the_platform_it_ships_for():
     assert peak_unavailable_reason() is None
 
 
+@pytest.mark.skipif(platform.system() == "Linux", reason="the lane's own platform")
+def test_the_lane_says_why_it_is_unavailable_on_a_platform_that_is_not_its_own():
+    """The other half, and it is not the monkeypatched row above wearing a different hat.
+
+    That row proves the branch fires when `platform.system()` answers `"Darwin"`. This one
+    proves the answer here **is** that -- an unavailability that only ever appears under a
+    substituted `platform.system` is a lane that could be silently available on a machine it
+    cannot measure, reporting a peak read from a file that is not there (D-161).
+
+    The whole sentence is asserted rather than a truthiness check, because a reason nobody can
+    act on is the failure mode this function exists to avoid, and it interpolates the platform
+    name -- so the two spellings have to agree on more than "not None".
+    """
+    reason = peak_unavailable_reason()
+    assert reason == (
+        f"peak memory is read from /proc/self/status, which {platform.system()} does not have; "
+        f"getrusage is not a substitute (it reports the parent's peak across posix_spawn)"
+    )
+
+
 # --- the report -------------------------------------------------------------------------
 
 
