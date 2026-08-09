@@ -20,6 +20,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+import leakcheck
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import Transport, open_local_server_transport
 from leakcheck import (
@@ -179,10 +180,16 @@ def test_the_descriptor_count_is_readable_here_and_tracks_opens_and_closes():
     This test is the calibration step the earlier note said any fd-based proof needs: open
     known descriptors, assert the counter sees them, close them, assert it sees that too. If
     the sandbox regresses, this skips rather than silently reporting clean.
+
+    **It stopped skipping on macOS in D-161.** There is no `/proc` there at all, so the whole
+    descriptor half of every leak reading was `None` -- honest, and therefore silent. `/dev/fd`
+    is the same per-process view under another name and this row is what proves it counts:
+    running the calibration is the only thing separating "the fallback works" from "the
+    fallback returns a number".
     """
     baseline = fd_count()
     if baseline is None:
-        pytest.skip("/proc/self/fd is not readable on this platform")
+        pytest.skip("no directory listing this process's descriptors is readable here")
 
     # SIM115 is suppressed rather than obeyed: holding these open *is* the measurement, and a
     # context manager would close them before the counter could see them.
@@ -195,6 +202,34 @@ def test_the_descriptor_count_is_readable_here_and_tracks_opens_and_closes():
         for handle in held:
             handle.close()
     assert fd_count() == baseline
+
+
+def test_the_descriptor_count_falls_through_to_the_next_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The fallback that arms this on macOS, exercised where the first candidate is missing.
+
+    On Linux `/proc/self/fd` answers and the second entry is never reached; on macOS the first
+    raises and the second is the whole measurement. **A loop that took the first `OSError` as
+    the answer would behave identically on Linux and count nothing on a Mac** -- so the fall-
+    through is asserted on every platform rather than only where it happens to be load-bearing.
+    """
+    monkeypatch.setattr(leakcheck, "_FD_DIRECTORIES", (tmp_path / "no-such-dir", Path("/dev/fd")))
+    counted = fd_count()
+    assert counted is not None, "an unreadable first candidate ended the search"
+    assert counted > 0
+
+
+def test_the_descriptor_count_is_none_when_no_directory_answers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The third state: unmeasurable, and it must say so rather than report a clean zero.
+
+    `sum(1 for _ in ...)` over an empty directory is `0`, which is the shape of a perfect
+    reading, and that collision is the reason this returns `None` at all.
+    """
+    monkeypatch.setattr(leakcheck, "_FD_DIRECTORIES", (tmp_path / "nope", tmp_path / "also-nope"))
+    assert fd_count() is None
 
 
 # --- arming, and the list that has to be maintained by hand ---------------------------------

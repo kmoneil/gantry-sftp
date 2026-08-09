@@ -93,7 +93,18 @@ adding it here.** Nothing enforces that automatically, which is why `test_leakch
 the list covers every `Transport` implementation the package exports.
 """
 
-_PROC_SELF_FD = Path("/proc/self/fd")
+_FD_DIRECTORIES = (Path("/proc/self/fd"), Path("/dev/fd"))
+"""Where this process's own descriptors can be listed, in the order they are tried.
+
+**`/dev/fd` is what arms this on macOS** (D-161), where there is no `/proc` at all and the
+descriptor half of every leak reading was `None` -- honestly reported as unmeasured, and
+therefore not reported. It is the `fdesc` filesystem there and it is a per-process view, the
+same thing `/proc/self/fd` is on Linux: probed on macOS 15, it tracks five opens and five
+closes exactly and returns to its baseline.
+
+On Linux `/dev/fd` is a symlink to `/proc/self/fd`, so the order costs nothing and the fallback
+is the same directory by another name.
+"""
 
 
 @dataclass(frozen=True)
@@ -102,8 +113,8 @@ class ResourceCount:
 
     types: Counter[str]
     fds: int | None
-    """``None`` when this platform has no readable ``/proc/self/fd``, so a caller can say
-    "not measured" rather than reporting a clean zero it did not observe."""
+    """``None`` when no directory in :data:`_FD_DIRECTORIES` could be listed, so a caller can
+    say "not measured" rather than reporting a clean zero it did not observe."""
 
     def growth_since(self, earlier: ResourceCount) -> dict[str, int]:
         """What is alive now that was not alive then.
@@ -128,11 +139,16 @@ def fd_count() -> int | None:
     Probed rather than assumed, which is the rule this project already applies to ``tc netem``:
     capability introspection was wrong there and probing was right. A counter that returns 0
     because it cannot see reads as proof that nothing leaked.
+
+    Each candidate in :data:`_FD_DIRECTORIES` is tried in turn, so ``None`` means *no* listing
+    worked rather than "the first one did not".
     """
-    try:
-        return sum(1 for _ in _PROC_SELF_FD.iterdir())
-    except OSError:
-        return None
+    for directory in _FD_DIRECTORIES:
+        try:
+            return sum(1 for _ in directory.iterdir())
+        except OSError:
+            continue
+    return None
 
 
 def live_resources() -> ResourceCount:
