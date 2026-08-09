@@ -41,6 +41,22 @@ and while the major version is `0` the minor version is where a breaking change 
   operation each one wanted is what let the whole of `put` below its public entry point move to a
   module of its own. Nothing about `get()`, `put()` or their results changed.
 
+### Fixed
+
+- **`chmod(..., follow_symlinks=False)` no longer attaches its `lchmod` explanation to a refusal
+  that already explains itself.** The note exists because OpenSSH's `FAILURE` carries no message —
+  five distinct conditions all render as `Failure` — and the common cause for this one flag is that
+  Linux has no `lchmod`. It was being attached to *every* `ServerError` from that branch, so a
+  `NO_SUCH_FILE` that had already said `No such file` arrived with a paragraph about a syscall that
+  was never reached, naming a kernel the server may not be running. It now travels with the
+  contentless `FAILURE` alone. If you branch on `__notes__` to tell an unexplained refusal from an
+  explained one, that distinction is now real. Documented under
+  [Paths, predicates and attributes](docs/paths.md).
+
+  Found by running the suite on macOS, where `lsetstat`'s permissions branch *succeeds* — so a
+  missing path is the only refusal that branch can produce there, and every one of them carried the
+  wrong diagnosis.
+
 ## 0.1.1 — 2026-08-06
 
 A patch rather than a minor, and the one judgement call in that is stated rather than left to be
