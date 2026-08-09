@@ -65,14 +65,34 @@ from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 pytestmark = [pytest.mark.anyio]
 
 needs_a_real_pipe = pytest.mark.skipif(
-    sys.platform != "linux",
+    sys.platform == "win32",
     reason=(
-        "these two rows spawn a real `sftp-server` and push a payload sized against a pipe's "
-        "capacity, which is a platform constant; what a SIGCONTed server does with the "
-        "half-written frame left behind is not known off Linux -- see D-160"
+        "these two rows SIGSTOP a real `sftp-server`, and Windows has neither the signal nor "
+        "the binary -- the process control they need does not exist there at all"
     ),
 )
-"""The two rows that spawn a process, and the whole of what D-160 leaves unproven off Linux.
+"""The two rows that spawn a process, and what is left of D-160's platform question.
+
+**macOS came back in D-161, on the evidence of a macOS run.** The condition was
+`sys.platform != "linux"` and its reason said the payload is "sized against a pipe's capacity,
+which is a platform constant" and that "what a SIGCONTed server does with the half-written frame
+left behind is not known off Linux". It is known now, because somebody ran it: on a Mac these two
+rows pass 60 consecutive times -- on 3.13 and on 3.14, under eight-way CPU saturation, and inside
+three full-suite runs -- the blocked write fills the pipe and the deadline reports it with the
+byte count the assertion spells out, and no `sftp-server` is left behind. Every mechanism the
+reason named was measured and none of them differs here.
+
+What that leaves unproven is **the runner**, not the platform, and the two are not the same claim.
+The hang was seen twice on `macos-latest` and nowhere else; if it returns it will return there,
+bounded to twenty minutes by the job's own `timeout-minutes`, which is the structural half D-160
+shipped and the reason this is affordable to find out rather than to assume.
+
+Windows keeps the skip and gains a reason of its own that is about Windows: `signal.SIGSTOP` does
+not exist there, so this is a missing capability rather than an open question.
+
+**This is the second time this marker's stated reason turned out to be about a mechanism nobody
+had measured**, which is the pattern worth naming: a skip whose reason names a plausible cause
+reads as diagnosed, and stops being read as unfinished.
 
 **This replaced a skip over the entire module, whose stated reason was wrong** (D-160). That
 reason was that every row wedges a peer, that teardown then makes a shielded uncancellable write,
@@ -88,8 +108,8 @@ sent the skip module-wide -- that pytest never printing the file's name meant it
 file's *first* row -- does not hold either, because that name is written without a newline and sits
 in a block-buffered stream until something flushes it.
 
-So fourteen rows are back on every platform and two are not, which is the scope the evidence
-supports. What stays open is *why* these two hang there, and that needs a macOS run to answer.
+So fourteen rows came back on every platform and two did not, which was the scope that evidence
+supported; D-161 then brought those two back on macOS as well.
 
 **Both rows carry it, including the control, which does not stop anything and could not hang the
 same way.** A control that runs where its subject is skipped is worse than no control: it goes
@@ -440,13 +460,16 @@ async def test_no_send_timeout_means_no_bound_at_all(tmp_path: Path):
     absence of a bound on the *transfer*, which the recovering server proves without wedging
     the suite.
 
-    **And "recovering" turned out to be a Linux fact** (D-160). On macOS this hung the whole
-    lane for 45 minutes and left an orphaned `sftp-server` behind: the peer did not drain the
-    way it does here, so the shielded `CLOSE` took exactly the no-deadline branch this docstring
-    warns about. Nothing in-process can rescue that -- `move_on_after` cannot cancel a shield,
-    which is the property that makes the shield worth having -- so the only bound is the CI
-    job's own `timeout-minutes`. Skipped by platform rather than by probe because there is no
-    probe for "will this fake drain here", and inventing one would be pretending.
+    **This row was blamed for the macOS hang and was not responsible** (D-160). It was skipped
+    off Linux first, on the reasoning that "recovering" was a Linux fact and the peer here did
+    not drain the same way -- picked because this docstring names the hazard, which is reading
+    the prose rather than the mechanism. `StallingServer` owns no operating-system object at
+    all: no pipe, no socket, no child, nothing that can differ by platform. The next macOS run
+    hung anyway, and the skip has since moved to the two rows that spawn a real process.
+
+    The paragraph above still holds and still cannot be asserted -- a test proving it would have
+    to hang to do so -- but it is a statement about a wedged peer, and this row does not keep
+    one.
     """
     server = StallingServer(stall_on=Read, stall_after=2, wedge=False)
     with anyio.move_on_after(1.0) as scope:
@@ -507,9 +530,14 @@ def test_only_the_marked_rows_reach_for_a_real_process():
 
     `needs_a_real_pipe` is narrow because `StallingServer` owns no operating-system object --
     it cannot fill a pipe, stop a child or behave differently on another platform. That is a
-    claim about *this file*, and a claim about a file rots the moment somebody adds a row. A
-    single unmarked row that spawns an `sftp-server` puts the macOS hang back, and it would
-    come back as a twenty-minute job with no failing assertion anywhere.
+    claim about *this file*, and a claim about a file rots the moment somebody adds a row.
+
+    **Two things go wrong when one is added unmarked**, and they have different costs. On
+    Windows it is a failure: there is no `SIGSTOP` and no `sftp-server`, so a row that reaches
+    for either has no business running and this marker is what says so. On macOS it is worse
+    than a failure, because that is where the twenty-minute hang came from twice -- those two
+    rows run there again as of D-161, and if the hang returns, the marker is the list of
+    suspects. A row missing from it is a suspect nobody wrote down.
 
     So the file checks its own shape, in the spirit of `test_layer_discipline.py`: anything
     naming a process, a signal or the local-server transport has to carry the marker. Names are
@@ -536,7 +564,8 @@ def test_only_the_marked_rows_reach_for_a_real_process():
 
     assert unmarked == [], (
         f"these rows reach for a real process without `@needs_a_real_pipe`: {unmarked}. "
-        "Either mark them or they will hang the macOS lane the way D-160 did."
+        "Either mark them or they will fail on Windows, which has no SIGSTOP, and hide from "
+        "the suspect list if the macOS hang D-160 describes ever comes back."
     )
 
 

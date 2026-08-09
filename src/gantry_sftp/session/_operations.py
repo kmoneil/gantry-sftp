@@ -279,7 +279,14 @@ class _SessionOperations(_SessionCore):
             # OpenSSH's FAILURE carries no message worth reading -- five distinct conditions
             # all render as "Failure" -- and for this one flag there is a specific, common and
             # unfixable cause that the bare status sends a reader looking in the wrong place.
-            if attrs.permissions is not None:
+            #
+            # **That status and no other, which is the note's whole premise** (D-161). It
+            # explains a refusal that says nothing; a ``NO_SUCH_FILE`` has already said what
+            # went wrong, and a paragraph about ``lchmod`` under it answers a question the
+            # server did not ask. Found on macOS, where the mode branch succeeds and a missing
+            # path is the *only* refusal this branch can produce -- so every refusal a Mac saw
+            # here carried a diagnosis about a kernel it was not running.
+            if attrs.permissions is not None and refusal.code == StatusCode.FAILURE:
                 refusal.add_note(
                     "the server may be refusing because it cannot do this at all: Linux has "
                     "no lchmod, so fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP and OpenSSH "
@@ -327,9 +334,14 @@ class _SessionOperations(_SessionCore):
         ``ENOTSUP``, measured, so ``lsetstat``'s permissions branch cannot succeed there however
         the server is configured. A symlink's own mode is meaningless to that kernel and always
         reads ``0o777``. The refusal arrives as OpenSSH's contentless ``FAILURE`` and this
-        library attaches a note saying so. :meth:`utime` and :meth:`chown` *do* work on a link
-        there -- ``utimensat`` and ``fchownat`` accept the flag -- so this limit is the mode's
-        alone, not the extension's.
+        library attaches a note saying so -- **to that status alone**, so a ``NO_SUCH_FILE`` or
+        a ``PERMISSION_DENIED``, which have already said what went wrong, arrive without it.
+        :meth:`utime` and :meth:`chown` *do* work on a link there -- ``utimensat`` and
+        ``fchownat`` accept the flag -- so this limit is the mode's alone, not the extension's.
+
+        **On a server whose platform has ``lchmod`` -- macOS, the BSDs -- it succeeds**, and it
+        changes the link's own mode while leaving the target alone. The condition is the
+        *server's* operating system, which a client cannot infer from its own.
 
         Args:
             path: What to modify.

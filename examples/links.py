@@ -116,7 +116,13 @@ async def show_attributes(sftp, release: Path) -> None:
 
 
 async def show_symlink_policy(sftp, release: Path, current: Path) -> None:
-    """`follow_symlinks=False`, where it works and the two ways it does not."""
+    """`follow_symlinks=False`, where it works and the two ways it does not.
+
+    The `chmod` branch is the one that depends on the **server's** operating system, and both
+    outcomes are printed. On Linux it is refused whatever the server is configured to do; on
+    macOS and the BSDs it succeeds and changes the link's own mode. An example that only ever
+    narrated the refusal ran on a Mac and said nothing at all about the call.
+    """
     print("\nnot following the link -- and where that is refused:\n")
     try:
         await sftp.utime(str(current).encode(), 1, 2, follow_symlinks=False)
@@ -137,9 +143,18 @@ async def show_symlink_policy(sftp, release: Path, current: Path) -> None:
             print("    Linux has no lchmod, so fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP.")
             print("    A symlink's own mode is meaningless there and always reads 0o777.")
             print("    utime and chown on a link do work -- the limit is the mode's.")
+    else:
+        link_mode = stat.S_IMODE((await sftp.lstat(str(current).encode())).permissions or 0)
+        target_mode = stat.S_IMODE((await sftp.stat(str(release).encode())).permissions or 0)
+        print("\n  chmod(follow_symlinks=False) succeeded: this server's OS has lchmod")
+        print(f"    the link's own mode is now {link_mode:04o}")
+        print(f"    and the target it points at still reads {target_mode:04o}")
+        print("    macOS and the BSDs do this; Linux refuses. It is the *server's*")
+        print("    platform that decides, and a client cannot infer it from its own.")
     print(
-        "\n  A refusal rather than a downgrade, because 'degrading' here would mean\n"
-        "  operating on the link's target -- exactly what the caller asked to avoid."
+        "\n  Where it is refused, that is a refusal rather than a downgrade, because\n"
+        "  'degrading' here would mean operating on the link's target -- exactly what\n"
+        "  the caller asked to avoid."
     )
 
 

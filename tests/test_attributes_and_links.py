@@ -69,21 +69,41 @@ On Linux `os.chmod` is absent from it and `chmod(..., follow_symlinks=False)` ra
 permissions branch succeeds there and `DID NOT RAISE` was the first CI failure on the macOS job.
 
 **The local platform is the right proxy here because the server *is* local**: these tests drive
-`sftp-server` on this machine. It would be the wrong proxy for a remote server, and that is
-exactly the gap D-151 is filed on -- a Linux client talking to a macOS server hits the same
-difference, and `docs/paths.md` and DESIGN's attribute table currently state the refusal without
-naming the condition.
+`sftp-server` on this machine. It would be the wrong proxy for a remote server, which is the
+difference D-151 closed on -- a Linux client talking to a macOS server gets the success, not the
+refusal, and `docs/paths.md` and DESIGN's attribute table now say so.
 """
 
 needs_a_server_that_cannot_chmod_a_symlink = pytest.mark.skipif(
     not SERVER_CANNOT_CHMOD_A_SYMLINK,
     reason=(
-        "this platform supports chmod without following a symlink (macOS does), so the refusal "
-        "these assert is not this server's behaviour -- what it does instead is D-151's open "
-        "question, and skipping is a placeholder for that answer rather than a decision"
+        "this platform's server can chmod a symlink (macOS has lchmod), so there is no refusal "
+        "here to carry a note or a path; what it does instead is asserted rather than skipped "
+        "past, by the `..._where_the_server_has_lchmod` rows below"
     ),
 )
-"""For the two tests whose subject is the *refusal* rather than the operation."""
+"""For the two tests whose subject is the *refusal* rather than the operation.
+
+**The reason names the rows that run in their place, and that is the correction D-161 made.**
+It used to say the macOS behaviour "is D-151's open question, and skipping is a placeholder for
+that answer rather than a decision" -- true when it was written, stale from the moment D-151
+closed, and behind it a real hole: on a platform with `lchmod` these two calls *succeed* and
+nothing asserted what they did. A skip reason that describes an open question is a skip nobody
+revisits, because it reads as work already scheduled.
+"""
+
+needs_a_server_that_can_chmod_a_symlink = pytest.mark.skipif(
+    SERVER_CANNOT_CHMOD_A_SYMLINK,
+    reason=(
+        "this platform's server has no lchmod (Linux does not), so the success these assert "
+        "cannot happen here -- the refusal it produces instead is asserted by the "
+        "`..._on_a_linux_server` rows above"
+    ),
+)
+"""The other half of the same fact, so exactly one of each pair runs and neither platform has a
+hole. Written as the inverse of the same probe rather than as its own condition: two
+independently-spelled predicates can both be false, and the pair would then silently prove
+nothing."""
 
 LCHMOD_NOTE = (
     "the server may be refusing because it cannot do this at all: Linux has no lchmod, so "
@@ -455,6 +475,48 @@ async def test_chmod_of_a_symlink_is_impossible_on_a_linux_server(tmp_path: Path
     assert bits(target) == 0o644
 
 
+@needs_a_server_that_can_chmod_a_symlink
+async def test_chmod_of_a_symlink_changes_only_the_link_where_the_server_has_lchmod(
+    tmp_path: Path,
+):
+    """D-151's last open question, asserted on the platform that can answer it.
+
+    The card closed asking one thing it could not settle: on a server whose kernel *has*
+    `lchmod`, does `follow_symlinks=False` genuinely change the link's own mode, or does it
+    succeed and change nothing? **A success that does nothing is worse than the Linux
+    refusal** -- a caller hardening a path against a planted symlink would be told the
+    operation happened.
+
+    It happens. Measured on macOS at all three layers before it was written down: the syscall,
+    `lsetstat@openssh.com` through this library at a local `sftp-server`, and the neighbouring
+    `chown` and `utime` -- so a difference here could be attributed rather than guessed at.
+
+    **Both halves are asserted, and the second is the one with teeth.** The link moved, *and*
+    the target did not: an implementation that quietly sent `SETSTAT` instead would satisfy the
+    first alone, on exactly the file the caller was avoiding.
+    """
+    needs_real_server()
+    target = tmp_path / "real.txt"
+    target.write_bytes(b"payload")
+    target.chmod(0o644)
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+    # Read rather than spelled, for the reason `test_by_default_these_follow_a_symlink` states:
+    # a fresh link's own mode is `0o777 & ~umask` here, and umask is the runner's business.
+    before = bits(link)
+    assert before != 0o600, "the mode this asks for has to be a change, or nothing is proven"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        assert sftp.supports(EXTENSION_LSETSTAT)
+        await sftp.chmod(str(link).encode(), 0o600, follow_symlinks=False)
+
+    assert bits(link) == 0o600, "the extension returned OK and the link's mode did not move"
+    assert bits(target) == 0o644, "chmod reached the target the caller was avoiding"
+
+
 async def test_utime_can_also_leave_the_target_alone(tmp_path: Path):
     """The same routing, a different flag -- so the helper is not proven by `chmod` alone."""
     needs_real_server()
@@ -732,6 +794,36 @@ async def test_the_non_following_refusal_also_names_the_path(tmp_path: Path):
     assert refusal.value.path == str(link).encode()
 
 
+@needs_a_server_that_can_chmod_a_symlink
+async def test_the_non_following_refusal_also_names_the_path_where_the_server_has_lchmod(
+    tmp_path: Path,
+):
+    """The same claim as the row above, through the refusal this platform actually produces.
+
+    `_set_one_attribute` passes `path=` into the `LSETSTAT` branch separately from the
+    `SETSTAT` one, so the non-following branch can stop naming the path with every following
+    test still green. That is worth proving on **both** platforms, and the Linux spelling
+    cannot run here: the mode branch succeeds, so a link is the one argument that will not
+    produce an error at all.
+
+    A path that is not there is what is left, and it is not a lesser proof -- the missing-file
+    refusal is the only one this branch has on a server with `lchmod`, which makes it the one a
+    Mac-hosted endpoint's users will actually see.
+    """
+    needs_real_server()
+    missing = tmp_path / "not-here.txt"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        assert sftp.supports(EXTENSION_LSETSTAT), "otherwise this refusal is the capability one"
+        with pytest.raises(NoSuchFileError) as refusal:
+            await sftp.chmod(str(missing).encode(), 0o600, follow_symlinks=False)
+
+    assert refusal.value.path == str(missing).encode()
+
+
 # --- ftruncate's boundary -------------------------------------------------------------------------
 
 
@@ -983,13 +1075,20 @@ async def test_a_timestamp_that_does_not_fit_is_refused_by_the_handle_form_too(t
 class _ScriptedServer:
     """A transport that answers each request from one function. Boilerplate, factored once.
 
-    The two tests below need shapes a real `sftp-server` will not make on demand -- an
-    `FSETSTAT` it refuses, and an `OP_UNSUPPORTED` for an extension it implements -- and the
-    framing around that answer is identical both times.
+    The tests below need shapes a real `sftp-server` will not make on demand -- an `FSETSTAT`
+    it refuses, an `OP_UNSUPPORTED` for an extension it implements, and a refusal of
+    `lsetstat` under a status the host kernel will not produce -- and the framing around that
+    answer is identical every time.
+
+    `extensions` is what the VERSION advertises, and it is not decoration:
+    `_attempt_extension` propagates a refusal only from a server that advertised the extension
+    and swallows it into the fallback otherwise, so a test about what a *refusal* carries has
+    to say the server offered the thing it refused.
     """
 
-    def __init__(self, answer) -> None:
+    def __init__(self, answer, extensions: tuple[tuple[bytes, bytes], ...] = ()) -> None:
         self._answer = answer
+        self._extensions = extensions
         self._splitter = Splitter()
         self._pending: list[bytes] = []
         self._has_output = anyio.Event()
@@ -1000,7 +1099,7 @@ class _ScriptedServer:
         for frame in self._splitter.feed(data):
             packet = decode(frame)
             if isinstance(packet, Init):
-                self._queue(encode(Version(3)))
+                self._queue(encode(Version(3, self._extensions)))
                 continue
             self.asked += 1
             self._queue(self._answer(packet))
@@ -1050,6 +1149,68 @@ async def test_the_handle_forms_name_the_path_they_were_given_when_the_server_re
             await getattr(sftp, call)(b"\x00\x00\x00\x00", *arguments, path=b"/staging.tmp.9f")
 
     assert refusal.value.path == b"/staging.tmp.9f"
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "explained"),
+    [
+        (StatusCode.FAILURE, b"", True),
+        (StatusCode.NO_SUCH_FILE, b"No such file", False),
+        (StatusCode.PERMISSION_DENIED, b"Permission denied", False),
+    ],
+    ids=["failure", "no-such-file", "permission-denied"],
+)
+async def test_only_the_contentless_failure_gets_the_lchmod_explanation(
+    code: StatusCode, message: bytes, explained: bool
+):
+    """The note answers "why does this say nothing", so a status that speaks must not carry it.
+
+    **A bug, found by running this suite on a Mac** (D-161). `_set_one_attribute` attached the
+    `lchmod` paragraph to *every* `ServerError` from the non-following branch whenever the flag
+    was `PERMISSIONS` -- so a `NO_SUCH_FILE` that had already said `No such file` arrived with a
+    page about a kernel call that was never reached, naming Linux on a server that may not be
+    running it. Nothing caught it because the only row asserting the note asserted the case
+    where it belongs.
+
+    Scripted rather than real, and that is the point: the three statuses have to be produced on
+    demand, on any platform, because which of them a host *can* produce is precisely the
+    platform difference this file is full of. The server advertises `lsetstat@openssh.com`,
+    without which `_attempt_extension` would swallow the refusal into the capability fallback
+    and this would test the wrong branch.
+    """
+    server = _ScriptedServer(
+        lambda packet: encode(Status(packet.request_id, code, message)),
+        extensions=((EXTENSION_LSETSTAT.encode("ascii"), b"1"),),
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as refusal:
+            await sftp.chmod(b"/alias.txt", 0o600, follow_symlinks=False)
+
+    assert refusal.value.code == int(code)
+    assert refusal.value.path == b"/alias.txt"
+    assert getattr(refusal.value, "__notes__", []) == ([LCHMOD_NOTE] if explained else [])
+
+
+async def test_the_lchmod_explanation_is_for_the_mode_alone_not_every_field():
+    """`chown` and `utime` reach the same `except`, and the note would be wrong for both.
+
+    `utimensat` and `fchownat` take `AT_SYMLINK_NOFOLLOW` on Linux and work, so a refusal of
+    those is never the missing `lchmod` -- which is why the note is behind
+    `attrs.permissions is not None` rather than behind the branch. The two conditions are
+    separate and only one of them had a test.
+    """
+    server = _ScriptedServer(
+        lambda packet: encode(Status(packet.request_id, StatusCode.FAILURE, b"")),
+        extensions=((EXTENSION_LSETSTAT.encode("ascii"), b"1"),),
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as refused_utime:
+            await sftp.utime(b"/alias.txt", 1, 2, follow_symlinks=False)
+        with pytest.raises(ServerError) as refused_chown:
+            await sftp.chown(b"/alias.txt", 0, 0, follow_symlinks=False)
+
+    assert not hasattr(refused_utime.value, "__notes__")
+    assert not hasattr(refused_chown.value, "__notes__")
 
 
 @pytest.mark.parametrize(

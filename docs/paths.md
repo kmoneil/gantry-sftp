@@ -315,6 +315,10 @@ meaningless to that kernel and always read `0o777`. It arrives as OpenSSH's cont
 `Failure`, so the exception carries a note saying why. `utime` and `chown` on a link _do_ work
 there: `utimensat` and `fchownat` both accept the flag. The limit is the mode's, not the
 extension's.
+
+That note belongs to the contentless `Failure` and to nothing else: a refusal that already
+explains itself — `NO_SUCH_FILE`, `PERMISSION_DENIED` — arrives without it. If you branch on
+`__notes__` to tell the two apart, that is the distinction you are reading.
 On a server whose operating system *does* have `lchmod` — macOS and the BSDs — the same call succeeds, because a symlink's mode is a real thing there. So this is a property of the **server's** platform rather than of SFTP or of this library, and a client on one cannot infer it from its own: a Linux client against a macOS server gets the success, not the refusal.
 
 `truncate` has no `follow_symlinks=` at all, for a related reason: `lsetstat` rejects a `SIZE`

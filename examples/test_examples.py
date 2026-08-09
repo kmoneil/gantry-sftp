@@ -107,6 +107,36 @@ def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
     assert "symlink" in stdout
 
 
+def test_the_links_example_narrates_the_chmod_outcome_whichever_one_it_gets():
+    """The one branch in `examples/` whose outcome is the *server's* operating system.
+
+    `chmod(follow_symlinks=False)` is refused on a Linux server -- it has no `lchmod` -- and
+    succeeds on macOS and the BSDs, where a symlink's mode is real. The example printed only
+    the refusal, so on a Mac it ran clean, exited 0, and said **nothing whatever** about the
+    call before printing a paragraph about refusals (D-161). `test_an_example_runs_clean`
+    cannot see that: silence is not a failure.
+
+    Asserted as "one of the two, and the paragraph after it either way", which is what makes
+    this row platform-free rather than a second skip.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "links.py")
+    assert returncode == 0
+    refused = "chmod(follow_symlinks=False) refused" in stdout
+    succeeded = "chmod(follow_symlinks=False) succeeded" in stdout
+    assert refused != succeeded, (
+        "the example must narrate exactly one of the two outcomes; it narrated "
+        f"{'both' if refused else 'neither'}"
+    )
+    if succeeded:
+        assert "the link's own mode is now 0600" in stdout
+        assert "still reads 0644" in stdout, "a success that left the target alone is the claim"
+    assert "utime(follow_symlinks=False) set the link's own times" in stdout
+    assert "refusal rather than a downgrade" in stdout
+
+
 def test_the_concurrency_example_shows_transfers_actually_overlapping():
     # The example is only worth having if it demonstrates overlap rather than asserting it,
     # and wall clock over a local pipe demonstrates nothing -- there is no round-trip time to
