@@ -23,6 +23,24 @@ and while the major version is `0` the minor version is where a breaking change 
   ladder's re-read rung reached into the session for its dispatcher, its depth and its idle
   timeout, and three call sites assembled the same eight-argument scheduler call by hand.
 
+- **`Session.fchmod(handle, mode)` and `Session.futime(handle, atime, mtime)`**, the `f` twins of
+  `chmod` and `utime`, beside the `fstat` and `ftruncate` that already existed. Setting a mode by
+  *name* on a file you hold open sets it on whatever the name refers to now — the shape of a swap
+  attack — and on a staging-and-rename publish the name is about to change, so there is a moment
+  when no correct name exists. Both take an optional `path=` carried on the error, because a
+  handle is meaningless in a message.
+
+- **`Session.fsync_if_supported(handle)` and `Session.posix_rename_if_supported(old, new)`**,
+  which answer `bool` where `fsync` and `posix_rename` raise. Reach for these when you have a
+  fallback and want it. Both are attempted whether or not the server advertised the extension,
+  and an `OP_UNSUPPORTED` is remembered for the session, so a tree of a thousand files asks once.
+  Documented under [Paths, predicates and attributes](docs/paths.md).
+
+  All four carry blocking forms on `SyncSession`. They exist because the upload path was building
+  those four requests by hand and could not be read anywhere but inside `Session`; naming the
+  operation each one wanted is what let the whole of `put` below its public entry point move to a
+  module of its own. Nothing about `get()`, `put()` or their results changed.
+
 ## 0.1.1 — 2026-08-06
 
 A patch rather than a minor, and the one judgement call in that is stated rather than left to be

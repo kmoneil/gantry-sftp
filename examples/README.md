@@ -85,7 +85,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
 | `resume.py`               | `get(resume=)`, `put(resume=)`, and the two refusals — a partial that cannot be a prefix, and atomic without a staging name |
 | `preserve_times.py`       | `preserve_times=` both directions, `UploadResult.times`, `entry.modified` — and why `longname` cannot carry a usable date |
-| `permissions.py`          | `mode=` and `Mode.PRESERVE` both directions, `chmod()`, `UploadResult.mode` — why an upload is world-readable without it, and why a `chmod` afterwards is not the same thing |
+| `permissions.py`          | `mode=` and `Mode.PRESERVE` both directions, `chmod()` and `fchmod()`, `UploadResult.mode` — why an upload is world-readable without it, why a `chmod` afterwards is not the same thing, and why the handle form is not merely the convenient one |
 | `links.py`                | `symlink()` / `readlink()` / `chown()` / `utime()` / `truncate()` / `fstat()`, one ATTRS flag per call, and `follow_symlinks=False` — where it works, where it is refused, and the one place Linux itself makes it impossible |
 | `verify_content.py`       | `verify=Verify.HASH` / `Verify.REREAD` on `put()` **and** `get()`, `content_check`, `resume_check`, and what rung 2 does not prove on a download — plus a resume that passes the size check while publishing a corrupt file |
 | `retry.py`                | `with_reconnect()`, `is_retryable()`, and why a failed authentication is never retried |

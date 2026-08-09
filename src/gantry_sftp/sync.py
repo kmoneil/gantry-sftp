@@ -666,6 +666,22 @@ class SyncSession:
         """Flush a handle's data to the server's disk, where the extension exists."""
         return self._run(partial(self._session.fsync, handle))
 
+    def fchmod(self, handle: bytes, mode: int, *, path: bytes | None = None) -> None:
+        """Set the permission bits of an open handle. The `f` twin of `chmod`."""
+        return self._run(partial(self._session.fchmod, handle, mode, path=path))
+
+    def futime(self, handle: bytes, atime: int, mtime: int, *, path: bytes | None = None) -> None:
+        """Set the times of an open handle, in whole seconds. The `f` twin of `utime`."""
+        return self._run(partial(self._session.futime, handle, atime, mtime, path=path))
+
+    def fsync_if_supported(self, handle: bytes) -> bool:
+        """Flush an open handle, and say whether the server did it."""
+        return self._run(partial(self._session.fsync_if_supported, handle))
+
+    def posix_rename_if_supported(self, old_path: bytes | str, new_path: bytes | str) -> bool:
+        """Rename atomically, and say whether the server did it."""
+        return self._run(partial(self._session.posix_rename_if_supported, old_path, new_path))
+
     def check_file(
         self,
         handle: bytes,

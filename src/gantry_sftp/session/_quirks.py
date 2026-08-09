@@ -36,6 +36,7 @@ __all__ = [
     "ServerProfile",
     "identify",
     "parse_vendor_id",
+    "server_note",
 ]
 
 
@@ -227,4 +228,27 @@ def _from_vendor_id(vendor_id: bytes) -> ServerProfile | None:
         description=f"{product}, self-reported and not in this library's profile table",
         version=version or None,
         informative_messages=False,
+    )
+
+
+def server_note(profile: ServerProfile, extensions: int) -> str:
+    """One line naming the peer, for a capability refusal to carry.
+
+    "This server does not advertise X" is a complaint about a server the message does not name.
+    A user reading it in a log two days later has to work out which endpoint the job was talking
+    to; the connection already knew, and threw it away.
+
+    A function here rather than only a method on the session (D-146), and the reason is that the
+    sentence has to have one spelling. Capability refusals are raised from two places -- the
+    session, and the upload orchestration that lives outside it -- and a second copy of this
+    format string is a second thing to update when the profile grows a field.
+
+    Args:
+        profile: What the handshake's extension list identified, or ``UNKNOWN``.
+        extensions: How many extensions the server advertised. Frequently zero, which is the
+            fact worth reporting rather than an omission.
+    """
+    return (
+        f"the server identifies as {profile.label} ({profile.description}) "
+        f"and advertises {extensions} extension(s)"
     )

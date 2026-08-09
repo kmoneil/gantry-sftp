@@ -20,6 +20,7 @@ import os
 import stat
 from pathlib import Path
 
+import anyio
 import pytest
 
 from gantry_sftp.codec import (
@@ -28,6 +29,7 @@ from gantry_sftp.codec import (
     Attrs,
     FSetStat,
     Handle,
+    Init,
     LSetStat,
     Name,
     NameEntry,
@@ -35,6 +37,12 @@ from gantry_sftp.codec import (
     Owner,
     Status,
     StatusCode,
+    Version,
+    decode,
+    encode,
+)
+from gantry_sftp.codec import (
+    FrameSplitter as Splitter,
 )
 from gantry_sftp.exceptions import (
     CapabilityError,
@@ -880,3 +888,206 @@ async def test_readlink_refuses_a_name_carrying_any_count_but_one(tmp_path: Path
         f"READLINK of {encoded!r} answered with 2 names, and a link has exactly one target"
     )
     assert confusion.value.request_id == seen_ids[-1]
+
+
+# --- the `f` twins and the two degrading spellings (D-146) ---------------------------------------
+
+
+async def test_fchmod_sets_the_mode_of_the_file_we_hold_not_the_name(tmp_path: Path):
+    """The argument for the method existing, and it is `fstat`'s argument in the other direction.
+
+    A caller holding an open file who chmods it *by name* is chmodding whatever the name refers
+    to now. Staged here the same way `test_fstat_describes_the_file_we_hold_not_the_name` stages
+    it: replace the name after opening, then set the mode through the handle and observe that
+    the *replacement* is untouched.
+    """
+    needs_real_server()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x" * 100)
+    source.chmod(0o644)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(source).encode(), OpenFlag.WRITE)
+        try:
+            held = tmp_path / "moved-away.bin"
+            source.rename(held)
+            source.write_bytes(b"y")
+            source.chmod(0o644)
+            await sftp.fchmod(handle, 0o600)
+        finally:
+            await sftp.close(handle)
+
+    assert bits(held) == 0o600
+    assert bits(source) == 0o644
+
+
+async def test_futime_sets_both_times_of_an_open_handle(tmp_path: Path):
+    """`utime`'s twin. The times cannot ride along on the OPEN, which is why this is reached for."""
+    needs_real_server()
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"payload")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(target).encode(), OpenFlag.WRITE)
+        try:
+            await sftp.futime(handle, KNOWN_ATIME, KNOWN_MTIME)
+        finally:
+            await sftp.close(handle)
+
+    assert int(target.stat().st_mtime) == KNOWN_MTIME
+    assert int(target.stat().st_atime) == KNOWN_ATIME
+
+
+async def test_a_timestamp_that_does_not_fit_is_refused_by_the_handle_form_too(tmp_path: Path):
+    """The same refusal as `utime`'s, at the same place -- the encoder -- and it is worth pinning.
+
+    Both spellings build the ATTRS the same way, so this could only diverge by one of them
+    growing a check the other did not. The value is one past the field's ceiling.
+    """
+    needs_real_server()
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"payload")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open(str(target).encode(), OpenFlag.WRITE)
+        try:
+            with pytest.raises(ValueError) as refusal:
+                await sftp.futime(handle, KNOWN_ATIME, MAX_V3_TIMESTAMP + 1)
+        finally:
+            await sftp.close(handle)
+
+    assert refusal.value.args[0].startswith(
+        f"mtime {MAX_V3_TIMESTAMP + 1} does not fit filexfer v3's uint32 seconds field"
+    )
+
+
+class _ScriptedServer:
+    """A transport that answers each request from one function. Boilerplate, factored once.
+
+    The two tests below need shapes a real `sftp-server` will not make on demand -- an
+    `FSETSTAT` it refuses, and an `OP_UNSUPPORTED` for an extension it implements -- and the
+    framing around that answer is identical both times.
+    """
+
+    def __init__(self, answer) -> None:
+        self._answer = answer
+        self._splitter = Splitter()
+        self._pending: list[bytes] = []
+        self._has_output = anyio.Event()
+        self._outbox = bytearray()
+        self.asked = 0
+
+    async def send(self, data: bytes | memoryview) -> None:
+        for frame in self._splitter.feed(data):
+            packet = decode(frame)
+            if isinstance(packet, Init):
+                self._queue(encode(Version(3)))
+                continue
+            self.asked += 1
+            self._queue(self._answer(packet))
+
+    def _queue(self, frame: bytes) -> None:
+        self._pending.append(frame)
+        self._has_output.set()
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        while not self._outbox:
+            await self._has_output.wait()
+            batch, self._pending = self._pending, []
+            self._has_output = anyio.Event()
+            for frame in batch:
+                self._outbox += frame
+        chunk = bytes(self._outbox[:max_bytes])
+        del self._outbox[:max_bytes]
+        return chunk
+
+    async def aclose(self) -> None:
+        return
+
+
+async def test_fchmod_names_the_path_it_was_given_when_the_server_refuses():
+    """A handle is meaningless in an error message, so the caller supplies the name for it.
+
+    Load-bearing on the atomic publish path, where the name that *would* be printed by default
+    is the destination -- a file nothing was ever published under. Driven against a scripted
+    server because a real one accepts the call.
+    """
+    server = _ScriptedServer(
+        lambda packet: encode(Status(packet.request_id, StatusCode.PERMISSION_DENIED, b"nope"))
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ServerError) as refusal:
+            await sftp.fchmod(b"\x00\x00\x00\x00", 0o600, path=b"/staging.tmp.9f")
+
+    assert refusal.value.path == b"/staging.tmp.9f"
+
+
+@pytest.mark.parametrize(
+    ("call", "advertised"),
+    [
+        ("fsync_if_supported", b"fsync@openssh.com"),
+        ("posix_rename_if_supported", b"posix-rename@openssh.com"),
+    ],
+)
+async def test_the_degrading_spellings_answer_true_against_a_server_that_has_it(
+    tmp_path: Path, call: str, advertised: bytes
+):
+    """`sftp-server` implements both, so the honest answer here is `True` rather than a fallback.
+
+    The pair exists so a caller doing their own publishing can ask "did that happen?" without
+    writing the catch-and-remember themselves. A version that always returned `False` would be
+    indistinguishable from a server that lacks the extension, and every caller would silently
+    take the fallback -- which for the rename means a window with no file at all.
+    """
+    needs_real_server()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        assert sftp.supports(advertised), "this server was expected to advertise it"
+        if call == "fsync_if_supported":
+            handle = await sftp.open(str(source).encode(), OpenFlag.WRITE)
+            try:
+                assert await sftp.fsync_if_supported(handle) is True
+            finally:
+                await sftp.close(handle)
+        else:
+            target = tmp_path / "target.bin"
+            target.write_bytes(b"older")
+            assert await sftp.posix_rename_if_supported(str(source).encode(), str(target).encode())
+            assert target.read_bytes() == b"payload"
+            assert not source.exists()
+
+
+@pytest.mark.parametrize(
+    "call", ["fsync_if_supported", "posix_rename_if_supported"], ids=["fsync", "posix-rename"]
+)
+async def test_the_degrading_spellings_answer_false_and_remember_it(call: str):
+    """`False` rather than an exception, once, and then without a round trip.
+
+    The remembering is the half worth sharing and the half a caller would get wrong: an
+    `OP_UNSUPPORTED` is a definitive answer about the *server*, so a tree of a thousand files
+    asks once. Counted rather than asserted in prose -- a version that did not cache would pass
+    every behavioural test and cost a round trip per file.
+    """
+    server = _ScriptedServer(
+        lambda packet: encode(Status(packet.request_id, StatusCode.OP_UNSUPPORTED))
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        arguments = (b"\x00\x00\x00\x00",) if call == "fsync_if_supported" else (b"/a", b"/b")
+        assert await getattr(sftp, call)(*arguments) is False
+        assert await getattr(sftp, call)(*arguments) is False
+
+    assert server.asked == 1, "the second call asked again rather than reading the cache"

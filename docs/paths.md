@@ -245,6 +245,52 @@ moved.
 are one flag apiece. To change a uid alone, read the gid back with `stat()` and send it
 unchanged.
 
+### By handle, when the name is not the file
+
+`fchmod` and `futime` are the `f` twins, beside `fstat` and `ftruncate`:
+
+```python
+handle = await sftp.open("/remote/report.csv", OpenFlag.WRITE)
+try:
+    await sftp.fchmod(handle, 0o600)
+    await sftp.futime(handle, atime, mtime)
+finally:
+    await sftp.close(handle)
+```
+
+**This is a correctness property, not a shortcut.** A path can be replaced between the `OPEN`
+and a `SETSTAT`, which is the shape of a swap attack; a handle cannot — it refers to the file
+this session opened. And on a staging-and-rename publish the name is about to change, so there
+is a moment when no correct name exists. That is why `put()` sets a mode this way, and why
+doing your own publishing needs the same spelling rather than a close-then-`chmod` you cannot
+make safe.
+
+Both take an optional `path=`, carried on the error only. A handle is meaningless in a message,
+and on a staging path the destination would be the *wrong* name to print — nothing was ever
+published under it.
+
+The times cannot ride along on the `OPEN` that creates the file. OpenSSH's `process_open` reads
+only `PERMISSIONS` out of that request's attributes, to pass as `open(2)`'s mode, and ignores
+`ACMODTIME` entirely — read in `sftp-server.c`, not assumed from the draft, which describes the
+field as settable there.
+
+### Asking whether an extension happened
+
+Two operations have a degrading spelling that answers `bool` instead of raising:
+
+```python
+if not await sftp.fsync_if_supported(handle):
+    ...  # the bytes are written; nothing can promise they reached stable storage
+if not await sftp.posix_rename_if_supported(staged, target):
+    ...  # no atomic replace here; any fallback has a window with no file in it
+```
+
+Use these when a fallback exists and you want it, and `fsync` / `posix_rename` when it does not
+and you want the error. Both are attempted whether or not the server advertised the extension —
+advertisement is a claim and an answer is a fact, and the endpoints most likely to
+under-advertise are the ones where these matter. An `OP_UNSUPPORTED` is remembered for the
+session, so a tree of a thousand files asks once.
+
 ### These follow symlinks by default
 
 `SETSTAT` is `chmod(2)`/`chown(2)`/`utimes(2)` on a path, and all three follow, the same

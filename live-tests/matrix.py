@@ -451,12 +451,28 @@ if paramiko is not None:
             Implemented for the same reason ``stat`` above is: without it the mode row would
             report "paramiko cannot set permissions", which is a fact about this thirty-line
             handler and not about paramiko. With it, what the row measures is the part that *is*
-            paramiko's -- whether the PERMISSIONS flag survives its ATTRS decode and arrives here.
+            paramiko's -- whether the flag survives its ATTRS decode and arrives here.
+
+            **It answered ``OK`` to a field it discarded, and that is worse than answering
+            ``OP_UNSUPPORTED``** (found by D-146's first ``futime`` row). Only ``st_mode`` was
+            applied and every other flag fell through to ``SFTP_OK``, so an ``ACMODTIME`` was
+            accepted and dropped -- which means an upload with ``preserve_times=True`` against
+            this server reported ``PRESERVED`` while the mtime stayed at the moment of the
+            write, the fabricated-but-plausible timestamp D-79 exists to prevent. A fake that
+            says yes and does nothing cannot be caught by any test of the client.
+
+            So the rule here is now: apply what is implemented, and **refuse** what is not.
+            ``UIDGID`` and ``SIZE`` are refused rather than ignored because this library sends
+            one flag per ``FSETSTAT`` and sends neither of those through one -- the day it does,
+            an ``OP_UNSUPPORTED`` is the answer that gets noticed.
             """
-            if getattr(attr, "st_mode", None) is None:
-                return paramiko.SFTP_OK
+            if getattr(attr, "st_size", None) is not None or getattr(attr, "st_uid", None):
+                return paramiko.SFTP_OP_UNSUPPORTED
             try:
-                os.fchmod(self.readfile.fileno(), stat.S_IMODE(attr.st_mode))
+                if getattr(attr, "st_mode", None) is not None:
+                    os.fchmod(self.readfile.fileno(), stat.S_IMODE(attr.st_mode))
+                if getattr(attr, "st_mtime", None) is not None:
+                    os.utime(self.readfile.fileno(), (attr.st_atime, attr.st_mtime))
             except OSError as error:
                 return paramiko.SFTPServer.convert_errno(error.errno)
             return paramiko.SFTP_OK

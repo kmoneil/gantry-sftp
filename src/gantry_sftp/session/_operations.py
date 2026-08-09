@@ -26,7 +26,9 @@ from pathlib import Path
 from gantry_sftp.codec import (
     EMPTY_ATTRS,
     EXTENSION_CHECK_FILE,
+    EXTENSION_FSYNC,
     EXTENSION_LSETSTAT,
+    EXTENSION_POSIX_RENAME,
     Attrs,
     AttrsReply,
     CheckFile,
@@ -89,6 +91,7 @@ from gantry_sftp.session._mode import (
 from gantry_sftp.session._policy import (
     _encode_path,
 )
+from gantry_sftp.session._quirks import server_note
 from gantry_sftp.session._recursive import (
     join_remote,
 )
@@ -104,14 +107,11 @@ class _SessionOperations(_SessionCore):
     def _server_note(self) -> str:
         """One line naming the peer, for a capability refusal to carry.
 
-        "This server does not advertise X" is a complaint about a server the message does not
-        name. A user reading it in a log two days later has to work out which endpoint the
-        job was talking to; the connection already knew, and threw it away.
+        The sentence itself lives in :func:`~gantry_sftp.session._quirks.server_note`, because
+        the upload orchestration raises capability refusals from outside this class and two
+        copies of the format string is two things to update.
         """
-        return (
-            f"the server identifies as {self._profile.label} ({self._profile.description}) "
-            f"and advertises {len(self._codec.extensions)} extension(s)"
-        )
+        return server_note(self._profile, len(self._codec.extensions))
 
     def _next(self) -> int:
         return self._codec.allocate_request_id()
@@ -479,6 +479,114 @@ class _SessionOperations(_SessionCore):
         if size < 0:
             raise ValueError(f"size must not be negative, got {size}")
         await self._expect_status(FSetStat(self._next(), handle, Attrs(size=size)))
+
+    async def fchmod(self, handle: bytes, mode: int, *, path: bytes | None = None) -> None:
+        """Set the permission bits of an **open handle**. The `f` twin of :meth:`chmod`.
+
+        ``FSETSTAT`` carrying only ``PERMISSIONS``, one flag per call for the reason
+        :meth:`chmod` gives: OpenSSH's ``process_fsetstat`` walks the flags in sequence and
+        reports one ``STATUS``, so a multi-field call that fails has already applied part of
+        itself and does not say which part.
+
+        **By handle rather than by path is a correctness property, not an economy** (D-146).
+        A caller holding an open file who chmods it by *name* is chmodding whatever that name
+        refers to now, which is not necessarily the file they hold — and on a staging-and-rename
+        publish the name is about to change, so there is a moment when no correct name exists.
+        That is why the upload path sets a mode this way, and why a caller doing their own
+        publishing needs the same spelling rather than a close-then-chmod they cannot make safe.
+
+        Args:
+            handle: An open file handle.
+            mode: Permission bits. Masked to ``0o7777``, as :meth:`chmod` does.
+            path: Carried on the error for diagnosis. A handle is meaningless in a message, and
+                on a staging path the destination name would be the *wrong* thing to print --
+                nothing was ever published under it.
+
+        Raises:
+            PermissionDeniedError: If the server will not change it.
+            ServerError: For any other refusal.
+        """
+        await self._expect_status(
+            FSetStat(self._next(), handle, Attrs(permissions=mode & PERMISSION_BITS)), path=path
+        )
+
+    async def futime(
+        self, handle: bytes, atime: int, mtime: int, *, path: bytes | None = None
+    ) -> None:
+        """Set the times of an **open handle**, in whole seconds. The `f` twin of :meth:`utime`.
+
+        Both together or neither, because they share one ``ACMODTIME`` flag, and v3 carries
+        ``uint32`` seconds so a value that does not fit is refused rather than truncated -- see
+        :data:`~gantry_sftp.codec.MAX_V3_TIMESTAMP`.
+
+        **The times cannot ride along on the ``OPEN`` that created the handle**, which is the
+        reason this is reached for at all: OpenSSH's ``process_open`` reads only ``PERMISSIONS``
+        out of that request's ATTRS, to pass as ``open(2)``'s mode, and ignores ``ACMODTIME``
+        entirely -- read in ``sftp-server.c`` rather than assumed from the draft, which
+        describes the field as settable there.
+
+        Args:
+            handle: An open file handle.
+            atime: Access time, seconds since the epoch.
+            mtime: Modification time, seconds since the epoch.
+            path: Carried on the error for diagnosis. See :meth:`fchmod`.
+
+        Raises:
+            PermissionDeniedError: If the server will not change them.
+            ServerError: For any other refusal.
+            ValueError: If either value does not fit filexfer v3's ``uint32`` seconds.
+        """
+        await self._expect_status(
+            FSetStat(self._next(), handle, Attrs(times=Times(atime=atime, mtime=mtime))),
+            path=path,
+        )
+
+    async def fsync_if_supported(self, handle: bytes) -> bool:
+        """Flush an open handle to stable storage, and say whether the server did it.
+
+        The degrading spelling of :meth:`fsync`, which raises instead. ``fsync@openssh.com`` is
+        optional in the field and absent from most of the endpoints DESIGN.md 7 lists, so a
+        caller who wants durability *where it is available* would otherwise write the
+        catch-and-remember themselves — and the remembering is the part worth sharing: an
+        ``OP_UNSUPPORTED`` is cached for the session, so the second call costs no round trip.
+
+        **Attempted whether or not the server advertised it** (D-51). Advertisement is a claim
+        and an answer is a fact, and the endpoints most likely to under-advertise are exactly
+        the ones where this is worth having.
+
+        Returns:
+            ``True`` if the server performed it. ``False`` if it will not — which is not an
+            error and is the common answer.
+
+        Raises:
+            ServerError: If a server that *advertised* the extension refuses for some reason
+                other than ``OP_UNSUPPORTED``. That refusal is about this handle rather than
+                about the server, so it propagates instead of degrading.
+        """
+        return await self._attempt_extension(EXTENSION_FSYNC, lambda: self.fsync(handle))
+
+    async def posix_rename_if_supported(self, old_path: bytes | str, new_path: bytes | str) -> bool:
+        """Rename, replacing the destination atomically, and say whether the server did it.
+
+        The degrading spelling of :meth:`posix_rename`, and the one an atomic publish is built
+        on: v3's own ``RENAME`` is specified to *fail* when the destination exists, so replacing
+        a file needs either this extension or a remove-then-rename with a window in it.
+
+        Attempted whether or not it was advertised, and an ``OP_UNSUPPORTED`` is cached, so a
+        tree of a thousand files asks once.
+
+        Returns:
+            ``True`` if the server performed the atomic rename. ``False`` if it will not, which
+            is when a caller has to decide what its fallback is -- and there is no safe one that
+            does not briefly leave the destination missing.
+
+        Raises:
+            ServerError: If a server that advertised the extension refuses for some reason other
+                than ``OP_UNSUPPORTED`` -- a permission, a missing parent, a cross-device move.
+        """
+        return await self._attempt_extension(
+            EXTENSION_POSIX_RENAME, lambda: self.posix_rename(old_path, new_path)
+        )
 
     async def fstat(self, handle: bytes) -> Attrs:
         """Attributes of an open handle.

@@ -369,7 +369,7 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 53
+SESSION_METHOD_CEILING = 35
 """What `Session` measures today, which is the whole of the rule.
 
 **Lowered from 109 to 59 by D-143**, which split the class into three layers: `_SessionCore`
@@ -377,10 +377,17 @@ SESSION_METHOD_CEILING = 53
 the compositions. The ratchet did its job on contact -- it failed the split with a message
 naming the new number, so tightening it was not something anybody had to remember.
 
-**59 to 53 by D-146**, which cut on the other axis: the verification ladder left as functions
-taking a session (`session/_verify.py`) and `_already_complete` joined `session/_policy.py`,
-which it had qualified for since the day it was written. D-143's cut was by depth and reached
-what depth could; this one is by concern, and it is the axis the mass was actually on.
+**59 to 35 by D-146**, which cut on the other axis. First the verification ladder left as
+functions taking a session (`session/_verify.py`) and `_already_complete` joined
+`session/_policy.py`, which it had qualified for since the day it was written. Then the whole of
+`put` below its public entry point left for `session/_put.py`. D-143's cut was by depth and
+reached what depth could; this one is by concern, and it is the axis the mass was actually on.
+
+**What unblocked the second half was a layer finding, not a concern one.** Four members could not
+leave because they built requests by hand and needed `_expect_status` / `_next` /
+`_attempt_extension`. Each turned out to be one round trip misfiled one layer up, and naming the
+operation it wanted -- `fchmod`, `futime`, `fsync_if_supported`, `posix_rename_if_supported` --
+retired the whole blocker. Reading them as a concern to extract had the diagnosis backwards.
 
 **A ratchet, not a target, and not a round number.** D-128's finding was that `Session` holds the
 orchestration half of all seven responsibilities `session/` has a module for, while every gate

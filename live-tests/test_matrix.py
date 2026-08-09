@@ -191,6 +191,62 @@ async def test_the_descriptor_pair_round_trips_through_every_server(
     assert local.read_bytes() == payload
 
 
+async def test_the_handle_addressed_metadata_calls_work_on_every_server(
+    server: MatrixServer, tmp_path: Path
+):
+    """`fchmod` and `futime` against three implementations, since `FSETSTAT` is where they differ.
+
+    `put` has used both since long before they had names, so the code is exercised -- what is
+    not is the public spelling, and `FSETSTAT` is a request each of these servers implements in
+    its own handler. asyncssh and paramiko are Python servers reimplementing what OpenSSH does
+    in C, which is exactly the population a golden frame cannot speak for.
+    """
+    target = server.root / "metadata.bin"
+    target.write_bytes(b"payload")
+
+    async with connected(server) as sftp:
+        handle = await sftp.open(str(target), OpenFlag.WRITE)
+        try:
+            await sftp.fchmod(handle, 0o640)
+            await sftp.futime(handle, 1_600_000_007, 1_600_000_000)
+        finally:
+            await sftp.close(handle)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert int(target.stat().st_mtime) == 1_600_000_000
+
+
+async def test_which_servers_perform_the_two_degrading_extensions(server: MatrixServer):
+    """The `bool` these answer is a fact about the server, so it is pinned per server.
+
+    DESIGN.md 7's claim is that endpoints differ on exactly this, and a client that assumed
+    either answer would be right about one of the three. A failure here is a finding: an
+    implementation gained or lost an extension, and the table is what needs re-reading.
+    """
+    expected = {
+        "openssh": (True, True),
+        "asyncssh": (True, True),
+        "paramiko": (False, False),
+    }[server.name]
+
+    async with connected(server) as sftp:
+        source = server.root / "renamed-from.bin"
+        source.write_bytes(b"payload")
+        target = server.root / "renamed-to.bin"
+        target.write_bytes(b"older")
+
+        handle = await sftp.open(str(source), OpenFlag.WRITE)
+        try:
+            flushed = await sftp.fsync_if_supported(handle)
+        finally:
+            await sftp.close(handle)
+        renamed = await sftp.posix_rename_if_supported(str(source), str(target))
+
+    assert (flushed, renamed) == expected
+    if renamed:
+        assert target.read_bytes() == b"payload"
+
+
 async def test_rung_3_is_satisfied_by_every_server(server: MatrixServer, tmp_path: Path):
     """DESIGN.md 6's size check, against three implementations instead of one.
 

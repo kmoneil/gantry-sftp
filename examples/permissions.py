@@ -28,7 +28,8 @@ from pathlib import Path
 
 import anyio
 
-from gantry_sftp.session import Mode, open_session
+from gantry_sftp import OpenFlag
+from gantry_sftp.session import Mode, Session, open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport
 
 
@@ -48,6 +49,35 @@ def show(label: str, path: Path) -> None:
     bits = stat.S_IMODE(path.stat().st_mode)
     others = "world-readable" if bits & stat.S_IROTH else "not readable by others"
     print(f"  {label:<36} {bits:04o}  ({others})")
+
+
+async def demonstrate_chmod(sftp: Session, default: Path) -> None:
+    """Setting a mode on a file that is already there, by name and by handle."""
+    print("\nchmod, for a file that is already there:\n")
+    await sftp.chmod(str(default).encode(), 0o600)
+    show("after chmod(0o600)", default)
+    print(
+        "\n  It follows symlinks, because SETSTAT is chmod(2). Where the path may be a\n"
+        "  link somebody else planted, that is a chmod of whatever it points at. The\n"
+        "  extension that does not follow is lsetstat@openssh.com; it is not\n"
+        "  implemented here and v3 has no fallback for it, so this is said rather than\n"
+        "  quietly assumed."
+    )
+
+    print("\nfchmod, for a file you are holding open:\n")
+    handle = await sftp.open(str(default).encode(), OpenFlag.WRITE)
+    try:
+        # By handle rather than by name, and the difference is not convenience: the path can
+        # be replaced between the OPEN and the SETSTAT, and on a staging-and-rename publish it
+        # is *about* to be -- which is why `put()` sets a mode this way.
+        await sftp.fchmod(handle, 0o640)
+    finally:
+        await sftp.close(handle)
+    show("after fchmod(0o640)", default)
+    print(
+        "\n  A handle refers to the file this session opened; a name refers to whatever it\n"
+        "  points at now. That is the whole of the difference, and it is a correctness one."
+    )
 
 
 async def main() -> None:
@@ -118,16 +148,7 @@ async def main() -> None:
                 "  not accept the files that belong in it."
             )
 
-            print("\nchmod, for a file that is already there:\n")
-            await sftp.chmod(str(default).encode(), 0o600)
-            show("after chmod(0o600)", default)
-            print(
-                "\n  It follows symlinks, because SETSTAT is chmod(2). Where the path may be a\n"
-                "  link somebody else planted, that is a chmod of whatever it points at. The\n"
-                "  extension that does not follow is lsetstat@openssh.com; it is not\n"
-                "  implemented here and v3 has no fallback for it, so this is said rather than\n"
-                "  quietly assumed."
-            )
+            await demonstrate_chmod(sftp, default)
 
 
 if __name__ == "__main__":
