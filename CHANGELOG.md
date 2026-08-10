@@ -3,7 +3,22 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## Unreleased
+## 0.1.2 — 2026-08-10
+
+**Six new methods and no breaking change, which under this project's `0.x` rule makes it a patch.**
+That rule — the minor version is where a break lands — is doing real work here rather than being
+recited: `download_into`, `upload_from`, `fchmod`, `futime`, `fsync_if_supported` and
+`posix_rename_if_supported` are additions, each with a blocking twin on `SyncSession`, and no
+existing signature, default or resolution order moved. Nothing written against 0.1.1 needs
+changing.
+
+**One reason to take this release even if none of those methods is interesting to you.** The
+source distribution ships `docs/`, and 0.1.1's copy states that `allowed_hosts()` refuses every
+connection on Windows because its `ssh -G` probe cannot execute there. That is wrong — the probe
+runs, and the failure the claim was read from belonged to five tests that hand it a `#!/bin/sh`
+script Windows cannot execute. The wheel never carried the claim and neither did the README, so
+this reaches you only if you rebuild from source; if you avoided a destination policy on Windows
+on our advice, you did not need to.
 
 ### Added
 
