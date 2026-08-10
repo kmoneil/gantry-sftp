@@ -341,10 +341,16 @@ calls and 25 ms the walk — and the fixture does two per test, so about 14 minu
 50-second suite. So the lane calls `gc.freeze()` once after collection, which moves that heap
 into a permanent generation the collector never scans again:
 
-| the same 4594 tests | armed |
-| --- | ---: |
-| before | 15m10s |
-| after | 2m43s |
+| armed, same suite | before | after |
+| --- | ---: | ---: |
+| one developer machine, idle | 15m10s | 2m30s |
+| a GitHub runner | 19–40 min | 5m24s, 8m51s |
+
+**Both columns, and which machine each came from, because that distinction is what this lane's
+sibling card got wrong.** The runner's figures are two runs of nearly identical work, and the
+1.6× between them is the same variance the lane had before the change — 19, 19, 20, 25, 27 and
+40 minutes across a single day. So the honest claim is *roughly three times faster in CI, with
+the spread unchanged*, not the 5.6× a quiet local box shows.
 
 It is sound because it is narrow: nothing the check watches exists before the first test, so
 what the freeze excludes is exactly the population that could never be the leak — and the rows
