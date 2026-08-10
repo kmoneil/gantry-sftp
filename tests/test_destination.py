@@ -13,6 +13,10 @@ that exits the way a broken ``ssh`` would, rather than by monkeypatching ``anyio
 -- a fake here would only confirm what its author believed about subprocess failure, which is
 DoD 1's whole objection.
 
+**That script is a ``#!/bin/sh`` file, and Windows cannot execute one** -- see
+:func:`broken_ssh`, which is where the skip and its reason live. It is worth knowing here
+because reading those rows' failures as the library's is how D-156 came to be filed.
+
 ``config_file=os.devnull`` is passed everywhere a probe runs. ``ssh`` reads the developer's own
 ``~/.ssh/config`` otherwise, and a test whose policy answer depends on the machine it runs on
 proves nothing -- DoD 1 again, and ``ssh`` resolves ``~`` from ``getpwuid`` rather than
@@ -22,6 +26,7 @@ proves nothing -- DoD 1 again, and ``ssh`` resolves ``~`` from ``getpwuid`` rath
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import anyio
@@ -29,7 +34,7 @@ import pytest
 
 from gantry_sftp import connect
 from gantry_sftp.exceptions import ConnectError, DestinationNotAllowedError
-from gantry_sftp.transport import _destination, build_ssh_argv
+from gantry_sftp.transport import _destination, build_ssh_argv, resolve_ssh_executable
 from gantry_sftp.transport._destination import (
     ALLOWED_HOSTS_ENV,
     _environment_layer,
@@ -50,6 +55,43 @@ def argv_for(host: str, **kwargs: object) -> list[str]:
     """A connection argv with the developer's ssh_config fenced off."""
     kwargs.setdefault("config_file", os.devnull)
     return build_ssh_argv(host, **kwargs)  # type: ignore[arg-type]
+
+
+def broken_ssh(tmp_path: Path, name: str, body: str) -> Path:
+    r"""A real program that misbehaves the way a broken ``ssh`` would.
+
+    Four of the probe's failure paths cannot be reached with a working ``ssh``: exiting
+    non-zero, answering with no ``hostname``, hanging past the bound, and writing bytes that
+    are not UTF-8. A shell script reaches all four for the cost of one file, and driving a real
+    process is the point -- monkeypatching ``anyio.run_process`` would assert what its author
+    believes about subprocess failure rather than what one does.
+
+    **It is POSIX-only, and mistaking that for a library defect is what D-156 was.** Windows
+    cannot execute a ``#!/bin/sh`` text file: ``CreateProcess`` refuses it with
+    ``ERROR_BAD_EXE_FORMAT``, which arrives as ``OSError(..., 193)``. So on Windows every one
+    of these rows refuses through the *spawn failed* path instead of the path it was written
+    for, and the resulting `'%1 is not a valid Win32 application'` was read as evidence that
+    ``allowed_hosts()``'s probe cannot run there at all. It can: on the same runners
+    ``resolve_ssh_executable()`` returns ``C:\Windows\System32\OpenSSH\ssh.exe``, and every row
+    that drives that -- the allowed host, the refused host, both config rewrites -- passed on
+    Windows in both of the runs the card was written from.
+
+    So these skip rather than being ported. A ``.cmd`` stand-in would be a second fixture to
+    keep in step, and it would put ``cmd.exe``'s argument re-parsing underneath a security
+    test, which is a poor trade for four platform-independent branches that Linux and macOS
+    already cover.
+    """
+    if sys.platform.startswith("win"):
+        pytest.skip(
+            "the stand-in is a '#!/bin/sh' script and Windows cannot execute one -- it fails "
+            "with ERROR_BAD_EXE_FORMAT before reaching the branch under test, which is what "
+            "D-156 mistook for allowed_hosts() being unusable there. The real probe is covered "
+            "on Windows by the rows that drive resolve_ssh_executable()'s answer"
+        )
+    fake = tmp_path / name
+    _ = fake.write_text(f"#!/bin/sh\n{body}")
+    fake.chmod(0o700)
+    return fake
 
 
 # --- folding and matching, which are pure ---------------------------------------------------
@@ -279,6 +321,34 @@ async def test_an_option_override_is_carried_into_the_probe(tmp_path: Path):
     assert exc.value.effective_host == "169.254.169.254"
 
 
+async def test_the_probe_runs_the_ssh_this_platform_resolved_and_reaches_an_answer(
+    tmp_path: Path,
+):
+    r"""D-156, refuted -- by evidence that was in the log the card was written from.
+
+    The card says ``allowed_hosts()`` refuses every connection on Windows because its
+    ``ssh -G`` probe cannot execute there, and it is wrong in a specific way worth pinning:
+    every ``ERROR_BAD_EXE_FORMAT`` in that run and in the one five days later belongs to a row
+    that hands the probe a ``#!/bin/sh`` stand-in (see :func:`broken_ssh`), and every row that
+    drives the *real* ``ssh`` passed on Windows both times.
+
+    Two things are asserted, because the card's open question was which executable runs.
+    ``build_ssh_argv`` takes it from :func:`resolve_ssh_executable`, so this fails if a bare
+    name ever goes back there -- on Windows that resolves to
+    ``C:\Windows\System32\OpenSSH\ssh.exe``, and ``gantry-sftp doctor`` reads
+    ``OpenSSH_for_Windows_9.5p2`` out of the same path. Then the check runs and **allows**,
+    which is the direct negation of the card's headline: the probe spawned, ``ssh -G``
+    answered, and the rewritten name is what got matched.
+    """
+    config = tmp_path / "resolved.conf"
+    _ = config.write_text("Host probe.example.com\n  Hostname resolved.example.com\n")
+    probe = argv_for("probe.example.com", config_file=str(config))
+
+    assert probe[0] == resolve_ssh_executable()
+    with allowed_hosts(["resolved.example.com"]):
+        await check_destination(probe, "probe.example.com", environ={})
+
+
 def test_the_probe_argv_replaces_the_subsystem_request_and_keeps_the_options():
     argv = argv_for("example.com", options={"ServerAliveInterval": "30"})
     probe = _probe_argv(argv, "example.com")
@@ -348,9 +418,7 @@ async def test_a_probe_that_exits_non_zero_refuses_and_keeps_stderr_verbatim(tmp
     A subclass that formatted its own copy would be the one place OpenSSH's stderr arrived
     differently from every other connection failure, which is the base class's whole point.
     """
-    fake = tmp_path / "broken-ssh"
-    _ = fake.write_text("#!/bin/sh\necho 'ssh: something went wrong' >&2\nexit 255\n")
-    fake.chmod(0o700)
+    fake = broken_ssh(tmp_path, "broken-ssh", "echo 'ssh: something went wrong' >&2\nexit 255\n")
     probe = argv_for("example.com", ssh_executable=str(fake))
 
     with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
@@ -373,9 +441,7 @@ async def test_a_probe_that_exits_non_zero_refuses_and_keeps_stderr_verbatim(tmp
 
 async def test_a_probe_that_reports_no_hostname_refuses(tmp_path: Path):
     """A zero exit with nothing usable in it is still an answer we do not have."""
-    fake = tmp_path / "quiet-ssh"
-    _ = fake.write_text("#!/bin/sh\necho 'user bob'\nexit 0\n")
-    fake.chmod(0o700)
+    fake = broken_ssh(tmp_path, "quiet-ssh", "echo 'user bob'\nexit 0\n")
     probe = argv_for("example.com", ssh_executable=str(fake))
 
     with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
@@ -404,9 +470,7 @@ async def test_a_probe_that_hangs_is_bounded_rather_than_hanging_the_connection(
     -- and the fake sleeps past both. The outer one is also what keeps this cheap when it does
     fire, since a mutant that removes the bound costs 3 s per backend rather than the sleep.
     """
-    fake = tmp_path / "hanging-ssh"
-    _ = fake.write_text("#!/bin/sh\nsleep 5\n")
-    fake.chmod(0o700)
+    fake = broken_ssh(tmp_path, "hanging-ssh", "sleep 5\n")
     probe = argv_for("example.com", ssh_executable=str(fake))
     monkeypatch.setattr(_destination, "ALLOWED_HOSTS_PROBE_TIMEOUT", 0.5)
 
@@ -432,9 +496,7 @@ async def test_a_probe_whose_stderr_is_not_utf8_still_produces_a_refusal(tmp_pat
     well-formed -- and the one place it is read is while building the refusal, where an
     exception replaces a security decision with a crash.
     """
-    fake = tmp_path / "noisy-ssh"
-    _ = fake.write_text("#!/bin/sh\nprintf 'ssh: \\377 broke\\n' >&2\nexit 255\n")
-    fake.chmod(0o700)
+    fake = broken_ssh(tmp_path, "noisy-ssh", "printf 'ssh: \\377 broke\\n' >&2\nexit 255\n")
     probe = argv_for("example.com", ssh_executable=str(fake))
 
     with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
@@ -449,9 +511,9 @@ async def test_a_probe_whose_stdout_is_not_utf8_still_reports_the_hostname(tmp_p
     The hostname line is well-formed and a different line is not, which is the shape a locale
     or a rewritten banner produces. The check has to survive it and still read the hostname.
     """
-    fake = tmp_path / "mixed-ssh"
-    _ = fake.write_text("#!/bin/sh\nprintf 'user \\377\\nhostname evil.example.com\\n'\nexit 0\n")
-    fake.chmod(0o700)
+    fake = broken_ssh(
+        tmp_path, "mixed-ssh", "printf 'user \\377\\nhostname evil.example.com\\n'\nexit 0\n"
+    )
     probe = argv_for("example.com", ssh_executable=str(fake))
 
     with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:

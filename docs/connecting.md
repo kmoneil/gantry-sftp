@@ -105,13 +105,14 @@ an absent one:
 When no policy is active nothing is spawned and nothing is checked, so an unrestricted caller
 pays no process and no latency for the feature existing.
 
-> **Known defect: this does not work on Windows.** The `ssh -G` probe cannot be executed there —
-> the spawn fails with `ERROR_BAD_EXE_FORMAT` — so the check can never reach an answer. It fails
-> *closed*, which is the correct direction and means there is no hole here: what happens is that
-> **every** connection is refused while a policy is active, with a message about the destination.
-> This is listed separately from the three above because it is a bug rather than a scope decision.
-> Transfers refuse on Windows by design in any case, so the surface affected is the remote-only
-> operations. There is no workaround beyond not activating a policy there.
+This page carried a "known defect: this does not work on Windows" note from 2026-08-05 to
+2026-08-10, and it was wrong. The probe runs there: the Windows job resolves
+`C:\Windows\System32\OpenSSH\ssh.exe`, `ssh -G` answers, and a config rewrite is caught exactly
+as it is on Linux. The `ERROR_BAD_EXE_FORMAT` the note was written from came from five tests
+that hand the probe a `#!/bin/sh` script to make it misbehave on purpose — a stand-in Windows
+cannot execute — and the failure was attributed to the library instead of to the stand-in.
+Transfers still refuse on Windows by design, so a policy there governs the remote-only
+operations.
 
 ### Passwords
 

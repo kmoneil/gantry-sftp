@@ -492,7 +492,8 @@ def test_the_windows_job_is_weekly_and_reports_rather_than_gates() -> None:
     what works on Windows is the codec, the transport and the remote-only operations -- for a
     file-transfer library, the product minus the product. The job therefore runs on the weekly
     `schedule:` rather than per change: the evidence is worth having (the first completed
-    Windows run is what found D-156) and a red row on every commit is D-152's pathology.
+    Windows run produced the out-of-scope list, and both raised D-156 and, once its log was
+    read row by row, refuted it) and a red row on every commit is D-152's pathology.
 
     Three assertions because the arrangement has three parts and any one of them silently
     reverting would put a permanently-red job back in front of every push. Read from the

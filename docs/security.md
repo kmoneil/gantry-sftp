@@ -52,8 +52,8 @@ places where that is easy to get backwards and is deliberately not:
   a positive report from the server. A permission error, or a server that will not say, is not a
   licence to proceed.
 - The destination allowlist refuses when its `ssh -G` probe cannot run, rather than allowing an
-  unverified destination. On Windows that probe cannot run *at all*, which makes the feature
-  unusable there rather than unsafe — see [what is not defended](#what-is-not-defended).
+  unverified destination. A probe that fails to spawn, exits non-zero, times out, or reports no
+  hostname all land there.
 
 ## What is not defended
 
@@ -79,9 +79,11 @@ resolves the same way at connect time. A documented limit of the control rather 
 **An attacker already running code as your user.** They can read your environment, attach a
 debugger, and replace `ssh` on your `PATH`.
 
-**Windows.** `allowed_hosts()` refuses every connection there, because the `ssh -G` probe it depends
-on cannot execute. Transfers refuse on Windows by design in any case — see
-[Requirements](../README.md#what-it-needs-read-this-before-you-install-it).
+**Windows transfers**, which refuse by design — see
+[Requirements](../README.md#what-it-needs-read-this-before-you-install-it). This entry used to
+say `allowed_hosts()` refuses every connection on Windows because its `ssh -G` probe cannot
+execute; that was read off five tests whose deliberately-broken `ssh` is a `#!/bin/sh` script,
+which is the thing Windows could not execute. The allowlist works there and is tested there.
 
 ## Supply chain, and why no SBOM ships
 
