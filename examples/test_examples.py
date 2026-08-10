@@ -296,9 +296,18 @@ def test_the_dry_run_example_shows_a_preview_that_wrote_nothing():
     own root `mkdir`, the one inside `_settle_directory` for every walked directory, and
     `_touch_destination`'s empty file per remote name.
 
-    The collision line is pinned for the opposite reason. On this filesystem `README.md` and
-    `readme.md` are two files, so the preview naming them and the real run then transferring
-    both is the example demonstrating that a fold is reported and never refused.
+    **The collision half is branched, and the branch is the platform finding.** The example
+    stages its own hazard by writing `README.md` beside `readme.md` into the directory the
+    server serves -- which on APFS is one file, written twice, listed once. So on macOS there is
+    no pair to preview and asserting one is asserting that the filesystem under CI is the one
+    the author had. That is what failed the first `fast (macos-latest)` run of this example, and
+    it is the same shape as the stand-in in `destination_collision.py` breaking on the only
+    platform where the hazard is real.
+
+    Branched on the example's **own** statement rather than on a probe here: `run_example`
+    spawns a subprocess with its own temporary directory, which need not be the filesystem
+    `tmp_path` is on, so a second probe could disagree with the first about the same machine.
+    The example is the only honest authority on where it ran.
     """
     if find_sftp_server() is None:
         pytest.skip("sftp-server not installed (ships in openssh-server)")
@@ -311,9 +320,18 @@ def test_the_dry_run_example_shows_a_preview_that_wrote_nothing():
     # says which question it declined to ask.
     assert "whether each remote directory already exists: not checked" in stdout
     assert "what the destination filesystem does with these names: not consulted" in stdout
-    # A fold, reported rather than raised -- and then both files transfer for real.
-    assert "would fold together" in stdout
-    assert "README.md -> b'the first file\\n'" in stdout
-    assert "readme.md -> b'a different file entirely\\n'" in stdout
     # The skip a preview exists to surface before anything moves.
     assert "symlink, and symlinks are not followed" in stdout
+
+    if "remote tree holds both names: yes" in stdout:
+        # A fold, reported rather than raised -- and then both files transfer for real, which
+        # is the whole demonstration: the preview flagged a pair the real run does not refuse.
+        assert "would fold together" in stdout
+        assert "README.md -> b'the first file\\n'" in stdout
+        assert "readme.md -> b'a different file entirely\\n'" in stdout
+    else:
+        # The other branch has to be pinned too, or "no pair reported" passes on a machine
+        # where the pair was staged and the preview simply stopped noticing it.
+        assert "remote tree holds both names: no" in stdout
+        assert "would fold together" not in stdout
+        assert "the fold happened when" in stdout
