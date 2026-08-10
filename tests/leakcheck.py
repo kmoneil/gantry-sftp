@@ -210,11 +210,35 @@ def freeze_the_import_time_heap() -> None:
     The import is lazy, so whether it happened before or after depended on whether a collected
     module used hypothesis: four modules passed and `test_leakcheck.py` did not.
 
-    Any *other* plugin that registers a PRNG lazily would reintroduce this. It fails loudly, at
-    collection, naming `register_random` -- so the way it comes back is not silent, and the fix
-    is to force that import here too.
+    **Importing it is not enough, and the second half cost a CI round trip.** Hypothesis
+    registers a *second* PRNG lazily, on the first test it runs rather than on import:
+    ``deterministic_PRNG`` creates ``hypothesis.core.threadlocal._hypothesis_global_random``
+    the first time it finds it unset. Its holder is a ``threading.local`` built at import, so
+    after a freeze that holder is in the permanent generation and the same `get_referrers`
+    blindness produces the same warning -- this time from inside a `@given` test, reported as a
+    `FlakyFailure`, which reads like a flaky test and not like a garbage collector setting.
+
+    So the machinery is *run* once here rather than merely imported: one example of a trivial
+    `@given` takes that branch while everything is still collectable. Public API on purpose --
+    reaching into ``hypothesis.core.threadlocal`` would work today and is a private name.
+
+    Any *other* library that registers a PRNG lazily would reintroduce this. It fails loudly and
+    names `register_random`, so it comes back visibly; what it will not do is say the word
+    "freeze", which is why this paragraph is here.
+
+    **It reproduces only in CI, and that is worth knowing on its own.** The local interpreter is
+    3.13 and the runners install 3.14, so "it passes locally" was never the same test: the whole
+    suite passes armed and frozen on both 3.13.14 and 3.14.6 here, and failed on the runner.
     """
-    import hypothesis  # noqa: F401, PLC0415  # its entry-point hooks must run before the freeze
+    import hypothesis  # noqa: PLC0415  # its entry-point hooks must run before the freeze
+    from hypothesis import strategies as st  # noqa: PLC0415  # imported with it, for the warm-up
+
+    @hypothesis.settings(max_examples=1, deadline=None, database=None)
+    @hypothesis.given(st.none())
+    def _take_the_lazy_branch(_: None) -> None:
+        """Run hypothesis once so its global PRNG exists before anything is frozen."""
+
+    _take_the_lazy_branch()
 
     _ = gc.collect()
     gc.freeze()
