@@ -338,13 +338,23 @@ jobs:
     # A starved job and a hung one produce the same message without this, which is most of why
     # D-154 took three runs to characterise.
     #
-    # **45 rather than the 30 this started at, and the first value was wrong for an instructive
-    # reason.** 30 was derived by extrapolating from the rate before the run died -- but the run
-    # died at the memory bomb, and every mutant after it was unmeasured. With the ceiling in
-    # place the lane reached 8065 of 8548 in 30 minutes and hit this instead, so the real figure
-    # is ~32 and the extrapolation was reading half a curve. 45 leaves room for a slower runner
-    # without leaving a hang to sit for an hour.
-    timeout-minutes: 45
+    # **120, and it is the first value here that a completed run produced.** 30 came from
+    # extrapolating the rate before a run died; 45 replaced it on a figure of "~32" that was
+    # measured on a developer's machine, not on a runner. Both were guesses wearing a
+    # measurement's clothes, and three runs at 45 stopped at 8312, 8277 and 8325 of 8760 --
+    # reproducible to 0.6%, so the wall was this number and not luck.
+    #
+    # A dispatch with the ceiling deliberately far too high answered it: **8760 of 8760 in 83.4
+    # minutes**, 8512 killed, 188 survived, 60 timeout, 0 `no tests`. The rate is why nothing
+    # shorter worked -- it falls from ~23 mutants/s in the first decile to under 1/s in the
+    # last, and the tail is `session/`, whose tests drive dispatchers and deadlines.
+    #
+    # 120 is 1.44x the measured figure. The headroom is for a slower runner and for the
+    # workload, which grew 8548 -> 8760 in five days and grows with `src/`. **Re-derive rather
+    # than raise**: if this starts hitting the wall again, dispatch `weekly_lane=mutation` on a
+    # branch with the ceiling lifted and read the real number off the log, which is how this one
+    # was arrived at.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0

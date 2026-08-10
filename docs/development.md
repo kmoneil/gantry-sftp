@@ -410,10 +410,18 @@ wrong. For frame parsing and offset arithmetic that distinction is the whole gam
 codec carries a `mutmut` run:
 
 ```bash
-python scripts/lanes.py mutation   # ~4 minutes; scoped to codec/ by pyproject.toml
+python scripts/lanes.py mutation   # the slowest lane here by an order of magnitude
 .venv/bin/mutmut browse            # inspect survivors
 .venv/bin/mutmut results           # non-interactive list
 ```
+
+Two things that line used to say and no longer does. The scope is **not** `codec/`: D-132 turned
+`[tool.mutmut]` from an allowlist into a denylist, because a module outside an allowlist is not
+mutated, produces no survivors, appears in no report, and so looks exactly like a module with
+nothing wrong — which had happened three times, twice to files holding security surface. And the
+duration was "~4 minutes", from when the scope really was one package. A complete run on a CI
+runner is **83 minutes**, which is why the job's ceiling is 120 and why the number lives in the
+workflow next to that ceiling rather than here, where it would go stale unwatched.
 
 It is a lane, not a pre-commit gate, because it takes minutes rather than seconds. A surviving
 mutant in `codec/` is a missing test, not a curiosity, and the survivors that are genuinely
