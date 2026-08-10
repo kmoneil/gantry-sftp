@@ -502,9 +502,12 @@ def test_the_windows_job_is_weekly_and_reports_rather_than_gates() -> None:
     runs = _uncommented(WORKFLOW_TEXT)
     assert "os: [ubuntu-latest, macos-latest]" in runs, "Windows is back in the gating matrix"
     assert "fast-windows:" in runs, "the weekly Windows job is gone rather than deferred"
-    assert (
-        "if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'" in runs
-    ), "the Windows job runs per change again"
+    # Asserted on what the guard *admits* rather than on its spelling. This pinned the exact
+    # string until the dispatch input made all four guards longer, and a literal that has to be
+    # retyped every time the condition is edited is a literal somebody retypes wrongly.
+    guard = job_guard(job_blocks()["fast-windows"])
+    assert "schedule" in guard, "the Windows job no longer runs weekly"
+    assert "pull_request" not in guard, "the Windows job runs per change again"
     # Flipping this is D-158's closure condition, not a tidy-up: it says Windows may block a
     # change, which is a claim about the platform being supported.
     assert "continue-on-error: true" in runs
@@ -810,38 +813,91 @@ def _rule(rule_type: str) -> dict:
     return matches[0]
 
 
-def contexts_a_pull_request_reports() -> set[str]:
-    """Every check a pull request will actually produce, read from the workflow.
+def job_blocks() -> dict[str, str]:
+    """Every job in the workflow, mapped to its own text.
 
-    **A job with no `if:` runs on every event this workflow takes, which includes
-    `pull_request`; a job with one does not.** That is the whole rule, and it is deliberately
-    not "matches the weekly guard": three lanes gate on
-    `schedule || workflow_dispatch` and `netem` on `!= 'pull_request'`, which are different
-    spellings of the same answer here. A test matching either string would classify the other
-    as gating.
-
-    Contexts rather than job ids, because `fast` is one job and two checks -- a ruleset can
-    only name what the check reports, so the matrix has to be expanded the way GitHub expands
-    it.
+    One walk, because two readers of the same structure drift. A block runs to the start of
+    the next job, so nothing below can be read as belonging to the one above -- which matters
+    here for exactly one reason: `fast` carries the only matrix, and a slice that overran would
+    hand its two images to whichever job was asked about first.
     """
     body = _uncommented(WORKFLOW_TEXT).split("\njobs:\n", 1)[1]
     starts = [
         (match.group(1), match.start())
         for match in re.finditer(r"^  ([a-z][a-z0-9-]*):$", body, flags=re.MULTILINE)
     ]
-    assert starts, "no jobs found in the workflow, so this sweep would pass by being empty"
-    contexts: set[str] = set()
-    for index, (job, start) in enumerate(starts):
-        end = starts[index + 1][1] if index + 1 < len(starts) else len(body)
-        block = body[start:end]
-        if re.search(r"^    if: ", block, flags=re.MULTILINE):
-            continue
-        matrix = re.search(r"^        os: \[(.+)\]$", block, flags=re.MULTILINE)
-        if matrix is None:
-            contexts.add(job)
-        else:
-            contexts.update(f"{job} ({image.strip()})" for image in matrix.group(1).split(","))
-    return contexts
+    assert starts, "no jobs found in the workflow, so every sweep below would pass while empty"
+    return {
+        job: body[start : (starts[index + 1][1] if index + 1 < len(starts) else len(body))]
+        for index, (job, start) in enumerate(starts)
+    }
+
+
+def job_guard(block: str) -> str:
+    """A job's `if:` text, whitespace-normalised, or `""` when it has none.
+
+    Returned whole rather than matched against, because it folds over several lines with `>-`
+    and a caller wants to ask what it mentions.
+    """
+    guard = re.search(r"^    if:(.*?)(?=^    [a-z-]+:)", block, flags=re.MULTILINE | re.DOTALL)
+    return " ".join(guard.group(1).split()) if guard else ""
+
+
+def job_contexts(job: str, block: str) -> set[str]:
+    """What a job reports as, which is not its id when it carries a matrix."""
+    matrix = re.search(r"^        os: \[(.+)\]$", block, flags=re.MULTILINE)
+    if matrix is None:
+        return {job}
+    return {f"{job} ({image.strip()})" for image in matrix.group(1).split(",")}
+
+
+def contexts_a_pull_request_reports() -> set[str]:
+    """Every check a pull request will actually produce, read from the workflow.
+
+    **A job with no `if:` runs on every event this workflow takes, which includes
+    `pull_request`; a job with one does not.** That is the whole rule, and it is deliberately
+    not "matches the weekly guard": the guards are not written the same way -- three name
+    `schedule` and `workflow_dispatch`, `netem` names `push` as well -- and a test matching one
+    spelling would classify the others as gating.
+
+    Contexts rather than job ids, because `fast` is one job and two checks -- a ruleset can
+    only name what the check reports, so the matrix has to be expanded the way GitHub expands
+    it.
+    """
+    return {
+        context
+        for job, block in job_blocks().items()
+        if not job_guard(block)
+        for context in job_contexts(job, block)
+    }
+
+
+def dispatchable_lanes() -> set[str]:
+    """The `weekly_lane` choice, minus the two that are not lane names."""
+    options = re.search(r"^        options: \[(.+)\]$", WORKFLOW_TEXT, flags=re.MULTILINE)
+    assert options is not None, "the weekly_lane input has no options list"
+    return {name.strip() for name in options.group(1).split(",")} - {"all", "none"}
+
+
+def test_every_lane_that_does_not_run_per_change_can_be_dispatched_on_its_own() -> None:
+    """Both directions, and they fail differently.
+
+    A guarded lane missing from the choice cannot be reached without running all four, which
+    is the two hours of runner time this input exists to stop paying. An option naming no job
+    is a dropdown entry that silently does nothing -- worse than absent, because somebody picks
+    it and reads the resulting green as an answer.
+    """
+    guarded = {job for job, block in job_blocks().items() if job_guard(block)}
+    assert guarded == dispatchable_lanes()
+
+
+@pytest.mark.parametrize("lane", sorted(dispatchable_lanes()))
+def test_a_dispatched_lane_names_itself_in_its_own_guard(lane: str) -> None:
+    # The failure this catches is a copy-paste: four guards with the same shape, and the one
+    # that still names its neighbour runs whenever the neighbour is asked for.
+    guard = job_guard(job_blocks()[lane])
+    assert f"inputs.weekly_lane == '{lane}'" in guard
+    assert "inputs.weekly_lane == 'all'" in guard
 
 
 def required_contexts() -> set[str]:

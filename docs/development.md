@@ -181,6 +181,27 @@ rather than on a defect. Re-export to compare:
 $ gh api repos/kmoneil/gantry-sftp/rulesets/20639723
 ```
 
+#### Running one weekly lane on demand
+
+The four lanes in the right-hand column are too slow for a per-change gate, so the only way to
+see one used to be the weekly run — or a `workflow_dispatch`, which ran **all four**. Three
+dispatches to read `fast-windows`, which does its work in 70 seconds, cost about two hours of
+runner time each. So the dispatch takes an input:
+
+```console
+$ gh workflow run ci.yml --ref <branch> -f weekly_lane=fast-windows
+```
+
+`all` (the default), `none`, or one lane name. The eight gating jobs run regardless — they are
+what the ruleset requires, and a run that skipped them would be green in a way that means less
+than it looks. `tests/test_lanes.py` holds the choice list and the guards in agreement in both
+directions: a guarded lane missing from the list cannot be reached on its own, and a list entry
+naming no job is a dropdown option that silently does nothing.
+
+Standard runners are free on public repositories, so none of this is billed — the usage report
+prices it and then discounts the same amount, which is worth knowing before reading the dollar
+column as a bill. Runner time is still worth not wasting.
+
 Linux and macOS gate on every push and pull request. **Windows runs on the weekly schedule
 only**, as `fast-windows`, and it **reports rather than gates** — not out of caution. Transfers
 are POSIX-only (see Requirements) and refuse there, so every test that moves bytes fails on
