@@ -143,18 +143,30 @@ through `scripts/lanes.py` rather than spelling out a `pytest` command of its ow
 developer cannot drift into running different things; `tests/test_lanes.py` asserts both that
 and that every lane the runner knows about is named in the workflow.
 
-**It has never run.** There is no git remote yet, so GitHub has never seen this repository.
-The file is committed anyway, because deciding which lane runs where and what it needs is most
-of the work and none of it needs a remote, and because a Windows job is the only thing that
-can settle whether `resolve_ssh_executable`'s `SysNative`-before-`System32` probe is right. It
-is unit-tested with injected inputs and has never executed on Windows.
+**It first ran on 2026-08-05**, and what that run found is listed in the workflow's own header
+rather than repeated here. This paragraph used to say the file had never run, because there was
+no remote for GitHub to see the repository through; the sentence outlived the remote by four
+days, which is the argument for keeping this section next to the file it describes.
 
-That Windows job **reports rather than gates**, and not out of caution. Transfers are
-POSIX-only (see Requirements) and refuse there, so every test that moves bytes fails on
-Windows by design. Making that job gate needs the out-of-scope rows marked as such, and
-marking them before a single Windows run has happened would be guessing at which ones they
-are. The job stays in the matrix because what is wanted from it is exactly that list, and no
-amount of reading the code produces it.
+Linux and macOS gate on every push and pull request. **Windows runs on the weekly schedule
+only**, as `fast-windows`, and it **reports rather than gates** — not out of caution. Transfers
+are POSIX-only (see Requirements) and refuse there, so every test that moves bytes fails on
+Windows by design. Making that job gate needs the out-of-scope rows marked as such, and marking
+them before a Windows run has happened would be guessing at which ones they are. The job exists
+because that list is exactly what is wanted from it, and no amount of reading the code produces
+it.
+
+**It has still never produced the list, and the reason is worth writing down.** The first
+scheduled run ended in 27 seconds with `ModuleNotFoundError: No module named 'resource'` while
+importing `tests/conftest.py` — zero tests collected, so the job reported nothing about the
+library at all, and `continue-on-error: true` made that indistinguishable from a lane with
+nothing to say. A `conftest.py` that fails to import ends the session; there is nowhere to
+attribute the error to. The same collision had already taken three test modules on the first
+Windows run ever and was answered in each of them with `pytest.importorskip`, which a conftest
+cannot use. The rule now lives in `tests/test_platform.py`, which walks every module the
+default run imports and fails on a module-scope import of anything CPython does not build on
+Windows. So `resolve_ssh_executable`'s `SysNative`-before-`System32` probe is still unit-tested
+with injected inputs and has still never executed on Windows.
 
 ### The controlled `ssh` environment
 
