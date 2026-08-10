@@ -29,6 +29,24 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      # Dispatching this file to reach one weekly lane used to run all four of them. Three
+      # dispatches on 2026-08-10 to see `fast-windows` -- which does its work in 70 seconds --
+      # ran `mutation` (45 min), `benchmarks` (29) and `netem` as well, about two hours of
+      # runner time each, for 70 seconds of the answer wanted. Public repositories are not
+      # billed for standard runners, so this cost $0.00 and 655 Linux minutes; the second
+      # number is the one worth reacting to.
+      #
+      # A `choice` rather than a comma-separated list: `workflow_dispatch` has no multi-select,
+      # and a free-text list is a thing to mistype in a field with no feedback. One lane is
+      # what the dispatch case actually wants. The eight gating jobs run regardless -- they are
+      # what the branch ruleset requires, and skipping them here would produce a run whose
+      # green means less than it looks.
+      weekly_lane:
+        description: "Which weekly lane to run (the eight gating jobs always run)"
+        type: choice
+        default: all
+        options: [all, none, fast-windows, mutation, benchmarks, netem]
   schedule:
     # Weekly, for the lanes that are too slow to run per-change. Nothing here fails on a
     # schedule today, which was the defect this file exists to fix.
@@ -151,7 +169,10 @@ jobs:
   # Flipping it is D-158's closure condition, not a tidy-up.
   # ---------------------------------------------------------------------------
   fast-windows:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.weekly_lane == 'all' || inputs.weekly_lane == 'fast-windows'))
     timeout-minutes: 25
     runs-on: windows-latest
     continue-on-error: true
@@ -257,7 +278,10 @@ jobs:
   # /proc/self/status, so it will say precisely what is missing if this is wrong.
   # ---------------------------------------------------------------------------
   netem:
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name == 'push' || github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.weekly_lane == 'all' || inputs.weekly_lane == 'netem'))
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
@@ -280,7 +304,10 @@ jobs:
   # PyPI cannot be taken back, and this lane found a bug that had been live for two releases
   # (D-152) the first time it was ever allowed to finish.
   benchmarks:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.weekly_lane == 'all' || inputs.weekly_lane == 'benchmarks'))
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
@@ -303,7 +330,10 @@ jobs:
   mutation:
     # The comment above has said "weekly and on demand" since this file was written; the
     # condition said `!= 'pull_request'`, which is every push. Now it matches (D-159).
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.weekly_lane == 'all' || inputs.weekly_lane == 'mutation'))
     runs-on: ubuntu-latest
     # A starved job and a hung one produce the same message without this, which is most of why
     # D-154 took three runs to characterise.
