@@ -31,6 +31,8 @@ from gantry_sftp.session._mode import Mode
 from gantry_sftp.session._policy import (
     _confirm_download_size,
     _download_mode,
+    _download_resume_offset,
+    _ensure_directory,
     _local_times,
     _optional_path,
     _preservation,
@@ -134,6 +136,11 @@ def test_turning_the_size_check_off_is_reported_rather_than_silent(tmp_path):
 
 
 def test_a_short_download_raises_and_the_error_names_both_paths_and_the_counts(tmp_path):
+    # **This name was true of the message and false of the error.** It asserted three substrings
+    # and nothing about the state the exception carries, so blanking `local_path` -- the file
+    # left on disk, which is the one fact deciding between resuming and deleting -- changed
+    # nothing here. Two mutants survived behind a test whose name says otherwise, which is the
+    # shape where a name stops anybody reading the body. D-162's triage of the first CI run.
     local = tmp_path / "f"
     with pytest.raises(TransferError) as failure:
         _confirm_download_size(b"/remote/f", local, arrived=3, announced=10, asked=True)
@@ -141,6 +148,12 @@ def test_a_short_download_raises_and_the_error_names_both_paths_and_the_counts(t
     assert "3" in message
     assert "10" in message
     assert "/remote/f" in message
+    assert failure.value.local_path == str(local)
+    assert failure.value.remote_path == b"/remote/f"
+    # `arrived` rather than 0: rung three runs after bytes have moved, and reporting none of
+    # them would make a truncation look like a failure that happened before the transfer began.
+    assert failure.value.transferred == 3
+    assert failure.value.offset == 3
 
 
 # --- the small predicates ----------------------------------------------------------------------
@@ -165,3 +178,55 @@ def test_a_local_path_passed_as_a_remote_one_is_explained_rather_than_coerced():
     explanation = _wrong_path_type(Path("/incoming"))
     assert "Path" in explanation
     assert _wrong_path_type(42)
+
+
+# --- the state these errors carry, which is not the message ------------------------------------
+#
+# D-162's triage of the first CI mutation run. Six survivors across these three raise sites were
+# all one shape: blank the `local_path` the error carries and every assertion still passes,
+# because the assertions stopped at the message. DoD 3 says these errors carry state rather than
+# strings -- `local_path` on a failed `get` is *the file left on disk*, which is the one fact a
+# caller needs to decide between resuming and deleting.
+#
+# Two mutants in the same cluster are **not** here and that is deliberate: dropping `transferred=0`
+# from `_download_mode` and from the too-long-partial refusal restates `TransferError`'s own
+# default, so no assertion can distinguish them. They are argued in the register instead.
+
+
+def test_a_resume_with_no_remote_size_names_the_partial_it_could_not_check(tmp_path):
+    target = tmp_path / "partial.bin"
+    target.write_bytes(b"already here")
+    with pytest.raises(TransferError) as exc:
+        _download_resume_offset(target, None, b"/remote/f")
+    assert exc.value.local_path == str(target)
+    assert exc.value.remote_path == b"/remote/f"
+
+
+def test_a_partial_longer_than_the_remote_file_names_both_and_where_it_stopped(tmp_path):
+    target = tmp_path / "partial.bin"
+    target.write_bytes(b"0123456789")
+    with pytest.raises(TransferError) as exc:
+        _download_resume_offset(target, 4, b"/remote/f")
+    assert exc.value.local_path == str(target)
+    assert exc.value.remote_path == b"/remote/f"
+    # The offset is what is on disk, not the remote size: it says where the disagreement is.
+    assert exc.value.offset == 10
+
+
+def test_creating_a_walked_directory_refuses_when_its_parent_is_missing(tmp_path):
+    """`parents=False` is a guard whose whole worth is that it never fires.
+
+    The tree walk creates parents before children, so `parents=True` would behave identically
+    for every input the walk produces -- which is why the mutation survived. What the default
+    buys is the case the walk is not supposed to produce: a child emitted before its parent
+    becomes a loud `FileNotFoundError` here instead of a silently invented directory chain,
+    under a destination the caller never asked us to create.
+    """
+    orphan = tmp_path / "never-created" / "child"
+    with pytest.raises(FileNotFoundError):
+        _ = _ensure_directory(orphan)
+    assert not orphan.exists()
+    assert not orphan.parent.exists()
+    # And the other half, so this pins the argument rather than only the refusal.
+    assert _ensure_directory(orphan, parents=True) == orphan
+    assert orphan.is_dir()
