@@ -301,6 +301,38 @@ def test_a_status_without_a_message_still_produces_a_usable_error():
     assert exc.value.args[0] == "server returned FAILURE"
 
 
+def test_a_code_v3_cannot_name_says_so_rather_than_reading_as_an_ordinary_failure():
+    """D-145's whole product is one clause, and nothing asserted the clause.
+
+    A status code outside v3's range is degraded to `FAILURE` with the number kept, so the
+    connection survives what would otherwise latch a terminal `ProtocolError`. The number is
+    then the *only* thing separating "this server is answering in a later dialect" from "this
+    server said no" -- and an operator who cannot tell those apart debugs the wrong one.
+
+    Found by D-162's triage of the first CI mutation run: replacing the whole f-string with
+    `None` survived, and `grep "does not define" tests/` returned nothing. The feature was a
+    sentence with no test on the sentence.
+    """
+    with pytest.raises(ServerError) as exc:
+        raise_for_status(Status(1, StatusCode.FAILURE, b"nope", raw_code=99))
+    assert exc.value.args[0] == (
+        "server returned FAILURE (wire status 99, which filexfer v3 does not define): nope"
+    )
+    # The degradation is not lossy on the way out either: `code` is the catch-all the caller
+    # branches on, and the raw number stays reachable through the message rather than replacing
+    # it. A caller matching `except ServerError` keeps working; one reading the text learns more.
+    assert exc.value.code == int(StatusCode.FAILURE)
+
+
+def test_an_ordinary_failure_gains_no_dialect_clause():
+    # The inverse, because the row above passes just as well against a version that appends the
+    # clause unconditionally -- which would tell an operator that every refusal came from a
+    # later dialect, and is the more damaging direction of the two.
+    with pytest.raises(ServerError) as exc:
+        raise_for_status(Status(1, StatusCode.FAILURE, b"nope"))
+    assert exc.value.args[0] == "server returned FAILURE: nope"
+
+
 async def test_a_missing_file_raises_no_such_file():
     class Missing(FakeServer):
         def _handle(self, packet: object) -> None:
