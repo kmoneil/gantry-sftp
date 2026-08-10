@@ -279,7 +279,7 @@ def resolve_ssh_executable(
     platform: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> str:
-    """Work out which ``ssh`` to run.
+    r"""Work out which ``ssh`` to run.
 
     On POSIX this is just ``ssh`` and ``PATH`` decides. On Windows it is the OpenSSH that
     ships with the OS, which needs care: a 32-bit Python on 64-bit Windows has its
@@ -296,8 +296,14 @@ def resolve_ssh_executable(
         time, which is what we want on POSIX.
 
     Note:
-        The Windows branch is exercised by unit tests with injected inputs. It has not been
-        run on Windows, and this docstring will say so until it has.
+        The Windows branch has run on Windows, and this note said it had not until 2026-08-10.
+        A ``fast-windows`` job resolved ``C:\Windows\System32\OpenSSH\ssh.exe`` on a
+        64-bit ``windows-latest`` runner and ``gantry-sftp doctor`` read
+        ``OpenSSH_for_Windows_9.5p2`` back out of it, so the loop, the ``SystemRoot`` read and
+        the ``System32`` arm are all confirmed against a real machine. **The ``SysNative`` arm
+        is not**, and cannot be from there: it exists only for a 32-bit process on 64-bit
+        Windows, so a 64-bit runner proves exactly the half that needs no alias. That half is
+        still unit tests with injected inputs.
     """
     platform = sys.platform if platform is None else platform
     if not platform.startswith("win"):
