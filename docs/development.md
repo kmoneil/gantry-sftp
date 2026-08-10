@@ -148,6 +148,39 @@ rather than repeated here. This paragraph used to say the file had never run, be
 no remote for GitHub to see the repository through; the sentence outlived the remote by four
 days, which is the argument for keeping this section next to the file it describes.
 
+#### What gates a merge
+
+`main` carries a ruleset, recorded in `.github/rulesets/main.json`. It refuses a direct push, a
+force-push and a deletion, offers the rebase merge button and no other, and requires the eight
+checks a pull request actually reports:
+
+| gates a merge | reports only |
+| --- | --- |
+| `audit`, `cost`, `fast (ubuntu-latest)`, `fast (macos-latest)`, `gates`, `leaks`, `live`, `server-matrix` | `fast-windows`, `mutation`, `benchmarks`, `netem` |
+
+The right-hand four are skipped on a pull request — three run on the weekly schedule, `netem`
+on anything that is not a pull request. **A skipped check that is marked required never
+reports, so it blocks every merge forever**, which is why the split is asserted rather than
+remembered: `tests/test_lanes.py` derives the left column from the workflow — a job with no
+`if:` runs on a pull request, a job with one does not — and fails if the ruleset and the
+workflow disagree in either direction.
+
+`leaks` is ~30 minutes and is always the last to finish, so a merge waits for it. That is the
+price of the lane that found D-153 blaming 140 tests which had not leaked.
+
+Two things the ruleset deliberately does not do. It requires **no approving review**: a solo
+maintainer cannot approve their own pull request, so any positive number blocks every merge.
+And it has **no bypass actor**, so there is no override — a change that CI cannot pass reaches
+`main` by editing the ruleset in Settings, visibly, rather than by forcing past it.
+
+The committed JSON is the intended configuration and GitHub holds the enforced one; nothing
+syncs them, because a test that read the API would need the network and would fail on an outage
+rather than on a defect. Re-export to compare:
+
+```console
+$ gh api repos/kmoneil/gantry-sftp/rulesets/20639723
+```
+
 Linux and macOS gate on every push and pull request. **Windows runs on the weekly schedule
 only**, as `fast-windows`, and it **reports rather than gates** — not out of caution. Transfers
 are POSIX-only (see Requirements) and refuse there, so every test that moves bytes fails on
