@@ -785,3 +785,117 @@ def test_the_table_carries_what_a_lane_is_for_and_what_it_needs(lane) -> None:
     assert ("gates" if lane.gates else "reports only") in table
     if lane.reports_only:
         assert " ".join(lane.reports_only.split()) in table
+
+
+# ---------------------------------------------------------------------------
+# The branch ruleset, and the workflow it has to agree with
+# ---------------------------------------------------------------------------
+
+RULESET_PATH = REPO_ROOT / ".github" / "rulesets" / "main.json"
+RULESET = json.loads(RULESET_PATH.read_text(encoding="utf-8"))
+"""The `main` ruleset as it is meant to be, committed so a change to it is reviewable.
+
+**What this file is not is a mirror of the live one.** GitHub holds the enforced copy and
+nothing here can read it -- a test that reached the API would need the network and would fail on
+an outage rather than on a defect. So the assertions below prove that *this* configuration and
+`ci.yml` agree with each other, which is the half that goes wrong silently. Drift between this
+file and the repository setting is found by re-exporting it, and `docs/development.md` says how.
+"""
+
+
+def _rule(rule_type: str) -> dict:
+    """The one rule of that type, so an assertion cannot be satisfied by a sibling."""
+    matches = [rule for rule in RULESET["rules"] if rule["type"] == rule_type]
+    assert len(matches) == 1, f"{rule_type} appears {len(matches)} times, expected once"
+    return matches[0]
+
+
+def contexts_a_pull_request_reports() -> set[str]:
+    """Every check a pull request will actually produce, read from the workflow.
+
+    **A job with no `if:` runs on every event this workflow takes, which includes
+    `pull_request`; a job with one does not.** That is the whole rule, and it is deliberately
+    not "matches the weekly guard": three lanes gate on
+    `schedule || workflow_dispatch` and `netem` on `!= 'pull_request'`, which are different
+    spellings of the same answer here. A test matching either string would classify the other
+    as gating.
+
+    Contexts rather than job ids, because `fast` is one job and two checks -- a ruleset can
+    only name what the check reports, so the matrix has to be expanded the way GitHub expands
+    it.
+    """
+    body = _uncommented(WORKFLOW_TEXT).split("\njobs:\n", 1)[1]
+    starts = [
+        (match.group(1), match.start())
+        for match in re.finditer(r"^  ([a-z][a-z0-9-]*):$", body, flags=re.MULTILINE)
+    ]
+    assert starts, "no jobs found in the workflow, so this sweep would pass by being empty"
+    contexts: set[str] = set()
+    for index, (job, start) in enumerate(starts):
+        end = starts[index + 1][1] if index + 1 < len(starts) else len(body)
+        block = body[start:end]
+        if re.search(r"^    if: ", block, flags=re.MULTILINE):
+            continue
+        matrix = re.search(r"^        os: \[(.+)\]$", block, flags=re.MULTILINE)
+        if matrix is None:
+            contexts.add(job)
+        else:
+            contexts.update(f"{job} ({image.strip()})" for image in matrix.group(1).split(","))
+    return contexts
+
+
+def required_contexts() -> set[str]:
+    parameters = _rule("required_status_checks")["parameters"]
+    return {check["context"] for check in parameters["required_status_checks"]}
+
+
+def test_every_check_a_pull_request_reports_is_required_to_merge() -> None:
+    """A gating lane the ruleset does not name is a lane that does not gate.
+
+    It still runs, still goes red, and still merges -- which is the failure this sweep exists
+    for, because nothing about the pull request looks different.
+    """
+    assert contexts_a_pull_request_reports() - required_contexts() == set()
+
+
+def test_no_required_check_is_one_a_pull_request_never_reports() -> None:
+    """The other direction, and it is the one that stops the repository dead.
+
+    `fast-windows`, `mutation`, `benchmarks` and `netem` are skipped on a pull request. A
+    required check that never reports leaves every pull request waiting for it, so moving a
+    lane to the weekly schedule without taking it out of the ruleset blocks all merges rather
+    than relaxing one.
+    """
+    assert required_contexts() - contexts_a_pull_request_reports() == set()
+
+
+def test_main_cannot_be_force_pushed_or_deleted() -> None:
+    """The two irreversible ones, and the reason they outrank the rest.
+
+    A wheel on PyPI carries an attestation naming a workflow, a repository and a commit. A
+    force-push to `main` invalidates what that attestation points at, and no green lane
+    anywhere would notice.
+    """
+    assert {rule["type"] for rule in RULESET["rules"]} >= {"deletion", "non_fast_forward"}
+
+
+def test_nothing_may_bypass_the_ruleset() -> None:
+    # An empty bypass list is what makes "must pass CI" true rather than customary -- with an
+    # actor in it the rule describes what everybody else has to do.
+    assert RULESET["bypass_actors"] == []
+    assert RULESET["enforcement"] == "active"
+
+
+def test_a_change_reaches_main_only_through_a_pull_request_that_rebases() -> None:
+    """Both halves of how a commit is allowed to land.
+
+    `rebase` alone, because `main` is linear and the merge button is where that is decided.
+    Squash is excluded on purpose and it is not a style preference: a pull request here can be
+    three commits where the third corrects the first, and collapsing them keeps the conclusion
+    while deleting the correction.
+    """
+    parameters = _rule("pull_request")["parameters"]
+    assert parameters["allowed_merge_methods"] == ["rebase"]
+    # Zero approvals required, and that is not an oversight: a solo maintainer cannot approve
+    # their own pull request, so any positive number blocks every merge permanently.
+    assert parameters["required_approving_review_count"] == 0
