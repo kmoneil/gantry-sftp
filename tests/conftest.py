@@ -21,7 +21,7 @@ from gantry_sftp.codec import Codec
 from gantry_sftp.exceptions import _flatten_exception_group
 from gantry_sftp.session import Dispatcher
 from gantry_sftp.transport import Transport
-from leakcheck import leak_check_enabled, settle
+from leakcheck import freeze_the_import_time_heap, leak_check_enabled, settle
 
 
 @asynccontextmanager
@@ -63,6 +63,24 @@ async def negotiate(transport: Transport) -> Codec:
     while codec.state.name != "READY":
         codec.receive(await transport.receive())
     return codec
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Arm the leak lane's one optimisation, once, after every module is imported (D-162).
+
+    Gated on the same variable as the check itself, so the default lane's garbage collection is
+    untouched -- this changes when objects are collected, and a suite that is not measuring
+    leaks should not be paying for, or reasoning about, a different GC regime.
+
+    `pytest_collection_finish` rather than `pytest_sessionstart` because the point is to freeze
+    a heap that is *finished*: every test module has been imported by now, so what gets frozen
+    is the whole import-time population rather than whatever had loaded when the session opened.
+
+    See :func:`leakcheck.freeze_the_import_time_heap` for what it buys and for the ordering
+    constraint that decides where this can go.
+    """
+    if leak_check_enabled():
+        freeze_the_import_time_heap()
 
 
 @pytest.fixture(autouse=True)

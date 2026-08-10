@@ -331,9 +331,33 @@ python scripts/lanes.py leaks
 
 The same unit tests as `fast`, with an autouse fixture that fails **the test that leaked** a
 transport, a session, a dispatcher or a child process. It is armed by `GANTRY_SFTP_LEAK_CHECK`
-and off otherwise, because it makes two full passes over `gc.get_objects()` per test — a cost
-that scales with the live heap, and lands about an order of magnitude above `fast` on the whole
-suite. The gating lane should stay under a minute.
+and off otherwise, because it collects twice and walks `gc.get_objects()` twice per test, which
+lands it several times above `fast` on the whole suite. The gating lane should stay under a
+minute.
+
+**Most of that cost was collecting the heap that imports built, over and over** (D-162).
+Measured in place: one `settle()` averaged 92 ms, of which 67 ms was the two `gc.collect()`
+calls and 25 ms the walk — and the fixture does two per test, so about 14 minutes on top of a
+50-second suite. So the lane calls `gc.freeze()` once after collection, which moves that heap
+into a permanent generation the collector never scans again:
+
+| the same 4594 tests | armed |
+| --- | ---: |
+| before | 15m10s |
+| after | 2m43s |
+
+It is sound because it is narrow: nothing the check watches exists before the first test, so
+what the freeze excludes is exactly the population that could never be the leak — and the rows
+that abandon a generator chain and drop a transport still fail the way they are meant to, which
+is the proof rather than the paragraph. The freeze is gated on the same variable as the check,
+so the default lane's garbage collection is unchanged.
+
+One ordering constraint, because it fails in a way that reads as something else. `hypothesis`
+runs its entry-point hooks on **first import**, and trio's hook calls `register_random` on
+trio's module-level PRNG, which decides whether to warn by asking `gc.get_referrers()`.
+Referrers in the permanent generation are invisible to that call, so freezing first makes
+hypothesis announce that it cannot manage the PRNG — an error here, aborting collection, with
+nothing in the message about freezing. The lane imports `hypothesis` before it freezes.
 
 Which test fails is the entire point. The last leak of this shape — `Process.aclose()` never
 called, leaving the pipe transports open for the garbage collector — surfaced as failures in
