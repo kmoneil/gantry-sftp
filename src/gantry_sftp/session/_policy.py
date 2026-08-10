@@ -38,8 +38,13 @@ from pathlib import Path, PurePath
 from gantry_sftp.codec import Attrs, Times
 from gantry_sftp.exceptions import DestinationCollisionError, PathCollision, TransferError
 from gantry_sftp.session._download import DownloadResult, ProgressCallback
-from gantry_sftp.session._listing import EntryKind
-from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
+from gantry_sftp.session._listing import DirEntry, EntryKind
+from gantry_sftp.session._localpath import (
+    DestinationLedger,
+    FoldedNameLedger,
+    check_contained,
+    local_child,
+)
 from gantry_sftp.session._localtree import LocalWalkEntry, remote_component
 from gantry_sftp.session._mode import PERMISSION_BITS, Mode, local_mode
 from gantry_sftp.session._platform import NO_FOLLOW
@@ -70,6 +75,7 @@ __all__ = [
     "_local_size",
     "_local_times",
     "_name_the_local_file",
+    "_note_planned",
     "_optional_path",
     "_preservation",
     "_remote_directory",
@@ -121,7 +127,7 @@ def _local_directory(destination: Path, relative: tuple[bytes, ...]) -> Path:
 
 
 def _claim_directory(
-    ledger: DestinationLedger, local_directory: Path, entry: WalkEntry
+    ledger: DestinationLedger | FoldedNameLedger, local_directory: Path, entry: WalkEntry
 ) -> tuple[PathCollision, ...]:
     """Claim a walked directory's local path, reporting a collision rather than merging.
 
@@ -655,11 +661,23 @@ class _DownloadState:
     :meth:`Session.get_tree`.
     """
 
-    ledger: DestinationLedger = field(default_factory=DestinationLedger)
+    # `FoldedNameLedger` under `dry_run`, and the swap is the whole of how a preview reaches a
+    # collision verdict without the write the real one needs (D-163). Both are asked the same
+    # two questions in the same order by the same walk, so there is one collision rule here
+    # rather than a preview's copy of it.
+    ledger: DestinationLedger | FoldedNameLedger = field(default_factory=DestinationLedger)
     directories: int = 0
     moved: list[int] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
     collisions: list[PathCollision] = field(default_factory=list)
+    # What a `dry_run` would move, summed as the walk sees each file (D-163). Written by the
+    # producer alone, like everything else here except `moved`, so `+=` is safe: the lost
+    # update `moved` documents needs two writers and this has one. Counted from the attributes
+    # READDIR already returned, which is why a preview costs no extra round trip -- and left
+    # short, with `PlanLimit.UNREPORTED_SIZES` said out loud, when a server volunteers none.
+    planned_files: int = 0
+    planned_bytes: int = 0
+    sizes_unreported: int = 0
     # Collected during the walk and applied after it -- see _stamp_local_directories. A
     # directory's times come from its *parent's* listing, which READDIR already returned, so
     # this costs no round trip.
@@ -668,6 +686,27 @@ class _DownloadState:
     # of the timestamps': a directory created 0o500 cannot have files written into it, so its
     # real mode has to wait until everything inside it has arrived.
     directory_modes: list[tuple[Path, int]] = field(default_factory=list)
+
+
+def _note_planned(state: _DownloadState, child: DirEntry) -> None:
+    """Count one file a preview would transfer, from what the listing already carried.
+
+    A module-level function rather than a method on :class:`_DownloadState` because that class
+    is a ``@dataclass`` and mutmut does not instrument a decorated class's members (D-129) --
+    a body of three arithmetic statements and a ``None`` test is precisely what the mutation
+    lane should be looking at, and `tests/test_layer_discipline.py` fails the change that hides
+    it.
+
+    Counted before the destination is settled, and **a collision does not undo it**: a
+    preview's collisions are name folds, so whether the real run refuses this file is a
+    property of the destination filesystem nobody has asked. Dropping it from the count would
+    make the plan wrong on every case-sensitive destination, which is most of them.
+    """
+    state.planned_files += 1
+    if child.attrs.size is None:
+        state.sizes_unreported += 1
+    else:
+        state.planned_bytes += child.attrs.size
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,12 +773,20 @@ def _settle_directory(
     preserve_times: bool,
     mode: int | Mode | None,
     state: _DownloadState,
+    dry_run: bool = False,
 ) -> None:
     """Create one walked directory locally and record what it contributes to the report.
 
     The root is deliberately not counted, stamped or chmodded: the caller named it, so creating
     it is :meth:`Session.get_tree`'s own ``_ensure_directory`` and modifying it would be a side
     effect on something they did not ask to have modified.
+
+    **``dry_run`` suppresses the one write, and it is easy to miss which one** (D-163). The
+    ``mkdir`` is a single call in the middle of a function whose name says "settle", and a
+    preview that skipped only the transfer and the destination root still left the whole
+    directory skeleton behind -- on a flat tree, where most tests of this live, with nothing to
+    show for it. Everything else here runs: the count, the claim, the times and modes it would
+    apply, the skips. Those are what a preview reports.
 
     **Only ``Mode.PRESERVE`` reaches directories.** An explicit integer is a *file* mode, and
     applying it here would make ``mode=0o600`` produce a tree nothing can descend into. A
@@ -749,7 +796,8 @@ def _settle_directory(
     not be carried leaves a readable tree and a listing that says what was skipped.
     """
     if entry.relative:
-        _ = _ensure_directory(local_directory)
+        if not dry_run:
+            _ = _ensure_directory(local_directory)
         state.directories += 1
         state.collisions.extend(_claim_directory(state.ledger, local_directory, entry))
     if preserve_times:

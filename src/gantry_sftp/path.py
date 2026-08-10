@@ -67,7 +67,7 @@ rather than re-deriving it, because the answer needs a round trip and the arithm
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Literal, overload, override
 
 from gantry_sftp.codec import OpenFlag
 from gantry_sftp.exceptions import NoSuchFileError, StateError, UnsafePathError
@@ -87,6 +87,7 @@ if TYPE_CHECKING:
         Publish,
         RemoteFile,
         Session,
+        TreePlan,
         TreeResult,
         UploadResult,
     )
@@ -1011,6 +1012,48 @@ class SFTPPath:
             depth=depth,
         )
 
+    @overload
+    async def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+    ) -> TreeResult: ...
+
+    @overload
+    async def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+    ) -> TreePlan: ...
+
+    @overload
+    async def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+    ) -> TreeResult | TreePlan: ...
+
     async def download_tree(
         self,
         local_path: Path | str,
@@ -1021,15 +1064,20 @@ class SFTPPath:
         mode: int | Mode | str | None = None,
         resume: bool = False,
         concurrency: int = 1,
-    ) -> TreeResult:
+        dry_run: bool = False,
+    ) -> TreeResult | TreePlan:
         """Download this directory into ``local_path``, refusing to escape it.
 
         Every argument is :meth:`~gantry_sftp.session.Session.get_tree`'s, and so is the
         zip-slip defence: each server-supplied name is validated, and the finished local path is
-        re-checked against the destination after symlinks are resolved.
+        re-checked against the destination after symlinks are resolved. ``dry_run=True`` reports
+        what the download would do and writes nothing, returning a
+        :class:`~gantry_sftp.session.TreePlan`; what a preview cannot determine is
+        :meth:`~gantry_sftp.session.Session.get_tree`'s to explain and is listed there.
 
         Returns:
-            What was transferred and what was skipped, with a reason for each skip.
+            What was transferred and what was skipped, with a reason for each skip -- or a
+            :class:`~gantry_sftp.session.TreePlan` when ``dry_run`` is set.
         """
         return await self._bound.get_tree(
             self._path,
@@ -1040,7 +1088,53 @@ class SFTPPath:
             mode=mode,
             resume=resume,
             concurrency=concurrency,
+            dry_run=dry_run,
         )
+
+    @overload
+    async def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+    ) -> TreeResult: ...
+
+    @overload
+    async def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+    ) -> TreePlan: ...
+
+    @overload
+    async def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+    ) -> TreeResult | TreePlan: ...
 
     async def upload_tree(
         self,
@@ -1053,14 +1147,19 @@ class SFTPPath:
         progress: ProgressCallback | None = None,
         resume: bool = False,
         concurrency: int = 1,
-    ) -> TreeResult:
+        dry_run: bool = False,
+    ) -> TreeResult | TreePlan:
         """Upload the local tree at ``local_path`` into this directory.
 
         Every argument is :meth:`~gantry_sftp.session.Session.put_tree`'s. Local symlinks are
         reported and never followed, which is this direction's hazard rather than the download's.
+        ``dry_run=True`` reports what the upload would do and sends nothing that writes; an
+        upload preview is silent about the destination, and
+        :meth:`~gantry_sftp.session.Session.put_tree` explains why.
 
         Returns:
-            What was transferred and what was skipped, with a reason for each skip.
+            What was transferred and what was skipped, with a reason for each skip -- or a
+            :class:`~gantry_sftp.session.TreePlan` when ``dry_run`` is set.
         """
         return await self._bound.put_tree(
             local_path,
@@ -1072,6 +1171,7 @@ class SFTPPath:
             progress=progress,
             resume=resume,
             concurrency=concurrency,
+            dry_run=dry_run,
         )
 
 

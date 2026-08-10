@@ -369,7 +369,7 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 35
+SESSION_METHOD_CEILING = 36
 """What `Session` measures today, which is the whole of the rule.
 
 **Lowered from 109 to 59 by D-143**, which split the class into three layers: `_SessionCore`
@@ -404,6 +404,16 @@ with D-128 took it from 114. If a change genuinely needs a new method here, the 
 failure asks is whether the method belongs on `Session` at all -- six of the seven that left did
 not.
 
+**35 to 36 by D-163**, and this is the raise the rule asks to be recorded rather than taken. The
+tree preview's branches put `_walk_for_download` at 21 against a cognitive-complexity ceiling of
+15, and the split falls where the two ceilings agree: `_settle_file` appends to the report and
+never walks, `_walk_for_download` walks and never decides what a refusal means. It is a method on
+`Session` because it needs `_claim_download`, which needs the session -- the membership test the
+docstring above describes, answered honestly rather than in the convenient direction.
+
+The count itself was corrected in the same change; see `_methods_of`. An `@overload` stub is a
+signature and not a method, and D-163 added six of them.
+
 The sync twin needs no ceiling of its own: `tests/test_sync_facade.py` derives `SyncSession` from
 `Session` by name, so a method that cannot be added here cannot appear there either.
 """
@@ -415,6 +425,38 @@ def _class_named(module: Path, name: str) -> ast.ClassDef:
         if isinstance(node, ast.ClassDef) and node.name == name:
             return node
     pytest.fail(f"{name} is not defined in {module.name}")
+
+
+def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether this ``def`` is a ``@typing.overload`` stub rather than a method.
+
+    Both spellings, because either resolves to the same decorator and a ceiling that could be
+    walked past by writing ``@typing.overload`` would be measuring the import style.
+    """
+    return any(
+        (isinstance(decorator, ast.Name) and decorator.id == "overload")
+        or (isinstance(decorator, ast.Attribute) and decorator.attr == "overload")
+        for decorator in node.decorator_list
+    )
+
+
+def _methods_of(module: Path, name: str) -> list[str]:
+    """The methods a class defines, counting an overloaded one once (D-163).
+
+    **An ``@overload`` stub is a signature, not a method**, and counting it makes the ceiling
+    measure typing sugar: `get_tree` gained three ``def``\\ s and no responsibility when
+    ``dry_run`` was overloaded to pick its own return type, which read as +3 against a limit
+    whose whole subject is how much this class does. Left uncorrected, the next real addition
+    would have been measured against a number six too high -- a ratchet that has stopped
+    tracking the thing it ratchets, which is what `test_the_session_ceiling_is_not_slack`
+    exists to prevent from the other direction.
+    """
+    body = _class_named(module, name).body
+    return [
+        node.name
+        for node in body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and not _is_overload(node)
+    ]
 
 
 _SHADOW_TREE = pytest.mark.skipif(
@@ -444,12 +486,7 @@ def test_the_session_class_does_not_grow() -> None:
     in this class was held only by attention, which is what let it become both the largest class
     in the library and the file with the most churn.
     """
-    session = _class_named(PACKAGE_ROOT / "session" / "_session.py", "Session")
-    methods = [
-        node.name
-        for node in session.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    ]
+    methods = _methods_of(PACKAGE_ROOT / "session" / "_session.py", "Session")
     assert len(methods) <= SESSION_METHOD_CEILING, (
         f"Session has grown to {len(methods)} methods, above the {SESSION_METHOD_CEILING} it "
         f"measured when D-128 pinned this. Ask whether the new method belongs on Session at "
@@ -467,12 +504,7 @@ def test_the_session_ceiling_is_not_slack() -> None:
     additions pass unnoticed -- which is how a ceiling set once becomes a ceiling that never
     fires. Failing here is the reminder to lower the constant in the same change as the cut.
     """
-    session = _class_named(PACKAGE_ROOT / "session" / "_session.py", "Session")
-    methods = [
-        node.name
-        for node in session.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    ]
+    methods = _methods_of(PACKAGE_ROOT / "session" / "_session.py", "Session")
     assert len(methods) == SESSION_METHOD_CEILING, (
         f"Session now has {len(methods)} methods and the ceiling still says "
         f"{SESSION_METHOD_CEILING}. Lower SESSION_METHOD_CEILING to {len(methods)} in this same "

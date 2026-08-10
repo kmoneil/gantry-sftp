@@ -11,6 +11,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import unicodedata
 from contextlib import aclosing
 from pathlib import Path
 
@@ -48,16 +49,21 @@ from gantry_sftp.exceptions import (
     CapabilityError,
     DestinationCollisionError,
     NoSuchFileError,
+    PathCollision,
     ServerError,
     TransferError,
     UnsafePathError,
 )
 from gantry_sftp.session import (
     EntryKind,
+    PlanLimit,
+    PotentialCollision,
     Publish,
     SkipReason,
+    TreePlan,
     TreeResult,
     check_listed_name,
+    fold_name,
     join_remote,
     local_child,
     open_session,
@@ -1964,3 +1970,286 @@ async def test_a_full_disk_is_not_reported_as_a_bad_name(
 
     assert caught.value.errno == errno.ENOSPC
     assert not isinstance(caught.value, TransferError), "a full disk is not a naming problem"
+
+
+# --- the preview, which must decide the same things and write none of them (D-163) ------------
+
+
+def _upload_tree(root: Path) -> None:
+    """A tree with a file, a nested directory, and a symlink the walk will skip."""
+    (root / "a.txt").write_bytes(b"0123456789")
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / "b.bin").write_bytes(b"xyz")
+    (root / "link").symlink_to(root / "a.txt")
+
+
+async def test_a_dry_run_upload_sends_nothing_that_writes(tmp_path: Path):
+    """The contract, asserted as a count rather than as an impression.
+
+    `TreeServer.seen` is every packet it was handed, so "makes no writes" is checkable
+    directly. `Realpath` and the version exchange are the whole of what a preview may send --
+    it has to resolve the destination to build remote paths at all, and resolving reads.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    _upload_tree(source)
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        plan = await sftp.put_tree(source, b"/dst", dry_run=True)
+
+    assert isinstance(plan, TreePlan)
+    written = {"MkDir", "Open", "Write", "SetStat", "FSetStat", "Rename", "Remove", "Close"}
+    assert not written.intersection(type(packet).__name__ for packet in server.seen)
+
+
+async def test_a_dry_run_upload_counts_what_the_real_one_moves(tmp_path: Path):
+    """The parity assertion the card asks for: same walk, same decisions, one type apart.
+
+    Run against the *same* tree, so a preview that quietly used a different walk -- a second
+    implementation of the skip rule, which is the drift this feature exists to prevent -- shows
+    up as a disagreement rather than as two plausible numbers nobody compares.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    _upload_tree(source)
+
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+    destination = tmp_path / "remote"
+
+    # A real server on a pipe rather than the fake, because this row is about the two paths
+    # agreeing and a fake would only confirm that they agree with the same author.
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        plan = await sftp.put_tree(source, str(destination), dry_run=True)
+        assert not destination.exists(), "the preview created the destination"
+        done = await sftp.put_tree(source, str(destination))
+
+    assert isinstance(plan, TreePlan)
+    assert isinstance(done, TreeResult)
+    assert (plan.files, plan.directories) == (done.files, done.directories)
+    assert plan.bytes_to_transfer == done.transferred == len(b"0123456789") + len(b"xyz")
+    # The symlink is skipped by both, with the same reason -- the shape most likely to drift,
+    # because a preview that forgot to consult the skip list would simply report more files.
+    assert [(s.path, s.reason) for s in plan.skipped] == [(s.path, s.reason) for s in done.skipped]
+    assert plan.skipped
+    assert not plan.complete
+
+
+async def test_a_dry_run_upload_says_what_it_did_not_find_out(tmp_path: Path):
+    """An empty `undetermined` would be a claim, and this preview is not entitled to it.
+
+    Every member here is a consequence of making no writes and asking the server nothing: the
+    upload's walk is local, so the destination is genuinely unexamined. Stating that is what
+    stops the plan reading as though it had checked.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"x")
+
+    async with open_session(TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)) as sftp:  # type: ignore[arg-type]
+        plan = await sftp.put_tree(source, b"/dst", dry_run=True)
+
+    assert isinstance(plan, TreePlan)
+    assert PlanLimit.REMOTE_DIRECTORY_EXISTENCE in plan.undetermined
+    assert PlanLimit.DESTINATION_COMPARISON in plan.undetermined
+    assert PlanLimit.PER_FILE_TRANSFER_DECISIONS in plan.undetermined
+
+
+async def test_a_dry_run_download_creates_nothing_on_disk(tmp_path: Path):
+    """The download's writes are local, and *three* of them hide in helpers that read as pure.
+
+    `_claim_download` calls `_touch_destination` to reserve each target with `O_CREAT`;
+    `get_tree` calls `_ensure_directory` on the destination root; and `_settle_directory` --
+    whose name says "settle" -- calls it again for every directory in the walk. A preview that
+    skipped only the transfer would leave an empty file per remote name and the whole directory
+    skeleton, and be able to say it made no writes.
+
+    **A nested tree, deliberately.** The flat one this row used to walk could not reach the
+    third of those, so it passed while `preview/sub/deeper` was being created on disk.
+    """
+    destination = tmp_path / "landing"
+    server = TreeServer(tree=SIMPLE_TREE, files=SIMPLE_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        plan = await sftp.get_tree(b"/root", destination, dry_run=True)
+
+    assert isinstance(plan, TreePlan)
+    assert (plan.files, plan.directories) == (3, 2)
+    assert plan.bytes_to_transfer == 3 + 5 + 7
+    assert not destination.exists(), "the preview created the destination directory"
+
+
+async def test_a_dry_run_download_reports_a_fold_it_cannot_confirm(tmp_path: Path):
+    """The half a preview cannot deliver, degraded rather than dropped or overstated.
+
+    A real `get_tree` names two remote paths as one local file by creating the file and asking
+    `lstat` for its inode -- authoritative on every filesystem, and a write. A dry run has
+    promised not to, so it folds names instead and reports the pair.
+
+    **It must not raise, and this row is what pins that.** On the filesystem underneath this
+    test `README.md` and `readme.md` are two files: the real download transfers both and
+    reports no collision at all, which the row below asserts rather than assumes. A preview
+    that raised `DestinationCollisionError` here would be refusing a transfer that works, on
+    the strength of a `str.lower()` -- the guess-wearing-a-fact's-clothes this library refuses
+    everywhere else. So the pair is reported and the caller, who knows what their destination
+    is, decides.
+    """
+    destination = tmp_path / "landing"
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        plan = await sftp.get_tree(b"/root", destination, dry_run=True)
+
+    assert isinstance(plan, TreePlan)
+    # Not `PathCollision`, and the type is the claim: that one records what the filesystem
+    # *did*, established by `lstat` after the write. Handing it back here would put a
+    # `str.lower()` into the record a caller trusts as a measurement.
+    assert all(isinstance(item, PotentialCollision) for item in plan.potential_collisions)
+    assert not any(isinstance(item, PathCollision) for item in plan.potential_collisions)
+    assert [(item.remote, item.first) for item in plan.potential_collisions] == [
+        (b"/root/readme.md", b"/root/README.md")
+    ]
+    assert [item.local for item in plan.potential_collisions] == [str(destination / "readme.md")]
+    # Reported, not deducted. Both files are still in the plan's counts, because on a
+    # case-sensitive destination both files transfer -- see the row below.
+    assert (plan.files, plan.bytes_to_transfer) == (2, len(b"AAA") + len(b"bbbbb"))
+    assert not plan.skipped, "a fold is not a skip: it is conditional on a filesystem"
+    assert not plan.complete, "but it is still a reason to read the plan before running it"
+    assert PlanLimit.DESTINATION_FILESYSTEM_RULES in plan.undetermined
+    assert not destination.exists()
+
+
+async def test_the_destination_this_runs_on_does_not_fold_so_the_real_run_transfers_both(
+    tmp_path: Path,
+):
+    """The oracle for the row above, and the reason it may not raise.
+
+    Without this the preview's caveat is an assertion about a filesystem nobody asked, which is
+    exactly the failure being guarded against. `COLLIDING_TREE` collides *on APFS and NTFS*;
+    here it is two ordinary files, and a preview claiming otherwise would contradict the run it
+    is previewing. Skipped rather than failed where the destination does fold -- the refusal is
+    then correct and `test_a_case_folding_destination_refuses_the_second_name` is its row.
+    """
+    destination = tmp_path / "landing"
+    probe = tmp_path / "PROBE"
+    probe.write_bytes(b"x")
+    if (tmp_path / "probe").exists():
+        pytest.skip("this filesystem folds case, so the collision below is real and is refused")
+
+    server = TreeServer(tree=COLLIDING_TREE, files=COLLIDING_FILES)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        done = await sftp.get_tree(b"/root", destination)
+
+    assert (done.files, done.transferred) == (2, len(b"AAA") + len(b"bbbbb"))
+    assert not done.skipped
+    assert (destination / "README.md").read_bytes() == b"AAA"
+    assert (destination / "readme.md").read_bytes() == b"bbbbb"
+
+
+async def test_a_dry_run_download_folds_an_nfc_nfd_pair(tmp_path: Path):
+    """The other fold, and the one nobody looks at until HFS+ merges two files.
+
+    `DestinationCollisionError`'s own docstring names an NFC/NFD pair as a case it covers, so a
+    preview that folded case and not normalisation would be quieter than the thing it previews
+    about precisely the hazard that is hardest to see in a listing.
+    """
+    composed = "café.txt"
+    decomposed = unicodedata.normalize("NFD", composed)
+    assert composed != decomposed, "the two spellings must differ or this row proves nothing"
+    tree = {
+        b"/root": (
+            named(os.fsencode(composed), REGULAR, 3),
+            named(os.fsencode(decomposed), REGULAR, 5),
+        )
+    }
+    files = {b"/root/" + os.fsencode(composed): b"AAA"}
+    server = TreeServer(tree=tree, files=files)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        plan = await sftp.get_tree(b"/root", tmp_path / "landing", dry_run=True)
+
+    assert isinstance(plan, TreePlan)
+    assert [item.remote for item in plan.potential_collisions] == [
+        b"/root/" + os.fsencode(decomposed)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "folds"),
+    [
+        ("README.md", "readme.md", True),
+        ("café.txt", unicodedata.normalize("NFD", "café.txt"), True),
+        ("Docs", "docs", True),
+        ("first.md", "second.md", False),
+        # `str.casefold()` expands this pair onto one key and `str.lower()` does not. Neither
+        # APFS nor NTFS expands, so folding them together would be inventing a hazard in a
+        # report a caller is reading *for* hazards -- see `fold_name`.
+        ("straße.txt", "strasse.txt", False),
+    ],
+)
+def test_the_fold_is_the_one_the_docstring_describes(left: str, right: str, folds: bool):
+    """Pin the approximation itself, because every plan built on it inherits its edges."""
+    assert (fold_name(Path("/dst") / left) == fold_name(Path("/dst") / right)) is folds
+
+
+async def test_a_dry_run_download_counts_what_the_real_one_moves(tmp_path: Path):
+    """Parity on the download side, against a real server rather than the fake."""
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "remote"
+    source.mkdir()
+    _upload_tree(source)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        plan = await sftp.get_tree(str(source), tmp_path / "preview", dry_run=True)
+        assert not (tmp_path / "preview").exists()
+        done = await sftp.get_tree(str(source), tmp_path / "real")
+
+    assert isinstance(plan, TreePlan)
+    assert isinstance(done, TreeResult)
+    assert (plan.files, plan.directories) == (done.files, done.directories)
+    assert plan.bytes_to_transfer == done.transferred
+    assert [(s.path, s.reason) for s in plan.skipped] == [(s.path, s.reason) for s in done.skipped]
+
+
+async def test_a_download_plan_says_it_did_not_compare_the_destination(tmp_path: Path):
+    """A download previews well, and `undetermined` has to stay honest about what is left.
+
+    Not empty: the plan still never asked whether these files are already on disk, which is
+    D-164's question rather than this one's.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "remote"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"0123456789")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        plan = await sftp.get_tree(str(source), tmp_path / "preview", dry_run=True)
+
+    assert isinstance(plan, TreePlan)
+    assert PlanLimit.DESTINATION_COMPARISON in plan.undetermined
+    assert PlanLimit.PER_FILE_TRANSFER_DECISIONS in plan.undetermined
+    # Always present on a download, collisions or not: the caveat is about what was *not
+    # asked*, so a clean plan needs it exactly as much as a colliding one -- more, arguably,
+    # since an empty `potential_collisions` is the answer a caller would otherwise read as
+    # "checked, and clear".
+    assert PlanLimit.DESTINATION_FILESYSTEM_RULES in plan.undetermined
+    assert not plan.potential_collisions
+    # This server reports sizes, so the total is complete and the caveat must be absent --
+    # the half that would make `undetermined` a list nobody reads.
+    assert PlanLimit.UNREPORTED_SIZES not in plan.undetermined
+    assert plan.bytes_to_transfer == len(b"0123456789")

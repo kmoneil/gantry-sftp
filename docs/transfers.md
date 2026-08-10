@@ -687,6 +687,69 @@ refusal is the safety net, and it means a wrong guess can only fail in the direc
 raises. There is no `max_depth`, because a depth-limited recursive delete leaves the deepest
 directories populated and their parents unremovable.
 
+## Previewing a tree, and the one thing a preview cannot know
+
+`dry_run=True` runs the same walk and makes the same decisions, then hands them back instead of
+acting on them. Both directions take it, and both return a `TreePlan` rather than a `TreeResult`:
+
+```python
+plan = await sftp.get_tree("/incoming", "downloads/", dry_run=True)
+
+print(plan.files, "files,", plan.bytes_to_transfer, "bytes,", plan.directories, "directories")
+for skip in plan.skipped:
+    print("would skip", skip.path, "--", skip.reason)
+for limit in plan.undetermined:
+    print("not determined:", limit)
+
+if plan.complete:
+    result = await sftp.get_tree("/incoming", "downloads/")
+```
+
+A different type rather than a `TreeResult` with its counters zeroed. `TreeResult.transferred ==
+0` means "nothing needed moving"; a preview's zero would mean "nothing was attempted", and one
+field cannot carry both. `dry_run` is overloaded on its literal value, so `get_tree(...)` still
+types as `TreeResult` and `get_tree(..., dry_run=True)` as `TreePlan` with nothing to narrow.
+
+**The contract is one sentence: a dry run makes no writes.** No `MKDIR`, no `OPEN`, no `SETSTAT`,
+no local directory — not even the destination root — and none of the empty files a download
+reserves for its collision check. It reads only what the operation would read anyway.
+
+That is why the two directions preview so differently, and the asymmetry is stated rather than
+hidden. Walking a remote tree **is** reading, so a download previews nearly completely. An
+upload's walk is local, so its plan is complete about every local fact and silent about the
+destination: whether those directories exist, and which files are already there, would cost a
+round trip per entry — on a large tree over a slow link, a "preview" that stats every target is
+a half-hour operation — and it is a mirror's question rather than a preview's.
+
+Whatever a plan did not find out is in `plan.undetermined`, in `PlanLimit`'s words. An empty
+list is a claim, so it is never padded and never silently short.
+
+### The collision check degrades, and says so
+
+The one decision a preview cannot reproduce. A real `get_tree` establishes that two remote names
+are one local file by creating the file and asking `lstat` for its inode — authoritative on every
+filesystem, and a write. A dry run has promised not to, so it folds names instead: Unicode NFC
+normalisation and `str.lower()`, reported as `PotentialCollision` and never raised.
+
+```python
+for maybe in plan.potential_collisions:
+    print(maybe.remote, "and", maybe.first, "fold together at", maybe.local)
+```
+
+It is wrong in **both** directions and neither is hidden:
+
+- On a case-sensitive destination — ext4, XFS, most Linux — every pair it lists is a non-event.
+  `README.md` and `readme.md` are two files there and the real download transfers both. They stay
+  in `plan.files` and `plan.bytes_to_transfer` for exactly that reason.
+- A hard link or symlink already sitting in the destination has no name to fold, so it is missed
+  entirely. That is precisely the case the inode check exists for.
+
+`PlanLimit.DESTINATION_FILESYSTEM_RULES` is in `plan.undetermined` on every download plan,
+collisions or not — the caveat is about what was not asked, so a clean plan needs it just as
+much. `plan.complete` is `False` when either the skip list or the collision list is non-empty.
+
+`examples/dry_run.py` runs both directions.
+
 ## Resuming a tree
 
 ```python

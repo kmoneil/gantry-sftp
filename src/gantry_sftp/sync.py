@@ -79,7 +79,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import Self, override
+from typing import Literal, Self, overload, override
 
 from anyio.from_thread import BlockingPortal, start_blocking_portal
 
@@ -105,6 +105,7 @@ from gantry_sftp.session import (
     Session,
     SessionOptions,
     TransferSizes,
+    TreePlan,
     TreeResult,
     UploadResult,
     Verify,
@@ -831,6 +832,56 @@ class SyncSession:
             )
         )
 
+    # Overloaded exactly as the async method is, and it has to be: the facade's job is that
+    # the blocking spelling types the same as the async one (D-84), so a preview that narrowed
+    # on one surface and not the other would be a parity gap the parity test cannot see --
+    # `test_sync_facade` compares names, arguments and return types, and both say
+    # `TreeResult | TreePlan` whether or not the overloads are here.
+    @overload
+    def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+    ) -> TreeResult: ...
+
+    @overload
+    def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+    ) -> TreePlan: ...
+
+    @overload
+    def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+    ) -> TreeResult | TreePlan: ...
+
     def get_tree(
         self,
         remote_path: bytes | str,
@@ -842,8 +893,9 @@ class SyncSession:
         mode: int | Mode | str | None = None,
         resume: bool = False,
         concurrency: int = 1,
-    ) -> TreeResult:
-        """Download a directory tree."""
+        dry_run: bool = False,
+    ) -> TreeResult | TreePlan:
+        """Download a directory tree, or report what it would download."""
         return self._run(
             partial(
                 self._session.get_tree,
@@ -855,8 +907,60 @@ class SyncSession:
                 mode=mode,
                 resume=resume,
                 concurrency=concurrency,
+                dry_run=dry_run,
             )
         )
+
+    @overload
+    def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+        **legacy: bool | bytes | str | None,
+    ) -> TreeResult: ...
+
+    @overload
+    def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+        **legacy: bool | bytes | str | None,
+    ) -> TreePlan: ...
+
+    @overload
+    def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+        **legacy: bool | bytes | str | None,
+    ) -> TreeResult | TreePlan: ...
 
     def put_tree(
         self,
@@ -870,9 +974,10 @@ class SyncSession:
         progress: ProgressCallback | None = None,
         resume: bool = False,
         concurrency: int = 1,
+        dry_run: bool = False,
         **legacy: bool | bytes | str | None,
-    ) -> TreeResult:
-        """Upload a directory tree."""
+    ) -> TreeResult | TreePlan:
+        """Upload a directory tree, or report what it would upload."""
         return self._run(
             partial(
                 self._session.put_tree,
@@ -885,6 +990,7 @@ class SyncSession:
                 progress=progress,
                 resume=resume,
                 concurrency=concurrency,
+                dry_run=dry_run,
                 **legacy,
             )
         )
@@ -1274,6 +1380,48 @@ class SyncSFTPPath:
             )
         )
 
+    @overload
+    def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+    ) -> TreeResult: ...
+
+    @overload
+    def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+    ) -> TreePlan: ...
+
+    @overload
+    def download_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+    ) -> TreeResult | TreePlan: ...
+
     def download_tree(
         self,
         local_path: Path | str,
@@ -1284,8 +1432,9 @@ class SyncSFTPPath:
         mode: int | Mode | str | None = None,
         resume: bool = False,
         concurrency: int = 1,
-    ) -> TreeResult:
-        """Download this directory into ``local_path``, refusing to escape it."""
+        dry_run: bool = False,
+    ) -> TreeResult | TreePlan:
+        """Download this directory into ``local_path``, or report what it would download."""
         return self._call(
             partial(
                 self._path.download_tree,
@@ -1296,8 +1445,54 @@ class SyncSFTPPath:
                 mode=mode,
                 resume=resume,
                 concurrency=concurrency,
+                dry_run=dry_run,
             )
         )
+
+    @overload
+    def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+    ) -> TreeResult: ...
+
+    @overload
+    def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+    ) -> TreePlan: ...
+
+    @overload
+    def upload_tree(
+        self,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+    ) -> TreeResult | TreePlan: ...
 
     def upload_tree(
         self,
@@ -1310,8 +1505,9 @@ class SyncSFTPPath:
         progress: ProgressCallback | None = None,
         resume: bool = False,
         concurrency: int = 1,
-    ) -> TreeResult:
-        """Upload the local tree at ``local_path`` into this directory."""
+        dry_run: bool = False,
+    ) -> TreeResult | TreePlan:
+        """Upload the local tree at ``local_path``, or report what it would upload."""
         return self._call(
             partial(
                 self._path.upload_tree,
@@ -1323,6 +1519,7 @@ class SyncSFTPPath:
                 progress=progress,
                 resume=resume,
                 concurrency=concurrency,
+                dry_run=dry_run,
             )
         )
 

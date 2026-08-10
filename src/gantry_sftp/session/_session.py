@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import override
+from typing import Literal, overload, override
 
 import anyio
 
@@ -97,7 +97,12 @@ from gantry_sftp.session._listing import (
     entry_kind,
     modified_at,
 )
-from gantry_sftp.session._localpath import DestinationLedger, check_contained, local_child
+from gantry_sftp.session._localpath import (
+    DestinationLedger,
+    FoldedNameLedger,
+    check_contained,
+    local_child,
+)
 from gantry_sftp.session._localtree import remote_component, walk_local
 from gantry_sftp.session._mode import (
     Mode,
@@ -120,7 +125,9 @@ from gantry_sftp.session._policy import (
     _DownloadState,
     _ensure_directory,
     _local_directory,
+    _local_size,
     _name_the_local_file,
+    _note_planned,
     _optional_path,
     _preservation,
     _remote_directory,
@@ -153,8 +160,11 @@ from gantry_sftp.session._put import (
 )
 from gantry_sftp.session._recursive import (
     GlobMatch,
+    PlanLimit,
+    PotentialCollision,
     Skipped,
     SkipReason,
+    TreePlan,
     TreeResult,
     WalkEntry,
     join_remote,
@@ -1963,6 +1973,60 @@ class Session(_SessionOperations):
             unclassifiable=self._unclassifiable,
         )
 
+    # Overloaded on `dry_run` so the flag picks the return type rather than every existing
+    # caller inheriting a union to narrow (D-163). Without this, adding a preview would be a
+    # source break on code that has never asked for one: `(await sftp.get_tree(...)).transferred`
+    # stops type-checking the day the flag lands, which is the shape "public API is stable or
+    # the break is deliberate" exists to catch.
+    @overload
+    async def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+    ) -> TreeResult: ...
+
+    @overload
+    async def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+    ) -> TreePlan: ...
+
+    # The third one is what a *forwarding* caller needs: `SFTPPath.download_tree` passes its own
+    # `dry_run` through as a plain `bool`, which matches neither literal, and without this the
+    # facade would have to branch and call twice to say one thing. A caller holding the flag in
+    # a variable gets the union and narrows it, which is correct -- they do not know either.
+    @overload
+    async def get_tree(
+        self,
+        remote_path: bytes | str,
+        local_path: Path | str,
+        *,
+        max_depth: int | None = ...,
+        progress: ProgressCallback | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+    ) -> TreeResult | TreePlan: ...
+
     async def get_tree(
         self,
         remote_path: bytes | str,
@@ -1974,7 +2038,8 @@ class Session(_SessionOperations):
         mode: int | Mode | str | None = None,
         resume: bool = False,
         concurrency: int = 1,
-    ) -> TreeResult:
+        dry_run: bool = False,
+    ) -> TreeResult | TreePlan:
         """Download a remote tree into ``local_path``, refusing to escape it.
 
         **Every name the server supplies is validated before it becomes a path**, and the
@@ -2050,16 +2115,47 @@ class Session(_SessionOperations):
                 ``docs/concurrency.md``'s *"``concurrency=`` bounds one call, and you own the
                 product"* is where that lives and DESIGN.md §5.2 has the measurement (D-116).
 
+            dry_run: Report what this call would do and do none of it, returning a
+                :class:`TreePlan` instead of a :class:`TreeResult`.
+
+                **Makes no writes** -- nothing is downloaded, no directory of the tree is
+                created, not even the destination root, and the empty file each remote name
+                would reserve is not created either. It reads only what the download would
+                read anyway, and for this direction that is most of the answer: walking a
+                remote tree *is* reading, so the plan carries every file, every skipped entry
+                with its reason, and the byte total from the sizes the listing already
+                returned. A server volunteering no size leaves that total short rather than
+                guessed, and says so through :data:`PlanLimit.UNREPORTED_SIZES`.
+
+                **The collision check is the one thing a preview cannot deliver in full, and
+                it degrades rather than disappearing.** The real download names two remote
+                paths as one local file by creating the file and asking ``lstat`` -- which is
+                a write, and the only answer that is right on every filesystem. A dry run
+                folds names instead (case and Unicode normalisation), so it reports
+                :class:`PotentialCollision` in
+                :attr:`TreePlan.potential_collisions` rather than raising
+                :exc:`~gantry_sftp.exceptions.DestinationCollisionError`, and it is wrong in
+                both directions: a case-sensitive destination keeps apart pairs listed there,
+                and a hard link or symlink already sitting in the destination has no name to
+                fold and is missed entirely. :data:`PlanLimit.DESTINATION_FILESYSTEM_RULES`
+                says so, and it is always present. Those files stay in ``files`` and
+                ``bytes_to_transfer`` for the same reason -- on most destinations they do
+                transfer.
+
         Returns:
-            Counts, bytes, and every entry that was skipped with the reason it was.
+            Counts, bytes, and every entry that was skipped with the reason it was -- or a
+            :class:`TreePlan` when ``dry_run`` is set.
 
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O -- today,
                 Windows. Raised before the walk starts; see :mod:`._platform`.
-            UnsafePathError: If a server-supplied name would escape the destination.
+            UnsafePathError: If a server-supplied name would escape the destination. A dry run
+                raises it too: the name alone decides, so nothing is being guessed at.
             DestinationCollisionError: If two remote names resolved to one local file. Raised
                 at the end rather than on contact, so everything transferable still transfers;
                 what is refused is only the write that would have destroyed an earlier one.
+                **Never raised by a dry run**, which has not created the files the filesystem
+                would need in order to say so -- see ``dry_run`` above.
             NoSuchFileError: If the remote directory does not exist.
             ServerError: If the server refuses.
             TransferError: If a transfer fails partway.
@@ -2068,14 +2164,18 @@ class Session(_SessionOperations):
         _check_local_path(local_path, method="get_tree()")
         _check_tree_concurrency(concurrency, progress=progress, caller="get_tree")
         requested_mode = resolve_mode(mode, caller="get_tree()")
-        destination = _ensure_directory(Path(local_path), parents=True)
-        state = _DownloadState()
+        destination = (
+            Path(local_path) if dry_run else _ensure_directory(Path(local_path), parents=True)
+        )
+        state = _DownloadState(ledger=FoldedNameLedger() if dry_run else DestinationLedger())
 
         with operation(
             session_logger, "get_tree", remote=self._resolve(remote_path), local=destination
         ) as record:
 
             async def transfer(item: _TreeDownload) -> None:
+                if dry_run:
+                    return
                 # Appended rather than `state.transferred += ...`: augmented assignment loads
                 # the target before evaluating the right-hand side, so with `concurrency > 1`
                 # every worker finishing inside another's await adds to a value it read before
@@ -2108,10 +2208,44 @@ class Session(_SessionOperations):
                     preserve_times=preserve_times,
                     mode=requested_mode,
                     state=state,
+                    dry_run=dry_run,
                 ),
                 transfer,
                 concurrency=concurrency,
             )
+
+            if dry_run:
+                undetermined = [
+                    PlanLimit.DESTINATION_COMPARISON,
+                    PlanLimit.DESTINATION_FILESYSTEM_RULES,
+                    PlanLimit.PER_FILE_TRANSFER_DECISIONS,
+                ]
+                if state.sizes_unreported:
+                    undetermined.append(PlanLimit.UNREPORTED_SIZES)
+                plan = TreePlan(
+                    files=state.planned_files,
+                    directories=state.directories,
+                    bytes_to_transfer=state.planned_bytes,
+                    skipped=tuple(state.skipped),
+                    # Reported, never raised. The walk collected these through a
+                    # `FoldedNameLedger`, so each is "one filesystem away from being a
+                    # collision" rather than one -- and `DestinationCollisionError` means the
+                    # filesystem said so. Converting here rather than at the walk keeps one
+                    # collision rule and puts the change of certainty at the boundary where
+                    # the result type changes too.
+                    potential_collisions=tuple(
+                        PotentialCollision(item.local, item.remote, item.first)
+                        for item in state.collisions
+                    ),
+                    undetermined=tuple(undetermined),
+                )
+                record["files"] = plan.files
+                record["directories"] = plan.directories
+                record["bytes"] = plan.bytes_to_transfer
+                record["skipped"] = len(plan.skipped)
+                record["collisions"] = len(plan.potential_collisions)
+                record["dry_run"] = True
+                return plan
 
             _stamp_local_directories(state.directory_times)
             _chmod_local_directories(state.directory_modes)
@@ -2135,6 +2269,7 @@ class Session(_SessionOperations):
         preserve_times: bool,
         mode: int | Mode | None,
         state: _DownloadState,
+        dry_run: bool = False,
     ) -> AsyncGenerator[_TreeDownload]:
         """Walk the remote tree and hand out one settled file at a time.
 
@@ -2160,40 +2295,80 @@ class Session(_SessionOperations):
                     preserve_times=preserve_times,
                     mode=mode,
                     state=state,
+                    dry_run=dry_run,
                 )
                 for child in entry.files:
-                    try:
-                        item, collision = self._claim_download(
-                            destination=destination,
-                            local_directory=local_directory,
-                            entry=entry,
-                            child=child,
-                            ledger=state.ledger,
-                        )
-                    except OSError as refusal:
-                        # The destination filesystem refusing the *name* (D-150), which on a Mac
-                        # is any name that is not UTF-8. Reported like a collision rather than
-                        # raised, for the reason `SkipReason` exists: one unlucky filename must
-                        # not cost every file after it in the walk. Narrow by errno -- a full
-                        # disk or a denied directory still aborts, and reporting either of those
-                        # as "bad name" is the failure a wide `except OSError` here would have.
-                        if not refuses_the_name(refusal):
-                            raise
-                        state.skipped.append(
-                            Skipped(
-                                join_remote(entry.path, child.filename),
-                                child,
-                                SkipReason.DESTINATION_REFUSED_THE_NAME,
-                            )
-                        )
-                        continue
-                    if collision is not None:
-                        state.collisions.append(collision)
-                        state.skipped.append(
-                            Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION)
-                        )
-                    elif item is not None:
+                    item = self._settle_file(
+                        destination=destination,
+                        local_directory=local_directory,
+                        entry=entry,
+                        child=child,
+                        state=state,
+                        dry_run=dry_run,
+                    )
+                    if item is not None:
                         yield item
+
+    def _settle_file(
+        self,
+        *,
+        destination: Path,
+        local_directory: Path,
+        entry: WalkEntry,
+        child: DirEntry,
+        state: _DownloadState,
+        dry_run: bool,
+    ) -> _TreeDownload | None:
+        """Settle one walked file and record whatever stopped it, or hand it back to transfer.
+
+        The reporting half of :meth:`_claim_download`, split from it so that one decides a
+        destination and this one decides what a refusal *means* for the report. Extracted from
+        :meth:`_walk_for_download` when the preview's branches took that method over the
+        cognitive-complexity ceiling, and the seam is real rather than convenient: everything
+        here appends to the report and nothing here walks.
+
+        Returns:
+            The file to transfer, or ``None`` if it was skipped or refused.
+        """
+        try:
+            if dry_run:
+                _note_planned(state, child)
+            item, collision = self._claim_download(
+                destination=destination,
+                local_directory=local_directory,
+                entry=entry,
+                child=child,
+                ledger=state.ledger,
+                dry_run=dry_run,
+            )
+        except OSError as refusal:
+            # The destination filesystem refusing the *name* (D-150), which on a Mac is any
+            # name that is not UTF-8. Reported like a collision rather than raised, for the
+            # reason `SkipReason` exists: one unlucky filename must not cost every file after
+            # it in the walk. Narrow by errno -- a full disk or a denied directory still
+            # aborts, and reporting either of those as "bad name" is the failure a wide
+            # `except OSError` here would have.
+            if not refuses_the_name(refusal):
+                raise
+            state.skipped.append(
+                Skipped(
+                    join_remote(entry.path, child.filename),
+                    child,
+                    SkipReason.DESTINATION_REFUSED_THE_NAME,
+                )
+            )
+            return None
+        if collision is None:
+            return item
+        state.collisions.append(collision)
+        # Not a skip in a preview, and the asymmetry is the point (D-163): a dry run's ledger
+        # folds names instead of asking the filesystem, so "these two are one file" is
+        # conditional on a destination nobody looked at. Recording a skip would make the plan
+        # disagree with the real run on every case-sensitive destination -- reporting it as a
+        # `PotentialCollision` says the same thing without asserting it.
+        if not dry_run:
+            state.skipped.append(Skipped(collision.remote, child, SkipReason.DESTINATION_COLLISION))
+        return None
 
     def _claim_download(
         self,
@@ -2202,7 +2377,8 @@ class Session(_SessionOperations):
         local_directory: Path,
         entry: WalkEntry,
         child: DirEntry,
-        ledger: DestinationLedger,
+        ledger: DestinationLedger | FoldedNameLedger,
+        dry_run: bool = False,
     ) -> tuple[_TreeDownload | None, PathCollision | None]:
         """Settle one walked file's destination, or report the collision that refuses it.
 
@@ -2228,7 +2404,13 @@ class Session(_SessionOperations):
         """
         target = check_contained(destination, local_child(local_directory, child.filename))
         remote = join_remote(entry.path, child.filename)
-        _touch_destination(target)
+        # The local write in this builder, and it is easy to miss because the name does not
+        # say it writes: `O_CREAT` reserves the destination so two remote names cannot race
+        # onto it. A preview must not leave that file behind, and skipping it is what forces
+        # `dry_run` to carry a `FoldedNameLedger` -- with no file there is no inode, and the
+        # inode is the only thing that can answer this question for certain.
+        if not dry_run:
+            _touch_destination(target)
         first = ledger.collides_with(target)
         if first is not None:
             return None, PathCollision(str(target), remote, first)
@@ -2488,6 +2670,60 @@ class Session(_SessionOperations):
 
     # --- trees, the other way ------------------------------------------------------------------
 
+    # Overloaded for the reason :meth:`get_tree` is, and note what `**legacy` does to the
+    # narrowing: a caller passing a deprecated publish spelling matches on `dry_run` alone, so
+    # the two overloads have to stay distinguishable by that keyword and nothing else.
+    @overload
+    async def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[False] = ...,
+        **legacy: bool | bytes | str | None,
+    ) -> TreeResult: ...
+
+    @overload
+    async def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: Literal[True],
+        **legacy: bool | bytes | str | None,
+    ) -> TreePlan: ...
+
+    @overload
+    async def put_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        max_depth: int | None = ...,
+        publish: Publish | None = ...,
+        preserve_times: bool = ...,
+        mode: int | Mode | str | None = ...,
+        progress: ProgressCallback | None = ...,
+        resume: bool = ...,
+        concurrency: int = ...,
+        dry_run: bool,
+        **legacy: bool | bytes | str | None,
+    ) -> TreeResult | TreePlan: ...
+
     async def put_tree(
         self,
         local_path: Path | str,
@@ -2500,8 +2736,9 @@ class Session(_SessionOperations):
         progress: ProgressCallback | None = None,
         resume: bool = False,
         concurrency: int = 1,
+        dry_run: bool = False,
         **legacy: bool | bytes | str | None,
-    ) -> TreeResult:
+    ) -> TreeResult | TreePlan:
         """Upload a local tree into ``remote_path``, creating directories as it goes.
 
         The mirror of :meth:`get_tree`, with the untrusted input on the other side. Every name
@@ -2578,11 +2815,31 @@ class Session(_SessionOperations):
                 sequential path this method has always had. See :meth:`get_tree` for what
                 concurrency buys, what it cannot lift, what it costs in ordering, and why the
                 total across several calls is the caller's and not this argument's.
+            dry_run: Report what this call would do and do none of it, returning a
+                :class:`TreePlan` instead of a :class:`TreeResult`.
+
+                **The contract is that it makes no writes** -- no ``MKDIR``, no ``OPEN``, no
+                ``SETSTAT`` -- and it reads only what the upload would read anyway, which for
+                this direction is the local filesystem alone. So the plan is complete about
+                everything local: every file, every byte, every skipped entry with its reason,
+                and every name that could not be a remote path component, which still raises
+                :exc:`UnsafePathError` here exactly as it would in a real run.
+
+                **It is silent about the destination on purpose.** Whether those directories
+                already exist, and which files are already there, would cost a round trip per
+                entry and is a mirror's question rather than a preview's; asking it here would
+                mean two implementations of one comparison. `TreePlan.undetermined` says so in
+                as many words rather than leaving the gap to be inferred.
+
+                A different type rather than a ``TreeResult`` with its counters at zero:
+                ``transferred == 0`` already means "nothing needed moving", and a preview's
+                zero would mean "nothing was attempted".
             **legacy: The publish arguments under their pre-:class:`Publish` names, as
                 :meth:`put` accepts them and for the same reason.
 
         Returns:
-            Counts, bytes, and every entry that was skipped with the reason it was.
+            Counts, bytes, and every entry that was skipped with the reason it was -- or a
+            :class:`TreePlan` when ``dry_run`` is set.
 
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O -- today,
@@ -2607,8 +2864,10 @@ class Session(_SessionOperations):
         _check_tree_publish(policy, resume=resume, caller="put_tree")
         requested_mode = resolve_mode(mode, caller="put_tree()")
         await self._require_rooted_paths(root, feature="uploading a tree")
-        await self._mkdir_parents(root, exist_ok=True)
+        if not dry_run:
+            await self._mkdir_parents(root, exist_ok=True)
         directories = 0
+        planned: list[int] = []
         moved: list[int] = []
         skipped: list[Skipped] = []
 
@@ -2634,7 +2893,13 @@ class Session(_SessionOperations):
                 for entry in walk_local(Path(local_path), max_depth=max_depth):
                     remote_directory = _remote_directory(root, entry.relative)
                     if entry.relative:
-                        await self.mkdir(remote_directory, exist_ok=True)
+                        # The one write in this producer, and the reason `dry_run` is checked
+                        # here rather than around the whole loop: everything else in it --
+                        # the walk, the component validation that raises `UnsafePathError`,
+                        # the skip reasons -- is what a preview exists to report, so a
+                        # preview has to run it rather than skip it.
+                        if not dry_run:
+                            await self.mkdir(remote_directory, exist_ok=True)
                         directories += 1
                         _settle_remote_directory(
                             entry,
@@ -2652,6 +2917,12 @@ class Session(_SessionOperations):
                         )
 
             async def transfer(item: _TreeUpload) -> None:
+                if dry_run:
+                    # A local `stat`, which is free and needs no server -- so an upload plan
+                    # reports its byte total in full where a download plan can only report
+                    # what the far end volunteered.
+                    planned.append(_local_size(item.source))
+                    return
                 result = await self.put(
                     item.source,
                     item.remote,
@@ -2667,6 +2938,26 @@ class Session(_SessionOperations):
                 moved.append(result.transferred)
 
             await for_each_bounded(produce(), transfer, concurrency=concurrency)
+
+            if dry_run:
+                record["files"] = len(planned)
+                record["directories"] = directories
+                record["bytes"] = sum(planned)
+                record["skipped"] = len(skipped)
+                record["dry_run"] = True
+                return TreePlan(
+                    files=len(planned),
+                    directories=directories,
+                    bytes_to_transfer=sum(planned),
+                    skipped=tuple(skipped),
+                    # Every one of these is a consequence of making no writes, and an upload
+                    # preview cannot escape any of them: it never asked the server anything.
+                    undetermined=(
+                        PlanLimit.REMOTE_DIRECTORY_EXISTENCE,
+                        PlanLimit.PER_FILE_TRANSFER_DECISIONS,
+                        PlanLimit.DESTINATION_COMPARISON,
+                    ),
+                )
 
             await _set_directory_times(self, directory_times)
             await _set_directory_modes(self, directory_modes)
