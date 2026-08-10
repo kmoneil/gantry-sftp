@@ -4,8 +4,9 @@
 # benchmark lane broken for two releases by a signature change nothing type-checked (D-152), a
 # leak detector blaming 140 tests that had not leaked (D-153), two hook scripts shipping to PyPI
 # without the config that invokes them, a filesystem that will not hold the filenames a whole
-# test axis is built on (D-150), and a security control dead on Windows (D-156). None of it was
-# visible to any gate that runs on a developer's machine.
+# test axis is built on (D-150), and what was filed as a security control dead on Windows
+# (D-156, later refuted from this same log -- the thing that could not execute was the test's
+# `#!/bin/sh` stand-in). None of it was visible to any gate that runs on a developer's machine.
 #
 # This header used to say the file had never run and explain why it was committed anyway. That
 # argument held -- writing down which lane runs where is most of the work and needed no remote --
@@ -138,9 +139,11 @@ jobs:
   # per-change gate would be gating a thing nobody can use yet.
   #
   # It is not deleted, because the evidence is worth having and was expensive to
-  # get: the first Windows run this project ever completed is what found D-156,
-  # a security control that refuses every connection there. Weekly keeps that
-  # channel open at no per-push cost and with no red row on somebody's commit --
+  # get: the first Windows run this project ever completed produced the
+  # out-of-scope list, and both raised D-156 and, once its log was read line by
+  # line, refuted it. A lane that can do that twice earns its slot.
+  # Weekly keeps that channel open at no per-push cost and with no red row on
+  # somebody's commit --
   # which is the failure D-152 describes, where a lane whose colour means
   # "somebody pushed" stops being read.
   #

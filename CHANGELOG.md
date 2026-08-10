@@ -57,7 +57,19 @@ and while the major version is `0` the minor version is where a breaking change 
   missing path is the only refusal that branch can produce there, and every one of them carried the
   wrong diagnosis.
 
-## 0.1.1 — 2026-08-06
+- **`allowed_hosts()` works on Windows, and the documentation saying it does not is withdrawn.**
+  From 2026-08-05 to 2026-08-10, [Connecting](docs/connecting.md) carried a "known defect" note
+  and [Security](docs/security.md) listed Windows under what is not defended, both stating that
+  the `ssh -G` probe cannot execute there so every connection is refused while a policy is
+  active. **It can, and they are not.** The Windows job resolves
+  `C:\Windows\System32\OpenSSH\ssh.exe`, `ssh -G` answers, and a config rewrite is caught exactly
+  as on Linux — proven by rows that passed on Windows in the two runs the note was written from.
+
+  The `ERROR_BAD_EXE_FORMAT` behind the note belongs to five tests that hand the probe a
+  `#!/bin/sh` script to make it misbehave on purpose. Windows cannot execute that file, so those
+  rows failed in the spawn path instead of the path they were written for, and the failure was
+  read as the library's. They skip there now with the reason. **If you avoided a destination
+  policy on Windows because of that note, you do not need to.**
 
 A patch rather than a minor, and the one judgement call in that is stated rather than left to be
 inferred. `get` of a name the local filesystem refuses used to raise a bare `OSError` and now
