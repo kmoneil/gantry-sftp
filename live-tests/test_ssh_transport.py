@@ -33,7 +33,15 @@ from gantry_sftp.codec import (
     StatusCode,
 )
 from gantry_sftp.exceptions import AuthenticationError, ConnectError, HostKeyError
-from gantry_sftp.session import Durability, Publish, PublishMechanism, SkipReason, open_session
+from gantry_sftp.session import (
+    Durability,
+    PlanLimit,
+    Publish,
+    PublishMechanism,
+    SkipReason,
+    TreePlan,
+    open_session,
+)
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -261,6 +269,47 @@ async def test_a_recursive_download_over_a_real_ssh_connection(ssh_server, tmp_p
     # Symlinks are reported rather than followed or copied, over ssh as over a pipe.
     assert [skip.reason for skip in result.skipped] == [SkipReason.SYMLINK]
     assert not (destination / "daily" / "latest.csv").exists()
+
+
+async def test_a_dry_run_over_a_real_ssh_connection_writes_nothing_and_agrees(
+    ssh_server, tmp_path: Path
+):
+    """The preview's contract against a real `sshd`, where the paths are resolved elsewhere.
+
+    A `MemoryTransport` row can assert that no write *packet* was sent, which is the stronger
+    statement about the wire and the weaker one about the world: it cannot show that the local
+    half wrote nothing either, and three of a download's writes are local. Here the destination
+    is a directory on this filesystem and its absence afterwards is the whole assertion.
+
+    Both halves run against the same tree in one connection, so a preview that had quietly
+    grown a second walk -- the drift this feature exists to prevent -- shows up as a
+    disagreement rather than as two plausible numbers nobody compares.
+    """
+    source = tmp_path / "remote"
+    (source / "daily" / "archive").mkdir(parents=True)
+    (source / "top.csv").write_bytes(b"top")
+    (source / "daily" / "archive" / "old.csv").write_bytes(b"old")
+    (source / "daily" / "latest.csv").symlink_to(source / "top.csv")
+    destination = tmp_path / "local"
+
+    async with connect(ssh_server) as transport, open_session(transport) as sftp:
+        plan = await sftp.get_tree(str(source), destination, dry_run=True)
+        previewed = destination.exists()
+        result = await sftp.get_tree(str(source), destination)
+
+    assert isinstance(plan, TreePlan)
+    assert not previewed, "the preview created the destination directory"
+    assert (plan.files, plan.directories) == (result.files, result.directories)
+    assert plan.bytes_to_transfer == result.transferred == len(b"top") + len(b"old")
+    # The same walk means the same skip, with the same reason, and not a second list of them.
+    assert [(skip.path, skip.reason) for skip in plan.skipped] == [
+        (skip.path, skip.reason) for skip in result.skipped
+    ]
+    assert [skip.reason for skip in plan.skipped] == [SkipReason.SYMLINK]
+    # This server reports sizes, so the total is whole and the caveat must be absent -- the
+    # half that would make `undetermined` a list nobody reads.
+    assert PlanLimit.UNREPORTED_SIZES not in plan.undetermined
+    assert PlanLimit.DESTINATION_FILESYSTEM_RULES in plan.undetermined
 
 
 def staging_files(directory: Path, stem: str) -> list[Path]:

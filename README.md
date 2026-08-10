@@ -128,7 +128,7 @@ task rather than by module:
 | Guide | What is in it |
 | --- | --- |
 | [Getting started](docs/getting-started.md) | Install, the `ssh` prerequisite, your first transfer, and the same code with and without an event loop |
-| [Transferring files](docs/transfers.md) | `get` / `put`, atomic publish, resume, content verification, timestamps, permissions, whole trees, and the incremental-ingest loop |
+| [Transferring files](docs/transfers.md) | `get` / `put`, atomic publish, resume, content verification, timestamps, permissions, whole trees, previewing one with `dry_run`, and the incremental-ingest loop |
 | [Paths, predicates and attributes](docs/paths.md) | `SFTPPath`, the bytes-versus-`Path` rule, `exists` / `is_dir` / `is_file`, a working directory, symlinks and `chmod` |
 | [Listing and matching](docs/listing-and-matching.md) | `listdir` / `scandir`, streaming a directory you did not size, and the `glob` dialect |
 | [Concurrency and byte ranges](docs/concurrency.md) | Many transfers over one connection, `concurrency=`, `open_file`, and reading part of a file |

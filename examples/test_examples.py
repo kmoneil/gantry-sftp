@@ -284,3 +284,36 @@ def test_the_paths_example_demonstrates_both_refusals_and_the_awkward_name():
     assert "and .staging.csv was not matched" in stdout
     # And the mode a file created through a path arrives with, which is not the server's.
     assert "mode 600" in stdout
+
+
+def test_the_dry_run_example_shows_a_preview_that_wrote_nothing():
+    """The claim is a negative, so the example has to be able to fail it.
+
+    "Makes no writes" is the whole contract, and a docstring stating it proves nothing -- the
+    example checks the destination is absent *after* previewing and prints the answer, so a
+    preview that started creating directories again would flip a line of output rather than
+    pass quietly. The three writes it has to miss are in three different places: `get_tree`'s
+    own root `mkdir`, the one inside `_settle_directory` for every walked directory, and
+    `_touch_destination`'s empty file per remote name.
+
+    The collision line is pinned for the opposite reason. On this filesystem `README.md` and
+    `readme.md` are two files, so the preview naming them and the real run then transferring
+    both is the example demonstrating that a fold is reported and never refused.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "dry_run.py")
+    assert returncode == 0
+    # Both directions preview, and neither leaves anything behind.
+    assert stdout.count("destination untouched: True") == 2
+    # The download previews nearly completely; the upload is silent about the far end and
+    # says which question it declined to ask.
+    assert "whether each remote directory already exists: not checked" in stdout
+    assert "what the destination filesystem does with these names: not consulted" in stdout
+    # A fold, reported rather than raised -- and then both files transfer for real.
+    assert "would fold together" in stdout
+    assert "README.md -> b'the first file\\n'" in stdout
+    assert "readme.md -> b'a different file entirely\\n'" in stdout
+    # The skip a preview exists to surface before anything moves.
+    assert "symlink, and symlinks are not followed" in stdout

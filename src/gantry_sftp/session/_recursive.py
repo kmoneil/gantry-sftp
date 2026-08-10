@@ -33,8 +33,11 @@ from gantry_sftp.session._listing import DirEntry
 
 __all__ = [
     "GlobMatch",
+    "PlanLimit",
+    "PotentialCollision",
     "SkipReason",
     "Skipped",
+    "TreePlan",
     "TreeResult",
     "WalkEntry",
     "check_listed_name",
@@ -249,3 +252,125 @@ class TreeResult:
         that says the report is worth reading before treating the copy as a copy.
         """
         return not self.skipped
+
+
+class PlanLimit:
+    """What a plan could not determine, and why (D-163).
+
+    Strings rather than an enum for :class:`SkipReason`'s reason: these are for a human reading
+    a preview, and the set grows with what a dry run declines to do rather than with anything
+    the protocol defines.
+
+    **Every member here exists because a dry run makes no writes**, which is the whole contract.
+    A preview that stated these as facts would be guessing, and a preview that omitted them
+    would read as though it had checked.
+    """
+
+    REMOTE_DIRECTORY_EXISTENCE = (
+        "whether each remote directory already exists: not checked, because finding out costs a "
+        "round trip per directory and a dry run does not consult the destination"
+    )
+    PER_FILE_TRANSFER_DECISIONS = (
+        "what each transfer would decide about resume, verification and publishing: not "
+        "computed, because those depend on the destination's current state"
+    )
+    DESTINATION_COMPARISON = (
+        "which files already exist on the destination and which differ: not compared, because "
+        "that is a mirror's question rather than a preview's"
+    )
+    UNREPORTED_SIZES = (
+        "the total size is short: this server volunteered no size for some entries, and a "
+        "preview does not stat them one at a time to find out"
+    )
+    DESTINATION_FILESYSTEM_RULES = (
+        "what the destination filesystem does with these names: not consulted, because the "
+        "only way to ask it is to create the files. Any collision reported is a name fold -- "
+        "a pair one filesystem merges and another keeps apart -- and a name a filesystem "
+        "would refuse outright is not predicted at all"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PotentialCollision:
+    """Two remote names a *folding* destination would make into one local file (D-163).
+
+    **Deliberately not :class:`~gantry_sftp.exceptions.PathCollision`**, which records two
+    names the filesystem *did* merge -- a fact, established by asking ``lstat`` after the
+    write. A preview makes no writes, so it compares folded names instead, and the two answers
+    are not the same kind of thing. Handing back the confirmed type would put an approximation
+    in the record a caller trusts, which is the ambiguity :class:`TreePlan` exists to refuse.
+
+    So this is a hazard rather than a verdict, and which one it turns out to be belongs to the
+    destination: on APFS or NTFS these two names are one file and the real download refuses the
+    second, on ext4 they are two files and it transfers both. The plan counts both as
+    transferable for that reason -- the refusal is conditional, so the count must not be.
+
+    Attributes:
+        local: The local path ``remote`` would be written to. On a case-sensitive destination
+            this is a different path from the one ``first`` took; on a folding one it is the
+            same file, which is the whole hazard.
+        remote: The remote path whose folded destination is already spoken for.
+        first: The remote path that folded onto it first, in ``READDIR`` order -- so which of
+            the pair is named here is the server's choice and is not reproducible.
+    """
+
+    local: str
+    remote: bytes
+    first: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class TreePlan:
+    """What a recursive transfer *would* do, having done none of it.
+
+    A deliberately different type from :class:`TreeResult` rather than one with its counters
+    zeroed. ``TreeResult.transferred == 0`` means "nothing needed moving"; a preview's zero
+    would mean "nothing was attempted", and one field cannot honestly carry both -- which is
+    the ambiguity this library refuses everywhere else.
+
+    **The contract is that producing this made no writes.** No ``MKDIR``, no ``OPEN``, no
+    ``SETSTAT``, and no local directory created. It reads only what the operation it previews
+    would read anyway, which is why the two directions preview so differently: walking a remote
+    tree *is* reading, so a download previews almost completely, while an upload's walk is
+    local and the destination is left unexamined. What that costs is listed in
+    :attr:`undetermined` rather than left for the reader to notice.
+
+    Attributes:
+        files: Files that would be transferred.
+        directories: Directories the walk encountered. **Not "would create"** -- for an upload
+            nothing has asked the server which of them are already there, and
+            :data:`PlanLimit.REMOTE_DIRECTORY_EXISTENCE` says so.
+        bytes_to_transfer: Total size of the files above, from the local ``stat`` on an upload
+            and from the attributes the walk already carried on a download. Free in both
+            directions, which is why it is here and the destination's state is not.
+        skipped: Entries the real transfer would skip, each with the reason it would give --
+            the same walk and the same reasons, not a second implementation of them.
+        potential_collisions: Remote name pairs that a case- or normalisation-folding
+            destination would land on one local file, found by folding names rather than by
+            asking the filesystem. Downloads only; an upload's names are the caller's own and
+            its destination is never examined. See :class:`PotentialCollision` for why these
+            are reported rather than refused.
+        undetermined: What this preview did not find out, in :class:`PlanLimit`'s words. Empty
+            is a claim, so it is never padded and never silently short.
+    """
+
+    files: int = 0
+    directories: int = 0
+    bytes_to_transfer: int = 0
+    skipped: tuple[Skipped, ...] = field(default_factory=tuple)
+    potential_collisions: tuple[PotentialCollision, ...] = field(default_factory=tuple)
+    undetermined: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def complete(self) -> bool:
+        """Whether the plan expects to transfer everything it encountered.
+
+        The mirror of :attr:`TreeResult.complete`, and it means the same thing one step
+        earlier: ``False`` says there is something to read before running this for real.
+
+        Collisions count against it where they cannot count against ``TreeResult`` -- a real
+        download raises on one rather than returning, so a result carrying one does not exist.
+        A plan's are conditional on the destination, and a caller asking one question of the
+        preview should not have to know that to get a true answer.
+        """
+        return not self.skipped and not self.potential_collisions

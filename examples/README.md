@@ -17,6 +17,7 @@ python examples/paths.py                          # SFTPPath: the algebra, and t
 python examples/recursive_download.py             # walk() + get_tree(), and the zip-slip refusal
 python examples/destination_collision.py          # two remote names, one local file, and the refusal
 python examples/recursive_upload.py               # walk_local() + put_tree() + rmtree()
+python examples/dry_run.py                        # what a tree transfer would do, and what it cannot know
 python examples/resume.py                         # interrupt a transfer, then finish it
 python examples/retry.py                          # a link that drops, reconnected and resumed
 python examples/concurrent_transfers.py           # many transfers over one session
@@ -83,6 +84,7 @@ will copy, so they are tested rather than trusted. They skip with a reason when
 | `recursive_download.py`   | `walk()`, `get_tree()`, skipped entries, the names a hostile server gets refused, and `server_root` — why an absolute path costs no probe |
 | `destination_collision.py` | `DestinationCollisionError`: two legal remote names that a case-folding destination makes one file, and why the check asks the filesystem rather than the name |
 | `recursive_upload.py`     | `walk_local()`, `put_tree()`, `rmtree()`, and the symlink that is neither followed nor deleted through |
+| `dry_run.py`              | `dry_run=True` both directions, `TreePlan`, and `plan.undetermined` — why a download previews nearly completely and an upload is silent about the destination, and why the collision check degrades to a name fold that is reported rather than raised |
 | `resume.py`               | `get(resume=)`, `put(resume=)`, and the two refusals — a partial that cannot be a prefix, and atomic without a staging name |
 | `preserve_times.py`       | `preserve_times=` both directions, `UploadResult.times`, `entry.modified` — and why `longname` cannot carry a usable date |
 | `permissions.py`          | `mode=` and `Mode.PRESERVE` both directions, `chmod()` and `fchmod()`, `UploadResult.mode` — why an upload is world-readable without it, why a `chmod` afterwards is not the same thing, and why the handle form is not merely the convenient one |

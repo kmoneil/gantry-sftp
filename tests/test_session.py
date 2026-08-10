@@ -796,6 +796,9 @@ TRANSFER_KEYWORDS = {
         "mode",
         "resume",
         "concurrency",
+        # D-163's other half. Both trees take it or neither should: an asymmetric preview is a
+        # question every caller asks once and answers by reading the source.
+        "dry_run",
     ),
     "put_tree": (
         "max_depth",
@@ -805,6 +808,11 @@ TRANSFER_KEYWORDS = {
         "progress",
         "resume",
         "concurrency",
+        # D-163, and it is an addition this pin is meant to make deliberate rather than stop.
+        # It joins no bundle: `dry_run` is not a transfer *policy* like `mode` or `resume`, it
+        # decides whether a transfer happens at all, and folding it into a parameter object
+        # with the others would put "do the thing" inside the description of how to do it.
+        "dry_run",
     ),
 }
 """The four transfer signatures, pinned so an addition is a decision rather than a surprise.

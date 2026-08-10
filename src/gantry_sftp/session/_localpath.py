@@ -29,6 +29,7 @@ reason: the environment that matters is not the one CI runs on.
 from __future__ import annotations
 
 import os
+import unicodedata
 from pathlib import Path
 from typing import override
 
@@ -38,8 +39,10 @@ __all__ = [
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
     "DestinationLedger",
+    "FoldedNameLedger",
     "check_component",
     "check_contained",
+    "fold_name",
     "identity",
     "local_child",
     "unsafe_reason",
@@ -178,6 +181,31 @@ def identity(path: Path) -> tuple[int, int]:
     return (status.st_dev, status.st_ino)
 
 
+def fold_name(path: Path) -> str:
+    """Approximate what a case-folding destination would make of ``path``, without touching it.
+
+    **This is a guess and it exists for a preview, not for a refusal.** :func:`identity` is the
+    real answer and it needs the file to exist; a dry run may not create one, so
+    :class:`FoldedNameLedger` uses this instead and everything built from it is reported as
+    conditional. Turning a fold into a :exc:`~gantry_sftp.exceptions.DestinationCollisionError`
+    would be exactly the "wrong guess" :class:`DestinationLedger` refuses to make.
+
+    Two transformations, each with a filesystem behind it. NFC normalisation catches the
+    NFC/NFD pair that HFS+ stores as one file. ``str.lower()`` catches the case pair that APFS
+    and NTFS fold, and it is ``lower()`` rather than ``str.casefold()`` deliberately: casefold
+    expands ``ß`` to ``ss``, no filesystem targeted here does, and an invented pair in a report
+    a caller is reading for hazards is worse than a plain one. It is also the model
+    ``tests/test_recursive.py``'s ``fold_case`` stand-in already uses, and one model of a
+    folding filesystem in this repository is better than two.
+
+    What it cannot see, in full: a filesystem whose table differs from this one in either
+    direction, a destination that is case-sensitive (where every pair it reports is a
+    non-event), and a hard link or symlink already sitting in the destination -- that last one
+    has no name to fold, which is precisely why :func:`identity` asks the filesystem instead.
+    """
+    return unicodedata.normalize("NFC", str(path)).lower()
+
+
 class DestinationLedger:
     """Which remote path each local file of a recursive download belongs to.
 
@@ -196,6 +224,10 @@ class DestinationLedger:
     What it prevents: the second write truncating the first while ``get_tree`` reports
     success. :func:`check_contained` cannot catch that one -- both paths are legitimately
     inside the destination.
+
+    **The one thing that cannot use it is a preview** (D-163), because the write it needs is
+    the write a dry run has promised not to make. :class:`FoldedNameLedger` is what stands in
+    there, and the paragraph above is the reason its answers are reported rather than raised.
     """
 
     def __init__(self) -> None:
@@ -227,3 +259,41 @@ class DestinationLedger:
         filesystem to have an opinion about its identity.
         """
         self._claims[identity(local)] = remote
+
+
+class FoldedNameLedger:
+    """:class:`DestinationLedger`'s shape for a dry run, keyed on a folded name (D-163).
+
+    Same two methods, so the walk that settles a destination is one implementation rather than
+    two -- a preview that reimplemented the collision rule would drift from the transfer, which
+    is the failure the whole preview exists to prevent.
+
+    **What changes is the certainty, not the code path.** This never stats anything, so it
+    answers on names alone, and :func:`fold_name` says what that costs in both directions: it
+    reports pairs a case-sensitive destination will keep apart, and it misses a hard link or a
+    symlink already lying in the destination. So a hit here is a
+    :class:`~gantry_sftp.session.PotentialCollision` in a
+    :class:`~gantry_sftp.session.TreePlan` and never a
+    :exc:`~gantry_sftp.exceptions.DestinationCollisionError` -- the ledger that raises is the
+    one that asked the filesystem.
+    """
+
+    def __init__(self) -> None:
+        self._claims: dict[str, bytes] = {}
+
+    @override
+    def __repr__(self) -> str:
+        """Name how many folded destinations have been claimed so far."""
+        return f"<FoldedNameLedger {len(self._claims)} claimed>"
+
+    def collides_with(self, local: Path) -> bytes | None:
+        """The remote path already holding ``local``'s folded name, or ``None``.
+
+        Two states rather than :meth:`DestinationLedger.collides_with`'s three, and the missing
+        one is the tell: there is no ``lstat`` to fail, because there is no file to ask about.
+        """
+        return self._claims.get(fold_name(local))
+
+    def claim(self, local: Path, remote: bytes) -> None:
+        """Record that ``remote`` would take ``local``, under its folded name."""
+        self._claims[fold_name(local)] = remote
