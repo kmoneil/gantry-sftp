@@ -8,7 +8,6 @@ packages installed is a test that reports the machine, not the code.
 from __future__ import annotations
 
 import os
-import resource
 import shutil
 import tempfile
 from collections.abc import AsyncGenerator
@@ -259,9 +258,22 @@ def _cap_mutant_memory() -> None:
     `RLIMIT_DATA` on Linux does not bound at all once glibc serves it from `mmap`. Guarded for
     platforms without the limit rather than assumed present, which is this repository's rule for
     anything the environment might not have.
+
+    **`resource` is imported here rather than at module scope, and the guard above is why that
+    was not enough.** It asks whether the *limit* exists; on Windows the *module* does not, and
+    a conftest that raises `ModuleNotFoundError` while being imported ends the session before a
+    single test is collected. That is what `fast-windows` reported on the first scheduled run --
+    zero tests in 27 seconds, five days after this ceiling landed, and `continue-on-error: true`
+    is why nobody saw it. Three test modules had already hit the same wall and answered it with
+    `pytest.importorskip`; a conftest cannot, because the `Skipped` that raises here would abort
+    the run rather than excuse one module. Deferring the import costs nothing: the lane that
+    needs it runs on Linux, and `MUTANT_UNDER_TEST` is already the gate.
+    `tests/test_platform.py` asserts no collected module reaches for a POSIX-only one this way.
     """
     if not os.environ.get("MUTANT_UNDER_TEST"):
         return
+    import resource  # noqa: PLC0415  # POSIX-only; module scope aborts Windows collection
+
     limit = getattr(resource, "RLIMIT_AS", None)
     if limit is None:  # pragma: no cover  # every platform this lane runs on has it
         return

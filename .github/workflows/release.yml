@@ -1,8 +1,10 @@
 # Publish a release to PyPI, triggered by pushing a tag.
 #
-# THIS FILE HAS NEVER RUN, for the same reason `ci.yml` says it has never run: nothing has
-# been pushed anywhere yet. It is committed with the release card so the mechanism exists
-# before the first tag rather than being invented under time pressure afterwards.
+# **It has run**, for 0.1.0 on 2026-08-05 and 0.1.1 on 2026-08-06: verify, build, publish with
+# attestations, announce. This header said the file had never run and cited a sentence in
+# `ci.yml` that no longer exists -- a citation is only alive while the thing it points at is,
+# and the one place that reads worst when it goes stale is a workflow nobody opens between
+# releases.
 #
 # **There is no API token here and there must not be one.** This uses PyPI's trusted
 # publishing (OpenID Connect): GitHub mints a short-lived token for this repository, this

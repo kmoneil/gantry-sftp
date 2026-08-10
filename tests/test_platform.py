@@ -7,10 +7,15 @@ Both are asserted below.
 
 The transfer methods are driven against `FakeServer`, whose `seen` list is every packet it was
 handed -- so "refuses before touching the wire" is a count rather than an impression.
+
+The last section is about a different near end: the machine running the suite. A Windows job
+that cannot import the suite reports nothing at all about the library, which is the state
+`fast-windows` was silently in for five days.
 """
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from pathlib import Path
@@ -196,3 +201,122 @@ def test_a_python_without_fchmod_reports_it(monkeypatch: pytest.MonkeyPatch) -> 
     """
     monkeypatch.delattr(os, "fchmod", raising=False)
     assert missing_local_io() == ("os.fchmod",)
+
+
+# ---------------------------------------------------------------------------
+# What the Windows lane can import at all
+# ---------------------------------------------------------------------------
+
+POSIX_ONLY_STDLIB = frozenset(
+    {
+        "curses",
+        "fcntl",
+        "grp",
+        "posix",
+        "pty",
+        "pwd",
+        "readline",
+        "resource",
+        "syslog",
+        "termios",
+        "tty",
+    }
+)
+"""Stdlib modules CPython does not build on Windows.
+
+Importing one of these while a module is being collected raises `ModuleNotFoundError`, and
+where that module is a `conftest.py` the whole session ends -- pytest has nowhere to attribute
+the failure, so the count is zero tests rather than one error.
+
+This has now happened twice. The first time took three modules with it and is recorded in the
+comments at the top of `test_benchmark_harness.py` and `test_instruction_harness.py`: 4352
+collected, none executed. Both were fixed with `pytest.importorskip`, **and the rule was left
+in the two files that had bitten** rather than spread. Five days later `tests/conftest.py`
+imported `resource` for the mutant memory ceiling and did it again, where `importorskip` is not
+available as a fix, and `continue-on-error: true` on the job meant the only signal was a red
+tick nobody reads on a lane that only runs on the schedule.
+
+So the rule lives here instead, where it is checked rather than remembered.
+"""
+
+
+def unconditional_imports(source: str) -> set[str]:
+    """Top-level package names this source imports simply by being imported.
+
+    Direct children of the module body only. An import nested in a module-scope `try` or `if`
+    is a deliberate guard and is the supported way to reach for something that may be absent;
+    so is one inside a function, and so is `pytest.importorskip`, which is a call rather than
+    an import statement and is invisible to this walk by construction.
+    """
+    names: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+def modules_pytest_imports() -> list[Path]:
+    """Every file the default run imports, which is what a Windows collection has to survive.
+
+    `testpaths` is `tests` and `examples`. Everything under `tests/` counts: pytest imports the
+    conftest and the `test_*` modules, and those import the helpers beside them. Under
+    `examples/` only a conftest or a test module would be imported -- the example scripts
+    themselves run as subprocesses, and transfers refuse on Windows anyway.
+    """
+    root = Path(__file__).resolve().parent.parent
+    collected = [p for p in sorted((root / "tests").rglob("*.py")) if "__pycache__" not in p.parts]
+    collected += [
+        p
+        for p in sorted((root / "examples").glob("*.py"))
+        if p.name == "conftest.py" or p.name.startswith("test_")
+    ]
+    return collected
+
+
+def test_no_collected_module_imports_a_posix_only_one_unconditionally() -> None:
+    root = Path(__file__).resolve().parent.parent
+    offenders = [
+        f"{path.relative_to(root)} imports {name}"
+        for path in modules_pytest_imports()
+        for name in sorted(
+            unconditional_imports(path.read_text(encoding="utf-8")) & POSIX_ONLY_STDLIB
+        )
+    ]
+    assert offenders == []
+
+
+def test_the_sweep_finds_a_module_scope_import_and_ignores_every_guarded_one() -> None:
+    """The decoy pass: a checker that reports nothing has two explanations.
+
+    Both directions, because the value of this sweep is that it stays quiet about the four
+    spellings that are correct. If it flagged them, the fix for the next occurrence would be to
+    delete the check.
+    """
+    assert "resource" in unconditional_imports("import resource")
+    assert "resource" in unconditional_imports("from resource import getrlimit")
+    assert "resource" not in unconditional_imports("def f():\n    import resource\n")
+    assert "resource" not in unconditional_imports(
+        "try:\n    import resource\nexcept ImportError:\n    resource = None\n"
+    )
+    assert "resource" not in unconditional_imports(
+        "import sys\nif sys.platform != 'win32':\n    import resource\n"
+    )
+    assert "resource" not in unconditional_imports(
+        "import pytest\nresource = pytest.importorskip('resource')\n"
+    )
+
+
+def test_the_conftest_defers_the_import_its_ceiling_needs() -> None:
+    """Named for the regression rather than for the rule, per the Definition of Done.
+
+    The sweep above would go quiet if `conftest.py` were ever dropped from its file list -- a
+    sweep proves an absence, and an absence is what an empty list also looks like. This row
+    names the one file whose failure costs the entire session, and asserts the import it needs
+    is reachable from inside the function rather than at the top.
+    """
+    conftest = Path(__file__).resolve().parent / "conftest.py"
+    source = conftest.read_text(encoding="utf-8")
+    assert "resource" not in unconditional_imports(source)
+    assert "    import resource" in source
