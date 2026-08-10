@@ -268,3 +268,34 @@ def test_live_resources_reports_a_count_and_a_descriptor_reading():
     counted = live_resources()
     assert isinstance(counted.types, Counter)
     assert counted.fds is None or counted.fds > 0
+
+
+# ---------------------------------------------------------------------------
+# The freeze, which is armed with the check and not otherwise (D-162)
+# ---------------------------------------------------------------------------
+
+
+def test_the_freeze_happens_only_when_the_check_is_armed(monkeypatch: pytest.MonkeyPatch):
+    """The default lane must not get a different garbage collector for free.
+
+    `gc.freeze()` changes when everything in the process is collected, not just what this
+    module measures. A suite that is not looking for leaks should not be paying for that or
+    reasoning about it, so the hook is gated on the same variable as the fixture.
+
+    `gc.freeze` is spied rather than called: freezing inside a test would freeze the running
+    session's heap, and `gc.unfreeze()` afterwards would throw away the lane's own freeze and
+    silently slow every test after this one. A row that damages the run it is part of is worse
+    than the one it replaces.
+    """
+    import conftest  # noqa: PLC0415  # the hook under test lives there, not in an importable package
+
+    froze: list[bool] = []
+    monkeypatch.setattr(gc, "freeze", lambda: froze.append(True))
+
+    monkeypatch.delenv(leakcheck.LEAK_CHECK_ENV, raising=False)
+    conftest.pytest_collection_finish(None)  # type: ignore[arg-type]  # the hook ignores it
+    assert froze == [], "the default lane froze the heap"
+
+    monkeypatch.setenv(leakcheck.LEAK_CHECK_ENV, "1")
+    conftest.pytest_collection_finish(None)  # type: ignore[arg-type]
+    assert froze == [True], "the leaks lane did not freeze the heap"

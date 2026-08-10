@@ -65,6 +65,7 @@ __all__ = [
     "WATCHED_TYPES",
     "ResourceCount",
     "fd_count",
+    "freeze_the_import_time_heap",
     "leak_check_enabled",
     "live_resources",
 ]
@@ -180,6 +181,43 @@ def settle() -> ResourceCount:
     _ = gc.collect()
     _ = gc.collect()
     return live_resources()
+
+
+def freeze_the_import_time_heap() -> None:
+    """Move everything alive before the first test into the permanent generation (D-162).
+
+    **72% of this check's cost was `gc.collect()`, and almost none of it was collecting
+    anything.** Measured in place over the whole suite: one `settle()` averages 92 ms, of which
+    67 ms is the two collections and 25 ms is the walk, and the fixture does two per test --
+    about 14 minutes on top of a 50-second suite. `gc.freeze()` exists for exactly this: the
+    heap that imports built is alive by definition and is rescanned every collection anyway.
+    Armed, the lane goes from **15m10s to 2m49s** on the same 4594 tests, with no false
+    positive.
+
+    Sound for what is measured here, and the reason is narrow rather than general: nothing in
+    :data:`WATCHED_TYPES` exists before the first test runs, so the population this excludes is
+    exactly the population that could never be the leak. `gc.get_objects()` returns 0 straight
+    after this call, and the rows in `test_leakcheck.py` that abandon a generator chain and drop
+    a transport still fail the way they are meant to -- which is the proof, rather than the
+    argument above it.
+
+    **`hypothesis` is imported first, and that import is the whole fix rather than a tidy-up.**
+    It runs its entry-point hooks on first import, and trio's hook calls
+    `register_random(trio._core._run._r)`, which decides whether to warn by asking
+    `gc.get_referrers(_r)`. Referrers in the permanent generation are invisible to that call, so
+    freezing first leaves the only reference to trio's PRNG unfindable and hypothesis warns that
+    it cannot manage it -- a warning this repository turns into an error, aborting collection.
+    The import is lazy, so whether it happened before or after depended on whether a collected
+    module used hypothesis: four modules passed and `test_leakcheck.py` did not.
+
+    Any *other* plugin that registers a PRNG lazily would reintroduce this. It fails loudly, at
+    collection, naming `register_random` -- so the way it comes back is not silent, and the fix
+    is to force that import here too.
+    """
+    import hypothesis  # noqa: F401, PLC0415  # its entry-point hooks must run before the freeze
+
+    _ = gc.collect()
+    gc.freeze()
 
 
 def leak_check_enabled(environ: dict[str, str] | None = None) -> bool:
