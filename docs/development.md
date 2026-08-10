@@ -156,17 +156,38 @@ them before a Windows run has happened would be guessing at which ones they are.
 because that list is exactly what is wanted from it, and no amount of reading the code produces
 it.
 
-**It has still never produced the list, and the reason is worth writing down.** The first
-scheduled run ended in 27 seconds with `ModuleNotFoundError: No module named 'resource'` while
-importing `tests/conftest.py` — zero tests collected, so the job reported nothing about the
-library at all, and `continue-on-error: true` made that indistinguishable from a lane with
+**It took until 2026-08-10 to produce that list, and the reason is worth writing down.** The
+first scheduled run ended in 27 seconds with `ModuleNotFoundError: No module named 'resource'`
+while importing `tests/conftest.py` — zero tests collected, so the job reported nothing about
+the library at all, and `continue-on-error: true` made that indistinguishable from a lane with
 nothing to say. A `conftest.py` that fails to import ends the session; there is nowhere to
 attribute the error to. The same collision had already taken three test modules on the first
 Windows run ever and was answered in each of them with `pytest.importorskip`, which a conftest
 cannot use. The rule now lives in `tests/test_platform.py`, which walks every module the
 default run imports and fails on a module-scope import of anything CPython does not build on
-Windows. So `resolve_ssh_executable`'s `SysNative`-before-`System32` probe is still unit-tested
-with injected inputs and has still never executed on Windows.
+Windows.
+
+**The list, from the first run that collected: 2772 passed, 1029 skipped, 698 failed, in 70
+seconds.** Four shapes, and only the first two are the by-design refusal this section already
+described:
+
+- **487 `NotImplementedError`** — the library refusing a transfer, which is what it is supposed
+  to do here. The message is the one `session/_platform.py` composes.
+- **117 `AttributeError: module 'os' has no attribute 'pread'`** — a *test* reaching for the
+  primitive directly rather than through the entry point that refuses. Out of scope too, but by
+  a different route, and marking them is a different edit.
+- **24 `ConnectError: sftp-server not found`** — the real-server rows, which skip with a reason
+  on a Linux box without `openssh-server` and *fail* here, because the paths they look in are
+  POSIX. A skip that only knows one way to be unavailable.
+- **53 assertion failures and 9 `UnicodeDecodeError`** — the ones worth reading. They cluster in
+  `test_destination.py` (the `ssh -G` allowed-destination probe answers `None` where the row
+  expects an exit status), `test_doctor.py`, and the non-UTF-8 filename axis.
+
+And the question this job was kept in the matrix for is answered. `resolve_ssh_executable`
+**has now run on Windows**: it resolved `C:\Windows\System32\OpenSSH\ssh.exe` and the diagnosis
+reports `OpenSSH_for_Windows_9.5p2, LibreSSL 3.8.2` from running it. `System32` won, which is
+the correct arm for a 64-bit process — `SysNative` is the redirector that only exists for a
+32-bit one, so that half of the order is still untested by anything but injected inputs.
 
 ### The controlled `ssh` environment
 
