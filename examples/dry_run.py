@@ -24,9 +24,15 @@ not found out, and the collision check is the one decision that cannot survive t
 rule intact: the real download establishes that two remote names are one local file by creating
 the file and asking `lstat` for its inode, which is authoritative on every filesystem and is a
 write. A preview folds names instead, and reports the pair rather than refusing it -- because on
-the case-sensitive filesystem this example runs on, those two names really are two files and the
-real download transfers both. Refusing them on the strength of a `str.lower()` would be a guess
-wearing a fact's clothes.
+a case-sensitive filesystem those two names really are two files and the real download transfers
+both. Refusing them on the strength of a `str.lower()` would be a guess wearing a fact's clothes.
+
+**On a folding filesystem this example cannot stage its own hazard**, and says so rather than
+pretending otherwise. The "remote" tree here is a real directory, so on APFS `README.md` and
+`readme.md` are one file before the server ever lists them -- the fold fires one layer upstream
+of the preview that warns about it. Same shape as `destination_collision.py` skipping its hard
+link where the destination already folds: a stand-in for a condition breaks on the platform that
+has the condition for real.
 """
 
 from __future__ import annotations
@@ -40,14 +46,32 @@ from gantry_sftp.session import TreePlan, open_session
 from gantry_sftp.transport import open_local_server_transport
 
 
-def build_remote(root: Path) -> None:
-    """A remote tree with a nested directory, a symlink, and a case-folding pair."""
-    _ = (root / "README.md").write_bytes(b"the first file\n")
-    _ = (root / "readme.md").write_bytes(b"a different file entirely\n")
+def build_remote(root: Path) -> bool:
+    """A remote tree with a nested directory, a symlink, and — where possible — a folding pair.
+
+    **On a case-folding filesystem the pair cannot be staged at all**, and that is worth saying
+    out loud rather than working around. The "remote" here is a real directory served by
+    `sftp-server`, so on APFS `README.md` and `readme.md` are one file: the second write lands
+    on the first and the server lists a single name. The example's own fixture is consumed by
+    the hazard the example is about, one layer earlier than where it warns about it.
+
+    `examples/destination_collision.py` handles the mirror image the same way — it detects the
+    fold and skips its hard link, because on a filesystem that already folds there is nothing to
+    simulate. Asked with `st_ino` rather than by comparing names, which is the instrument the
+    library itself uses and the only one that is right on every filesystem.
+
+    Returns:
+        Whether the two names ended up as two files.
+    """
+    first = root / "README.md"
+    second = root / "readme.md"
+    _ = first.write_bytes(b"the first file\n")
+    _ = second.write_bytes(b"a different file entirely\n")
     nested = root / "reports"
     nested.mkdir()
     _ = (nested / "q1.csv").write_bytes(b"1,2,3\n")
     (root / "shortcut").symlink_to(nested / "q1.csv")
+    return first.stat().st_ino != second.stat().st_ino
 
 
 def build_local(root: Path) -> None:
@@ -81,12 +105,20 @@ async def main() -> None:
         workdir = Path(scratch)
         remote = workdir / "remote"
         remote.mkdir()
-        build_remote(remote)
+        staged_pair = build_remote(remote)
         outgoing = workdir / "outgoing"
         outgoing.mkdir()
         build_local(outgoing)
 
         landing = workdir / "downloaded"
+
+        # Printed rather than assumed, because it decides what the rest of this output can
+        # show -- and because the example is the only honest authority on the filesystem it
+        # is actually running on. `test_examples.py` reads this line rather than probing for
+        # itself, so the two cannot disagree about the same machine.
+        held = "yes" if staged_pair else "no -- this filesystem folds them into one"
+        print(f"remote tree holds both names: {held}")
+        print()
 
         async with (
             open_local_server_transport(cwd=workdir) as transport,
@@ -108,9 +140,14 @@ async def main() -> None:
             # same arithmetic: the plan counted the sizes READDIR volunteered, and this counted
             # the bytes that arrived.
             print(f"  {done.files} files, {done.transferred} bytes -- plan said {plan.files}")
-            print("  and the pair the preview flagged is two files here, both intact:")
-            print(f"    README.md -> {(landing / 'README.md').read_bytes()!r}")
-            print(f"    readme.md -> {(landing / 'readme.md').read_bytes()!r}")
+            if staged_pair:
+                print("  and the pair the preview flagged is two files here, both intact:")
+                print(f"    README.md -> {(landing / 'README.md').read_bytes()!r}")
+                print(f"    readme.md -> {(landing / 'readme.md').read_bytes()!r}")
+            else:
+                print("  the preview flagged no pair, and correctly: the fold happened when")
+                print("  this tree was built, so the server only ever listed one name. What")
+                print("  a preview cannot see is a hazard that already fired upstream of it.")
 
 
 if __name__ == "__main__":
