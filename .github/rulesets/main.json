@@ -54,7 +54,10 @@
             "context": "leaks"
           },
           {
-            "context": "live"
+            "context": "live (ubuntu-latest)"
+          },
+          {
+            "context": "live (macos-latest)"
           },
           {
             "context": "server-matrix"
