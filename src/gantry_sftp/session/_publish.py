@@ -113,7 +113,7 @@ class SizeCheck(StrEnum):
     """Whether a transferred file's length was confirmed against the other side's.
 
     This is rung 3 of DESIGN.md 6's verification ladder, the one that section says runs
-    *always*. Until 0.8 it ran nowhere, so a truncated upload published successfully and a
+    *always*. It originally ran nowhere, so a truncated upload published successfully and a
     short download returned successfully -- while four documents said a size check had
     happened. More than a boolean because "the server would not say" is a different fact from
     "the lengths agreed", and a caller who cares needs to tell them apart.
@@ -131,7 +131,7 @@ class SizeCheck(StrEnum):
     to be reportable or the result would claim a check that did not run.
 
     **The upload has no opt-out because the measurement did not justify one.** The cost is one
-    ``STAT`` per upload, and 0.8 shipped it unconditionally while promising a ``verify_size``
+    ``STAT`` per upload, and it first shipped unconditionally while promising a ``verify_size``
     flag once ``put``'s argument list had room. Benchmarking it removed the reason. On every
     shaped profile the small-file upload row is a three-way tie with paramiko and asyncssh --
     where a round trip costs something, this one is invisible against the three the transfer
@@ -311,7 +311,7 @@ def _legacy_staging_name(legacy: Mapping[str, object], *, caller: str) -> bytes 
 class TimePreservation(StrEnum):
     """Whether the local file's timestamps survived the upload.
 
-    They do not survive by default, and until 0.9 they could not survive at all: a file this
+    They do not survive by default, and originally they could not survive at all: a file this
     library moved arrived stamped with the moment it was moved, in both directions and with
     nothing to say so. That is a wrong answer rather than a missing one -- every downstream
     decision keyed on mtime is then made on a fabricated value that looks entirely plausible,

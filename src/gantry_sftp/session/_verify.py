@@ -92,7 +92,7 @@ class Verify(StrEnum):
     silently settling for a weaker check than the one that was requested is the exact failure
     this ladder is documented to prevent.
 
-    **Both directions accept it as of 0.11** (D-99). ``get`` could not until then, and the
+    **Both directions accept it** (D-99). ``get`` could not at first, and the
     blocker was its return type rather than any missing machinery: an ``int`` had nowhere to
     report ``UNAVAILABLE``. On a resume it also selects the rung the adopted prefix is gated
     on, in either direction.

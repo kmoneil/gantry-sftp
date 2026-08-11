@@ -17,7 +17,7 @@ while ``os.fchmod`` either exists or does not.
 
 So the four transfer operations refuse on such a platform, in one place, naming what is
 missing -- rather than raising ``AttributeError: module 'os' has no attribute 'pwrite'`` four
-frames inside a download loop, which is what happened before 0.9 and reads like a library bug.
+frames inside a download loop, which is what happened originally and reads like a library bug.
 The refusal is at ``get`` / ``get_tree`` / ``put`` / ``put_tree`` rather than deeper, because
 that is where the operation still has the name the caller used; the helpers underneath are
 reachable only through them.
@@ -44,7 +44,7 @@ NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
 Windows has no equivalent, so the flag silently becomes nothing there rather than the open
 failing. That is a documented weakness rather than a hidden one: on Windows the containment
 check in ``_localpath`` is the whole defence, and it is checked before the open rather than
-enforced by it. It is also, since 0.9, unreachable there in practice -- a download on a
+enforced by it. It is also unreachable there in practice -- a download on a
 platform without ``O_NOFOLLOW`` is a download on a platform without :func:`os.pwrite`, and
 :func:`require_local_io` refuses before any of this is consulted.
 """

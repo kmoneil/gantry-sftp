@@ -711,7 +711,8 @@ class DownloadResult:
     """What one ``get`` actually did.
 
     Returned rather than an ``int`` because the byte count was never the whole answer and,
-    until 0.11, the rest of it was computed and thrown away (D-99). A ``get`` establishes the
+    before the first release, the rest of it was computed and thrown away (D-99). A ``get``
+    establishes the
     remote file's size, gates whatever a resume adopted, stamps the local file, sets its mode
     and checks the length that arrived -- and had one integer to report all of it through. The
     visible consequence was that ``get`` could not offer ``verify=`` at all: with nowhere to

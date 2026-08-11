@@ -223,7 +223,7 @@ class SessionOptions:
     A parameter object where ``pyproject.toml`` normally argues against one -- and the argument
     it makes is about the *connection* entry points, where ``host`` and ``identity_file`` are
     genuinely unrelated. These three are not: they are one scheduling policy, which is the same
-    reasoning that made ``Publish`` a type in 0.9 rather than five arguments.
+    reasoning that made ``Publish`` a type rather than five arguments.
 
     It exists because :func:`~gantry_sftp.connect` fuses two signatures that together come to
     thirteen arguments against a ceiling of ten, and the ssh half is precisely the half that
@@ -1336,7 +1336,7 @@ class Session(_SessionOperations):
         """Download ``remote_path`` to ``local_path``.
 
         The size is taken from a STAT so the transfer is bounded, the progress callback has a
-        total to report against, and -- as of 0.8 -- what arrived is checked against it. A
+        total to report against, and what arrived is checked against it. A
         server that declines to report one is fine: the download reads until EOF instead, at
         the cost of one extra round trip and of rung 3 being unavailable rather than passed.
 
@@ -1381,7 +1381,7 @@ class Session(_SessionOperations):
                 :class:`~gantry_sftp.exceptions.TransferError`.
 
                 :data:`~gantry_sftp.session.Verify.SIZE` -- the default -- checks no content,
-                which is what every release before 0.11 did and could not say. It is the same
+                which is what this originally did and could not say. It is the same
                 default ``put`` has, for the same reason: both other rungs cost something.
 
                 :data:`~gantry_sftp.session.Verify.HASH` is rung 1, one round trip and no
@@ -1424,7 +1424,7 @@ class Session(_SessionOperations):
                 partial.
 
                 **A server that reports no times leaves the local file stamped with now**, and
-                since 0.11 it says so:
+                it says so:
                 :attr:`~gantry_sftp.session.DownloadResult.times` is ``UNAVAILABLE`` rather
                 than ``PRESERVED``. Until then ``get`` returned a byte count and this
                 docstring argued that widening it for one uncommon case was the worse trade;
@@ -1459,7 +1459,8 @@ class Session(_SessionOperations):
             while :attr:`~gantry_sftp.session.DownloadResult.size` is what the local file
             holds now.
 
-            **This was an ``int`` until 0.11 and the break is deliberate** (D-99). A call that
+            **This was an ``int`` before the first release and the break is deliberate**
+            (D-99). A call that
             only wants the count reads ``.transferred``; there is no ``int`` subclass to make
             the old spelling keep working, because a type that lies about what it is turns
             every downstream ``isinstance`` into an accident that happens to work.
@@ -1934,7 +1935,7 @@ class Session(_SessionOperations):
                 look" is the shape of partial success this library refuses everywhere else.
 
                 Both halves of the pattern space, and that is D-102 rather than a restatement:
-                until 0.11 the literal half caught every ``ServerError`` and answered "no
+                the literal half originally caught every ``ServerError`` and answered "no
                 matches" to ``PERMISSION_DENIED`` and to the ``BAD_MESSAGE`` an over-long name
                 arrives as. Whether the caller's pattern happened to contain a ``*`` decided
                 which of two opposite answers they got.
@@ -2058,8 +2059,8 @@ class Session(_SessionOperations):
         :class:`~gantry_sftp.exceptions.UnsafePathError` and nothing is written -- this is the
         zip-slip class, and it is a real and exploited pattern in file-transfer clients.
 
-        **Transfers are sequential by default and overlap on request** (``concurrency=``, new
-        in 0.10). The walk feeds a bounded pool rather than starting a task per file: a tree's
+        **Transfers are sequential by default and overlap on request** (``concurrency=``).
+        The walk feeds a bounded pool rather than starting a task per file: a tree's
         size is the server's choice, so a task per entry is unbounded allocation driven by the
         peer. The producer blocks while every worker is busy, so peak memory is the worker
         count and not the tree.
@@ -2398,8 +2399,8 @@ class Session(_SessionOperations):
 
         **The destination file is created here, empty, before the check** -- and that is what
         makes the check mean anything. A collision is two remote names that the *filesystem*
-        resolves to one file, which it can only be asked about once an inode exists; until
-        0.10 the check ran before the transfer that created it, so it detected a collision
+        resolves to one file, which it can only be asked about once an inode exists; the check
+        originally ran before the transfer that created it, so it detected a collision
         only because the *previous* file's transfer had already finished. With workers running
         concurrently that stopped being true, and two colliding names would both have opened
         the same file with ``O_TRUNC``, the second destroying the first while ``get_tree``

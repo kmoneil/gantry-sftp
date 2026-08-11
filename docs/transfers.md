@@ -29,7 +29,7 @@ result.durable  # True: the bytes reached stable storage before the rename
 result.staged_at  # b'/incoming/.report.csv.20b59c88.part'
 ```
 
-**`get` returns the same shape for the other direction**, and did not until 0.11 — it returned
+**`get` returns the same shape for the other direction**, and originally did not — it returned
 a byte count, which is why the verification ladder below reached only one way:
 
 ```python
@@ -148,7 +148,7 @@ found: it may be another publisher's, and it is the only evidence of what went w
 
 The download side is gated too, including the case where the local file is _already complete_.
 That one adopts the whole file and returns success having moved nothing, which makes it the
-one most worth checking rather than the one to skip — and since 0.11 it reports as well as
+one most worth checking rather than the one to skip — and it reports as well as
 refuses: `get` returns a `DownloadResult` whose `resume_check` says which of the three
 happened. A resume that adopts the _whole_ file has compared the whole file, so that same
 answer is its `content_check` rather than being measured twice.
@@ -265,7 +265,7 @@ success:
 A **mismatch** never appears as a value: it raises `TransferError`, and under `atomic` it
 raises _before the rename_, so corrupt content never becomes the destination.
 
-**`verify=` is on both directions as of 0.11**, and until then it was on `put` only — the
+**`verify=` is on both directions**, and originally it was on `put` only — the
 blocker was the return type rather than the machinery. `get` returned an `int`, so a rung that
 could not run had nowhere to report `unavailable` and the only options left were to pass
 silently or fail the transfer, a silent degrade being the one outcome this ladder exists to

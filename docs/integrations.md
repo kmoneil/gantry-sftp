@@ -106,7 +106,7 @@ not already grant. It is there because calling `password` "unknown" would be fal
 
 **Four arguments `connect()` takes cannot come from a URL**, and this is a security boundary
 rather than an omission. `identity_file`, `config_file` and `ssh_executable` each name a
-**local** path, and until 0.11 all three were accepted as query parameters. Two of them were
+**local** path, and before the first release all three were accepted as query parameters. Two of them were
 remote code execution from a URL string:
 
 - `?ssh_executable=` is `argv[0]`. The URL chose which program this library spawned.
@@ -123,7 +123,7 @@ config, a notebook parameter, a database row or an API request — which is prec
 population this adapter exists to serve, since `pd.read_parquet` of a URL somebody else chose
 is the reason it is here at all.
 
-`options` is the fourth and it was never accepted — it is named here because until 0.11 that
+`options` is the fourth and it was never accepted — it is named here because before the first release that
 was true only because nobody had added it, which is not a rule and cannot fail a test. It is
 also the most dangerous of the four: `-o ProxyCommand=…` is the same execution payload, and
 `-o StrictHostKeyChecking=no` silently removes the defence that makes an attacker-chosen

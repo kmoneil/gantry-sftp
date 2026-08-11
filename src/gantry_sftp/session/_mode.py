@@ -1,6 +1,6 @@
 """How a transferred file's permission bits are decided.
 
-Until 0.10 they were not decided at all, and the asymmetry between the two directions is what
+Originally they were not decided at all, and the asymmetry between the two directions is what
 gave it away. The **download** side already opens its destination ``0o600`` "so a file is never
 briefly world-readable while it is being written" -- see :meth:`Session._download_into` -- and
 then leaves it there. The **upload** side sent an empty ATTRS on every ``OPEN``, and OpenSSH's

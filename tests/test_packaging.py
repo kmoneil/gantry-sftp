@@ -936,3 +936,49 @@ def test_the_transcribed_doctor_output_reports_the_packaged_version() -> None:
         f"the README's doctor output reports {sorted(set(transcribed))} and this package is "
         f"{gantry_sftp.__version__} -- re-run `python -m gantry_sftp doctor` and paste it back"
     )
+
+
+def shipped_surfaces() -> list[Path]:
+    """Everything a user reads: the package they import and the guides that ship beside it."""
+    return sorted([*(ROOT / "src").rglob("*.py"), *DOCS.glob("*.md"), ROOT / "README.md"])
+
+
+VERSION_PHRASE = re.compile(
+    r"\b(?:until|since|as of|before|new in|fixed in|added in|shipped in|in)\s+(0\.\d+)(?!\.\d)",
+    re.IGNORECASE,
+)
+"""A two-part version introduced by a phrase that dates something.
+
+Anchored on the phrase rather than on the number, and that is what makes it usable. `docs/` and
+`src/` legitimately contain `0.5 GB` and `0.9 s`; nobody writes "since 0.9 s". The negative
+lookahead lets a real three-part version through, so `0.1.2` is never matched.
+"""
+
+
+def test_no_shipped_surface_dates_itself_by_an_uninstallable_version() -> None:
+    """`_plans/` counts development cycles; a user counts what `pip install` will give them.
+
+    Those two schemes look identical and are not. DESIGN.md says `SFTPPath` "shipped in 0.12";
+    the changelog puts it in package **0.1.0**. That stayed private until the cycle numbers
+    leaked into the wheel and the guides: 28 docstrings and 9 documentation lines dated features
+    to `0.5` through `0.12`, none of which has ever existed on PyPI.
+
+    The harm is not pedantic. `docs/transfers.md` told a reader "`verify=` is on both directions
+    as of 0.11" -- so a user on **0.1.2** concludes their version is too old for a feature that
+    has been there since the first release, because every one of those cycles landed before
+    `0.1.0`. Every such annotation could only mislead; none of them named a version anybody
+    could install.
+
+    Cycle numbers stay in `_plans/` and in `tests/`, which no user reads. What ships names a card
+    (`D-99`) or says "before the first release" -- both of which mean something to a reader.
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}: {match.group(0)!r}"
+        for path in shipped_surfaces()
+        for match in VERSION_PHRASE.finditer(path.read_text(encoding="utf-8"))
+    ]
+    assert not offenders, (
+        "a shipped surface dates something to a version nobody can install -- `_plans/` counts "
+        "development cycles and they are not package releases. Name the card, or say 'before "
+        "the first release':\n  " + "\n  ".join(offenders)
+    )

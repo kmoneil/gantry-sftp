@@ -1256,7 +1256,7 @@ class _SessionOperations(_SessionCore):
                 largest block paramiko answers correctly.
 
                 ``0`` is the wire value for "one digest over the whole range" and it was this
-                parameter's default until 0.9. **Do not send it**, and do not send anything
+                parameter's original default. **Do not send it**, and do not send anything
                 above 64 KiB either: measured against paramiko, a block over 64 KiB returns
                 digests of the wrong bytes, and once its runaway offsets pass EOF the server
                 loops forever and answers nothing -- permanently, from our side as well as
