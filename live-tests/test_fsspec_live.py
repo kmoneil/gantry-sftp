@@ -35,6 +35,7 @@ from gantry_sftp.fsspec import (  # noqa: E402
     GantrySFTPFileSystem,
     register,
 )
+from local_filesystem import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -58,7 +59,14 @@ def remote(ssh_server, tmp_path: Path) -> Path:
     _ = (drop / "big.bin").write_bytes(bytes(range(256)) * 8192)
     # Not valid UTF-8, and the whole point of carrying names as bytes: this one has crashed
     # paramiko's listdir since 2015 (`paramiko#546`, open, 47 comments).
-    _ = (drop / "caf\udce9.csv").write_bytes(b"\xe9")
+    #
+    # Guarded, because the *server's* filesystem is this machine's and APFS refuses the name
+    # outright -- `OSError: [Errno 92] Illegal byte sequence`, at setup, for all nine rows in
+    # this module. The unit twin has guarded the identical line since the first macOS CI run
+    # (`tests/test_fsspec.py`); this one could not reach the probe until it moved out of a
+    # conftest, and so asked nothing. See `local_filesystem.HOLDS_NON_UTF8_NAMES`.
+    if HOLDS_NON_UTF8_NAMES:
+        _ = (drop / "caf\udce9.csv").write_bytes(b"\xe9")
     (drop / "latest.csv").symlink_to(drop / "events.csv")
     return drop
 
@@ -99,12 +107,17 @@ def test_a_listing_crosses_a_real_ssh_connection(filesystem, remote: Path):
     assert names == sorted(names)
 
 
+@needs_non_utf8_names
 def test_a_name_that_is_not_utf8_survives_a_real_connection(filesystem, remote: Path):
     """The unit lane proves the encoding round trip; this proves it through ``ssh``.
 
     Nothing between here and the wire is allowed to normalise the name: not the subprocess
     pipe, not the codec, not the adapter's decode. A lossy step anywhere would make this file
     unnameable, which is the decade-old open bug in the incumbent.
+
+    The only row here whose *subject* is the odd name, so the only one that skips where the
+    filesystem refuses it. The other eight merely stood in a directory that contained one, and
+    they now run on a Mac.
     """
     listed = [name for name in filesystem.ls(str(remote)) if "caf" in name]
     assert listed == [f"{remote}/caf\udce9.csv"]

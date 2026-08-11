@@ -24,7 +24,6 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
-from conftest import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names
 from gantry_sftp.codec import OpenDir
 from gantry_sftp.exceptions import (
     CapabilityError,
@@ -43,6 +42,7 @@ from gantry_sftp.session._glob import (
     validate_pattern,
 )
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from local_filesystem import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names
 from test_recursive import DIRECTORY, REGULAR, SYMLINK, SparseAndRefusing, TreeServer, named
 
 pytestmark = pytest.mark.anyio

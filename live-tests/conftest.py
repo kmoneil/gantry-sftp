@@ -12,8 +12,11 @@ Nothing here is allowed to *fail* because a dependency is missing. It skips, wit
 
 from __future__ import annotations
 
+import socket
+import tempfile
 from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import ExitStack, asynccontextmanager
+from pathlib import Path
 
 import anyio
 import pytest
@@ -37,8 +40,53 @@ __all__ = [
     "negotiate",
     "running_dispatcher",
     "scrubbed_ssh_env",
+    "short_socket_dir",
     "still_open",
 ]
+
+
+@pytest.fixture
+def short_socket_dir() -> Iterator[Path]:
+    """A directory whose paths fit in ``sun_path``, which pytest's ``tmp_path`` does not.
+
+    A ``ControlPath`` and an ``ssh-agent`` socket are both Unix domain sockets, so the *path* is
+    bounded -- 108 bytes on Linux and **104 on macOS and the BSDs** -- and the bound is on the
+    string, not on the file. pytest's ``tmp_path`` on macOS is
+    ``/private/var/folders/<20 chars>/T/pytest-of-<user>/pytest-<n>/<test-name-cut-to-30>/``,
+    which is past 104 before a filename is appended.
+
+    **Both ways it then fails read as this library refusing to multiplex.** ``ssh-agent`` says
+    ``unix_listener: path "..." too long for Unix domain socket`` and exits 1, so the fixture
+    raising it errors the test at setup; ``ssh`` says ``ControlPath too long ('...' >= 104
+    bytes)`` and exits 255, which reaches the caller as a ``ConnectError``. That is fourteen
+    rows across two files on the first run of this lane off Linux -- the whole ControlMaster
+    guarantee and the whole agent-defence truth table -- and ``test_control_master.py``'s own
+    docstring predicted the shape while sizing the fix for Linux's bound alone.
+
+    ``/tmp`` rather than the platform temporary directory, because the platform temporary
+    directory is the problem. The path is then **checked by binding a socket to it** rather than
+    compared against a constant: the constant differs per platform, is not exposed by Python,
+    and a probe of the exact path is the question these tests actually have. It follows the same
+    rule as every other capability this suite depends on -- netem, Docker, ``sftp-server``.
+
+    Yields:
+        An empty directory, removed when the test ends.
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp") as short:
+        directory = Path(short)
+        probe = directory / "probe.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(probe))
+        except OSError as refusal:
+            pytest.fail(
+                f"no unix socket can be created under {short!r} "
+                f"({len(str(probe).encode())} bytes): {refusal}"
+            )
+        finally:
+            listener.close()
+            probe.unlink(missing_ok=True)
+        yield directory
 
 
 async def still_open(sftp, handle: bytes) -> bool:

@@ -20,7 +20,10 @@ import pytest
 from gantry_sftp.transport import find_sftp_server
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "tests"))
-from conftest import HOLDS_NON_UTF8_NAMES  # one probe, shared with tests/
+from local_filesystem import (  # one probe and one marker, shared with tests/ and live-tests/
+    HOLDS_NON_UTF8_NAMES,
+    needs_non_utf8_names,
+)
 
 # The examples that put a non-UTF-8 filename on disk to demonstrate this library handling one.
 # macOS refuses such a name outright (`OSError: [Errno 92] Illegal byte sequence`), so these
@@ -84,13 +87,6 @@ def test_the_publish_example_reports_the_mechanism_it_used():
     # confirmed against the local file's before the rename ran.
     assert "size=matched" in stdout
     assert "mechanism=in-place" in stdout
-
-
-needs_non_utf8_names = pytest.mark.skipif(
-    not HOLDS_NON_UTF8_NAMES,
-    reason="this filesystem rejects names that are not valid UTF-8 (macOS APFS/HFS+ does)",
-)
-"""For the two tests whose subject *is* the odd name rather than the example around it."""
 
 
 @needs_non_utf8_names

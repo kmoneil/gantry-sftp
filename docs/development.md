@@ -123,6 +123,18 @@ confident, wrong answer somebody will copy. `live-tests/` starts a real `sshd` o
 from the default `pytest` run, and every lane skips with a reason rather than failing when the
 thing it needs is absent.
 
+Two things a new row in `live-tests/` has to know, both of which cost the lane its whole macOS
+run the first time it was tried off Linux. **A Unix socket path comes from the
+`short_socket_dir` fixture, never from `tmp_path`** — `sun_path` is 108 bytes on Linux and 104
+on macOS and the BSDs, and pytest's temporary directory is past that on a Mac before a filename
+is appended, which `ssh` and `ssh-agent` both report as a refusal to multiplex rather than as a
+path-length problem. `tests/test_live_socket_paths.py` fails the build if a row takes `tmp_path`
+and builds a socket, and it lives in `tests/` because the `live` job runs on Linux only, where
+the mistake cannot be observed. **And a filename that is not valid UTF-8 is guarded by
+`local_filesystem.HOLDS_NON_UTF8_NAMES`** — a plain module rather than a `conftest`, because
+`live-tests/` has a conftest of its own and two files cannot both be the module named `conftest`;
+it reaches every lane through the `pythonpath = ["tests"]` that `server_contract` already uses.
+
 The comparison libraries are a separate dependency group and are deliberately not installed by
 default. They pull in `cryptography`, `pynacl` and `bcrypt`, and Python cryptography is precisely
 what this project exists not to need, and a `uv sync` that installed it would make that claim

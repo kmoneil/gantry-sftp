@@ -17,12 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import give_one_file_a_second_name
 from gantry_sftp._logging import record_fields
 from gantry_sftp.codec import Read
 from gantry_sftp.exceptions import DestinationCollisionError
 from gantry_sftp.session import Publish, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from local_filesystem import give_one_file_a_second_name
 from test_observability import names_path
 from test_recursive import (
     DIRECTORY,

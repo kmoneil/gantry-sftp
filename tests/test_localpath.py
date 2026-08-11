@@ -20,7 +20,6 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from conftest import give_one_file_a_second_name
 from gantry_sftp.codec import Times
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session import (
@@ -39,6 +38,7 @@ from gantry_sftp.session._policy import (
     _stamp_local,
     _stamp_local_directories,
 )
+from local_filesystem import give_one_file_a_second_name
 
 # --- names that must never become a filename ----------------------------------------------
 

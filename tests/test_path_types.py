@@ -32,9 +32,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
-from conftest import needs_non_utf8_names
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from local_filesystem import needs_non_utf8_names
 
 pytestmark = pytest.mark.anyio
 

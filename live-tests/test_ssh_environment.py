@@ -487,7 +487,9 @@ def _fingerprint(key: Path) -> str:
 
 
 @pytest.fixture
-def agent_holding_the_right_key(ssh_server: SSHServer, tmp_path: Path) -> Iterator[dict[str, str]]:
+def agent_holding_the_right_key(
+    ssh_server: SSHServer, short_socket_dir: Path
+) -> Iterator[dict[str, str]]:
     """A real ``ssh-agent`` loaded with the key that *would* authenticate.
 
     Real rather than faked, because the thing under test is whether ``ssh`` consults it, and a
@@ -501,6 +503,13 @@ def agent_holding_the_right_key(ssh_server: SSHServer, tmp_path: Path) -> Iterat
     file that can fail for the right reason, and it is the first thing a flake would be
     tempted to skip. Missing binaries are a skip; a broken agent is a failure.
 
+    **The socket comes from ``short_socket_dir`` rather than ``tmp_path``, and that is not
+    tidiness.** An agent socket is bound, so its path is bounded by ``sun_path`` -- 104 bytes on
+    macOS -- and pytest's is 126 there. ``ssh-agent`` answers ``unix_listener: path "..." too
+    long for Unix domain socket`` and exits 1, which `check=True` turns into an error at setup:
+    all eight rows of the truth table below, on the first run of this lane off Linux. The design
+    above is what made that loud rather than green, and it worked.
+
     Yields:
         The two variables a shell would have exported, for a test to poison with.
     """
@@ -508,7 +517,7 @@ def agent_holding_the_right_key(ssh_server: SSHServer, tmp_path: Path) -> Iterat
         if shutil.which(binary) is None:  # pragma: no cover -- ships with the ssh client
             pytest.skip(f"{binary} not installed; the agent-rescue proof needs a real agent")
 
-    socket_path = tmp_path / "agent.sock"
+    socket_path = short_socket_dir / "agent.sock"
     started = subprocess.run(
         ["ssh-agent", "-s", "-a", str(socket_path)],
         capture_output=True,
