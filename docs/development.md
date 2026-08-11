@@ -163,12 +163,12 @@ days, which is the argument for keeping this section next to the file it describ
 #### What gates a merge
 
 `main` carries a ruleset, recorded in `.github/rulesets/main.json`. It refuses a direct push, a
-force-push and a deletion, offers the rebase merge button and no other, and requires the eight
-checks a pull request actually reports:
+force-push and a deletion, offers the rebase merge button and no other, and requires every check
+a pull request actually reports:
 
 | gates a merge | reports only |
 | --- | --- |
-| `audit`, `cost`, `fast (ubuntu-latest)`, `fast (macos-latest)`, `gates`, `leaks`, `live`, `server-matrix` | `fast-windows`, `mutation`, `benchmarks`, `netem` |
+| `audit`, `cost`, `fast (ubuntu-latest)`, `fast (macos-latest)`, `gates`, `leaks`, `live (ubuntu-latest)`, `live (macos-latest)`, `server-matrix` | `fast-windows`, `mutation`, `benchmarks`, `netem` |
 
 The right-hand four are skipped on a pull request — three run on the weekly schedule, `netem`
 on anything that is not a pull request. **A skipped check that is marked required never
@@ -177,8 +177,21 @@ remembered: `tests/test_lanes.py` derives the left column from the workflow — 
 `if:` runs on a pull request, a job with one does not — and fails if the ruleset and the
 workflow disagree in either direction.
 
-`leaks` is ~30 minutes and is always the last to finish, so a merge waits for it. That is the
-price of the lane that found D-153 blaming 140 tests which had not leaked.
+That test is also why there is no third column. A lane that runs per change **gates**, because
+every context a pull request reports is required; `continue-on-error: true` does not buy an
+advisory row, it buys a job that reports green while failing. The `fast-windows` row did exactly
+that for five days and nobody saw it (D-158), so the choice for a new lane is per-change-and-
+gating or weekly-and-dispatchable, and there is no middle.
+
+**Renaming a required check is the dangerous edit**, and it is the same trap as the skipped one
+seen from the other side. Matrixing `live` in D-168 turned the context `live` into
+`live (ubuntu-latest)` and `live (macos-latest)`; the old name then reports never, and a required
+check that never reports blocks every merge. The committed JSON and the workflow move together in
+one commit, and the enforced copy is patched **while the pull request is open and green** —
+before the merge, after the new contexts have reported at least once.
+
+`leaks` is the slowest gating lane and finishes last, so a merge waits for it. That is the price
+of the lane that found D-153 blaming 140 tests which had not leaked.
 
 Two things the ruleset deliberately does not do. It requires **no approving review**: a solo
 maintainer cannot approve their own pull request, so any positive number blocks every merge.
@@ -204,7 +217,7 @@ runner time each. So the dispatch takes an input:
 $ gh workflow run ci.yml --ref <branch> -f weekly_lane=fast-windows
 ```
 
-`all` (the default), `none`, or one lane name. The eight gating jobs run regardless — they are
+`all` (the default), `none`, or one lane name. The gating jobs run regardless — they are
 what the ruleset requires, and a run that skipped them would be green in a way that means less
 than it looks. `tests/test_lanes.py` holds the choice list and the guards in agreement in both
 directions: a guarded lane missing from the list cannot be reached on its own, and a list entry

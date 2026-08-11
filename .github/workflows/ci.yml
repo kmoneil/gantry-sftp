@@ -39,11 +39,12 @@ on:
       #
       # A `choice` rather than a comma-separated list: `workflow_dispatch` has no multi-select,
       # and a free-text list is a thing to mistype in a field with no feedback. One lane is
-      # what the dispatch case actually wants. The eight gating jobs run regardless -- they are
-      # what the branch ruleset requires, and skipping them here would produce a run whose
-      # green means less than it looks.
+      # what the dispatch case actually wants. The gating jobs run regardless -- they are what
+      # the branch ruleset requires, and skipping them here would produce a run whose green
+      # means less than it looks. Unnumbered on purpose: the count moved from eight to nine
+      # when `live` gained its macOS row, and a number here is a number to forget.
       weekly_lane:
-        description: "Which weekly lane to run (the eight gating jobs always run)"
+        description: "Which weekly lane to run (the gating jobs always run)"
         type: choice
         default: all
         options: [all, none, fast-windows, mutation, benchmarks, netem]
@@ -204,22 +205,45 @@ jobs:
       - run: uv run --frozen python scripts/lanes.py leaks
 
   # ---------------------------------------------------------------------------
-  # A real sshd on localhost. Linux only for now: the harness probes for its binaries and
-  # validates its sshd config with `sshd -t` rather than assuming either, so it may well run
-  # on macOS -- but "may well" is not a lane, and adding a runner is cheap once there is a
-  # remote to run it on.
+  # A real sshd on localhost, on both platforms this library claims to support.
+  #
+  # This was Linux-only, and the comment here said the harness probes for its binaries rather
+  # than assuming them, so it "may well run on macOS -- but 'may well' is not a lane". It did
+  # not. The first time anyone ran `live-tests/` off Linux, 23 rows failed at once (D-167): a
+  # Unix socket path is bounded by `sun_path`, which is 104 bytes on macOS against 108 on
+  # Linux, and pytest's `tmp_path` is past that on a Mac before a filename is appended. That
+  # took out the whole ControlMaster guarantee and the whole agent-defence truth table, and
+  # both read as this library refusing to multiplex rather than as a path-length bug. The fix
+  # was made by hand on a developer's Mac with nothing here asking for the proof again, which
+  # is what this matrix is (D-168).
+  #
+  # `openssh-server` is an apt package on the Linux image and built into the macOS one, hence
+  # the guarded install.
   # ---------------------------------------------------------------------------
   live:
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
-      - run: sudo apt-get update && sudo apt-get install -y openssh-server
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y openssh-server
       - run: uv python install
       - run: uv sync --frozen
+      # `live-tests/` skips rather than fails when a binary is missing. That is right on a
+      # developer's machine and wrong on a gating lane, where it means the job reports green
+      # having proven nothing -- measured, not feared: a container with no `sshd` ran this
+      # lane to `164 passed, 185 skipped` and exit 0, and the skipped rows were precisely the
+      # ones under test. Asked of the harness rather than re-spelled here, because two
+      # answers to "where does sshd live" is how they drift apart.
+      - name: fail rather than skip if this runner has no server
+        run: uv run --frozen python -c "import sys; sys.path.insert(0, 'live-tests'); from sshd import unavailable_reason; reason = unavailable_reason(); print(reason or 'sshd and sftp-server present'); sys.exit(reason is not None)"
       - run: uv run --frozen python scripts/lanes.py live
 
   # ---------------------------------------------------------------------------
