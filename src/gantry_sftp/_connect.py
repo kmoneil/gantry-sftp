@@ -69,7 +69,7 @@ async def connect(
     :func:`~gantry_sftp.session.with_reconnect` takes a callable that produces a *transport*,
     because a retry builds a new session over a new connection and the session is what it
     rebuilds. Passing this function to it would nest a session inside a session. The spelling
-    stays what it has been since 0.7::
+    stays what it has always been::
 
         recipe = functools.partial(open_ssh_transport, "example.com", user="bob")
         await with_reconnect(recipe, lambda sftp: sftp.get("/big.iso", "big.iso"))

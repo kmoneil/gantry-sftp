@@ -47,7 +47,7 @@ capability.
 
 If a hostname comes from user input — a job config, an API request, a `gantry-sftp://` URL —
 then the application chooses the destination and the user chooses the application's mind. That
-is server-side request forgery, and nothing in this library restricted it before 0.11.
+is server-side request forgery, and nothing in this library restricted it before the first release.
 
 The control is an allowlist, and it is **off by default** because only the deployment knows
 the policy:

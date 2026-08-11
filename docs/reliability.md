@@ -104,7 +104,7 @@ shield is not cancellable from outside, so with `request_timeout=None` and a pee
 stopped reading its socket, leaving the `async with` block waits forever on the cleanup
 `CLOSE`. `request_timeout` is the only thing that bounds it.
 
-**The write half was unbounded until 0.9, and "in practice it cannot block" is why** (D-40).
+**The write half was originally unbounded, and "in practice it cannot block" is why** (D-40).
 A request is around thirty bytes and a pipe holds 64 KiB, so a sender could not fill it, while
 a session ran one transfer at a time. Once transfers share a connection, one upload's 255 KiB
 `WRITE` fills the pipe and every other task's write queues behind it, so an ordinary concurrent
@@ -139,7 +139,7 @@ server slow enough that callers are giving up on it.
 Cleanup is shielded so it survives the cancellation that triggered it, and **the session's
 reader is shielded for the same reason**: cleanup sends requests, and something has to read
 the replies. When it was not, a cancelled transfer took a full `request_timeout` to unwind and,
-with `request_timeout=None`, never finished at all (fixed in 0.8, D-34). The reader stops when
+with `request_timeout=None`, never finished at all (fixed by D-34). The reader stops when
 the `async with open_session(...)` block ends and at no other time; cancelling the task group
 it happens to run in deliberately does not stop it.
 

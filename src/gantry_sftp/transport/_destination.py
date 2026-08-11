@@ -1,6 +1,6 @@
 """Which hosts this process is allowed to dial.
 
-D-121. Nothing in this library restricted the *destination* until 0.11:
+D-121. Nothing in this library restricted the *destination* before the first release:
 :func:`~gantry_sftp.transport.build_ssh_argv` refuses a host that could be reparsed as an
 ``ssh`` flag, which is argument-injection defence and a different vulnerability class. An
 application that takes a hostname -- or a ``gantry-sftp://`` URL -- from user input and hands
@@ -47,7 +47,7 @@ The assumption this makes, stated rather than implied
 ``ssh -G`` **evaluates** ``Match exec``, which runs a program -- verified, not assumed. So this
 check assumes the ``ssh_config`` is trusted. That is not a weakening: a config you do not trust
 is already arbitrary code execution through ``ProxyCommand`` or ``Match exec`` whether or not
-an allowlist exists, which ``_argv.py`` has documented since 0.9, and the control for it is
+an allowlist exists, which ``_argv.py`` has documented from the start, and the control for it is
 ``config_file=os.devnull``. An allowlist is a defence against an untrusted *host*, not an
 untrusted *config*, and it does not pretend to be one.
 

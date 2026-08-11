@@ -155,7 +155,8 @@ _REFUSED_IN_URL: Final[Mapping[str, str]] = {
 }
 """Constructor arguments a URL may **not** set, mapped to why. Each is still an argument.
 
-D-120. The first three were accepted as query parameters until 0.11, and two of them were
+D-120. The first three were accepted as query parameters before the first release, and two
+of them were
 remote code execution from a URL string -- measured, not reasoned about:
 
 - ``ssh_executable`` is ``argv[0]``. A URL naming it chooses the program this library spawns.
@@ -164,7 +165,7 @@ remote code execution from a URL string -- measured, not reasoned about:
   *parsing* before any connection is attempted. Neither is neutralised by any option in
   :data:`~gantry_sftp.transport._argv.DEFAULT_SSH_OPTIONS` -- ``PermitLocalCommand=no`` and
   ``ClearAllForwardings=yes`` do not reach either of them, which ``transport/_argv.py`` has
-  said in a comment since 0.9. So a URL plus one attacker-writable file anywhere on disk was
+  said in a comment from the start. So a URL plus one attacker-writable file anywhere on disk was
   arbitrary command execution.
 - ``identity_file`` is ``-i``, which is not execution but is still a URL choosing which local
   file gets read, and it tells the caller whether that file exists.
@@ -482,7 +483,8 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
 
     **Three arguments cannot come from a URL** and are constructor-only: ``identity_file``,
     ``config_file`` and ``ssh_executable``, each of which names a local path. Two of them were
-    remote code execution from a URL string until 0.11 -- see :data:`_REFUSED_IN_URL` for what
+    remote code execution from a URL string before the first release -- see
+    :data:`_REFUSED_IN_URL` for what
     was measured. Pass them here, or in ``storage_options``, where the author of the program
     is the one writing them.
 

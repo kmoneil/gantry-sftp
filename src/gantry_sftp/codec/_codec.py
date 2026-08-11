@@ -277,7 +277,7 @@ class Codec:
         except ProtocolError:
             # Three sources, one consequence. `_handle` fails the codec for the cases it owns
             # -- a reply nobody asked for, a second VERSION, a server-sent request -- and
-            # until 0.8 the other two were not covered at all: a length the splitter rejects
+            # originally the other two were not covered at all: a length the splitter rejects
             # and a body the decoder cannot parse both left the state at READY, so the next
             # `receive()` carried on reading a stream whose frame boundaries are no longer
             # known. That does not surface as an error; it surfaces as replies correlated to
@@ -353,7 +353,7 @@ class Codec:
         Returned rather than raised so the call site reads ``raise self._fail(...)`` and
         static analysis can see the control flow.
 
-        This set :attr:`CodecState.FAILED` itself until 0.8. Widening the latch to
+        This originally set :attr:`CodecState.FAILED` itself. Widening the latch to
         ``receive``'s ``except ProtocolError`` -- which had to happen, because a length the
         splitter rejects and a body the decoder cannot parse never reach this method -- made
         that assignment dead: every call site is inside that ``try``, so the handler
@@ -367,7 +367,8 @@ class Codec:
 def _version_refusal(version: int) -> str:
     """Why a negotiated version that is not ours cannot be spoken to. Two cases, two messages.
 
-    **Nothing checked this until 0.12**, and the gap was not that a violation went unreported
+    **Nothing checked this before the first release**, and the gap was not that a violation
+    went unreported
     -- it was that the *legal* case went unreported. ``draft-ietf-secsh-filexfer-02`` 4 has the
     server answer with the lower of its own version and the client's, so a server that speaks
     only v2 answering ``2`` is behaving correctly and this client then spoke v3 at it anyway.
