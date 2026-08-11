@@ -45,7 +45,7 @@ from gantry_sftp.session._localpath import (
     check_contained,
     local_child,
 )
-from gantry_sftp.session._localtree import LocalWalkEntry, remote_component
+from gantry_sftp.session._localtree import LocalWalkEntry, remote_component, times_from_stat
 from gantry_sftp.session._mode import PERMISSION_BITS, Mode, local_mode
 from gantry_sftp.session._platform import NO_FOLLOW
 from gantry_sftp.session._publish import Publish, SizeCheck, TimePreservation
@@ -240,12 +240,12 @@ def _local_size(path: Path | str) -> int:
 def _local_times(path: Path | str) -> Times:
     """A local file's atime and mtime, truncated to the seconds filexfer v3 can carry.
 
-    ``int()`` rather than ``round()``: rounding a timestamp *up* invents a modification that
-    has not happened yet, and a file dated one second into the future is exactly what makes a
-    "modified since" sweep behave differently between two runs of the same upload.
+    The truncation and its reason live in :func:`~gantry_sftp.session.times_from_stat`; this is
+    the spelling that starts from a path rather than from a ``stat`` somebody already has. Two
+    copies of an ``int()`` is two places to reason about rounding, and D-164 made the rule part
+    of a *comparison* as well as of a write.
     """
-    stat_result = Path(path).stat()
-    return Times(atime=int(stat_result.st_atime), mtime=int(stat_result.st_mtime))
+    return times_from_stat(Path(path).stat())
 
 
 def _download_mode(mode: int | Mode | None, attributes: Attrs, remote_path: bytes) -> int | None:

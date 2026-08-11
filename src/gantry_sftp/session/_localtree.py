@@ -41,7 +41,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from gantry_sftp.codec import Attrs
+from gantry_sftp.codec import Attrs, Times
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session._listing import DirEntry, EntryKind, entry_kind
 from gantry_sftp.session._recursive import Skipped, SkipReason, remote_component_reason
@@ -50,6 +50,7 @@ __all__ = [
     "LocalWalkEntry",
     "local_dir_entry",
     "remote_component",
+    "times_from_stat",
     "walk_local",
 ]
 
@@ -82,6 +83,22 @@ def remote_component(name: bytes) -> bytes:
     )
 
 
+def times_from_stat(stat_result: os.stat_result) -> Times:
+    """A local ``stat``'s atime and mtime, truncated to the seconds filexfer v3 can carry.
+
+    ``int()`` rather than ``round()``: rounding a timestamp *up* invents a modification that
+    has not happened yet, and a file dated one second into the future is exactly what makes a
+    "modified since" sweep behave differently between two runs of the same upload.
+
+    Here rather than beside its other caller because this module is imported by that one and
+    not the reverse, and the rule is worth having once. :func:`~gantry_sftp.session.sync_tree`
+    compares against these values, so the truncation is part of a comparison rather than only
+    of a ``preserve_times`` write: a mirror that compared a float against a wire timestamp
+    would find every file changed, every run (D-164).
+    """
+    return Times(atime=int(stat_result.st_atime), mtime=int(stat_result.st_mtime))
+
+
 def local_dir_entry(name: bytes, stat_result: os.stat_result) -> DirEntry:
     """Adapt a local name and ``stat`` into the entry type a report is written in.
 
@@ -93,11 +110,21 @@ def local_dir_entry(name: bytes, stat_result: os.stat_result) -> DirEntry:
     ``longname`` is empty because there is no display string to have: it is an ``ls -l`` line
     the *server* composed, and inventing one locally would be inventing a format nobody asked
     for.
+
+    **Times are carried as of D-164**, and they were not before. A mirror compares a local
+    entry against what it recorded sending, so an entry that dropped its modification time made
+    the comparison unbuildable from this type -- and this is the type both directions already
+    share. Truncated on the way in by :func:`times_from_stat`, so what is compared is what the
+    protocol can carry rather than what the local filesystem happens to store.
     """
     return DirEntry(
         filename=name,
         longname=b"",
-        attrs=Attrs(size=stat_result.st_size, permissions=stat_result.st_mode),
+        attrs=Attrs(
+            size=stat_result.st_size,
+            permissions=stat_result.st_mode,
+            times=times_from_stat(stat_result),
+        ),
     )
 
 
