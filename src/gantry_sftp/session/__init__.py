@@ -55,6 +55,7 @@ from gantry_sftp.session._localtree import (
     LocalWalkEntry,
     local_dir_entry,
     remote_component,
+    times_from_stat,
     walk_local,
 )
 from gantry_sftp.session._mode import (
@@ -115,6 +116,17 @@ from gantry_sftp.session._session import (
     SessionOptions,
     open_session,
 )
+from gantry_sftp.session._sync import (
+    MANIFEST_VERSION,
+    Comparison,
+    ManifestEntry,
+    SyncDecision,
+    SyncManifest,
+    SyncOutcome,
+    SyncReason,
+    SyncResult,
+    compare_for_sync,
+)
 from gantry_sftp.session._upload import upload_handle, write_range_from
 from gantry_sftp.session._verify import (
     CHECK_FILE_BLOCK_SIZE,
@@ -137,6 +149,7 @@ __all__ = [
     "DEFAULT_SESSION_OPTIONS",
     "DOT_ENTRIES",
     "LIMITS_EXTENSION",
+    "MANIFEST_VERSION",
     "MAX_STAGED_NAME_LENGTH",
     "PERMISSION_BITS",
     "PREFERRED_READ_LENGTH",
@@ -146,6 +159,7 @@ __all__ = [
     "UNKNOWN",
     "WINDOWS_FORBIDDEN_CHARACTERS",
     "WINDOWS_RESERVED_NAMES",
+    "Comparison",
     "ContentCheck",
     "DestinationLedger",
     "DirEntry",
@@ -158,6 +172,7 @@ __all__ = [
     "FoldedNameLedger",
     "GlobMatch",
     "LocalWalkEntry",
+    "ManifestEntry",
     "Mode",
     "PlanLimit",
     "PotentialCollision",
@@ -173,6 +188,11 @@ __all__ = [
     "SizeCheck",
     "SkipReason",
     "Skipped",
+    "SyncDecision",
+    "SyncManifest",
+    "SyncOutcome",
+    "SyncReason",
+    "SyncResult",
     "TimePreservation",
     "TransferSizes",
     "TreePlan",
@@ -184,6 +204,7 @@ __all__ = [
     "check_component",
     "check_contained",
     "check_listed_name",
+    "compare_for_sync",
     "decode_name",
     "download_handle",
     "entry_kind",
@@ -208,6 +229,7 @@ __all__ = [
     "split_parent",
     "staged_path",
     "staging_token",
+    "times_from_stat",
     "unsafe_reason",
     "upload_handle",
     "walk_local",

@@ -276,8 +276,17 @@ class PlanLimit:
     )
     DESTINATION_COMPARISON = (
         "which files already exist on the destination and which differ: not compared, because "
-        "that is a mirror's question rather than a preview's"
+        "that is a mirror's question rather than a preview's -- `sync_tree` is the mirror, and "
+        "it answers this by listing each destination directory and comparing against its own "
+        "record of what it sent"
     )
+    """Still true, and now it names what does the comparing (D-164).
+
+    It read as a permanent limitation for as long as there was no mirror. A preview still does
+    not consult the destination -- that costs a round trip per directory and is a different
+    question from "what would this upload" -- but a reader who wants the answer should be told
+    where it lives rather than left with a closed door.
+    """
     UNREPORTED_SIZES = (
         "the total size is short: this server volunteered no size for some entries, and a "
         "preview does not stat them one at a time to find out"

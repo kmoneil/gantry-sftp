@@ -104,6 +104,7 @@ from gantry_sftp.session import (
     ServerProfile,
     Session,
     SessionOptions,
+    SyncResult,
     TransferSizes,
     TreePlan,
     TreeResult,
@@ -992,6 +993,35 @@ class SyncSession:
                 concurrency=concurrency,
                 dry_run=dry_run,
                 **legacy,
+            )
+        )
+
+    def sync_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        manifest: Path | str,
+        max_depth: int | None = None,
+        publish: Publish | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        progress: ProgressCallback | None = None,
+        concurrency: int = 1,
+    ) -> SyncResult:
+        """Mirror a directory tree, sending only what the record says is not already there."""
+        return self._run(
+            partial(
+                self._session.sync_tree,
+                local_path,
+                remote_path,
+                manifest=manifest,
+                max_depth=max_depth,
+                publish=publish,
+                preserve_times=preserve_times,
+                mode=mode,
+                progress=progress,
+                concurrency=concurrency,
             )
         )
 

@@ -769,6 +769,75 @@ the generated name exists to prevent, so the combination is refused rather than 
 downgraded. Resuming an upload therefore means resuming the destination files themselves, and a
 consumer polling the directory can see a partial file while it happens.
 
+## Mirroring a tree
+
+`sync_tree` makes a remote directory match a local one, sending only what is not already there:
+
+```python
+result = await sftp.sync_tree("build/", "/deploy", manifest="state.json")
+
+print(result.transferred, "sent,", result.skipped, "unchanged,", result.undecidable, "unproven")
+for outcome in result.outcomes:
+    print(outcome.remote_path, outcome.decision, "--", outcome.reason)
+```
+
+**The feature is the decision not to transfer, not the bytes it saves.** Get that wrong and a
+changed file keeps its old contents on the server while the run returns a successful result —
+data loss with a green report, which this project ranks above any throughput win. So every file
+comes back with the reason it was or was not sent.
+
+### What it compares against, and why it is not the remote timestamp
+
+The obvious rule — local mtime against remote mtime — does not work, and it fails in the
+direction that looks like it is working. `preserve_times` is [off by
+default](#timestamps), so a file uploaded by `put_tree` carries the _time of the upload_.
+Measured against a real `sftp-server`:
+
+```
+                 local mtime         remote mtime after put
+report.csv       1700000000      →   1786470831        ← the upload, not the file
+```
+
+Comparing those finds every file changed, on every run, forever. Turning `preserve_times` on to
+fix it would force on a flag that exists to be off — a landing zone whose consumer collects
+"modified since X" never picks up a file wearing last year's date — so the mirror compares
+against **its own record of what it sent**. That is the `manifest` argument: a JSON file this
+library reads at the start and writes at the end.
+
+Losing it costs one full re-send and loses nothing. Absent, unreadable, or written by a future
+version all mean the same thing — nothing is known — because a record a comparison cannot trust
+is worse than no record.
+
+### The record stores both sides
+
+A record of what _we_ sent cannot see a change made **on the server**. Truncate the remote file
+and the local one still matches the record exactly, so a record-only mirror skips and the
+destination stays truncated — the same wrong skip, reintroduced by the fix for it.
+
+Closing that costs nothing, because v3 returns attributes _with_ a listing: the walk already
+reads every remote size and modification time it needs. So the record holds both sides, and a
+file changed on the server is re-sent with `REMOTE_SIZE_CHANGED` or `REMOTE_MTIME_CHANGED` as
+the reason. Only a file actually sent costs an extra round trip, to record what the destination
+ended up holding.
+
+### Three outcomes, and the third one sends
+
+| `decision`    | what it means                                     | sends |
+| ------------- | ------------------------------------------------- | ----- |
+| `TRANSFER`    | something differs, or nothing is on record         | yes   |
+| `SKIPPED`     | proven identical on both sides against the record  | no    |
+| `UNDECIDABLE` | the server volunteered no size or no modification time for it | yes |
+
+`UNDECIDABLE` is counted separately rather than folded into either neighbour. Skipping on it
+would lose the file; calling it `TRANSFER` would hide which entries this run could not actually
+check. `result.complete` is `True` when there were none.
+
+### It does not delete
+
+A file on the server that is no longer in the local tree is left alone. Deletion is the one
+mirror operation whose mistakes are unrecoverable, and nothing on this side can tell an
+extraneous file from somebody else's.
+
 ## Incremental ingest, and the two ways it loses data
 
 The loop nearly every scheduled SFTP job runs:
@@ -780,6 +849,15 @@ This library ships every piece and **not** a `since()` method, because retention
 clock-trust policy are exactly what differs between deployments. What it ships instead is
 `examples/incremental_ingest.py` and these two warnings, both of which are one line of caller
 code away from silent data loss.
+
+**Why this is pieces and [`sync_tree`](#mirroring-a-tree) is a method**, given that both are
+"decide what to move by looking at timestamps". The mirror's comparison is not policy: size
+against a recorded modification time, with an explicit third state, is the same rule in every
+deployment, and it is the part callers get wrong. An ingest's rule is not — how long to remember
+what was taken, whether a re-appearing name is a new file, and whether the server's clock can be
+trusted at all are answers that differ per trading partner. So the mirror ships the comparison
+and no deletion policy, and the ingest ships the assembly and no comparison. Where a decision is
+yours, this library declines to make it quietly.
 
 **1. `mtime > watermark` loses files.** v3 carries whole seconds. A file that lands 0.9 s into
 the same second as the file that set your watermark reports the _same_ timestamp, so `>`

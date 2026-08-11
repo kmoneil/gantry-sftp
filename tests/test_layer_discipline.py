@@ -369,8 +369,16 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 36
+SESSION_METHOD_CEILING = 38
 """What `Session` measures today, which is the whole of the rule.
+
+**36 to 38 by D-164**, the mirror, and the ratchet's question was asked rather than waved
+through. `sync_tree` is an orchestration over the walk, the comparison and `put`, which is what
+`put_tree` and `get_tree` beside it already are, so it belongs here for the same reason they do.
+`_listing_by_name` awaits `scandir` and could not be a pure function. **The pure half did leave**
+-- the comparison, the manifest and the per-directory decision are `session/_sync.py`, which is
+where the thing that can lose data is testable with two dictionaries and no server. Two methods
+is what was left once that was taken out.
 
 **Lowered from 109 to 59 by D-143**, which split the class into three layers: `_SessionCore`
 (state, the properties, and `request`), `_SessionOperations` (one round trip each), and this,

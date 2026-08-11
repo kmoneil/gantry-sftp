@@ -169,6 +169,16 @@ from gantry_sftp.session._recursive import (
     WalkEntry,
     join_remote,
 )
+from gantry_sftp.session._sync import (
+    ManifestEntry,
+    SyncManifest,
+    SyncOutcome,
+    SyncResult,
+    _SyncCandidate,
+    candidates_in,
+    manifest_entry_for,
+    summarise,
+)
 from gantry_sftp.session._verify import (
     Verify,
     gate_resume,
@@ -2966,6 +2976,172 @@ class Session(_SessionOperations):
             record["bytes"] = sum(moved)
             record["skipped"] = len(skipped)
             return TreeResult(len(moved), directories, sum(moved), tuple(skipped))
+
+    async def sync_tree(
+        self,
+        local_path: Path | str,
+        remote_path: bytes | str,
+        *,
+        manifest: Path | str,
+        max_depth: int | None = None,
+        publish: Publish | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        progress: ProgressCallback | None = None,
+        concurrency: int = 1,
+    ) -> SyncResult:
+        """Make ``remote_path`` match a local tree, sending only what is not already there.
+
+        **The defining operation is deciding not to transfer something**, and a wrong decision
+        leaves a changed file wearing its old contents on the server while this returns a
+        successful result. That is why the comparison, not the saving of bytes, is the feature:
+        see :mod:`gantry_sftp.session._sync` for the ladder and
+        :class:`~gantry_sftp.session.SyncResult` for what comes back.
+
+        **What it compares against is its own record, not the destination's clock** (D-164).
+        ``preserve_times`` is off by default, so a file uploaded by :meth:`put_tree` normally
+        carries the *upload* time rather than the local one -- comparing those two finds every
+        file changed on every run, forever. ``manifest`` is where this library writes what it
+        sent, and the comparison is against that. It records **both sides**, so a file changed
+        on the server behind us is still detected: a record of the local half alone would skip
+        it and leave the destination wrong.
+
+        Three outcomes per file, and the third is the one to read: ``transferred`` differed,
+        ``skipped`` was proven identical, and ``undecidable`` **was sent** because this server
+        volunteered no size or no modification time for it. Undecidable is not folded into
+        either neighbour, because a mirror that quietly re-sends everything and one that quietly
+        skips are both things you want to find out about early.
+
+        The remote listing costs nothing extra: v3 returns attributes with ``READDIR``, so one
+        listing per directory -- which the walk needs anyway -- carries every size and time the
+        comparison reads. Only a file that is actually sent costs a ``STAT`` afterwards, to
+        record what the destination ended up holding.
+
+        Not in scope, deliberately, and it is not an oversight: **nothing here deletes.** A file
+        on the server that is no longer in the local tree is left alone. Deletion is the one
+        mirror operation whose mistakes are unrecoverable, and which of "extraneous" and
+        "somebody else's" a remote file is cannot be decided from this side.
+
+        Args:
+            local_path: Local directory to mirror from.
+            remote_path: Remote directory to mirror into. Created with its missing parents.
+            manifest: Where to read and write the record of what was sent. Absent, unreadable
+                or from a future version all mean "nothing is known", which costs a full
+                re-send and loses nothing.
+            max_depth: Stop descending below this many levels.
+            publish: How each file becomes visible, as :meth:`put` takes it.
+            preserve_times: Carry each local file's times across. Independent of the comparison
+                -- the record is what makes the mirror work, and this only decides what the
+                destination's own metadata says afterwards.
+            mode: Permission bits for the files this creates, as :meth:`put` takes them.
+            progress: Called as bytes move, for files that are actually sent.
+            concurrency: Files in flight at once.
+
+        Returns:
+            Counts, the per-file outcomes with the reason for each, and the walk's own skips.
+
+        Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O.
+            UnsafePathError: If a local name cannot be one remote path component.
+        """
+        _check_local_path(local_path, method="sync_tree()")
+        _check_tree_concurrency(concurrency, progress=progress, caller="sync_tree")
+        root = self._resolve(remote_path)
+        policy = publish_from_legacy(publish, {}, caller="sync_tree")
+        _check_tree_publish(policy, resume=False, caller="sync_tree")
+        requested_mode = resolve_mode(mode, caller="sync_tree()")
+        await self._require_rooted_paths(root, feature="mirroring a tree")
+        await self._mkdir_parents(root, exist_ok=True)
+
+        record_file = Path(manifest)
+        recorded = SyncManifest.load(record_file)
+        directories = 0
+        outcomes: list[SyncOutcome] = []
+        walk_skipped: list[Skipped] = []
+        # Collected rather than written into the manifest as they finish: several workers
+        # complete inside one another's awaits, and a dict is not the place to discover that.
+        written: list[tuple[bytes, ManifestEntry]] = []
+        directory_times: list[tuple[bytes, Times]] = []
+        directory_modes: list[tuple[bytes, int]] = []
+
+        with operation(session_logger, "sync_tree", local=local_path, remote=root) as record:
+
+            async def produce() -> AsyncGenerator[_SyncCandidate]:
+                """Create each directory, list it once, and decide about every file in it.
+
+                The listing happens **after** the ``mkdir``, which is what makes it total: the
+                directory is there by the time it is read, so a missing one is not a case this
+                has to tell apart from an empty one.
+                """
+                nonlocal directories
+                for entry in walk_local(Path(local_path), max_depth=max_depth):
+                    remote_directory = _remote_directory(root, entry.relative)
+                    if entry.relative:
+                        await self.mkdir(remote_directory, exist_ok=True)
+                        directories += 1
+                        _settle_remote_directory(
+                            entry,
+                            remote_directory,
+                            preserve_times=preserve_times,
+                            mode=requested_mode,
+                            times=directory_times,
+                            modes=directory_modes,
+                        )
+                    walk_skipped.extend(entry.skipped)
+                    present = await self._listing_by_name(remote_directory)
+                    for candidate in candidates_in(
+                        entry, remote_directory, present, recorded, outcomes
+                    ):
+                        yield candidate
+
+            async def transfer(item: _SyncCandidate) -> None:
+                result = await self.put(
+                    item.source,
+                    item.remote,
+                    publish=policy,
+                    preserve_times=preserve_times,
+                    mode=requested_mode,
+                    progress=progress,
+                )
+                outcomes.append(
+                    SyncOutcome(
+                        item.remote,
+                        item.verdict.decision,
+                        item.verdict.reason,
+                        result.transferred,
+                    )
+                )
+                landed = await self.stat(item.remote)
+                entry = manifest_entry_for(item.source, landed)
+                if entry is not None:
+                    written.append((item.remote, entry))
+
+            await for_each_bounded(produce(), transfer, concurrency=concurrency)
+
+            await _set_directory_times(self, directory_times)
+            await _set_directory_modes(self, directory_modes)
+            for path, entry in written:
+                recorded.record(path, entry)
+            recorded.save(record_file)
+
+            report = summarise(outcomes, directories=directories, walk_skipped=walk_skipped)
+            record["files"] = report.transferred
+            record["directories"] = directories
+            record["bytes"] = report.bytes_transferred
+            record["skipped"] = report.skipped
+            record["undecidable"] = report.undecidable
+            return report
+
+    async def _listing_by_name(self, directory: bytes) -> dict[bytes, Attrs]:
+        """One directory's entries, by filename, as the comparison reads them.
+
+        A ``dict`` rather than a scan the caller iterates, because the mirror asks about names
+        it got from the *local* walk and needs random access. One ``READDIR`` sequence per
+        directory either way, and the attributes ride along with it -- which is the whole reason
+        the comparison costs no round trips of its own.
+        """
+        async with self.scandir(directory) as scan:
+            return {entry.filename: entry.attrs async for entry in scan}
 
     async def _mkdir_parents(self, path: bytes, *, exist_ok: bool) -> None:
         """Create ``path`` and any missing ancestors, cheaply in the common case.
