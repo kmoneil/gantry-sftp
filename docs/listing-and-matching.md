@@ -107,7 +107,7 @@ for entry in await sftp.listdir(drop):
   `CON`, none of which contains a `/` and all of which mean something on Windows — so passing
   the remote check is not a reason to skip this one.
 
-The same three are what `glob`, `walk`, `get_tree` and `put_tree` use internally, so a
+The same three are what `glob`, `walk`, `get_tree`, `put_tree` and `sync_tree` use internally, so a
 hand-written loop and a library one refuse the same names for the same reasons. `entry` here
 is a `DirEntry`, which deliberately does **not** carry a `.path`: it is also what the upload
 walk reports, where a remote directory does not exist, and a property that worked in one

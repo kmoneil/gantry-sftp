@@ -53,9 +53,19 @@ sizing a WAN transfer needs the second and a reader reading a frame dump sees th
 | `put(publish=Publish(atomic=False, fsync=False))` | 3 + `ceil(size / request size)`                                            | 3 + 1 for the writes    | `OPEN`, the `WRITE`s, `CLOSE`, `STAT`                  |
 | `put` (the default, atomic and flushed)           | 5 + `ceil(size / request size)`                                            | 5 + 1 for the writes    | the four above plus `fsync@openssh.com` and the rename |
 | `listdir` / `scandir`                             | 2 + one `READDIR` per reply the server chooses to split the directory into | the same                | `OPENDIR`, the `READDIR`s, `CLOSE`                     |
+| `sync_tree`, per directory                        | one `MKDIR` + one `listdir`                                                | the same                | the directory, then its listing                        |
+| `sync_tree`, per file **skipped**                 | 0                                                                          | **0**                   | nothing — the listing already answered                 |
+| `sync_tree`, per file **sent**                    | one `put` + 1                                                              | `put` + 1               | the transfer, then a `STAT` to record what landed      |
 
 The `READ`s and `WRITE`s pipeline — that is what `depth` is for — so they cost one round trip
 in total rather than one each, provided the file is smaller than `depth × request size`.
+
+**A skipped file in `sync_tree` costs nothing at all**, and that is the whole reason the
+comparison is affordable. v3 returns attributes *with* a listing, so one `READDIR` sequence per
+directory carries every size and modification time the comparison reads — there is no `STAT` per
+candidate. Only a file actually sent pays the extra round trip, to record what the destination
+ended up holding. So a mirror of an unchanged tree costs two round trips per *directory* and none
+per file, which is what makes running it on a schedule over a slow link reasonable.
 
 **`get`'s `STAT` and `OPEN` go out together**, which is why it makes four requests and waits
 three times. Neither reads the other's answer on the default path, so the ordering between them

@@ -881,3 +881,58 @@ def test_the_wheel_carries_only_the_package(distribution: tuple[Path, Path]):
         top = {name.split("/")[0] for name in archive.namelist()}
     unexpected = sorted(name for name in top if not name.startswith("gantry_sftp"))
     assert unexpected == [], f"the wheel carries more than the package: {unexpected}"
+
+
+# --- the version, wherever a reader can see it -------------------------------------------------
+
+
+def readme_section(heading: str) -> str:
+    """One `## ` section of the front page, to its next sibling heading."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    body = readme.split(f"\n## {heading}\n", 1)
+    assert len(body) == 2, f"README.md has no `## {heading}` section"
+    return body[1].split("\n## ", 1)[0]
+
+
+def test_the_status_section_names_the_packaged_version() -> None:
+    """It drifted a release behind with nothing checking, in two places at once.
+
+    `README.md` opened its status with "0.1.0, the first public release" while `__version__` was
+    `0.1.2` and three tags existed -- a claim a reader checks against `pip show` inside a minute.
+
+    **Scoped to the section rather than to the whole page, because the page-wide form is
+    vacuous.** Written first as `__version__ in readme`, it passed against a README whose status
+    still said 0.1.0: the transcribed `doctor` output mentions the right version a hundred lines
+    away, and one mention anywhere satisfied it. Verified by reverting each drift separately --
+    the page-wide check caught neither on its own.
+    """
+    status = readme_section("Status")
+    assert gantry_sftp.__version__ in status, (
+        f"the README's status section does not say this is {gantry_sftp.__version__}; update it "
+        "in the same change as the bump"
+    )
+
+
+def test_the_transcribed_doctor_output_reports_the_packaged_version() -> None:
+    """The second drift, and the one that hides.
+
+    The README transcribes a `python -m gantry_sftp doctor` run, whose first row is the library's
+    own version. It read `0.1.0` against a package at `0.1.2`: nobody bumping a version thinks to
+    re-read a console block halfway up the front page, and no gate looked either.
+
+    Asserted on that one line rather than by scanning the page for version-shaped tokens. The
+    scan was written first and matched `OpenSSL 3.5.6` out of the very same transcript -- a check
+    that cannot tell whose version it found has to be taught exceptions, and the exceptions are
+    where it stops reporting. The rest of the block is genuinely environmental (an `ssh` build, a
+    home directory) and is illustrative; this row is a claim about *this* package.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    # Anchored on the doctor row's own shape -- indent, aligned column, and the `(filexfer`
+    # suffix only that row has. A looser `^\s*library\s+(\S+)` also matched a sentence
+    # beginning "library contains", which is the same class of mistake as matching OpenSSL.
+    transcribed = re.findall(r"^  library {2,}(\S+) \(filexfer", readme, flags=re.MULTILINE)
+    assert transcribed, "the README's doctor transcript lost its `library` row"
+    assert set(transcribed) == {gantry_sftp.__version__}, (
+        f"the README's doctor output reports {sorted(set(transcribed))} and this package is "
+        f"{gantry_sftp.__version__} -- re-run `python -m gantry_sftp doctor` and paste it back"
+    )

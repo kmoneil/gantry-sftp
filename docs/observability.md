@@ -103,7 +103,7 @@ on the root logger. The attribute name is `LOG_FIELDS` if you would rather read 
 
 |             |                                                                                                    |
 | ----------- | -------------------------------------------------------------------------------------------------- |
-| `operation` | `get`, `put`, `get_tree`, `put_tree`, `rmtree`, `spawn`, `close`, `reconnect`                      |
+| `operation` | `get`, `put`, `get_tree`, `put_tree`, `sync_tree`, `rmtree`, `spawn`, `close`, `reconnect`         |
 | `event`     | `start`, `ok`, `failed`, `retrying` — the field a "started but never finished" query needs         |
 | `elapsed`   | seconds, on the closing record. `error` joins it on a failure, carrying the exception's class name |
 

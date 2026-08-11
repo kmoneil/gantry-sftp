@@ -32,7 +32,7 @@ Three things worth knowing before you fan out:
 - **One operation is one consumer.** Two tasks may each run a `get`; two tasks driving _the
   same_ `get` is not a thing.
 
-`get_tree()` and `put_tree()` take `concurrency=` as of 0.10, defaulting to `1`:
+`get_tree()`, `put_tree()` and `sync_tree()` take `concurrency=`, defaulting to `1`:
 
 ```python
 result = await sftp.get_tree("/incoming", "downloads/", concurrency=8)
