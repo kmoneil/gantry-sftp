@@ -67,9 +67,11 @@ pytestmark = [pytest.mark.anyio]
 needs_a_real_pipe = pytest.mark.skipif(
     sys.platform != "linux",
     reason=(
-        "these two rows hang the `macos-latest` runner -- measured three times, most recently "
-        "by lifting this skip on purpose -- and Windows has neither SIGSTOP nor sftp-server; "
-        "a developer Mac runs them clean, so the subject is that machine, not the platform "
+        "SIGSTOP on a child spawned through asyncio deadlocks the event loop from Python 3.14 "
+        "onward on any platform without os.pidfd_open: the threaded child watcher schedules "
+        "os.waitpid(pid, 0) onto the loop, and a stopped child never satisfies it, so no "
+        "deadline in the process can fire. Windows additionally has neither SIGSTOP nor "
+        "sftp-server. A replacement row has to wedge the peer WITHOUT stopping the process "
         "-- see D-160"
     ),
 )
@@ -78,8 +80,10 @@ needs_a_real_pipe = pytest.mark.skipif(
 **D-161 lifted this to `win32` only and CI put it back within the hour**, which is the most useful
 thing this marker has ever done. Both halves are worth keeping, because they are different claims:
 
-*On macOS the platform, these rows work.* Sixty consecutive clean runs on a developer Mac -- 3.13
-and 3.14.6, under eight-way CPU saturation, and inside three full-suite runs. The blocked write
+*On macOS the platform, these rows worked on the interpreter they were tried on.* Sixty
+consecutive clean runs on a developer Mac -- **Python 3.13.1**, under eight-way CPU saturation, and
+inside three full-suite runs. That result is real and it is narrower than it looked: the code path
+that hangs **does not exist in 3.13**, so those runs could not have reached it. The blocked write
 fills the pipe exactly as on Linux and the deadline reports it with the byte count the assertion
 spells out, so it could not have passed without that happening, and no `sftp-server` is left
 behind. Every mechanism the old reason named -- "a payload sized against a pipe's capacity, which
@@ -92,11 +96,20 @@ observation.* Same commit family, one variable: with these two rows skipped the 
 **19m28s** until `timeout-minutes` cut it, leaving an orphaned `sftp-server` and an orphaned
 `python3.14`. Three occurrences, all stopping at the same line -- the one before this file.
 
-So the skip is by `sys.platform` and its reason is about a machine. That is a deliberate exception
-to this repository's probe-don't-introspect rule, and it is a smaller exception than it was: there
-is no probe for "is this the runner", the difference between the two macOS machines is not
-understood, and inventing a probe for something nobody has diagnosed would be dressing a guess as a
-capability check.
+**The cause is known as of D-160's answer, and it is not this library.** The event loop thread
+blocks inside `os.waitpid()`, in a callback it is running itself, so nothing else in the process
+executes -- not the send deadline, not `call_later`, not any cancel scope. Linux gets
+`_PidfdChildWatcher`; a platform without `os.pidfd_open` gets `_ThreadedChildWatcher`, which after
+`waitid(WEXITED|WNOWAIT)` schedules `_reap_and_notify` onto the loop, calling
+`os.waitpid(expected_pid, 0)` -- no `WNOHANG`, no `WUNTRACED`. A *stopped* child never satisfies
+that call. `_reap_and_notify` is **new in 3.14**, which is what separates the two Macs: the
+interpreter, not the machine.
+
+So the skip stays on `sys.platform`, and that is now a plain capability statement rather than an
+exception to the probe-don't-introspect rule: the incapable platforms are the ones without
+`os.pidfd_open`, and `sys.platform != "linux"` is the honest spelling of that set here. **Nothing
+in `src/` is implicated** -- this library never sends `SIGSTOP`, so no user can reach it. What
+hangs is the test technique.
 
 **What it costs is stated rather than absorbed**: the absence of a send-deadline bound is proven on
 one platform, and the two rows that prove a real pipe genuinely fills do not run on two of three.

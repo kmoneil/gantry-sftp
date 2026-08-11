@@ -223,6 +223,26 @@ than it looks. `tests/test_lanes.py` holds the choice list and the guards in agr
 directions: a guarded lane missing from the list cannot be reached on its own, and a list entry
 naming no job is a dropdown option that silently does nothing.
 
+#### Diagnosing a job that hangs
+
+Two things make this much harder than it looks, and both were learned the expensive way (D-160,
+which took six days and four wrong diagnoses).
+
+**A job killed by `timeout-minutes` serves no log at all.** Not a truncated one — GitHub returns
+`BlobNotFound`, measured at 215 bytes against 38 KB from the sibling job in the same run. So the
+`timeout-minutes` that stops a hang from costing six hours is also what destroys the evidence for
+diagnosing it. Anything investigating a hang has to finish *below* the job timeout: run the
+suspect in the background, bound it from the shell, and let the step exit normally so the log is
+written.
+
+**Nothing that needs the event loop can report on a wedged event loop.** `anyio.fail_after`,
+`move_on_after` and `loop.call_later` all die with the thing they are measuring — and a shielded
+scope is uncancellable by construction, which is the property it exists to provide.
+`faulthandler.dump_traceback_later(seconds, exit=True)` runs on its own thread and fires anyway;
+it is the only in-process watchdog worth arming here. Pair it with progress markers written via
+`os.write(2, ...)` rather than `print`, because a block-buffered stream in a non-tty log is how
+this project twice concluded a hang was somewhere it was not.
+
 Standard runners are free on public repositories, so none of this is billed — the usage report
 prices it and then discounts the same amount, which is worth knowing before reading the dollar
 column as a bill. Runner time is still worth not wasting.
