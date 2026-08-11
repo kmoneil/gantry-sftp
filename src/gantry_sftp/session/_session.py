@@ -3044,6 +3044,7 @@ class Session(_SessionOperations):
             NotImplementedError: On a platform without offset-addressed local I/O.
             UnsafePathError: If a local name cannot be one remote path component.
         """
+        require_local_io("sync_tree()")
         _check_local_path(local_path, method="sync_tree()")
         _check_tree_concurrency(concurrency, progress=progress, caller="sync_tree")
         root = self._resolve(remote_path)

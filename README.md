@@ -58,7 +58,7 @@ same sentence as the reason to use it, so it is here rather than at the bottom.
 - **Python 3.13+**
 - **An `ssh` binary on `PATH`**, meaning `openssh-client`. Not a soft dependency, not vendored,
   and not optional.
-- **A POSIX host, for transfers.** `get` / `put` / `get_tree` / `put_tree` need
+- **A POSIX host, for transfers.** `get` / `put` / `get_tree` / `put_tree` / `sync_tree` need
   offset-addressed local I/O and raise `NotImplementedError` on Windows, before anything is
   sent. Everything that only talks to the far end works there. See
   [Requirements](#requirements) for why, and for the full list.
@@ -79,7 +79,7 @@ $ python -m gantry_sftp doctor
 gantry-sftp doctor
 
 local
-  library                 0.1.0 (filexfer v3)
+  library                 0.1.2 (filexfer v3)
   ssh executable          ssh -- a bare name, so PATH decides at spawn time
   ssh version             OpenSSH_10.0p2 Debian-7+deb13u4, OpenSSL 3.5.6 7 Apr 2026
   transfers               supported
@@ -128,7 +128,7 @@ task rather than by module:
 | Guide | What is in it |
 | --- | --- |
 | [Getting started](docs/getting-started.md) | Install, the `ssh` prerequisite, your first transfer, and the same code with and without an event loop |
-| [Transferring files](docs/transfers.md) | `get` / `put`, atomic publish, resume, content verification, timestamps, permissions, whole trees, previewing one with `dry_run`, and the incremental-ingest loop |
+| [Transferring files](docs/transfers.md) | `get` / `put`, atomic publish, resume, content verification, timestamps, permissions, whole trees, previewing one with `dry_run`, mirroring one with `sync_tree`, and the incremental-ingest loop |
 | [Paths, predicates and attributes](docs/paths.md) | `SFTPPath`, the bytes-versus-`Path` rule, `exists` / `is_dir` / `is_file`, a working directory, symlinks and `chmod` |
 | [Listing and matching](docs/listing-and-matching.md) | `listdir` / `scandir`, streaming a directory you did not size, and the `glob` dialect |
 | [Concurrency and byte ranges](docs/concurrency.md) | Many transfers over one connection, `concurrency=`, `open_file`, and reading part of a file |
@@ -166,6 +166,10 @@ suite. If you would rather read code than prose, start there.
   verbatim, a `TransferError` holds both paths and the offset it stopped at.
 - **Timeouts on every wait**, including the send, so a transfer cannot hang with nothing to
   escape it.
+- **A mirror whose skips carry their evidence.** `sync_tree` sends only what changed, and every
+  file comes back with the reason it was or was not sent — because the dangerous operation in a
+  mirror is the one that does nothing, and a wrong skip leaves stale bytes on the far end under a
+  successful result.
 - **One connection, many transfers**, multiplexed over a single `ssh` child.
 - **A `pathlib`-shaped path object**, an **fsspec filesystem**, and a **blocking facade**: three
   ways in besides the async session.
@@ -176,9 +180,9 @@ performance, and it writes its figures to a report rather than to this file.
 
 ## Status
 
-**0.1.0, the first public release, and beta rather than alpha: the feature set is complete and
-the API can still change.** While the major version is `0` a breaking change lands in the minor
-version. Two already have, deliberately, in the releases leading to this one.
+**0.1.2, and beta rather than alpha: the feature set is complete and the API can still change.**
+While the major version is `0` a breaking change lands in the minor version, so everything
+released so far — `0.1.0`, `0.1.1`, `0.1.2` — is source-compatible with what came before it.
 
 The protocol layer is complete: all 27 filexfer v3 packet types, encoded and decoded, each with a
 byte-level fixture asserted in **both** directions, checked against `draft-ietf-secsh-filexfer-02`
@@ -237,7 +241,7 @@ what typed it.
   worker thread, and `preserve_times` stamps a descriptor rather than a path. All three are
   Unix-only in CPython, and they are not incidental: writing at an explicit offset is why
   writes need no ordering and why a short `READ` is re-queued rather than restarting the
-  transfer. On Windows `get` / `get_tree` / `put` / `put_tree` raise `NotImplementedError`
+  transfer. On Windows `get` / `get_tree` / `put` / `put_tree` / `sync_tree` raise `NotImplementedError`
   naming what is missing, before anything is sent and before any local file is touched.
   Everything that talks only to the far end (connecting, `listdir`, `scandir`, `walk`,
   `stat`, `realpath`, `rename`, `remove`, `mkdir`, `rmdir`, `rmtree` and `check_file`) is

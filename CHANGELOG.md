@@ -3,6 +3,63 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## Unreleased
+
+**`Unreleased` rather than a version heading, and that distinction is enforced rather than
+observed.** `tests/test_packaging.py` accepts this heading *or* one naming the packaged version;
+`release.yml` refuses this one on a tag. Writing a version heading before the tag exists is how a
+changelog comes to describe a release that does not exist.
+
+### Added
+
+- **`Session.sync_tree(local, remote, manifest=...)`**, with a blocking form on `SyncSession`.
+  Makes a remote tree match a local one, sending only what changed, and returns a `SyncResult`
+  carrying a decision *and the reason for it* per file. New public names alongside it:
+  `SyncResult`, `SyncOutcome`, `SyncDecision`, `SyncReason`, `SyncManifest`, `ManifestEntry`,
+  `Comparison`, `compare_for_sync`, `MANIFEST_VERSION` and `times_from_stat`.
+
+  **The comparison is against a manifest this library writes, not against the remote timestamp**,
+  and that is not a preference. `preserve_times` is off by default, so a file uploaded by
+  `put_tree` carries the time of the *upload* — measured against a real `sftp-server` at
+  86,470,831 seconds away from the local mtime. A mirror comparing those two finds every file
+  changed on every run, forever. Turning `preserve_times` on to compensate would force on a flag
+  that exists to be off, so the comparison is against a record instead.
+
+  **The record stores both sides.** A record of what we sent cannot see a file truncated *on the
+  server*: the local half still matches, so a record-only mirror skips and leaves the destination
+  broken. A v3 listing carries the remote size and modification time already, so closing this
+  costs no round trips.
+
+  **Three decisions, and the third one transfers.** `TRANSFER`, `SKIPPED`, and `UNDECIDABLE` for a
+  server that volunteered no size or no modification time. Undecidable files are **sent** — a file
+  that could not be proven identical is not a file to leave alone — and counted separately, so a
+  run that could check nothing is visible without reading every outcome.
+
+  **It does not delete**, and there is no delta transfer: filexfer v3 has no rolling checksum and
+  no extension provides one, so an rsync-shaped algorithm is not implementable over this protocol.
+
+- **`DirEntry` from a local walk now carries modification times.** `local_dir_entry` filled
+  `size` and `permissions` and dropped `times`; it fills all three. Visible on `Skipped.entry` for
+  an upload, where the field was previously always `None`.
+
+### Fixed
+
+- **`live-tests/` had never run off Linux and did not survive contact.** 23 rows failed on macOS
+  at once: a Unix socket path is bounded by `sun_path`, which is 108 bytes on Linux and **104 on
+  macOS and the BSDs**, and pytest's `tmp_path` is past that on a Mac before a filename is
+  appended. That took out the whole `ControlMaster` guarantee and the whole agent-defence truth
+  table, and both failed looking like this library refusing to multiplex. A separate nine failed
+  because the non-UTF-8 filesystem probe lived in `tests/conftest.py`, which `live-tests/` cannot
+  import — two files cannot both be the module named `conftest` — so that lane asked the
+  filesystem nothing. No library code changed; this is the suite, and it is listed because the
+  guarantees it had stopped proving are ones this project advertises.
+
+### Changed
+
+- **CI runs the `live` lane on macOS as well as Linux**, so the above stays fixed. Required
+  status checks are now `live (ubuntu-latest)` and `live (macos-latest)` in place of `live`.
+  Nothing a user installs is affected.
+
 ## 0.1.2 — 2026-08-10
 
 **Six new methods and no breaking change, which under this project's `0.x` rule makes it a patch.**

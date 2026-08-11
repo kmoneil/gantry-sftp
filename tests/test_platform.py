@@ -126,7 +126,16 @@ def test_the_refusal_lists_every_missing_primitive(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 
 
-TRANSFERS = ("get", "get_tree", "put", "put_tree")
+TRANSFERS = ("get", "get_tree", "put", "put_tree", "sync_tree")
+"""Every entry point that places bytes in a local file, which is the POSIX-only set.
+
+`sync_tree` joined it in D-164 and **was missing its refusal when it did**. Its docstring already
+promised `NotImplementedError`, and nothing raised one: the call reached `put()`, which refuses
+for itself, so on Windows it would have created the whole remote directory skeleton and then
+failed naming the wrong method. Found by a documentation sweep asking which enumerations of the
+tree operations had gone stale, not by any gate -- this list is hand-maintained, which is the
+cost of it being the thing that proves the refusal comes before the wire.
+"""
 
 
 async def call_transfer(sftp: object, name: str, tmp_path: Path) -> None:
@@ -138,9 +147,14 @@ async def call_transfer(sftp: object, name: str, tmp_path: Path) -> None:
         source = tmp_path / "source.bin"
         _ = source.write_bytes(b"payload")
         await sftp.put(source, b"/remote/file.bin")  # type: ignore[attr-defined]
-    else:
+    elif name == "put_tree":
         (tmp_path / "tree").mkdir()
         await sftp.put_tree(tmp_path / "tree", b"/remote")  # type: ignore[attr-defined]
+    else:
+        (tmp_path / "tree").mkdir()
+        await sftp.sync_tree(  # type: ignore[attr-defined]
+            tmp_path / "tree", b"/remote", manifest=tmp_path / "state.json"
+        )
 
 
 @pytest.mark.parametrize("name", TRANSFERS)
