@@ -41,7 +41,6 @@ from fsspec.registry import (
     registry,
 )
 
-from conftest import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names
 from gantry_sftp import fsspec as gantry_fsspec
 from gantry_sftp.codec import Attrs
 from gantry_sftp.exceptions import CapabilityError, NoSuchFileError, ServerError
@@ -61,6 +60,7 @@ from gantry_sftp.fsspec import (
 from gantry_sftp.session import SessionOptions
 from gantry_sftp.sync import BoundPortal
 from gantry_sftp.transport import find_sftp_server
+from local_filesystem import HOLDS_NON_UTF8_NAMES, needs_non_utf8_names
 
 ROOT = Path(__file__).resolve().parent.parent
 

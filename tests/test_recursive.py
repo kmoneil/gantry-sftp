@@ -18,7 +18,6 @@ from pathlib import Path
 import anyio
 import pytest
 
-from conftest import HOLDS_NON_UTF8_NAMES, give_one_file_a_second_name
 from gantry_sftp.codec import (
     Attrs,
     AttrsReply,
@@ -70,6 +69,7 @@ from gantry_sftp.session import (
     remote_component_reason,
 )
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from local_filesystem import HOLDS_NON_UTF8_NAMES, give_one_file_a_second_name
 
 # `build_tree` adds the non-UTF-8 name only where the filesystem will hold it, so every
 # count and byte total over that tree has to move with it rather than being a literal.

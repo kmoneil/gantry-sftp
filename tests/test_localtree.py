@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from conftest import HOLDS_NON_UTF8_NAMES
 from gantry_sftp.exceptions import UnsafePathError
 from gantry_sftp.session import (
     EntryKind,
@@ -22,6 +21,7 @@ from gantry_sftp.session import (
     remote_component,
     walk_local,
 )
+from local_filesystem import HOLDS_NON_UTF8_NAMES
 
 
 def build(root: Path) -> None:

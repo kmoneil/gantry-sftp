@@ -45,16 +45,21 @@ def authentications(server: SSHServer) -> int:
     return log.count("Accepted publickey")
 
 
-def control_path(tmp_path: Path) -> Path:
+def control_path(short_socket_dir: Path) -> Path:
     """A socket path for one test.
 
-    Short by construction. A `ControlPath` is a Unix socket path and therefore bounded by
-    ``sun_path`` -- 108 bytes on Linux -- and pytest's ``tmp_path`` under a long temp root plus
-    the ``%r@%h:%p`` expansion gets close enough that a test named for something else starts
-    failing on path length. `ssh` reports that as a plain refusal to multiplex, which reads as
-    this library's fault.
+    A `ControlPath` is a Unix socket path and therefore bounded by ``sun_path`` -- 108 bytes on
+    Linux, **104 on macOS and the BSDs** -- and the ``%r@%h:%p`` expansion spends more of it.
+    `ssh` reports the overrun as a plain refusal to multiplex, which reads as this library's
+    fault.
+
+    **This took `tmp_path` and the warning above was written against Linux's bound alone**, so
+    all six rows here failed the first time the lane ran on macOS: `ControlPath too long
+    ('/private/var/folders/.../pytest-of-kevin/pytest-N/<test-name>/cm' >= 104 bytes)`. The
+    fixture is where the shortness now comes from, and it proves it by binding rather than
+    asserting a constant.
     """
-    return tmp_path / "cm"
+    return short_socket_dir / "cm"
 
 
 def start_master(server: SSHServer, socket_path: Path) -> subprocess.Popen[bytes]:
@@ -114,7 +119,7 @@ def wait_for_socket(socket_path: Path, process: subprocess.Popen[bytes]) -> None
 
 
 async def test_an_existing_master_is_reused_because_controlpath_is_untouched(
-    ssh_server: SSHServer, tmp_path: Path
+    ssh_server: SSHServer, short_socket_dir: Path
 ) -> None:
     """The half of the claim that `ssh -G` cannot reach.
 
@@ -122,7 +127,7 @@ async def test_an_existing_master_is_reused_because_controlpath_is_untouched(
     shipped default also suppressed reuse -- which is what a reader would reasonably fear on
     seeing it -- then every connection here would authenticate again and the count would climb.
     """
-    socket_path = control_path(tmp_path)
+    socket_path = control_path(short_socket_dir)
     master = start_master(ssh_server, socket_path)
     try:
         wait_for_socket(socket_path, master)
@@ -146,7 +151,7 @@ async def test_an_existing_master_is_reused_because_controlpath_is_untouched(
 
 
 async def test_this_library_does_not_start_a_master_of_its_own(
-    ssh_server: SSHServer, tmp_path: Path
+    ssh_server: SSHServer, short_socket_dir: Path
 ) -> None:
     """The consequence a reader pays for, and the reason the docs had to change.
 
@@ -154,7 +159,7 @@ async def test_this_library_does_not_start_a_master_of_its_own(
     `ControlMaster auto` in their `ssh_config` and running only this library: the socket is
     never created, so connection two has nothing to reuse and the config line bought nothing.
     """
-    socket_path = control_path(tmp_path)
+    socket_path = control_path(short_socket_dir)
     before = authentications(ssh_server)
 
     for _ in range(2):
@@ -173,7 +178,7 @@ async def test_this_library_does_not_start_a_master_of_its_own(
     )
 
 
-async def test_asking_for_a_master_gets_one(ssh_server: SSHServer, tmp_path: Path) -> None:
+async def test_asking_for_a_master_gets_one(ssh_server: SSHServer, short_socket_dir: Path) -> None:
     """The third state, and the one that makes the other two a decision rather than a limit.
 
     Without this the pair above is equally consistent with multiplexing being unreachable from
@@ -181,7 +186,7 @@ async def test_asking_for_a_master_gets_one(ssh_server: SSHServer, tmp_path: Pat
     the shipped value is *replaced* rather than joined -- there is no repeated `-o` here for
     `ssh`'s first-wins rule to resolve.
     """
-    socket_path = control_path(tmp_path)
+    socket_path = control_path(short_socket_dir)
     before = authentications(ssh_server)
 
     async with (
