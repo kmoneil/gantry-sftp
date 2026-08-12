@@ -67,6 +67,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import mkstemp
 
 from gantry_sftp.session._listing import decode_name
 
@@ -80,6 +81,7 @@ __all__ = [
     "entry_matches",
     "fold",
     "fsync_directory",
+    "replace_atomically",
     "source_identity",
     "staged_for",
 ]
@@ -235,6 +237,52 @@ def fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def replace_atomically(destination: Path, payload: bytes) -> None:
+    """Put ``payload`` at ``destination`` through a temporary sibling nobody else can name.
+
+    **The name is the security decision** (D-175). Both rewrites here used to derive the
+    temporary from the real file -- ``<journal>.compacting``, ``<manifest>.partial`` -- and open
+    it ``O_CREAT|O_TRUNC``, which is a name a caller never asked for, in a directory this library
+    does not own, that anybody able to write there could predict. A symlink planted at it was
+    followed: the file it pointed at was truncated and overwritten, and the ``replace`` below
+    then renamed the *link* over the real path, so every later append went there too.
+
+    This is the argument :func:`~gantry_sftp.session._publish.staging_token` already makes about
+    the file we create on the *server* -- a predictable staging name is what the randomness is
+    for -- arriving at the two we create on the local disk. :func:`tempfile.mkstemp` is the
+    whole mechanism: ``O_CREAT | O_EXCL``, plus ``O_NOFOLLOW`` where the platform has it, at a
+    name that is not derivable. ``O_EXCL`` is doing work ``O_NOFOLLOW`` cannot, because a *hard*
+    link at the name is not a symlink and would be written through.
+
+    **The refusal stops at the name we chose.** The path the caller named is opened the way
+    ``get`` opens a caller's download destination -- following a link, because a state file that
+    is a symlink to somewhere else is a deployment rather than an attack, and ``no_follow`` is a
+    parameter there and off by default. Where the journal may be placed is a documented rule
+    instead: see :class:`UploadJournal` and ``docs/reliability.md``.
+
+    Cleans up on any failure, which the predictable name did not do either -- a temporary left
+    behind under a random name is litter nobody can identify, so the cost of the unpredictable
+    name is paid here rather than by whoever finds it.
+
+    Args:
+        destination: The file to end up holding ``payload``. Its parent directory must exist.
+        payload: The whole new contents.
+    """
+    descriptor, name = mkstemp(dir=destination.parent, prefix=f"{destination.name}.")
+    staging = Path(name)
+    try:
+        try:
+            _ = os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _ = staging.replace(destination)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+    fsync_directory(destination.parent)
+
+
 def fold(path: Path | str) -> dict[str, JournalEntry]:
     """Read the log and return what is still in flight, keyed by decoded target path.
 
@@ -324,24 +372,18 @@ def compact(path: Path | str) -> int:
     between the fold and the replace has its record dropped. The sweep calls it; a transfer
     never does.
 
-    Written to a sibling and renamed, so an interrupted compaction leaves the original log
-    rather than half of one.
+    Written to a temporary sibling and renamed, so an interrupted compaction leaves the original
+    log rather than half of one. That sibling's *name* is :func:`replace_atomically`'s subject
+    and is not derived from this file's (D-175).
 
     Returns:
         How many entries survived, which is how many staging files may still be out there.
     """
     destination = Path(path)
     surviving = fold(destination)
-    staging = destination.with_name(f"{destination.name}.compacting")
-    lines = b"".join(_line(_STAGED, _fields_of(entry)) for entry in surviving.values())
-    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        _ = os.write(descriptor, lines)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    staging.replace(destination)
-    fsync_directory(destination.parent)
+    replace_atomically(
+        destination, b"".join(_line(_STAGED, _fields_of(entry)) for entry in surviving.values())
+    )
     return len(surviving)
 
 
@@ -408,6 +450,13 @@ class UploadJournal:
     will not be one -- it has to outlive the process to be worth anything, so it cannot go
     anywhere this library would clean up, and choosing a directory on somebody's disk is not a
     decision a library gets to make.
+
+    **Put it somewhere only this job can write.** This path is opened following a symlink, the
+    way ``get`` opens a download destination and for the same reason -- a state file that is a
+    link to somewhere else is a deployment rather than an attack -- so in a shared directory the
+    records can be appended into a file somebody else chose. The temporary that :meth:`compact`
+    writes is the half this library owns, and it is unpredictable and ``O_EXCL | O_NOFOLLOW``
+    (D-175). ``docs/reliability.md`` has the rule under "Where to put the journal".
 
     Attributes:
         path: Where the log lives. Its parent directory must exist.

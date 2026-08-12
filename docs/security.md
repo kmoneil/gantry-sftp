@@ -41,6 +41,7 @@ are not — see [the URL form](integrations.md#the-url-form).
 | A connection going somewhere the program never meant to reach | [Restricting where a connection may go](connecting.md#restricting-where-a-connection-may-go) | [CWE-918](https://cwe.mitre.org/data/definitions/918.html) |
 | A delivered file being world-readable between creation and `chmod` | [The mode is on the file before anything can open it by name](transfers.md#the-mode-is-on-the-file-before-anything-can-open-it-by-name) | [CWE-732](https://cwe.mitre.org/data/definitions/732.html) |
 | An operation following a symlink somebody planted | [Changing attributes, and links](paths.md#changing-attributes-and-links) | [CWE-59](https://cwe.mitre.org/data/definitions/59.html) |
+| A local file this library creates beside one you named being planted at first | [Where to put the journal](reliability.md#where-to-put-the-journal) | [CWE-59](https://cwe.mitre.org/data/definitions/59.html) |
 | A predicate answering "no" when it means "I could not tell" | *below* | [CWE-636](https://cwe.mitre.org/data/definitions/636.html) |
 
 ### Controls fail closed

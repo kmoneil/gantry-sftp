@@ -843,7 +843,10 @@ the compaction, where it costs nothing worth measuring and turns a power cut fro
 record" into "lose nothing".
 
 The manifest path is opened before the walk starts, so a directory that does not exist is
-reported then rather than by whichever file the walk happened to reach first.
+reported then rather than by whichever file the walk happened to reach first. Put it where only
+this job can write, for the reason
+[Where to put the journal](reliability.md#where-to-put-the-journal) gives about the other
+long-lived file this library keeps on your disk.
 
 ### The record stores both sides
 
