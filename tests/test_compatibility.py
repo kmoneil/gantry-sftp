@@ -85,7 +85,7 @@ from gantry_sftp.session import ServerLimits, raise_for_status
 from gantry_sftp.session._quirks import PROFILES, UNKNOWN
 from gantry_sftp.sync import open_local_server_transport, open_session
 from gantry_sftp.transport import find_sftp_server
-from local_filesystem import SERVER_CAN_CHMOD_A_SYMLINK
+from local_filesystem import FILESYSTEM_FOLDS_CASE, SERVER_CAN_CHMOD_A_SYMLINK
 
 CASE_FOLDS = "this server folds case in names"
 ROOT_IS_SLASH = "the root of this server's namespace is /"
@@ -1022,7 +1022,10 @@ def test_the_reference_server_answers_every_question_the_battery_asks(tmp_path: 
         # differ from each other and are both the code's own name.
         ("a refusal carries a message that says more than its status code", Verdict.NO),
         ("limits@openssh.com answers with a usable maximum", Verdict.YES),
-        ("this server folds case in names", Verdict.NO),
+        # A property of the disk this server is serving, not of the server. macOS's APFS
+        # folds and ext4 does not, so this row is derived -- and the battery reporting `yes`
+        # on a Mac is the battery *working*.
+        ("this server folds case in names", Verdict.YES if FILESYSTEM_FOLDS_CASE else Verdict.NO),
         ("RENAME replaces an existing target", Verdict.NO),
         ("a file's timestamps survive being set", Verdict.YES),
         ("posix-rename@openssh.com actually renames", Verdict.YES),

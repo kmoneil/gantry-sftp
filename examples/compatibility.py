@@ -15,10 +15,16 @@ ones are permanently outside it. The evidence has to come from the person who ca
 server, which means it has to be producible by them.
 
 **The one lesson worth copying out of here** is the reason every extension probe checks the
-*result* instead of the status. ``lsetstat@openssh.com`` is advertised by OpenSSH's server and
-by asyncssh's; on Linux it works on neither, and the two fail differently -- OpenSSH refuses,
-asyncssh answers ``OK`` and moves nothing. A report that believed the status would call the
-second one working, which is the confident-and-wrong answer this whole feature exists to avoid.
+*result* instead of the status. ``lsetstat@openssh.com`` is the row to watch below, and what it
+answers **depends on the machine the server is running on**: Linux has no ``lchmod``, so
+OpenSSH's permissions branch cannot succeed there and refuses; macOS has one, so it works. The
+advertisement is byte-identical in both cases.
+
+That is the whole claim in one line -- *what a server advertises does not tell you what it
+does* -- and it is why the probe reads the link's mode and the target's afterwards rather than
+believing the status. asyncssh, measured on Linux, is the case that makes believing the status
+actively dangerous: it answers ``OK`` and moves nothing, so a report that trusted the reply
+would call the one server that silently discards the request the one where the extension works.
 
 This example runs **both** batteries, because it owns the directory it is pointed at. Against a
 real server that directory is a scratch directory under your home, and every file it creates is
