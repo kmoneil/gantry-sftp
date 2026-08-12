@@ -55,7 +55,10 @@ the spelling for "give me one fsspec will not hand to anybody else".
 would otherwise take out of our hands: ``storage_options`` is what ``__reduce__`` pickles --
 so a dask scheduler ships it to every worker -- and what ``to_json()`` serialises, whose
 ``include_password`` parameter defaults to ``True``. Listing it in ``_strip_tokenize_options``
-means it reaches ``__init__`` and is never stored there. The measured cost is stated on
+means it reaches ``__init__`` and is never stored there, and
+:class:`_CredentialAwareCache` scrubs the mapping afterwards so the guarantee does not rest on
+a private attribute of somebody else's release. The same metaclass is why a password-bearing
+filesystem is not shared out of the instance cache; the cost of that is stated on
 :class:`GantrySFTPFileSystem`.
 """
 
@@ -73,7 +76,7 @@ try:
     from fsspec import AbstractFileSystem
     from fsspec.callbacks import DEFAULT_CALLBACK, Callback
     from fsspec.registry import known_implementations, register_implementation, registry
-    from fsspec.spec import AbstractBufferedFile
+    from fsspec.spec import AbstractBufferedFile, _Cached
     from fsspec.utils import infer_storage_options, isfilelike
 except ModuleNotFoundError as _exc:  # pragma: no cover -- proven by a subprocess test
     raise ModuleNotFoundError(
@@ -444,7 +447,70 @@ def _parse_query(query: str) -> dict[str, Any]:
     return kwargs
 
 
-class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec ships no py.typed
+class _CredentialAwareCache(_Cached):  # type: ignore[misc]  # fsspec ships no py.typed
+    """Two guarantees about a password that fsspec's own metaclass does not make.
+
+    Both are one line and neither is redundant with the other or with
+    ``_strip_tokenize_options``; they cover three different surfaces, and the third only exists
+    because of what the first two cannot reach.
+
+    **Skipping the cache under a credential** (D-178). ``_Cached.__call__`` keys its cache on
+    ``tokenize(cls, pid, threading.get_ident(), *args, **kwargs)`` *after*
+    ``_strip_tokenize_options`` has removed the password -- so two constructions differing only
+    in password collide, and the second gets a session the first authenticated. That is the
+    right trade for the token and the wrong default for the caller, so a password-bearing
+    construction opts out of the cache here. ``setdefault`` rather than assignment: a caller who
+    passes ``skip_instance_cache=False`` explicitly still shares, because a default this library
+    changes must not become a rule a caller cannot override. Key-based authentication is
+    untouched, which is where the cache was worth having.
+
+    **Scrubbing** ``storage_options`` (D-177). Keeping the password out of that mapping is
+    currently *fsspec's* behaviour and not ours: we contribute a tuple, and ``_Cached.__call__``
+    contributes the ``kwargs.pop`` that runs before ``obj.storage_options = kwargs``. It is one
+    mapping and both serialisation surfaces read it -- ``__reduce__`` returns it verbatim, and
+    ``to_json()`` reaches it through ``FilesystemJSONEncoder``, whose ``include_password``
+    parameter defaults to ``True``. So a release that stops honouring the attribute puts the
+    credential into a dask worker's pickle with nothing raised anywhere. Measured with the
+    attribute neutered, in ``_plans/probes/fsspec_credential_belt_probe.py``.
+
+    **Why a scrub and not a check.** The first shape considered was a loud self-check at
+    :func:`register`, and it was refused: a detector turns a silent leak into a startup failure,
+    which is better, while a structural fix turns it into nothing, for the same number of lines.
+    A detector is what you build when the structural fix is unavailable.
+
+    ``_strip_tokenize_options`` **stays** and is not made redundant by any of this. It keeps the
+    password out of the cache *token*, which this metaclass cannot do from where it stands --
+    the token is computed inside ``super().__call__`` and is gone by the time an instance comes
+    back. Braces and belt, each load-bearing for a different property.
+
+    **The private import is deliberate.** ``type(AbstractFileSystem)`` is the same object and
+    spells no private name, and it was refused for that: a released fsspec that renames
+    ``_Cached`` should break this at import, loudly, rather than silently rebind a metaclass
+    whose contract nobody re-read.
+    """
+
+    def __call__(
+        cls,  # noqa: N805  # a metaclass method receives the class, and `cls` is its name
+        *args: object,
+        **kwargs: object,
+    ) -> GantrySFTPFileSystem:
+        """Construct, or return a cached instance, with the two guarantees above applied."""
+        if kwargs.get("password") is not None:
+            kwargs.setdefault("skip_instance_cache", True)
+        # Annotated rather than inferred: `_Cached` is untyped, so `super().__call__` is `Any`
+        # and returning it directly would be a `no-any-return` under --strict.
+        instance: GantrySFTPFileSystem = super().__call__(*args, **kwargs)
+        # Unconditional, and cheap: on a cache hit the key is already gone, and on the shipped
+        # fsspec it was never there. This is the line that costs nothing until it is the only
+        # thing standing between a credential and a pickle.
+        _ = instance.storage_options.pop("password", None)
+        return instance
+
+
+class GantrySFTPFileSystem(
+    AbstractFileSystem,  # type: ignore[misc]  # fsspec ships no py.typed
+    metaclass=_CredentialAwareCache,
+):
     """Files over SFTP, with OpenSSH doing the cryptography.
 
     Not registered on import -- see :func:`register` and this module's docstring.
@@ -458,22 +524,31 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         frame = pd.read_parquet("gantry-sftp://user@example.com/incoming/events.parquet")
 
     **The password is deliberately absent from** ``storage_options``, so it cannot travel in a
-    pickle or a ``to_json()``. The measured cost is the instance cache: two constructions
-    differing *only* in password return the same instance, holding the first password, because
-    the password is not part of the cache token.
+    pickle or a ``to_json()``. Two mechanisms hold that, covering different surfaces, and
+    :class:`_CredentialAwareCache` is where both live and why neither is redundant.
 
-    **Read that as an authentication consequence, not a caching one.** The second caller's
-    password is never checked against anything -- so a password that is *wrong* for the account
-    still yields a working session, authenticated by whoever constructed first. In a process
-    where one principal supplies credentials that is a stale connection; in a process where
-    several do -- a dask worker, a notebook server, a shared ETL job, which is the audience this
-    adapter exists for -- knowing a username is enough to inherit somebody else's session, and
-    nothing distinguishes it in a log because it *is* a legitimate connection. Pass
-    ``skip_instance_cache=True`` whenever more than one principal can reach this process.
+    **A password-bearing filesystem is not served from the instance cache** (D-178). Keeping the
+    password out of the cache *token* is what makes it un-picklable, and is not negotiable -- but
+    it means two constructions differing *only* in password would otherwise collide, and the
+    second caller's password is never checked against anything, so one that is *wrong* for the
+    account still yields a working session authenticated by whoever constructed first. In a
+    process where several principals supply credentials -- a dask worker, a notebook server, a
+    shared ETL job, which is the audience this adapter exists for -- knowing a username was
+    enough to inherit somebody else's session, and nothing distinguished it in a log because it
+    *is* a legitimate connection.
 
-    Keeping the password out of the token is still the right trade and is not negotiable: it is
-    what makes the credential un-picklable. The cache collision is its price, and this is what
-    the price actually is.
+    So that is now the default: pass a ``password`` and you get an instance nobody else is
+    handed. **What it costs is a connection**, and it is worth knowing which one you are paying:
+    a program resolving the same password-bearing URL in a loop spawns an ``ssh`` per resolution
+    instead of reusing one. ``skip_instance_cache=False``, passed explicitly, restores the old
+    sharing for a caller who has decided their process has one principal in it. Key-based
+    authentication is untouched and still caches, which is where the cache was worth having.
+
+    **The collision needed one thread, which is why the old advice was hard to act on.** The
+    token carries ``threading.get_ident()``, so a thread-per-request server was never exposed
+    and a single-threaded async service always was -- and the docstring that told a reader to
+    reach for ``skip_instance_cache=True`` gave them no way to work out which they were. A
+    default does not need them to.
 
     **The predicates here are fsspec's, not this library's.** ``exists`` / ``isdir`` /
     ``isfile`` come from ``AbstractFileSystem`` and swallow every exception, including a
@@ -494,10 +569,11 @@ class GantrySFTPFileSystem(AbstractFileSystem):  # type: ignore[misc]  # fsspec 
         port: Remote port.
         identity_file: Private key to offer. Not settable from a URL.
         password: Sent through ``SSH_ASKPASS``, never argv, never a log line, and never stored
-            in ``storage_options``. Not part of the instance-cache token either, so a second
-            construction differing only in this argument reuses the first one's session and its
-            credential -- including when this one is wrong for the account. Pass
-            ``skip_instance_cache=True`` where more than one principal shares the process.
+            in ``storage_options``. Not part of the instance-cache token either, which is what
+            keeps it un-picklable -- so supplying one makes this instance uncached, and a
+            program resolving the same URL repeatedly gets an ``ssh`` child per resolution.
+            Pass ``skip_instance_cache=False`` to share anyway, in a process you know has one
+            principal in it.
         config_file: An ``ssh_config`` to read instead of the default. Not settable from a URL.
         options: Extra ``-o`` options for ``ssh``. Never settable from a URL.
         ssh_executable: Which ``ssh`` to spawn. Not settable from a URL.

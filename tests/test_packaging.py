@@ -737,6 +737,13 @@ def test_the_adapter_page_still_names_the_cache_as_an_authentication_cost():
     So the consequence is pinned rather than the mechanism -- an edit may rewrite the sentence
     and may not quietly demote it back to a caching note.
 
+    **D-178 made the control the default and the pin grew a third phrase for it.** The
+    consequence stays on the page in the past tense, because a reader upgrading needs to know
+    what changed and a reader on an older version needs to know what they have -- and because
+    the page is where the connection-count cost is explained. Pinning only the first two would
+    let an edit delete the new default and keep the test green, which is the shape this file
+    exists to refuse.
+
     Note the spelling of the first phrase: the page emphasises *wrong* in that sentence, so a
     pin reading "wrong for the account" is broken by the asterisks and fails against a page
     that says exactly what it should. Pin a span with no markup inside it, or the test reports
@@ -746,6 +753,7 @@ def test_the_adapter_page_still_names_the_cache_as_an_authentication_cost():
     admissions = (
         "for the account still gives a working session",
         "skip_instance_cache=True",
+        "not shared out of the instance cache",
     )
     missing = [phrase for phrase in admissions if phrase not in page]
     assert not missing, (

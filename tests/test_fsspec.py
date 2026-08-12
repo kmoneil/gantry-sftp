@@ -282,36 +282,93 @@ def test_the_repr_names_the_endpoint_and_the_state():
     assert repr(filesystem) == "<GantrySFTPFileSystem bob@example.com (not connected)>"
 
 
-def test_a_wrong_password_reuses_the_session_the_right_one_opened():
-    """D-126. The price of keeping the password out of the cache token, named as what it is.
+def test_a_password_is_not_served_from_the_instance_cache():
+    """D-178, and the inverse of what this test asserted as D-126.
 
     The token omits ``password`` so the credential cannot travel in a pickle or a ``to_json()``,
-    and that stays -- but it means the second caller's password is **never checked against
-    anything**. A password that is wrong for the account still yields a working session,
-    authenticated by whoever constructed first.
-
-    Asserted as the security statement rather than as a caching one, because the two get read by
-    different people: this used to be named for the *cost* and a reader budgeting for a stale
-    connection does not reach for ``skip_instance_cache=True``, which is the control.
+    and that stays -- but it meant the second caller's password was **never checked against
+    anything**, so one that is wrong for the account still yielded a working session
+    authenticated by whoever constructed first. D-126 found that, named it correctly and wrote
+    ``skip_instance_cache=True`` into three docstrings as the control. What it left was the
+    unsafe arrangement as the default, which is what this now refuses.
     """
     try:
         right = GantrySFTPFileSystem("example.com", user="bob", password="correct-horse")
         wrong = GantrySFTPFileSystem("example.com", user="bob", password="not-the-password")
 
-        assert wrong is right
-        # The whole finding in one line: what `wrong` will authenticate with is not what it
-        # was given.
-        assert wrong._password == "correct-horse"  # noqa: SLF001
-
-        apart = GantrySFTPFileSystem(
-            "example.com", user="bob", password="not-the-password", skip_instance_cache=True
-        )
-        assert apart is not right
-        assert apart._password == "not-the-password"  # noqa: SLF001
+        assert wrong is not right
+        # The whole card in one line: what `wrong` will authenticate with is what it was given.
+        assert wrong._password == "not-the-password"  # noqa: SLF001
+        assert right._password == "correct-horse"  # noqa: SLF001
     finally:
-        # Both cached constructions above are keyed on a token this test invented, and the
-        # cache is process-global. Leaving them behind would let this test decide what a later
-        # one resolves -- the failure `_restore_registry` exists for, one cache along.
+        # Nothing above should have been cached, so this clears an empty dict on the happy
+        # path -- and is what stops a regression here deciding what a later test resolves.
+        GantrySFTPFileSystem._cache.clear()  # noqa: SLF001
+
+
+def test_skip_instance_cache_false_still_shares_under_a_password():
+    """D-178's compatibility half: the old spelling still resolves the old way.
+
+    ``_CredentialAwareCache`` uses ``setdefault``, not assignment, so a caller who has decided
+    their process holds one principal can still have the cache. Passing it explicitly is the
+    difference between a default this library chose and a rule a caller cannot override -- and
+    without this test the two are indistinguishable.
+    """
+    try:
+        first = GantrySFTPFileSystem(
+            "example.com", user="bob", password="correct-horse", skip_instance_cache=False
+        )
+        second = GantrySFTPFileSystem(
+            "example.com", user="bob", password="not-the-password", skip_instance_cache=False
+        )
+        assert second is first
+        assert second._password == "correct-horse"  # noqa: SLF001
+    finally:
+        GantrySFTPFileSystem._cache.clear()  # noqa: SLF001
+
+
+def test_the_cache_still_works_without_a_credential():
+    """D-178 costs a connection on the password path and must cost nothing on the other one.
+
+    Key-based authentication is the common path and the one the instance cache was worth having
+    for -- an ``ssh`` child per resolution instead of per thread per endpoint. A fix that
+    disabled the cache outright would pay for this card with everybody else's connections.
+    """
+    try:
+        first = GantrySFTPFileSystem("example.com", user="bob")
+        second = GantrySFTPFileSystem("example.com", user="bob")
+        assert second is first
+    finally:
+        GantrySFTPFileSystem._cache.clear()  # noqa: SLF001
+
+
+def test_the_password_stays_out_of_storage_options_without_fsspec_stripping_it():
+    """D-177. The guarantee must not rest on a private attribute of somebody else's release.
+
+    ``_strip_tokenize_options`` is consumed entirely inside fsspec's ``_Cached.__call__``: we
+    contribute a tuple and *fsspec* contributes the ``kwargs.pop`` that runs before
+    ``obj.storage_options = kwargs``. An empty tuple is exactly what its removal looks like from
+    our side -- nothing gets popped -- and with no belt the credential lands in the one mapping
+    ``__reduce__`` returns verbatim and ``to_json(include_password=True)`` serialises, with
+    nothing raised anywhere.
+
+    Neutered on the class rather than by patching fsspec, because the attribute is read off
+    ``cls`` and that is the surface a release would change.
+    """
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(GantrySFTPFileSystem, "_strip_tokenize_options", ())
+        filesystem = GantrySFTPFileSystem(
+            "example.com", user="bob", password="hunter2", skip_instance_cache=True
+        )
+        assert "password" not in filesystem.storage_options
+        assert "hunter2" not in filesystem.to_json()
+        assert "hunter2" not in repr(filesystem.__reduce__())
+        # And the argument still arrives, so the scrub is not deleting a working parameter --
+        # the failure mode a fix aimed at a mapping could easily have.
+        assert filesystem._password == "hunter2"  # noqa: SLF001
+    finally:
+        monkey.undo()
         GantrySFTPFileSystem._cache.clear()  # noqa: SLF001
 
 
