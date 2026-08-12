@@ -2927,9 +2927,11 @@ class Session(_SessionOperations):
                 Windows. Raised before the walk starts; see :mod:`._platform`.
             UnsafePathError: If a local name could not be a remote path component.
             ValueError: If ``publish`` carries a ``staging_name``, which one tree's many files
-                cannot share; if ``resume`` is asked for with atomic publishing, which has
-                nothing findable to resume into; or if ``concurrency`` is below 1 or is above 1
-                with a ``progress`` callback.
+                cannot share; if ``resume`` is asked for with atomic publishing and no journal,
+                which leaves nothing findable to resume into; if ``publish`` contradicts itself
+                the way :meth:`put` refuses; or if ``concurrency`` is below 1 or is above 1
+                with a ``progress`` callback. All of them are raised **before the walk starts**,
+                so a refused request creates no directory on the server.
             OSError: If a local directory or file cannot be read.
             CapabilityError: If a required guarantee is not available on this server, or if
                 ``remote_path`` is relative and this server's default directory is not rooted
@@ -3114,6 +3116,9 @@ class Session(_SessionOperations):
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O.
             UnsafePathError: If a local name cannot be one remote path component.
+            ValueError: If ``publish`` carries a ``staging_name`` or contradicts itself the way
+                :meth:`put` refuses, or if ``concurrency`` is below 1 or is above 1 with a
+                ``progress`` callback. Raised before the walk starts.
         """
         require_local_io("sync_tree()")
         _check_local_path(local_path, method="sync_tree()")

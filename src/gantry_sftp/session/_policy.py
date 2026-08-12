@@ -895,25 +895,40 @@ def _check_tree_concurrency(
 
 
 def _check_tree_publish(policy: Publish, *, resume: bool, caller: str) -> None:
-    """Refuse a publish policy that one name cannot serve a whole tree with.
+    """Refuse a publish policy a whole tree cannot be given.
 
-    Both refusals are about the **staging name**, which is per file for a reason, and both are
-    raised here rather than at the first transfer: the fault is in the request, so a report
-    blaming a file chosen by walk order would name the wrong thing.
+    **Two refusals are this function's own and the rest are delegated**, which is structural
+    rather than tidy. Every file in the tree goes through :meth:`Session.put`, so every rule
+    :func:`_check_publish_flags` enforces is enforced anyway -- but *per file, inside the walk*,
+    which is precisely what this function exists to prevent: the fault is in the request, so a
+    report blaming a file chosen by walk order would name the wrong thing, and by then
+    ``put_tree`` has already created the destination and its missing parents for a transfer that
+    will not happen.
 
-    Split out of :meth:`Session.put_tree` in the same shape as
-    :func:`_check_tree_concurrency`, which validates the argument beside these two. Nothing
-    downstream of it moved -- these guards read ``policy`` and ``resume`` and nothing the walk
-    builds, which is why they were already the first thing after the policy was resolved.
+    The two kept here are kept because a tree's answer differs from one file's. ``resume`` needs
+    a journal rather than a journal *or* a ``staging_name``, and a message offering a
+    ``staging_name`` to a caller who cannot use one is worse than no message; and a
+    ``staging_name`` is refused outright, since one name applied to every file in a tree means
+    they all stage under it and overwrite each other.
 
-    **A journal lifts the first refusal, exactly as it does for one file** (D-172). This guard
-    is :func:`_check_publish_flags` one layer out, and that one was amended by D-166 to accept a
-    journal while still refusing a derived name; this one was not, so for a day it raised the
-    pre-journal argument -- *"a previous run's partial cannot be found"* -- at the caller who
-    had just made it findable. A tree needs nothing extra for it to work: ``put_tree`` forwards
-    ``resume`` and the policy to :meth:`Session.put` per file, and each file records its own
-    random staging name under its own target. Verified by killing a ``put_tree`` mid-file and
-    restarting it, rather than by reading the call chain.
+    They run **before** the delegation, which is what keeps those two messages reachable: after
+    them the state :func:`_check_publish_flags` would refuse for ``resume`` is already refused
+    here, so its clause is dead and every other rule it grows in future arrives automatically.
+
+    **A journal lifts the resume refusal, exactly as it does for one file** (D-172). That guard
+    was amended by D-166 to accept a journal while still refusing a derived name; this one was
+    not, so for a day it raised the pre-journal argument -- *"a previous run's partial cannot be
+    found"* -- at the caller who had just made it findable. A tree needs nothing extra for it to
+    work: ``put_tree`` forwards ``resume`` and the policy to :meth:`Session.put` per file, and
+    each file records its own random staging name under its own target. Verified by killing a
+    ``put_tree`` mid-file and restarting it, rather than by reading the call chain.
+
+    **The delegation is the fix for what that near-miss was an instance of.** Two guards
+    restating one rule drift, and the drift is invisible: both were correct in isolation, the
+    suite was green, and the stale one's message was well written, which is what made it read as
+    current. Asking the other guard is the only version that cannot go stale, and
+    ``tests/test_tree_resume_and_concurrency.py`` derives the leftover difference from
+    :class:`~gantry_sftp.session.Publish`'s own fields so a new one fails by name.
 
     Args:
         policy: The resolved publish policy.
@@ -922,7 +937,8 @@ def _check_tree_publish(policy: Publish, *, resume: bool, caller: str) -> None:
 
     Raises:
         ValueError: If ``resume`` is asked for with atomic publishing and no journal to find
-            the staging files by, or if the policy carries a ``staging_name``.
+            the staging files by, if the policy carries a ``staging_name``, or for anything
+            :func:`_check_publish_flags` refuses one file.
     """
     if resume and policy.atomic and policy.journal is None:
         # The decision D-54 had to make, and it is `put`'s rule reaching a tree rather than a
@@ -949,3 +965,16 @@ def _check_tree_publish(policy: Publish, *, resume: bool, caller: str) -> None:
             f"so they would all stage under one name and overwrite each other. Leave it "
             f"unset to get a generated hidden sibling per file."
         )
+    # Asked rather than restated, so the two cannot drift. `staging_name` is `None` and the
+    # resume case is already refused by the time this runs, so the only clauses that can fire
+    # are the `require_*` contradictions -- which a tree used to reach one file late, having
+    # already created the destination directory on the server.
+    _check_publish_flags(
+        atomic=policy.atomic,
+        fsync=policy.fsync,
+        require_atomic=policy.require_atomic,
+        require_fsync=policy.require_fsync,
+        resume=resume,
+        staging_name=policy.staging_name,
+        journal=policy.journal,
+    )
