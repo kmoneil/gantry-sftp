@@ -13,6 +13,8 @@ because what it exercises is the concurrency.
 from __future__ import annotations
 
 import logging
+from dataclasses import fields
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ from gantry_sftp._logging import record_fields
 from gantry_sftp.codec import Read
 from gantry_sftp.exceptions import DestinationCollisionError
 from gantry_sftp.session import Publish, UploadJournal, open_session
+from gantry_sftp.session._policy import _check_publish_flags, _check_tree_publish
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 from local_filesystem import give_one_file_a_second_name
 from test_observability import names_path
@@ -293,6 +296,82 @@ async def test_an_uploaded_tree_cannot_resume_atomically_without_a_journal(tmp_p
     )
 
 
+def test_the_tree_guard_refuses_everything_the_one_file_guard_would(tmp_path: Path):
+    """The parity D-172 was a near-miss on, asserted rather than remembered.
+
+    Two guards restating one rule drift, and the drift is invisible: `_check_publish_flags` was
+    amended by D-166 and `_check_tree_publish` was not, both stayed correct in isolation, the
+    suite stayed green, and the stale message was *well written* -- which is what made it read
+    as current.
+
+    **The fix is the delegation and this is what pins what delegation cannot.** A tree must
+    refuse a superset of what one file refuses, because every file goes through `put` anyway and
+    a rule reached per file is reached *inside the walk* -- after `put_tree` has created the
+    destination and its parents for a transfer that will not happen. The one legitimate extra is
+    `staging_name`, which a tree cannot have at all.
+
+    Driven from `Publish`'s own fields, so a new flag on it fails here by name instead of
+    joining the untested set silently.
+    """
+    flags = [field.name for field in fields(Publish) if isinstance(field.default, bool)]
+    assert flags == ["atomic", "fsync", "require_atomic", "require_fsync"], (
+        f"Publish grew or lost a boolean: {flags}. Each one is a rule, and this check has to "
+        f"be read again rather than extended blindly -- a tree's answer is not always one "
+        f"file's, which is why `resume` and `staging_name` are handled separately below"
+    )
+    journal = UploadJournal(tmp_path / "uploads.journal")
+
+    tree_only: list[tuple[Publish, bool, str]] = []
+    for values in product([True, False], repeat=len(flags)):
+        for resume, has_journal, has_name in product([True, False], repeat=3):
+            policy = Publish(
+                **dict(zip(flags, values, strict=True)),
+                journal=journal if has_journal else None,
+                staging_name=b"/dest/one.part" if has_name else None,
+            )
+            one_file = _one_file_refusal(policy, resume=resume)
+            tree = _tree_refusal(policy, resume=resume)
+            assert not (one_file and not tree), (
+                f"a tree accepts what one file refuses: {policy}, resume={resume}, "
+                f"put said {one_file!r}"
+            )
+            if tree is not None and one_file is None:
+                tree_only.append((policy, resume, tree))
+
+    assert tree_only, "the check found no difference at all, so it is asserting nothing"
+    unexplained = [case for case in tree_only if case[0].staging_name is None]
+    assert not unexplained, (
+        f"a tree refuses something one file allows, for a reason that is not staging_name: "
+        f"{unexplained}"
+    )
+
+
+def _one_file_refusal(policy: Publish, *, resume: bool) -> str | None:
+    """What `put`'s guard says about this policy, or ``None`` if it accepts it."""
+    try:
+        _check_publish_flags(
+            atomic=policy.atomic,
+            fsync=policy.fsync,
+            require_atomic=policy.require_atomic,
+            require_fsync=policy.require_fsync,
+            resume=resume,
+            staging_name=policy.staging_name,
+            journal=policy.journal,
+        )
+    except ValueError as refused:
+        return str(refused.args[0])
+    return None
+
+
+def _tree_refusal(policy: Publish, *, resume: bool) -> str | None:
+    """What the tree's guard says about it, or ``None`` if it accepts it."""
+    try:
+        _check_tree_publish(policy, resume=resume, caller="put_tree")
+    except ValueError as refused:
+        return str(refused.args[0])
+    return None
+
+
 async def test_a_tree_still_refuses_a_staging_name_even_with_a_journal(tmp_path: Path):
     """The second clause of the old message was a different guard, and D-172 did not touch it.
 
@@ -355,6 +434,40 @@ async def test_a_real_tree_resumes_and_overlaps(tmp_path: Path):
     assert (destination / "sub" / "nested.bin").read_bytes() == (
         remote / "sub" / "nested.bin"
     ).read_bytes()
+
+
+async def test_a_contradictory_policy_is_refused_before_the_tree_creates_anything(tmp_path: Path):
+    """What the delegation buys, stated as the thing a caller can see.
+
+    `require_atomic=True, atomic=False` was reached one *file* late, because the tree guard
+    restated three of `put`'s rules and not these two. The exception was identical, so the only
+    visible difference was this: `put_tree` had already created the destination and its missing
+    parents on the server for a transfer that was never going to happen.
+
+    A real server rather than `TreeServer`, because the claim is about directories that exist.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    _ = (source / "a.csv").write_bytes(b"aaa")
+    destination = tmp_path / "deep" / "dest"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        with pytest.raises(ValueError) as caught:
+            _ = await sftp.put_tree(
+                source,
+                str(destination).encode(),
+                publish=Publish(require_atomic=True, atomic=False),
+            )
+
+    assert caught.value.args[0] == "require_atomic=True contradicts atomic=False"
+    assert not destination.exists(), "a refused request created its destination"
+    assert not destination.parent.exists(), "a refused request created a parent directory"
 
 
 async def test_a_real_tree_resumes_atomically_with_a_journal(tmp_path: Path):

@@ -130,6 +130,13 @@ changelog comes to describe a release that does not exist.
 - **CI runs the `live` lane on macOS as well as Linux**, so the above stays fixed. Required
   status checks are now `live (ubuntu-latest)` and `live (macos-latest)` in place of `live`.
   Nothing a user installs is affected.
+- **A tree refuses a contradictory `publish` before it creates anything** (D-172 follow-on).
+  `put_tree` and `sync_tree` restated three of `put`'s rules and not the two `require_*` ones, so
+  `Publish(require_atomic=True, atomic=False)` was caught one *file* late — same exception, same
+  message, but the destination and its missing parents had already been created on the server for
+  a transfer that was never going to happen. The tree guard now asks `put`'s guard instead of
+  restating it, so the two cannot drift again, and a test derives the leftover difference from
+  `Publish`'s own fields.
 - **`put_tree(resume=True)` accepts atomic publishing when given a journal**, and its refusal
   message changed (D-172). Since 0.1.0 the combination raised unconditionally, on the argument
   that a staging name generated fresh per call cannot be found again — which is exactly what the
