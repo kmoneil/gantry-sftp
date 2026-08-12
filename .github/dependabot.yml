@@ -1,0 +1,28 @@
+# Keep the pinned GitHub Actions from going stale silently (D-174).
+#
+# **The pin is the problem this solves, not a thing it fights.** Every third-party action here is
+# pinned to a commit SHA -- `tests/test_lanes.py` asserts it -- because a floating tag is a mutable
+# reference to somebody else's code and `release.yml` runs with permission to publish. But a SHA
+# cannot look outdated: nothing reads as wrong, no gate fires, and the first signal is a
+# deprecation warning in a job log that nobody opens between releases. That is exactly how
+# `upload-artifact` and `download-artifact` sat three and four major versions behind on a runtime
+# GitHub had already deprecated. Dependabot opens a pull request when an action moves and rewrites
+# the SHA *and* the trailing tag comment, so the pin survives and the staleness becomes visible.
+#
+# Actions only. Python dependencies are resolved by `uv.lock`, whose updates go through
+# `uv lock --upgrade` and the `audit` lane; a second updater on the same file would fight it.
+#
+# Weekly rather than daily, because the cost of this file is pull-request noise and the thing it
+# protects against moves in months. Grouped into one pull request for the same reason -- five
+# actions updating in a week should be one review, not five.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
