@@ -906,32 +906,42 @@ def _check_tree_publish(policy: Publish, *, resume: bool, caller: str) -> None:
     downstream of it moved -- these guards read ``policy`` and ``resume`` and nothing the walk
     builds, which is why they were already the first thing after the policy was resolved.
 
+    **A journal lifts the first refusal, exactly as it does for one file** (D-172). This guard
+    is :func:`_check_publish_flags` one layer out, and that one was amended by D-166 to accept a
+    journal while still refusing a derived name; this one was not, so for a day it raised the
+    pre-journal argument -- *"a previous run's partial cannot be found"* -- at the caller who
+    had just made it findable. A tree needs nothing extra for it to work: ``put_tree`` forwards
+    ``resume`` and the policy to :meth:`Session.put` per file, and each file records its own
+    random staging name under its own target. Verified by killing a ``put_tree`` mid-file and
+    restarting it, rather than by reading the call chain.
+
     Args:
         policy: The resolved publish policy.
         resume: Whether the caller asked to resume.
         caller: The public method name, without parentheses, for the messages.
 
     Raises:
-        ValueError: If ``resume`` is asked for with atomic publishing, or if the policy
-            carries a ``staging_name``.
+        ValueError: If ``resume`` is asked for with atomic publishing and no journal to find
+            the staging files by, or if the policy carries a ``staging_name``.
     """
-    if resume and policy.atomic:
+    if resume and policy.atomic and policy.journal is None:
         # The decision D-54 had to make, and it is `put`'s rule reaching a tree rather than a
-        # new one. `put(resume=True, atomic=True)` needs an explicit staging_name, because the
-        # generated one carries fresh randomness per call and last run's partial cannot be
-        # found again -- and `put_tree` cannot take a staging_name at all, since one name
-        # cannot serve a tree's many files. Deriving one per file from the target was rejected
-        # rather than overlooked: a predictable staging name is exactly what `staging_token`
-        # exists to avoid, and here it would be predictable for every file in the tree at once,
-        # so two mirrors resuming into one destination would interleave file by file. So tree
-        # resume means resuming the destination itself, which is `atomic=False`, and the caller
-        # is told rather than downgraded.
+        # new one. `put(resume=True, atomic=True)` needs a journal or an explicit staging_name,
+        # because the generated one carries fresh randomness per call and last run's partial
+        # cannot be found again -- and `put_tree` cannot take a staging_name at all, since one
+        # name cannot serve a tree's many files. Deriving one per file from the target was
+        # rejected rather than overlooked: a predictable staging name is exactly what
+        # `staging_token` exists to avoid, and here it would be predictable for every file in
+        # the tree at once, so two mirrors resuming into one destination would interleave file
+        # by file. A journal is the way out that does not weaken that, because it makes this
+        # run's own name recoverable rather than making any name guessable.
         raise ValueError(
-            f"{caller}() cannot resume with atomic publishing: each file stages under a "
-            f"name generated fresh per call, so a previous run's partial cannot be found, "
-            f"and a staging_name cannot be fixed for a whole tree. Pass "
-            f"publish=Publish(atomic=False) to resume the destination files themselves, "
-            f"or drop resume=True to re-upload the tree atomically"
+            f"{caller}() needs a journal to resume with atomic publishing: each file stages "
+            f"under a name generated fresh per call, so a previous run's partials cannot be "
+            f"found without a record of them, and a staging_name cannot be fixed for a whole "
+            f"tree. Pass publish=Publish(journal=UploadJournal(path)) to record each name "
+            f"durably, or publish=Publish(atomic=False) to resume the destination files "
+            f"themselves"
         )
     if policy.staging_name is not None:
         raise ValueError(

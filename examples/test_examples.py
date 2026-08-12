@@ -402,3 +402,17 @@ def test_the_crash_resume_example_actually_dies_and_actually_resumes():
     assert "journal is clear:       True" in stdout
     # And the sweep removed only what the journal recorded.
     assert "after:  ['.orphan.bin.cafebabe.part']" in stdout
+
+    # The tree section (D-172), which has to fail the same two ways the single file can: a run
+    # that was never killed, and a resume that quietly restarted the interrupted file.
+    assert "into the big file, killing myself" in stdout
+    assert "published before the crash: ['small-a.bin', 'small-b.bin']" in stdout
+    assert "one file was in flight:     .zz-big.bin." in stdout
+    moved = next(line for line in stdout.splitlines() if "same journal: moved" in line)
+    tree_transferred = int(moved.split("moved ")[1].split(" of ")[0])
+    tree_total = int(moved.split(" of ")[1].split(" bytes")[0])
+    assert 0 < tree_transferred < tree_total, moved
+    assert "resumed rather than restarted: True" in stdout
+    assert "every file matches its source: True" in stdout
+    assert "nothing left staged:           True" in stdout
+    assert "journal is clear:              True" in stdout

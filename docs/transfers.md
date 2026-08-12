@@ -761,13 +761,29 @@ it inherits their guarantees exactly: an already-complete file costs one `STAT` 
 nothing, a partial one continues from where it stopped, and a local partial _longer_ than the
 remote file is refused rather than truncated. It composes with `concurrency=`.
 
-**Uploading a tree with `resume=True` requires `publish=Publish(atomic=False)`**, and raises
-otherwise. Each file stages under a name generated fresh per call, so a previous run's partial
-cannot be found again, and a `staging_name` cannot be fixed for a whole tree. Deriving one per
-file from the target would make it predictable for every file at once, which is exactly what
-the generated name exists to prevent, so the combination is refused rather than quietly
-downgraded. Resuming an upload therefore means resuming the destination files themselves, and a
-consumer polling the directory can see a partial file while it happens.
+**Uploading a tree with `resume=True` needs either a journal or
+`publish=Publish(atomic=False)`**, and raises with neither. Each file stages under a name
+generated fresh per call, so a previous run's partials cannot be found again unless something
+wrote them down, and a `staging_name` cannot be fixed for a whole tree. Deriving one per file
+from the target would make it predictable for every file at once, which is exactly what the
+generated name exists to prevent, so that remains refused rather than quietly downgraded.
+
+```python
+journal = UploadJournal(Path("/var/lib/myjob/uploads.journal"))
+
+await sftp.put_tree("outgoing/", "/incoming", resume=True, publish=Publish(journal=journal))
+```
+
+The two spellings differ in what a consumer can observe:
+
+| | atomic publishing | resumes from |
+| --- | --- | --- |
+| `publish=Publish(journal=…)` | kept — nothing partial is ever visible at a destination path | the staging file the journal named |
+| `publish=Publish(atomic=False)` | given up — a consumer polling the directory can see a partial file | the destination file itself |
+
+See [Surviving the process, not just the connection](reliability.md#surviving-the-process-not-just-the-connection)
+for what the journal records, what it deliberately does not, and how to sweep what an
+interrupted run left behind.
 
 ## Mirroring a tree
 

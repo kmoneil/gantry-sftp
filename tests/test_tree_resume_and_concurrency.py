@@ -20,7 +20,7 @@ import pytest
 from gantry_sftp._logging import record_fields
 from gantry_sftp.codec import Read
 from gantry_sftp.exceptions import DestinationCollisionError
-from gantry_sftp.session import Publish, open_session
+from gantry_sftp.session import Publish, UploadJournal, open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 from local_filesystem import give_one_file_a_second_name
 from test_observability import names_path
@@ -264,13 +264,16 @@ async def test_resume_and_concurrency_compose(tmp_path: Path):
     assert not [packet for packet in again.seen if isinstance(packet, Read)]
 
 
-async def test_an_uploaded_tree_cannot_resume_atomically(tmp_path: Path):
+async def test_an_uploaded_tree_cannot_resume_atomically_without_a_journal(tmp_path: Path):
     """The decision D-54 had to make, and it is `put`'s rule reaching a tree.
 
-    Each file stages under a name generated fresh per call, so last run's partial cannot be
-    found; and a `staging_name` cannot be fixed for a whole tree. Deriving one per file from
-    the target would make it predictable for every file at once -- which is what
-    `staging_token` exists to prevent -- so the combination is refused, not downgraded.
+    Each file stages under a name generated fresh per call, so last run's partials cannot be
+    found unless something wrote them down; and a `staging_name` cannot be fixed for a whole
+    tree. Deriving one per file from the target would make it predictable for every file at
+    once -- which is what `staging_token` exists to prevent -- so that stays refused.
+
+    Renamed by D-172, which added the second way out. The refusal is still the default answer
+    and the message now names both.
     """
     source = tmp_path / "outgoing"
     source.mkdir()
@@ -282,11 +285,39 @@ async def test_an_uploaded_tree_cannot_resume_atomically(tmp_path: Path):
             _ = await sftp.put_tree(source, b"/dest/tree", resume=True)
 
     assert caught.value.args[0] == (
-        "put_tree() cannot resume with atomic publishing: each file stages under a name "
-        "generated fresh per call, so a previous run's partial cannot be found, and a "
-        "staging_name cannot be fixed for a whole tree. Pass publish=Publish(atomic=False) "
-        "to resume the destination files themselves, or drop resume=True to re-upload the "
-        "tree atomically"
+        "put_tree() needs a journal to resume with atomic publishing: each file stages under "
+        "a name generated fresh per call, so a previous run's partials cannot be found "
+        "without a record of them, and a staging_name cannot be fixed for a whole tree. Pass "
+        "publish=Publish(journal=UploadJournal(path)) to record each name durably, or "
+        "publish=Publish(atomic=False) to resume the destination files themselves"
+    )
+
+
+async def test_a_tree_still_refuses_a_staging_name_even_with_a_journal(tmp_path: Path):
+    """The second clause of the old message was a different guard, and D-172 did not touch it.
+
+    One name cannot serve a tree whatever else is passed, so a journal must not read as
+    permission for the thing that was never about findability.
+    """
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    _ = (source / "a.csv").write_bytes(b"aaa")
+    journal = UploadJournal(tmp_path / "uploads.journal")
+
+    server = TreeServer(tree={b"/dest": ()}, root=b"/dest")
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(ValueError) as caught:
+            _ = await sftp.put_tree(
+                source,
+                b"/dest/tree",
+                resume=True,
+                publish=Publish(journal=journal, staging_name=b"/dest/one.part"),
+            )
+
+    assert caught.value.args[0] == (
+        "put_tree() cannot take a staging_name: it applies to every file in the tree, so they "
+        "would all stage under one name and overwrite each other. Leave it unset to get a "
+        "generated hidden sibling per file."
     )
 
 
@@ -324,6 +355,49 @@ async def test_a_real_tree_resumes_and_overlaps(tmp_path: Path):
     assert (destination / "sub" / "nested.bin").read_bytes() == (
         remote / "sub" / "nested.bin"
     ).read_bytes()
+
+
+async def test_a_real_tree_resumes_atomically_with_a_journal(tmp_path: Path):
+    """D-172: what the lifted guard actually permits, against a server that stages for real.
+
+    Not against `TreeServer`: the acceptance is only interesting if the upload then goes
+    through the staged path, and a fake that answers every `OPEN` cannot show that each file
+    chose a name of its own. Four journal records for two files -- a `staged` and a
+    `published` each -- is what says the tree did not share one.
+
+    That a *killed* run resumes from those names needs a real crash in a real process and
+    lives in `live-tests/test_journal_live.py`.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    _ = (source / "a.csv").write_bytes(b"aaa")
+    _ = (source / "b.csv").write_bytes(b"bbbb")
+    destination = tmp_path / "uploaded"
+    journal = UploadJournal(tmp_path / "uploads.journal")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        result = await sftp.put_tree(
+            source,
+            str(destination),
+            resume=True,
+            publish=Publish(journal=journal, fsync=False),
+        )
+
+    assert result.files == 2
+    assert (destination / "a.csv").read_bytes() == b"aaa"
+    assert (destination / "b.csv").read_bytes() == b"bbbb"
+    # Published, so nothing is in flight and no staging file survived the run.
+    assert journal.in_flight() == {}
+    assert not [path for path in destination.iterdir() if ".part" in path.name]
+    staged = [line for line in journal.path.read_text().splitlines() if '"event": "staged"' in line]
+    assert len(staged) == 2, "each file needs its own recorded staging name"
+    assert len({line.split('"staged": ')[1].split(",")[0] for line in staged}) == 2
 
 
 async def test_a_real_tree_uploads_concurrently_and_resumes_in_place(tmp_path: Path):

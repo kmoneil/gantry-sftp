@@ -27,6 +27,13 @@ changelog comes to describe a release that does not exist.
   so a second publisher elsewhere has a different journal and a different token. The old spelling
   still raises when neither a journal nor a `staging_name` is given.
 
+  **A whole tree resumes on the same journal** (D-172):
+  `put_tree(resume=True, publish=Publish(journal=...))`. Each file records its own random staging
+  name under its own target, so a run killed partway through continues the file that was in
+  flight. Without a journal that call still requires `publish=Publish(atomic=False)`, and a
+  `staging_name` is still refused for a tree whatever else is passed — one name cannot serve many
+  files, which was never the clause the journal answered.
+
   **Downloads were already fine and get nothing.** Measured across two separate interpreter
   processes before any of this was written: a download's partial is a file on your own disk, so
   its length is a fact rather than a report. There is no download journal and no plan for one.
@@ -123,6 +130,12 @@ changelog comes to describe a release that does not exist.
 - **CI runs the `live` lane on macOS as well as Linux**, so the above stays fixed. Required
   status checks are now `live (ubuntu-latest)` and `live (macos-latest)` in place of `live`.
   Nothing a user installs is affected.
+- **`put_tree(resume=True)` accepts atomic publishing when given a journal**, and its refusal
+  message changed (D-172). Since 0.1.0 the combination raised unconditionally, on the argument
+  that a staging name generated fresh per call cannot be found again — which is exactly what the
+  journal above dissolves, and which `put`'s own guard was amended to say. Nothing that worked
+  before stops working: with no journal the call still raises, and the code that catches the
+  `ValueError` still catches it. Only callers matching on the message text see a difference.
 
 ## 0.1.2 — 2026-08-10
 

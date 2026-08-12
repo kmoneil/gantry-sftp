@@ -172,6 +172,25 @@ would interleave into a single file.
 local and private to whoever wrote it, so a second publisher on another machine has a different
 journal and a different token, and the hazard is untouched.
 
+### A whole tree, not just one file
+
+`put_tree(resume=True)` takes the same journal and needs nothing else (D-172):
+
+```python
+await sftp.put_tree("outgoing/", "/incoming", resume=True, publish=Publish(journal=journal))
+```
+
+Each file records its own random staging name under its own target, so a run killed partway
+through a tree resumes the file that was in flight and re-sends nothing that was already
+published. This is the case the append-only format was chosen for — see
+[Durability](#durability-and-the-shape-that-follows-from-it) — and one journal serves any
+`concurrency=`.
+
+Without a journal, `put_tree(resume=True)` still requires `publish=Publish(atomic=False)` and
+raises with neither, for the reason above: there is nothing to resume *into* when no record of
+the staging names exists. [Resuming a tree](transfers.md#resuming-a-tree) has the comparison
+table.
+
 ### Downloads need none of this
 
 `get(..., resume=True)` already survived a process death and still does. Its partial is a file on
