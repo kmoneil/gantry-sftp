@@ -31,6 +31,15 @@ would be the internet.
 The report is data before it is text: :func:`local_diagnosis` and :func:`server_diagnosis` return
 dataclasses, ``--json`` renders them, and a program that wants to assert on its own deployment can
 import them rather than scrape the output.
+
+**The negotiation is not the whole answer, which is why there is a battery as well** (D-165).
+Everything above is what the server *said* at the handshake, and the question a user with an
+unreachable enterprise endpoint actually has is what it *does* --
+:mod:`gantry_sftp.compatibility` asks that, and ``server_diagnosis`` runs it on the same
+session so both halves describe one connection. It is off by default here and on by default in
+the command, and the split is deliberate: this function's existing contract is a negotiation
+report and a caller who has one should keep getting it, while ``doctor <host>`` is a diagnostic
+whose whole purpose is to find out more.
 """
 
 from __future__ import annotations
@@ -46,6 +55,7 @@ from pathlib import Path
 from gantry_sftp import __version__
 from gantry_sftp._logging import mask_environment
 from gantry_sftp.codec import IMPLEMENTED_EXTENSIONS, PROTOCOL_VERSION
+from gantry_sftp.compatibility import CompatibilityReport, Verdict, compatibility_report
 from gantry_sftp.exceptions import SFTPError
 from gantry_sftp.session import (
     DEFAULT_IDLE_TIMEOUT,
@@ -198,6 +208,8 @@ class ServerDiagnosis:
         depth: Requests kept in flight.
         start_directory: The canonical path of the session's starting point.
         reaped: Handles the router closed because nobody claimed them.
+        compatibility: What the server *does*, as distinct from what it advertised, or ``None``
+            where the battery was not run. See :mod:`gantry_sftp.compatibility`.
     """
 
     host: str
@@ -217,10 +229,18 @@ class ServerDiagnosis:
     depth: int | None = None
     start_directory: str | None = None
     reaped: int | None = None
+    compatibility: CompatibilityReport | None = None
 
     @property
     def exit_code(self) -> Exit:
-        """Reached or not. Nothing a server says makes a session that happened a failure."""
+        """Reached or not. Nothing a server says makes a session that happened a failure.
+
+        **A battery finding of ``no`` is not a failure either**, and that is the same rule
+        rather than an exception to it. "This server does not fold case" is an answer; so is
+        "``lsetstat`` is advertised and refuses". A command that exited non-zero on those would
+        be reporting a *difference* as a *fault*, and the endpoints this battery exists for
+        differ from the reference in a dozen ways while working perfectly well.
+        """
         return Exit.OK if self.reached else Exit.UNREACHABLE
 
 
@@ -334,6 +354,8 @@ def server_diagnosis(
     identity_file: str | os.PathLike[str] | None = None,
     config_file: str | os.PathLike[str] | None = None,
     options: Mapping[str, str] | None = None,
+    probes: bool = False,
+    write_directory: bytes | str | None = None,
 ) -> ServerDiagnosis:
     """Connect once, report what was negotiated, and close.
 
@@ -350,6 +372,13 @@ def server_diagnosis(
         config_file: An ``ssh_config`` to use instead of the account's own.
         options: ``-o`` options, which is how a diagnosis reproduces the connection that is
             actually failing rather than a simplified one that works.
+        probes: Run :mod:`gantry_sftp.compatibility`'s read-only battery as well, which asks
+            what the server *does* rather than what it advertised. **Off by default here and
+            on by default in the command**: an existing caller of this function asked for a
+            negotiation report and still gets exactly that.
+        write_directory: Run the write battery too, in this directory. Implies ``probes``.
+            There is no default and there will not be one -- the caller nominates a place they
+            are content to have files created and removed in, or no files are created.
 
     Named parameters rather than a ``**kwargs`` passed through, and the reason is worth
     keeping: a splat is untypeable at the ``connect`` call below, and silencing that would
@@ -378,6 +407,19 @@ def server_diagnosis(
             advertised = tuple(name.decode("utf-8", "replace") for name in sftp.extensions)
             implemented = tuple(name for name in advertised if name in IMPLEMENTED_EXTENSIONS)
             sizes = sftp.sizes_for(TYPICAL_HANDLE)
+            # Read before the battery runs, because the battery is allowed to end the session:
+            # its last probe sends the largest request a transfer would, and a server may
+            # answer that by closing the channel. Everything the negotiation established is
+            # already known here, and losing it to a probe would turn the most informative
+            # report this command can produce into `NOT REACHED`.
+            start_directory = sftp.realpath().decode("utf-8", "surrogateescape")
+            battery = None
+            if probes or write_directory is not None:
+                battery = compatibility_report(
+                    sftp,
+                    request_bytes=sizes.write_length,
+                    write_directory=write_directory,
+                )
             return ServerDiagnosis(
                 host=host,
                 reached=True,
@@ -393,8 +435,9 @@ def server_diagnosis(
                 read_size=sizes.read_length,
                 write_size=sizes.write_length,
                 depth=sftp.depth,
-                start_directory=sftp.realpath().decode("utf-8", "surrogateescape"),
+                start_directory=start_directory,
                 reaped=sftp.reaped,
+                compatibility=battery,
             )
     except (SFTPError, OSError) as failure:
         return ServerDiagnosis(
@@ -504,6 +547,34 @@ def _server_lines(server: ServerDiagnosis) -> list[str]:
         f"  start directory         {server.start_directory}",
         f"  handles reaped          {server.reaped}",
     ]
+    if server.compatibility is not None:
+        lines += _compatibility_lines(server.compatibility)
+    return lines
+
+
+def _compatibility_lines(report: CompatibilityReport) -> list[str]:
+    """What the server *does*, one fact per block, with the exchange indented under it.
+
+    **The evidence is printed, not summarised.** This report's whole purpose is to be pasted
+    into a message read by somebody who was not there, and a verdict without its round trips is
+    the rumour the card was written to stop. It is the same argument the failure block above
+    makes for OpenSSH's stderr, one layer further in.
+    """
+    answered = sum(1 for finding in report.findings if finding.verdict is not Verdict.UNDETERMINED)
+    lines = [
+        "",
+        f"  compatibility           {len(report.findings)} probed, {answered} answered"
+        f"{'' if report.wrote_into is None else f', wrote into {report.wrote_into}'}",
+    ]
+    for finding in report.findings:
+        lines.append(f"    {finding.verdict.value:<14}{finding.fact}")
+        lines.append(f"      {finding.answer}")
+        lines += [f"        {line}" for line in finding.evidence]
+    if report.left_behind:
+        lines.append("    LEFT BEHIND -- these were created and could not be removed")
+        lines += [f"      {item}" for item in report.left_behind]
+    lines.append("  not determined")
+    lines += [f"    - {limit}" for limit in report.undetermined]
     return lines
 
 

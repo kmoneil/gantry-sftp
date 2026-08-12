@@ -12,6 +12,36 @@ changelog comes to describe a release that does not exist.
 
 ### Added
 
+- **A compatibility report, for the endpoints nobody here can reach.** `gantry_sftp.compatibility`
+  runs a battery against a live server and returns, per fact, a verdict and **the exchange that
+  produced it**. Reached as `python -m gantry_sftp doctor <host>`, which now runs the read-only
+  half by default; `--no-probes` turns it off and `--probe-writes DIR` adds the questions that can
+  only be answered by writing. New public names: `CompatibilityReport`, `Finding`, `Verdict`,
+  `ProbeLimit`, `compatibility_report`, `read_only_probes`, `write_probes`, `restates_the_code`,
+  `CODE_IN_PROSE`, `PROBE_PREFIX`, `PROBE_MODE`, `PROBE_TIMESTAMP`, plus a `compatibility` field on
+  `ServerDiagnosis` and `probes` / `write_directory` arguments on `server_diagnosis`.
+
+  **The reason it exists is arithmetic, not modesty.** MOVEit, GoAnywhere, Cleo and Sterling belong
+  to somebody's employer and sit behind a VPN, so no maintainer can start one and the endpoints
+  this library is *for* are the ones it can never measure. The evidence has to be producible by the
+  person who can reach the server, and reviewable by somebody who was not there.
+
+  **Advertised and working are different questions**, and every extension probe checks the result
+  rather than the status. `lsetstat@openssh.com` is the row that proves it: advertised by both
+  OpenSSH's server and asyncssh's, working on neither under Linux, and failing *differently* on
+  each — OpenSSH refuses with a contentless `FAILURE`, asyncssh answers `OK` and moves nothing.
+  A report that believed the status would have called the second one working.
+
+  **Safe to point at production, by default.** The read-only battery creates, renames and removes
+  nothing. The write battery runs only into a directory the caller nominates by name — there is no
+  default and there will not be one — creates every file `0600` under a `gantry-probe` prefix,
+  removes them before returning, and names anything it could not remove. `undetermined` stays a
+  third answer throughout: a finding that could not be established and a question the run declined
+  to ask are recorded by different mechanisms, copying `TreePlan.undetermined`'s shape.
+
+  Not a registry: nothing it emits changes what the library does. DESIGN §7's declarative quirks
+  registry stays struck. `docs/compatibility.md` and `examples/compatibility.py`.
+
 - **`Session.sync_tree(local, remote, manifest=...)`**, with a blocking form on `SyncSession`.
   Makes a remote tree match a local one, sending only what changed, and returns a `SyncResult`
   carrying a decision *and the reason for it* per file. New public names alongside it:

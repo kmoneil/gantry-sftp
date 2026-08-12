@@ -30,6 +30,7 @@ python examples/doctor.py                         # what this machine can do, as
 python examples/password_auth.py                  # password= , and where the secret does not go
 python examples/observability.py                  # the logs, a frame dump, and the counters
 python examples/server_capabilities.py            # who is at the other end, and what they refuse
+python examples/compatibility.py                  # does this work against your server, with the workings
 ```
 
 Pass a destination to run the same code against a real server:
@@ -55,6 +56,7 @@ python examples/doctor.py user@host
 GANTRY_SFTP_PASSWORD=... python examples/password_auth.py user@host
 python examples/observability.py user@host /remote/dir
 python examples/server_capabilities.py user@host
+python examples/compatibility.py user@host
 ```
 
 `password_auth.py` is the one example that takes its input from the environment rather than

@@ -209,11 +209,18 @@ derived from them, the pipeline depth, and where the session starts. That is a b
 _why did `posix_rename` not happen_ or _why is this slow_ than any log line, because it is not a
 description of the handshake; it is the handshake.
 
+With a host it also runs a read-only **compatibility battery**, which asks what the server
+*does* rather than what it advertised and prints the exchange behind every answer. That has a
+page of its own — [Does this work against my server?](compatibility.md) — because it is the
+report to send when the answer is _it does not_.
+
 | flag                                      |                                                                            |
 | ----------------------------------------- | -------------------------------------------------------------------------- |
 | `--json`                                  | the same report as JSON, so CI asserts on fields rather than scraping text |
 | `--user`, `--port`, `-i`, `--config-file` | as `ssh` takes them                                                        |
 | `-o KEY=VALUE`                            | repeatable, so the connection you diagnose is the one that is failing      |
+| `--no-probes`                             | skip the battery and report the negotiation alone                          |
+| `--probe-writes DIR`                      | also run the probes that create files, in `DIR`, removing them afterwards  |
 
 It is safe to paste into a bug report, which is the point of it: only the variables that steer
 `ssh` are read at all, and their values go through the same masking chokepoint as everything
@@ -248,6 +255,12 @@ you get rather than the nearest match.
 Three profiles ship, not ten, because three is how many `live-tests/matrix.py` can actually
 start: OpenSSH, asyncssh and paramiko all serve SFTP and the last two were already installed
 as benchmark dependencies. A profile without a test against that server is a rumour.
+
+**There is no registry to contribute a fourth to, and that is deliberate rather than unfinished.**
+A profile carries identity and nothing else, so what a user with a MOVEit endpoint could
+contribute is a name, a description and one boolean — none of which changes anything. What they
+can produce instead is evidence: [Does this work against my server?](compatibility.md) is the
+report, and it is the artifact that would justify a behavioural rule if one ever earned its place.
 
 One measurement from that matrix is worth repeating here, because it decides what any
 "quirks" layer can ever do. Five distinct failure conditions (`MKDIR` on an existing

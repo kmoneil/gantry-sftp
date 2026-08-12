@@ -135,6 +135,7 @@ task rather than by module:
 | [Connecting and authenticating](docs/connecting.md) | Keys, agents, `ssh_config`, passwords, restricting where a connection may go, which `ssh_config` settings this library overrides, and what a failure tells you |
 | [Reconnecting and timeouts](docs/reliability.md) | `with_reconnect`, deadlines on every wait, and stopping a transfer cleanly |
 | [Seeing what it is doing](docs/observability.md) | Structured logs, session counters, the frame dump, credential redaction, and `doctor` |
+| [Does this work against my server?](docs/compatibility.md) | The compatibility battery, what a finding carries, the write probes and how to nominate a directory for them |
 | [fsspec, pandas and dask](docs/integrations.md) | `pd.read_parquet("gantry-sftp://…")`, and the two things to know before deploying it |
 | [Tunables, and what things cost](docs/tuning.md) | Every knob and its default, round trips per operation, memory per transfer |
 | [Why this exists](docs/architecture.md) | The design argument, the failures it prevents, and where this library is behind |
