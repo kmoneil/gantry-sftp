@@ -104,7 +104,7 @@ from gantry_sftp.session._localpath import (
     check_contained,
     local_child,
 )
-from gantry_sftp.session._localtree import remote_component, walk_local
+from gantry_sftp.session._localtree import LocalWalkEntry, remote_component, walk_local
 from gantry_sftp.session._mode import (
     Mode,
     local_mode,
@@ -139,6 +139,7 @@ from gantry_sftp.session._policy import (
     _touch_destination,
     _TreeDownload,
     _TreeUpload,
+    _UploadWalkState,
     refuses_the_name,
 )
 from gantry_sftp.session._pool import for_each_bounded
@@ -2274,6 +2275,76 @@ class Session(_SessionOperations):
                 raise _collision_error(state.collisions, destination, result)
             return result
 
+    async def _walk_for_upload(
+        self,
+        local_path: Path | str,
+        root: bytes,
+        *,
+        max_depth: int | None,
+        preserve_times: bool,
+        mode: int | Mode | None,
+        state: _UploadWalkState,
+        dry_run: bool = False,
+    ) -> AsyncGenerator[tuple[LocalWalkEntry, bytes]]:
+        """Walk the local tree, create each directory, and hand out one settled position.
+
+        The upload twin of :meth:`_walk_for_download`, extracted for the same reason and split
+        on the same seam: this decides *where* things go, the caller decides *what* to send and
+        how many at once. Both trees that upload -- :meth:`put_tree` and :meth:`sync_tree` --
+        restated this loop, and D-179 is the card for what that costs.
+
+        **The ``mkdir`` is awaited here, in the walk, before the position is yielded** -- so a
+        worker never writes into a directory that does not exist yet. ``walk_local`` is
+        top-down, which is what makes that sufficient rather than merely usual. That ordering is
+        an invariant between two ``await``s and nothing checked it until the characterization
+        test this extraction was written behind;
+        ``test_an_uploaded_directory_is_created_before_any_of_its_files`` is what would report
+        losing it, and it needs a destination whose directories already exist to say anything at
+        all -- against a fresh one the server refuses first and the ordering never speaks.
+
+        **What is yielded is a position, not a transfer**, and that is the one place this
+        differs from the download twin, which hands out finished items. The two callers'
+        per-file work genuinely differs -- ``put_tree`` sends every file, ``sync_tree`` compares
+        each against a remote listing first -- so folding that in would mean a callback
+        parameter, which is the merge D-179 exists to avoid rather than the duplication it
+        removes. The seam is the directory handling, because the directory handling is what was
+        duplicated.
+
+        ``dry_run`` suppresses the ``mkdir`` and nothing else. Everything the loop does besides
+        that -- the walk, the component validation that raises
+        :exc:`~gantry_sftp.exceptions.UnsafePathError`, the skip reasons -- is what a preview
+        exists to report, so a preview has to run it rather than skip it.
+
+        Args:
+            local_path: The local tree to walk.
+            root: The remote directory it is being written under, already resolved.
+            max_depth: Levels below the root to descend, or ``None`` for no limit.
+            preserve_times: Whether directories owe the final metadata pass their timestamps.
+            mode: The resolved mode. Only ``Mode.PRESERVE`` reaches a directory.
+            state: Accumulates the directory count, the deferred metadata and the skips.
+            dry_run: Make no directory. Report everything else.
+
+        Yields:
+            Each walked directory and the remote path it maps to, once its own ``mkdir`` has
+            been awaited.
+        """
+        for entry in walk_local(Path(local_path), max_depth=max_depth):
+            remote_directory = _remote_directory(root, entry.relative)
+            if entry.relative:
+                if not dry_run:
+                    await self.mkdir(remote_directory, exist_ok=True)
+                state.directories += 1
+                _settle_remote_directory(
+                    entry,
+                    remote_directory,
+                    preserve_times=preserve_times,
+                    mode=mode,
+                    times=state.times,
+                    modes=state.modes,
+                )
+            state.skipped.extend(entry.skipped)
+            yield entry, remote_directory
+
     async def _walk_for_download(
         self,
         remote_path: bytes | str,
@@ -2950,55 +3021,41 @@ class Session(_SessionOperations):
         await self._require_rooted_paths(root, feature="uploading a tree")
         if not dry_run:
             await self._mkdir_parents(root, exist_ok=True)
-        directories = 0
         planned: list[int] = []
         moved: list[int] = []
-        skipped: list[Skipped] = []
-
-        # Collected during the walk and applied after it -- see _set_directory_times. Local
-        # `stat` is free, so this costs nothing until the final pass.
-        directory_times: list[tuple[bytes, Times]] = []
-        # Same collection and the same final pass, plus one reason the timestamps do not have:
-        # a directory created with a restrictive source mode could not have its files written
-        # into it. Only `Mode.PRESERVE` fills this -- an integer `mode=` is a file mode.
-        directory_modes: list[tuple[bytes, int]] = []
+        state = _UploadWalkState()
 
         with operation(session_logger, "put_tree", local=local_path, remote=root) as record:
 
             async def produce() -> AsyncGenerator[_TreeUpload]:
-                """Create each directory, then hand out its files one at a time.
+                """Hand out one file at a time, from a walk that has already made its directory.
 
-                The ``mkdir`` is awaited **here**, in the producer, before any of that
-                directory's files are queued -- so a worker never writes into a directory that
-                does not exist yet. `walk_local` is top-down, which is what makes that
-                sufficient rather than merely usual.
+                Every directory-level decision -- the ``mkdir`` and its ordering, the count, the
+                deferred timestamps and modes, the skips -- belongs to
+                :meth:`_walk_for_upload`, which :meth:`sync_tree` shares. What is left here is
+                the only part the two trees do differently: this one sends every file.
+
+                ``aclosing`` for the reason :meth:`_walk_for_download`'s caller gives: the
+                common exit is an exception, and a suspended async generator that is merely
+                dropped is left to the collector, which trio will not finalise for it.
                 """
-                nonlocal directories
-                for entry in walk_local(Path(local_path), max_depth=max_depth):
-                    remote_directory = _remote_directory(root, entry.relative)
-                    if entry.relative:
-                        # The one write in this producer, and the reason `dry_run` is checked
-                        # here rather than around the whole loop: everything else in it --
-                        # the walk, the component validation that raises `UnsafePathError`,
-                        # the skip reasons -- is what a preview exists to report, so a
-                        # preview has to run it rather than skip it.
-                        if not dry_run:
-                            await self.mkdir(remote_directory, exist_ok=True)
-                        directories += 1
-                        _settle_remote_directory(
-                            entry,
-                            remote_directory,
-                            preserve_times=preserve_times,
-                            mode=requested_mode,
-                            times=directory_times,
-                            modes=directory_modes,
-                        )
-                    skipped.extend(entry.skipped)
-                    for name in entry.files:
-                        yield _TreeUpload(
-                            entry.path / os.fsdecode(name),
-                            join_remote(remote_directory, remote_component(name)),
-                        )
+                async with aclosing(
+                    self._walk_for_upload(
+                        local_path,
+                        root,
+                        max_depth=max_depth,
+                        preserve_times=preserve_times,
+                        mode=requested_mode,
+                        state=state,
+                        dry_run=dry_run,
+                    )
+                ) as walker:
+                    async for entry, remote_directory in walker:
+                        for name in entry.files:
+                            yield _TreeUpload(
+                                entry.path / os.fsdecode(name),
+                                join_remote(remote_directory, remote_component(name)),
+                            )
 
             async def transfer(item: _TreeUpload) -> None:
                 if dry_run:
@@ -3025,15 +3082,15 @@ class Session(_SessionOperations):
 
             if dry_run:
                 record["files"] = len(planned)
-                record["directories"] = directories
+                record["directories"] = state.directories
                 record["bytes"] = sum(planned)
-                record["skipped"] = len(skipped)
+                record["skipped"] = len(state.skipped)
                 record["dry_run"] = True
                 return TreePlan(
                     files=len(planned),
-                    directories=directories,
+                    directories=state.directories,
                     bytes_to_transfer=sum(planned),
-                    skipped=tuple(skipped),
+                    skipped=tuple(state.skipped),
                     # Every one of these is a consequence of making no writes, and an upload
                     # preview cannot escape any of them: it never asked the server anything.
                     undetermined=(
@@ -3043,13 +3100,13 @@ class Session(_SessionOperations):
                     ),
                 )
 
-            await _set_directory_times(self, directory_times)
-            await _set_directory_modes(self, directory_modes)
+            await _set_directory_times(self, state.times)
+            await _set_directory_modes(self, state.modes)
             record["files"] = len(moved)
-            record["directories"] = directories
+            record["directories"] = state.directories
             record["bytes"] = sum(moved)
-            record["skipped"] = len(skipped)
-            return TreeResult(len(moved), directories, sum(moved), tuple(skipped))
+            record["skipped"] = len(state.skipped)
+            return TreeResult(len(moved), state.directories, sum(moved), tuple(state.skipped))
 
     async def sync_tree(
         self,
@@ -3141,41 +3198,40 @@ class Session(_SessionOperations):
         await self._mkdir_parents(root, exist_ok=True)
 
         recorded = SyncManifest.load(record_file)
-        directories = 0
         outcomes: list[SyncOutcome] = []
-        walk_skipped: list[Skipped] = []
-        directory_times: list[tuple[bytes, Times]] = []
-        directory_modes: list[tuple[bytes, int]] = []
+        state = _UploadWalkState()
 
         with operation(session_logger, "sync_tree", local=local_path, remote=root) as record:
 
             async def produce() -> AsyncGenerator[_SyncCandidate]:
-                """Create each directory, list it once, and decide about every file in it.
+                """List each directory once, and decide about every file in it.
 
                 The listing happens **after** the ``mkdir``, which is what makes it total: the
                 directory is there by the time it is read, so a missing one is not a case this
-                has to tell apart from an empty one.
+                has to tell apart from an empty one. That ordering is
+                :meth:`_walk_for_upload`'s, which awaits the ``mkdir`` before yielding the
+                position -- the same guarantee :meth:`put_tree` relies on for its workers.
+
+                What is left here is the only part the two trees do differently: this one asks
+                the server what is already in the directory and sends what the comparison says
+                to send.
                 """
-                nonlocal directories
-                for entry in walk_local(Path(local_path), max_depth=max_depth):
-                    remote_directory = _remote_directory(root, entry.relative)
-                    if entry.relative:
-                        await self.mkdir(remote_directory, exist_ok=True)
-                        directories += 1
-                        _settle_remote_directory(
-                            entry,
-                            remote_directory,
-                            preserve_times=preserve_times,
-                            mode=requested_mode,
-                            times=directory_times,
-                            modes=directory_modes,
-                        )
-                    walk_skipped.extend(entry.skipped)
-                    present = await self._listing_by_name(remote_directory)
-                    for candidate in candidates_in(
-                        entry, remote_directory, present, recorded, outcomes
-                    ):
-                        yield candidate
+                async with aclosing(
+                    self._walk_for_upload(
+                        local_path,
+                        root,
+                        max_depth=max_depth,
+                        preserve_times=preserve_times,
+                        mode=requested_mode,
+                        state=state,
+                    )
+                ) as walker:
+                    async for entry, remote_directory in walker:
+                        present = await self._listing_by_name(remote_directory)
+                        for candidate in candidates_in(
+                            entry, remote_directory, present, recorded, outcomes
+                        ):
+                            yield candidate
 
             async def transfer(item: _SyncCandidate) -> None:
                 result = await self.put(
@@ -3208,15 +3264,15 @@ class Session(_SessionOperations):
 
             await for_each_bounded(produce(), transfer, concurrency=concurrency)
 
-            await _set_directory_times(self, directory_times)
-            await _set_directory_modes(self, directory_modes)
+            await _set_directory_times(self, state.times)
+            await _set_directory_modes(self, state.modes)
             # Compaction, so the log does not grow across runs. Interrupted before here, the
             # appended records are what the next run reads.
             recorded.save(record_file)
 
-            report = summarise(outcomes, directories=directories, walk_skipped=walk_skipped)
+            report = summarise(outcomes, directories=state.directories, walk_skipped=state.skipped)
             record["files"] = report.transferred
-            record["directories"] = directories
+            record["directories"] = state.directories
             record["bytes"] = report.bytes_transferred
             record["skipped"] = report.skipped
             record["undecidable"] = report.undecidable
