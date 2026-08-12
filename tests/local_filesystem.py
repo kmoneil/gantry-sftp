@@ -105,3 +105,25 @@ Lives here rather than in the file that first needed it, because it now has thre
 the attribute tests, the compatibility battery's expectations, and the live matrix's. One probe,
 or it is not one probe.
 """
+
+
+def _filesystem_folds_case() -> bool:
+    """Whether this machine's temporary filesystem treats two cases of a name as one file.
+
+    **macOS does; Linux does not**, and like every probe here it is asked of the *filesystem*
+    rather than of `sys.platform`: APFS and HFS+ fold by default and can be formatted not to,
+    NTFS folds, ext4 does not, and a case-insensitive mount can be arranged anywhere.
+
+    It decides what `gantry_sftp.compatibility` reports for "this server folds case in names"
+    when the server is local, which is what every lane here runs. The answer is a property of
+    the disk the server is serving, not of SFTP -- which is the whole reason the battery asks
+    a server instead of assuming (D-165).
+    """
+    with tempfile.TemporaryDirectory() as probe:
+        lower = Path(probe) / "gantry-case-probe-aa"
+        lower.touch()
+        return (Path(probe) / "GANTRY-CASE-PROBE-AA").exists()
+
+
+FILESYSTEM_FOLDS_CASE = _filesystem_folds_case()
+"""Set once, for the same reason :data:`HOLDS_NON_UTF8_NAMES` is."""

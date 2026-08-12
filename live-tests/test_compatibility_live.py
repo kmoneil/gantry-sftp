@@ -44,7 +44,7 @@ from gantry_sftp.compatibility import (
 )
 from gantry_sftp.doctor import local_diagnosis, render_json, render_text, server_diagnosis
 from gantry_sftp.sync import open_session, open_ssh_transport
-from local_filesystem import SERVER_CAN_CHMOD_A_SYMLINK
+from local_filesystem import FILESYSTEM_FOLDS_CASE, SERVER_CAN_CHMOD_A_SYMLINK
 
 TYPICAL_HANDLE = b"\x00\x00\x00\x00"
 
@@ -69,8 +69,28 @@ server offered it and it does not work" are different answers, and the report ke
 by not producing a finding at all for the first.
 """
 
-# Measured 2026-08-12 against OpenSSH 10.0p2, asyncssh 2.24.0 and paramiko's SFTPServer, all on
-# Linux. A change here is a finding first and a broken test second.
+FOLDS = Verdict.YES if FILESYSTEM_FOLDS_CASE else Verdict.NO
+LCHMOD = Verdict.YES if SERVER_CAN_CHMOD_A_SYMLINK else Verdict.NO
+"""The two facts below that belong to the *machine* rather than to the server implementation.
+
+**This distinction cost two red macOS lanes to learn, and the audit is written down here so the
+next reader does not redo it.** Every server in this matrix is served from the local filesystem
+by a process on this kernel, so a fact the battery reports is about the server *only* when the
+server is what decides it. Of the twelve:
+
+* ``CASE_FOLDS`` is the **filesystem's** -- APFS folds, ext4 does not.
+* ``LSETSTAT`` is the **kernel's** -- macOS has ``lchmod``, Linux does not, so OpenSSH's
+  permissions branch succeeds on one and answers ``ENOTSUP`` on the other.
+* Every other row is decided in the server's own code -- how it canonicalises, what its message
+  table says, whether it refuses a ``RENAME`` onto an existing name, which extensions it
+  implements -- and does not move with the host.
+
+A row that turns out to be in the wrong group shows up as one red lane and gains a line here
+with its reason. That is the process; guessing which rows were portable is what produced the two.
+"""
+
+# Measured 2026-08-12 against OpenSSH 10.0p2, asyncssh 2.24.0 and paramiko's SFTPServer, on Linux
+# except where a value is derived above. A change here is a finding first and a broken test second.
 MEASURED: dict[str, dict[str, Verdict | None]] = {
     "openssh": {
         REALPATH_MISSING: Verdict.YES,
@@ -78,17 +98,12 @@ MEASURED: dict[str, dict[str, Verdict | None]] = {
         # 'No such file' and 'Bad message' -- each is its own status code spelled out.
         MESSAGES_INFORMATIVE: Verdict.NO,
         LIMITS_USABLE: Verdict.YES,
-        CASE_FOLDS: Verdict.NO,
+        CASE_FOLDS: FOLDS,
         RENAME_REPLACES: Verdict.NO,
         TIMES_SURVIVE: Verdict.YES,
         POSIX_RENAME: Verdict.YES,
         FSYNC: Verdict.YES,
-        # Advertised, and what it does is a property of the *server's* operating system:
-        # Linux has no lchmod so the permissions branch answers ENOTSUP, which OpenSSH maps to
-        # a contentless FAILURE; macOS has one and the link's own mode really changes. The
-        # `live` lane runs on both, so this row is derived rather than pinned -- and it is
-        # derived from the local platform only because this server is local.
-        LSETSTAT: Verdict.YES if SERVER_CAN_CHMOD_A_SYMLINK else Verdict.NO,
+        LSETSTAT: LCHMOD,
         LARGEST_REQUEST: Verdict.YES,
         CHECK_FILE: NOT_ASKED,
     },
@@ -99,14 +114,16 @@ MEASURED: dict[str, dict[str, Verdict | None]] = {
         # already recorded `informative_messages=True` for this server.
         MESSAGES_INFORMATIVE: Verdict.YES,
         LIMITS_USABLE: Verdict.YES,
-        CASE_FOLDS: Verdict.NO,
+        CASE_FOLDS: FOLDS,
         RENAME_REPLACES: Verdict.NO,
         TIMES_SURVIVE: Verdict.YES,
         POSIX_RENAME: Verdict.YES,
         FSYNC: Verdict.YES,
         # Advertised, answers OK, and moves nothing -- on the same kernel where OpenSSH
         # refuses. Believing the status would have reported the one server that silently
-        # discards the request as the one where the extension works.
+        # discards the request as the one where the extension works. Pinned rather than
+        # derived: asyncssh needs the `bench` group, which only the ubuntu-only
+        # `server-matrix` job installs, so this row never runs on a kernel with lchmod.
         LSETSTAT: Verdict.NO,
         LARGEST_REQUEST: Verdict.YES,
         CHECK_FILE: NOT_ASKED,
@@ -117,7 +134,7 @@ MEASURED: dict[str, dict[str, Verdict | None]] = {
         # 'No such file' and 'Operation unsupported', both of which are their codes.
         MESSAGES_INFORMATIVE: Verdict.NO,
         LIMITS_USABLE: NOT_ASKED,
-        CASE_FOLDS: Verdict.NO,
+        CASE_FOLDS: FOLDS,
         # `_ParamikoHandler.rename` -- the harness's choice, recorded as such in matrix.py.
         RENAME_REPLACES: Verdict.YES,
         # `_ParamikoHandler.chattr` answers OK to an ACMODTIME it discards. See this module's

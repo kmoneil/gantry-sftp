@@ -352,7 +352,18 @@ def test_the_compatibility_example_shows_a_verdict_that_disagrees_with_the_adver
     returncode, stdout, _ = run_example(Path(__file__).parent / "compatibility.py")
     assert returncode == 0
     assert "lsetstat@openssh.com actually changes a symlink's own mode" in stdout
-    assert "lsetstat PERMISSIONS -> FAILURE" in stdout, "the exchange behind the verdict is gone"
+    # **One outcome or the other, and the exchange that matches it.** Which one is a property of
+    # the machine the example spawns its server on -- Linux refuses for want of `lchmod`, macOS
+    # succeeds -- and asserting the Linux line alone made this row a claim about the host. The
+    # portable claim, and the example's actual subject, is that the verdict carries its workings.
+    refused = "lsetstat PERMISSIONS -> FAILURE" in stdout
+    worked = "lsetstat PERMISSIONS -> OK" in stdout
+    assert refused != worked, (
+        "the example must show exactly one lsetstat outcome with its exchange; it showed "
+        f"{'both' if refused else 'neither'}"
+    )
+    if worked:
+        assert "LSTAT of the link ->" in stdout, "an OK is only evidence with the check after it"
     # Every finding carries its workings, and the run answered everything it asked.
     assert "complete:        True" in stdout
     assert "answers, not faults" in stdout
