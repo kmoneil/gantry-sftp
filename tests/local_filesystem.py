@@ -83,3 +83,25 @@ def give_one_file_a_second_name(first: Path, second: Path) -> None:
     if second.exists():
         return
     os.link(first, second)
+
+
+SERVER_CAN_CHMOD_A_SYMLINK = os.chmod in os.supports_follow_symlinks
+"""Whether the machine running ``sftp-server`` can change a symlink's *own* permission bits.
+
+**macOS can; Linux cannot**, and the consequence reaches further than one syscall: it decides
+what `lsetstat@openssh.com` does on a server running here. Linux has no `lchmod`, so
+`fchmodat(AT_SYMLINK_NOFOLLOW)` answers `ENOTSUP` and OpenSSH maps it to a contentless
+`FAILURE`; on macOS the same request succeeds and the link's mode really changes.
+
+`os.supports_follow_symlinks` is the platform's own answer -- the documented capability set --
+rather than a `sys.platform` string or a `try`/`except` that would also swallow a real error.
+
+**The local platform is the right proxy only because the server is local**: these lanes drive
+`sftp-server` on this machine. It would be the wrong proxy for a remote server, and a Linux
+client talking to a macOS server does get the success -- which is the whole reason
+`gantry_sftp.compatibility` asks the server rather than assuming (D-165).
+
+Lives here rather than in the file that first needed it, because it now has three consumers:
+the attribute tests, the compatibility battery's expectations, and the live matrix's. One probe,
+or it is not one probe.
+"""
