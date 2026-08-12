@@ -1051,6 +1051,29 @@ EXPECTED_ARGUMENTS = [
         "_StoreTrueAction",
         "emit the report as JSON rather than as text",
     ),
+    # D-165. `_StoreFalseAction` is the load-bearing column on this row: the read-only battery
+    # is on by default for a host, so the flag has to *remove* it, and a `_StoreTrueAction`
+    # here would silently invert what `doctor example.com` does.
+    (
+        ("--no-probes",),
+        "probes",
+        None,
+        None,
+        0,
+        None,
+        "_StoreFalseAction",
+        "skip the read-only compatibility battery; report the negotiation only",
+    ),
+    (
+        ("--probe-writes",),
+        "probe_writes",
+        "DIR",
+        None,
+        None,
+        None,
+        "_StoreAction",
+        "also run the probes that create files, in DIR, removing them afterwards",
+    ),
 ]
 
 
@@ -1106,6 +1129,11 @@ def test_main_forwards_every_argument_to_the_server_diagnosis(monkeypatch, tmp_p
     An operator diagnosing a connection passes the identity, the config and the options that
     connection actually uses -- so an argument dropped here diagnoses a *different* connection
     and reports that it worked.
+
+    The two battery arguments are here at their *defaults*, which pins what `doctor <host>`
+    does with no flags: the read-only battery runs and nothing is written. Their non-default
+    spellings are a separate test, because an argument forwarded at its default value is an
+    argument no assertion can see.
     """
     seen: dict[str, object] = {}
 
@@ -1143,7 +1171,63 @@ def test_main_forwards_every_argument_to_the_server_diagnosis(monkeypatch, tmp_p
         "config_file": str(tmp_path / "ssh_config"),
         # Repeated `-o` accumulates, and the value keeps the `=` inside it.
         "options": {"Compression": "yes", "ProxyCommand": "ssh -W %h:%p bastion"},
+        "probes": True,
+        "write_directory": None,
     }
+
+
+def test_the_battery_flags_reach_the_diagnosis_at_their_non_default_values(monkeypatch, capsys):
+    """D-165. Both spellings, because a default that is forwarded is a default either way.
+
+    `--no-probes` has to arrive as `probes=False` and `--probe-writes` as the directory: the
+    first is what an operator reaches for when the battery itself is the problem, and the
+    second is the only way any file gets created, so a dropped argument is a promise not kept
+    in one direction and a surprise in the other. They are mutually exclusive, so this is two
+    runs rather than one.
+    """
+    seen: list[dict[str, object]] = []
+
+    def spy(host: str, **kwargs: object) -> ServerDiagnosis:
+        seen.append({**kwargs, "host": host})
+        return reachable()
+
+    monkeypatch.setattr(gantry_main, "server_diagnosis", spy)
+    _ = gantry_main.main(["doctor", "example.com", "--no-probes"])
+    _ = gantry_main.main(["doctor", "example.com", "--probe-writes", "/incoming/scratch"])
+    _ = capsys.readouterr()
+
+    assert seen[0]["probes"] is False
+    assert seen[0]["write_directory"] is None
+    assert seen[1]["probes"] is True
+    assert seen[1]["write_directory"] == "/incoming/scratch"
+
+
+def test_the_two_battery_flags_contradict_each_other_and_are_refused(capsys):
+    """ "Skip the probes, and here is where to write probe files" has no reading worth guessing.
+
+    Argparse owns the message, which is why they are a mutually exclusive group rather than a
+    precedence rule this file would have to keep in step with itself.
+    """
+    with pytest.raises(SystemExit) as exit_status:
+        _ = gantry_main.main(
+            ["doctor", "example.com", "--no-probes", "--probe-writes", "/incoming/scratch"]
+        )
+
+    assert exit_status.value.code == int(Exit.USAGE)
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_probing_writes_with_no_host_is_a_usage_error(capsys):
+    """A flag that promises to create files somewhere must not silently create none.
+
+    Deliberately not symmetric with `--no-probes`, which is harmless with no host: skipping a
+    battery that was never going to run tells the operator nothing untrue.
+    """
+    with pytest.raises(SystemExit) as exit_status:
+        _ = gantry_main.main(["doctor", "--probe-writes", "/incoming/scratch"])
+
+    assert exit_status.value.code == int(Exit.USAGE)
+    assert "--probe-writes needs a host to probe" in capsys.readouterr().err
 
 
 def test_no_options_reaches_the_diagnosis_as_none_rather_than_an_empty_mapping(monkeypatch, capsys):

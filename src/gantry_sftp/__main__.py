@@ -37,12 +37,24 @@ the mode to run in a Dockerfile: it needs no server and its exit status is the a
 
 With a host, it connects once and reports the same negotiation a transfer performs: the
 protocol version, the advertised extensions and which of them this library uses, the limits
-and the request size derived from them, and where the session starts.
+and the request size derived from them, and where the session starts. It then runs a
+read-only compatibility battery, which asks what the server *does* rather than what it
+advertised, and prints the exchange behind every answer. That battery makes no writes and is
+safe to point at production; --no-probes turns it off.
+
+--probe-writes DIR adds the questions that can only be answered by writing -- whether names
+fold case, whether RENAME replaces an existing target, whether an uploaded file's timestamps
+survive. Every file it creates begins with `gantry-probe`, lives in DIR and is removed before
+the command exits; anything it could not remove is named in the report. There is no default
+directory and there will not be one.
 """
 
 _EPILOG = """\
 exit status: 0 usable | 2 usage | 3 no ssh binary | 4 platform cannot transfer |
 5 host unreachable
+
+a compatibility finding of "no" is an answer, not a fault, and does not change the status:
+real endpoints differ from the reference in a dozen ways and work perfectly well.
 """
 
 
@@ -75,6 +87,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _ = parser.add_argument(
         "--json", action="store_true", help="emit the report as JSON rather than as text"
+    )
+    # Mutually exclusive rather than resolved by precedence: "skip the probes, and here is a
+    # directory to write probes into" has no reading a user would be glad we guessed, and
+    # argparse's own error names both flags without this file owning the sentence.
+    battery = parser.add_mutually_exclusive_group()
+    _ = battery.add_argument(
+        "--no-probes",
+        dest="probes",
+        action="store_false",
+        help="skip the read-only compatibility battery; report the negotiation only",
+    )
+    _ = battery.add_argument(
+        "--probe-writes",
+        metavar="DIR",
+        help="also run the probes that create files, in DIR, removing them afterwards",
     )
     return parser
 
@@ -124,6 +151,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         options = parse_options(arguments.options)
     except ValueError as malformed:
         parser.error(str(malformed))  # exits USAGE, which is argparse's 2
+    if arguments.probe_writes is not None and arguments.host is None:
+        # Refused rather than ignored, and the asymmetry with `--no-probes` is deliberate:
+        # skipping a battery that was never going to run is harmless, but a flag that promises
+        # to create files somewhere and silently creates none has told the operator something
+        # untrue about what just happened.
+        parser.error("--probe-writes needs a host to probe")
     local = local_diagnosis()
     server = None
     # Not attempted when ssh is unusable: a connection failure would be the *symptom*, and
@@ -137,6 +170,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             identity_file=arguments.identity_file,
             config_file=arguments.config_file,
             options=options or None,
+            probes=arguments.probes,
+            write_directory=arguments.probe_writes,
         )
     render = render_json if arguments.json else render_text
     print(render(local, server))  # noqa: T201  # printing the report is what this program is

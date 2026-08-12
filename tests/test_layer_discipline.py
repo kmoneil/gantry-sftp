@@ -194,6 +194,7 @@ def test_codec_imports_only_itself_and_the_exception_module() -> None:
 
 ERGONOMICS = (
     "gantry_sftp.doctor",
+    "gantry_sftp.compatibility",
     "gantry_sftp.__main__",
     "gantry_sftp.path",
     "gantry_sftp.sync",

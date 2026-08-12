@@ -331,3 +331,34 @@ def test_the_dry_run_example_shows_a_preview_that_wrote_nothing():
         assert "remote tree holds both names: no" in stdout
         assert "would fold together" not in stdout
         assert "the fold happened when" in stdout
+
+
+def test_the_compatibility_example_shows_a_verdict_that_disagrees_with_the_advertisement():
+    """The example is only worth having if it demonstrates the gap the report exists for.
+
+    "Which extensions are advertised" and "which extensions work" are different questions, and
+    against the OpenSSH server this example spawns there is exactly one row where they give
+    different answers: `lsetstat@openssh.com` is advertised and cannot succeed on Linux. An
+    example that printed only agreeing rows would be demonstrating the easy half.
+
+    The cleanup claim is asserted twice on purpose, because the two are different statements.
+    `left behind: nothing` is what the *report* says; the scratch listing is what the
+    *filesystem* says, and a battery that lost track of a name it created would pass the first
+    and fail the second.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "compatibility.py")
+    assert returncode == 0
+    assert "lsetstat@openssh.com actually changes a symlink's own mode" in stdout
+    assert "lsetstat PERMISSIONS -> FAILURE" in stdout, "the exchange behind the verdict is gone"
+    # Every finding carries its workings, and the run answered everything it asked.
+    assert "complete:        True" in stdout
+    assert "answers, not faults" in stdout
+    # Both cleanup claims.
+    assert "left behind:     nothing" in stdout
+    assert "scratch directory afterwards: []" in stdout
+    # And what it declined to ask is named rather than implied.
+    assert "not determined -- what this run did not ask, and why:" in stdout
+    assert "not probed, because that means moving somebody's data" in stdout
