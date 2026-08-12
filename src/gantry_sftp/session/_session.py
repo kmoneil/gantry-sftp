@@ -2876,15 +2876,22 @@ class Session(_SessionOperations):
                 partial of the right length from the wrong source is the failure resume exists
                 to avoid.
 
-                **Requires ``publish=Publish(atomic=False)``** and raises :exc:`ValueError`
-                otherwise. Each file stages under a name generated fresh per call, so last
-                run's partial cannot be found again -- and a ``staging_name`` cannot be fixed
-                for a whole tree. Deriving one per file from the target would make it
-                predictable for every file at once, which is what
-                :func:`~gantry_sftp.session.staging_token` exists to prevent, so the
-                combination is refused rather than silently downgraded. Resuming therefore
-                means resuming the destination files themselves, and a consumer polling the
-                directory can see a partial file while it happens.
+                **Needs either a journal or ``publish=Publish(atomic=False)``**, and raises
+                :exc:`ValueError` with neither. Each file stages under a name generated fresh
+                per call, so last run's partials cannot be found again unless something wrote
+                them down -- and a ``staging_name`` cannot be fixed for a whole tree. Deriving
+                one per file from the target would make it predictable for every file at once,
+                which is what :func:`~gantry_sftp.session.staging_token` exists to prevent, so
+                that is still refused rather than silently downgraded.
+
+                The two spellings differ in what a consumer can observe. With
+                ``publish=Publish(journal=UploadJournal(path))`` the tree keeps atomic
+                publishing: each file's random staging name is recorded durably before its
+                ``OPEN``, a later process reads them back, and nothing incomplete is ever
+                visible at a destination path. With ``publish=Publish(atomic=False)`` there is
+                no staging file to find, resuming means resuming the destination files
+                themselves, and a consumer polling the directory can see a partial file while
+                it happens.
             concurrency: Files uploaded at once. ``1`` -- the default -- keeps the exact
                 sequential path this method has always had. See :meth:`get_tree` for what
                 concurrency buys, what it cannot lift, what it costs in ordering, and why the

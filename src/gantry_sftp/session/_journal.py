@@ -43,8 +43,11 @@ file, and ``tests/test_journal.py`` asserts that rather than arguing it.
 ## Append-only, because a tree uploads concurrently
 
 ``put_tree(concurrency=N)`` runs N uploads against one journal, so a read-modify-write of a whole
-document would need a lock and would lose records to interleaving. Each event is instead one
-line, appended to a file opened ``O_APPEND`` and ``fsync``ed, and the state is folded on read:
+document would need a lock and would lose records to interleaving. That sentence described a
+capability the tree API refused for a day -- ``_check_tree_publish`` did not read the journal, so
+``put_tree(resume=True)`` still raised the pre-journal argument at a caller who had answered it,
+which D-172 fixed. Each event is instead one line, appended to a file opened ``O_APPEND`` and
+``fsync``ed, and the state is folded on read:
 a target with a ``staged`` line and no ``published`` line is one that may have a partial. The
 append is a single :func:`os.write` of a short buffer, which is the assumption every append-only
 log makes; :func:`compact` is how the file stops growing, and it is explicit rather than

@@ -62,6 +62,33 @@ with open_ssh_transport(host, **plan) as t, open_session(t, depth=2) as s:
 """
 
 
+KILLED_TREE_UPLOAD = """
+import json, os, signal, sys
+from pathlib import Path
+from gantry_sftp.session import Publish, UploadJournal
+from gantry_sftp.sync import open_ssh_transport, open_session
+
+plan = json.loads(sys.argv[1])
+source, journal, target = Path(sys.argv[2]), UploadJournal(Path(sys.argv[3])), sys.argv[4]
+host = plan.pop("host")
+
+def die(transferred, total):
+    # Only on the one file large enough to leave a partial worth resuming: the small files
+    # ahead of it must reach their destinations, because what this row proves is that the
+    # restart continues *one* file and does not care about the others.
+    if total is not None and total > 500_000 and transferred > 200_000:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+# `depth=2` for the reason the single-file script gives: at the shipped depth the whole payload
+# is in flight before the first callback crosses the threshold, and there is nothing partial.
+with open_ssh_transport(host, **plan) as t, open_session(t, depth=2) as s:
+    s.put_tree(
+        source, target.encode(),
+        resume=True, publish=Publish(journal=journal), progress=die, concurrency=1,
+    )
+"""
+
+
 @pytest.fixture(params=SERVER_NAMES)
 def server(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[MatrixServer]:
     """One running server per implementation, skipping with a reason when it cannot start."""
@@ -133,6 +160,84 @@ def test_an_upload_killed_mid_transfer_resumes_against_this_server(
     # No exact listing: `server.root` is the test's own `tmp_path` for this fixture, so it also
     # holds the script, the keys and the journal. The claim is about staging files.
     assert [p.name for p in server.root.iterdir() if p.name.endswith(".part")] == []
+    assert journal.in_flight() == {}
+
+
+def test_a_tree_killed_mid_file_resumes_against_this_server(server: MatrixServer, tmp_path: Path):
+    """D-172, and the row the lifted guard exists for.
+
+    `tests/` proves the *request* is accepted and that each file records a name of its own. What
+    only a real crash can show is the rest of it: that the record on disk survives a process
+    that ran no cleanup, that the restart finds the one file that was in flight, and that it
+    continues that file while re-sending the others from scratch -- `put_tree` is not a mirror
+    and does not skip what is already there.
+
+    Against all three implementations for the reason this module's docstring gives: adopting a
+    partial and publishing over a destination are the two things they disagree about, and a tree
+    does both once per file.
+    """
+    source = tmp_path / "outgoing"
+    source.mkdir()
+    _ = (source / "a.bin").write_bytes(b"a" * 4096)
+    _ = (source / "b.bin").write_bytes(b"b" * 4096)
+    _ = (source / "big.bin").write_bytes(PAYLOAD)
+    total = sum(path.stat().st_size for path in source.iterdir())
+    # A directory of its own under the server's root, which for this fixture is also the test's
+    # `tmp_path` and holds the keys, the script and the journal.
+    destination = server.root / "incoming"
+    journal = UploadJournal(tmp_path / "uploads.journal")
+    script = tmp_path / "killed_tree.py"
+    _ = script.write_text(KILLED_TREE_UPLOAD, encoding="utf-8")
+
+    plan = {key: _jsonable(value) for key, value in server.connect.items()}
+    killed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            json.dumps(plan),
+            str(source),
+            str(journal.path),
+            str(destination),
+        ],
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert killed.returncode == -9, killed.stderr.decode("utf-8", "replace")
+    staged = [path for path in destination.iterdir() if path.name.endswith(".part")]
+    assert len(staged) == 1, f"{server.name} left {len(staged)} staging files, expected one"
+    # `walk_local` yields entries sorted by name, so the two small files are published before
+    # the kill lands inside `big.bin`. Asserted rather than assumed: with the order the other
+    # way the row would still pass its arithmetic while proving nothing about the others.
+    assert sorted(p.name for p in destination.iterdir() if not p.name.endswith(".part")) == [
+        "a.bin",
+        "b.bin",
+    ]
+    partial = staged[0].stat().st_size
+    assert 0 < partial < len(PAYLOAD)
+    in_flight = journal.in_flight()
+    assert len(in_flight) == 1, "the killed file is the only one that should still be in flight"
+    assert (
+        journal.staged_for(
+            str(destination / "big.bin").encode(), source_identity(source / "big.bin")
+        )
+        == str(staged[0]).encode()
+    )
+
+    with connected(server) as transport, open_session(transport) as sftp:
+        result = sftp.put_tree(
+            source, str(destination).encode(), resume=True, publish=Publish(journal=journal)
+        )
+
+    assert result.files == 3
+    # The small files are sent again in full and the big one continues, so the difference from
+    # the whole tree is exactly the prefix that was already staged. Anything else means it
+    # restarted the file it was supposed to resume.
+    assert result.transferred == total - partial, "it restarted rather than resuming"
+    for name in ("a.bin", "b.bin", "big.bin"):
+        assert (destination / name).read_bytes() == (source / name).read_bytes()
+    assert [path.name for path in destination.iterdir() if path.name.endswith(".part")] == []
     assert journal.in_flight() == {}
 
 

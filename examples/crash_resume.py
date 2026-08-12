@@ -23,9 +23,15 @@ Where to resume from is read off the server, exactly as it was before.
 performed, so the note saying where the bytes are going has to be durable before anything could
 create the file.
 
-**Cleanup is the half you notice first.** The last section leaves an orphan on purpose and sweeps
+**Cleanup is the half you notice first.** The third section leaves an orphan on purpose and sweeps
 it, because a directory that slowly fills with ``.part`` files nobody owns is what an operator
 actually complains about.
+
+**And then the same crash one level up.** The last section kills a ``put_tree`` inside one of its
+files and resumes the whole tree on one journal -- the combination that was refused outright until
+D-172, because each file stages under a name generated fresh per call and nothing could find them
+again. Note what it does *not* do: ``put_tree`` re-sends the files that already landed, because it
+is not a mirror. ``sync_tree`` is the operation that decides not to send something.
 """
 
 from __future__ import annotations
@@ -128,6 +134,85 @@ def run_locally(workdir: Path) -> None:
         print(f"  nothing left staged:    {[p.name for p in root.iterdir()] == ['big.bin']}")
         print(f"  journal is clear:       {journal.in_flight() == {}}")
         sweep(sftp, root, target, journal)
+
+    run_tree_demonstration(workdir)
+
+
+def upload_tree_and_die(root: Path, source: Path, target: bytes, journal: UploadJournal) -> None:
+    """Start a whole tree and SIGKILL this process inside one of its files. Never returns."""
+
+    def die(transferred: int, total: int | None) -> None:
+        # Only inside the large file: the small ones ahead of it have to reach their
+        # destinations, because what the resume then demonstrates is that it continues the one
+        # that was interrupted and re-sends the others from scratch.
+        if total is not None and total > KILL_AFTER and transferred > KILL_AFTER:
+            print(f"  child: {transferred} bytes into the big file, killing myself")
+            sys.stdout.flush()
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    with open_local_server_transport(cwd=root) as transport, open_session(transport) as sftp:
+        _ = sftp.put_tree(
+            source,
+            target,
+            resume=True,
+            publish=Publish(journal=journal),
+            progress=die,
+            concurrency=1,
+        )
+
+
+def run_tree_demonstration(workdir: Path) -> None:
+    """The same crash one level up: a tree, killed inside one file, resumed on one journal.
+
+    `put_tree(resume=True)` used to be refused outright with atomic publishing, because a
+    staging name generated fresh per call cannot be found again. The journal is what makes each
+    of them findable, so the tree keeps atomic publishing *and* resumes.
+
+    **`put_tree` is not a mirror.** The files that already landed are uploaded again in full --
+    only the interrupted one continues. `sync_tree` is the operation that decides not to send
+    something, and it decides that against a manifest rather than a journal.
+    """
+    root = workdir / "tree-srv"
+    root.mkdir()
+    source = workdir / "outgoing"
+    source.mkdir()
+    _ = (source / "small-a.bin").write_bytes(b"a" * 4096)
+    _ = (source / "small-b.bin").write_bytes(b"b" * 4096)
+    # Named to sort last: `walk_local` yields entries sorted by name, so the two small files
+    # are published before the kill lands inside this one.
+    _ = (source / "zz-big.bin").write_bytes(PAYLOAD)
+    total = sum(path.stat().st_size for path in source.iterdir())
+    destination = root / "incoming"
+    journal = UploadJournal(workdir / "tree.journal")
+
+    print(f"\nuploading a {total}-byte tree, and dying inside the big file:")
+    child = os.fork()
+    if child == 0:  # pragma: no cover -- the child never returns, it is killed
+        upload_tree_and_die(root, source, str(destination).encode(), journal)
+        os._exit(0)
+    _, status = os.waitpid(child, 0)
+    print(f"  parent: child exited on signal {os.WTERMSIG(status)} (9 = SIGKILL)")
+
+    staged = [path for path in destination.iterdir() if path.name.endswith(".part")]
+    landed = sorted(p.name for p in destination.iterdir() if not p.name.endswith(".part"))
+    partial = staged[0].stat().st_size
+    print(f"  published before the crash: {landed}")
+    print(f"  one file was in flight:     {staged[0].name} ({partial} bytes)")
+    print(f"  the journal has {len(journal.in_flight())} record still in flight")
+
+    with open_local_server_transport(cwd=root) as transport, open_session(transport) as sftp:
+        result = sftp.put_tree(
+            source, str(destination).encode(), resume=True, publish=Publish(journal=journal)
+        )
+
+    # The whole tree less the prefix already staged: the small files go again, the big one
+    # continues. A run that restarted the big file would move `total` and read identically.
+    print(f"\nsecond process, same journal: moved {result.transferred} of {total} bytes")
+    print(f"  resumed rather than restarted: {result.transferred == total - partial}")
+    matches = all((destination / p.name).read_bytes() == p.read_bytes() for p in source.iterdir())
+    print(f"  every file matches its source: {matches}")
+    print(f"  nothing left staged:           {not list(destination.glob('*.part'))}")
+    print(f"  journal is clear:              {journal.in_flight() == {}}")
 
 
 def run_remotely(destination: str, workdir: Path) -> None:

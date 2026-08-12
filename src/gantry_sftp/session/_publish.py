@@ -195,11 +195,20 @@ class Publish:
         require_fsync: Raise rather than publish with no durability barrier.
         staging_name: Where to stage, instead of a generated hidden sibling. Naming it yourself
             drops the ``EXCL`` that otherwise refuses a collision, so the collision risk moves
-            to you.
+            to you. Applies to the atomic path only, for the reason under ``journal``.
         journal: A durable note of which staging file this upload chose, so a **later process**
             can find it (D-166). This is what makes ``resume=True`` legal alongside
-            ``atomic=True``: the staging name keeps its randomness, and the journal is what
-            recovers it. See :class:`~gantry_sftp.session.UploadJournal`.
+            ``atomic=True`` -- for one file and, since D-172, for a whole tree: the staging
+            name keeps its randomness, and the journal is what recovers it. See
+            :class:`~gantry_sftp.session.UploadJournal`.
+
+            **Ignored when** ``atomic=False``, and that is not refused. There is no staging
+            file on the in-place path, so there is no name to write down and nothing is
+            silently dropped: the upload is exactly as durable as it was asked to be, and
+            ``resume`` there continues into the destination itself, which needs no record.
+            Refusing the combination was considered and rejected for consistency --
+            ``staging_name`` is atomic-only in the same way and has always been accepted -- so
+            the honest fix is this sentence rather than a fourth contradiction rule.
     """
 
     atomic: bool = True
