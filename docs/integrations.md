@@ -163,20 +163,27 @@ None is a defect of this adapter, and each will surprise you if nobody says it.
 - **A password in a URL is a password in `storage_options`** for every other fsspec
   filesystem, which is what `__reduce__` pickles — so a dask scheduler ships it to every
   worker — and what `to_json()` serialises, with `include_password` defaulting to `True`.
-  **Not here**: `_strip_tokenize_options` means the password reaches the constructor and never
-  reaches `storage_options`, so none of those carry it. It is held on the instance, because the
-  connection is opened lazily and something has to remember it — as a `Secret`, whose `repr()`
-  is `'<redacted>'`, so an object dump of a cached filesystem does not disclose it either. The
-  cost is stated rather than hidden — the password is not part of the cache token either, so two
-  filesystems differing only in password come back as one instance holding the first.
-- **That cost is an authentication one.** The second caller's password is never checked against
-  anything, so a password that is *wrong* for the account still gives a working session,
-  authenticated by whoever constructed first. With one principal in the process that is a stale
-  connection. With several — a dask worker, a notebook server, a shared ETL job — knowing a
-  username is enough to inherit a colleague's session, and no log distinguishes it, because it
-  is a legitimate connection that simply is not theirs. **Pass `skip_instance_cache=True`
-  whenever more than one principal can reach the process.** Keeping the password out of the
-  token stays right regardless; this is what its price is.
+  **Not here**, and two mechanisms hold that rather than one. `_strip_tokenize_options` means
+  the password reaches the constructor and never reaches `storage_options`; that mechanism is
+  fsspec's own, read off a private attribute, so `_CredentialAwareCache` scrubs the mapping
+  afterwards and the guarantee does not depend on a release nobody here controls. The password
+  is held on the instance, because the connection is opened lazily and something has to remember
+  it — as a `Secret`, whose `repr()` is `'<redacted>'`, so an object dump of a cached filesystem
+  does not disclose it either.
+- **A filesystem with a password is not shared out of the instance cache.** Keeping the
+  credential out of the cache token is what makes it un-picklable and stays — but it meant two
+  filesystems differing only in password came back as one, holding the first. That cost was an
+  authentication one: the second caller's password is never checked against anything, so a
+  password that is *wrong* for the account still gives a working session, authenticated by
+  whoever constructed first. With several principals in a process — a dask worker, a notebook
+  server, a shared ETL job — knowing a username was enough to inherit a colleague's session, and
+  no log distinguished it, because it is a legitimate connection that simply is not theirs.
+  So supplying a `password` now defaults to `skip_instance_cache=True`.
+- **What that costs is connections, on the password path only.** A program resolving the same
+  password-bearing URL in a loop spawns an `ssh` child per resolution instead of reusing one.
+  Key-based authentication is untouched and still caches per thread, which is where the cache
+  was worth having. Pass `skip_instance_cache=False` explicitly to share anyway, in a process
+  you know holds one principal.
 - **`ls()` holds the whole directory, and the server decides how big that is.** fsspec's
   contract is that `ls` returns a list, so there is no streaming form of it to reach for and no
   override that could add one. A directory with millions of entries — or a hostile server

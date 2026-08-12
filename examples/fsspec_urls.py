@@ -148,10 +148,13 @@ def read_bytes(filesystem: GantrySFTPFileSystem, directory: str) -> None:
 
 
 def show_the_credential() -> None:
-    """Where a password would be, in every other fsspec filesystem, and is not here."""
-    filesystem = GantrySFTPFileSystem(
-        "example.com", user="bob", password="hunter2", skip_instance_cache=True
-    )
+    """Where a password would be, in every other fsspec filesystem, and is not here.
+
+    No ``skip_instance_cache=True`` anywhere below, and its absence is half the demonstration:
+    supplying a password is what makes an instance uncached, so the spelling this example used
+    to need is now what the library does on its own.
+    """
+    filesystem = GantrySFTPFileSystem("example.com", user="bob", password="hunter2")
     print("\na filesystem built with password='hunter2':")
     print(f"    storage_options   {filesystem.storage_options}")
     print(f"    to_json()         {filesystem.to_json()}")
@@ -164,6 +167,15 @@ def show_the_credential() -> None:
     ):
         assert "hunter2" not in text, f"the password reached {surface}"
     print("    -- and none of those four carries it, so a pickle to a dask worker cannot")
+
+    # The other half, and the reason it is worth a runnable line rather than a sentence: the
+    # cache is keyed on everything *except* the password, so before D-178 the second of these
+    # was the first, holding a credential it was never given.
+    other = GantrySFTPFileSystem("example.com", user="bob", password="a-different-password")
+    assert other is not filesystem, "a password-bearing filesystem was served from the cache"
+    print("    -- and a second password for the same account is a second filesystem, not the")
+    print("       first one wearing it")
+    GantrySFTPFileSystem._cache.clear()  # noqa: SLF001
 
 
 def show_what_a_url_may_not_set() -> None:

@@ -5,7 +5,37 @@ and while the major version is `0` the minor version is where a breaking change 
 
 ## Unreleased
 
+### Changed
+
+- **A `gantry-sftp` filesystem built with a `password=` is no longer shared out of fsspec's
+  instance cache** (D-178). The cache token deliberately omits the password — that is what keeps
+  the credential out of a pickle — so two filesystems differing *only* in password used to come
+  back as one, holding the first. 0.2.0 documented that and named the control; this makes the
+  control the default, because the consequence is an authentication one: the second caller's
+  password is never checked against anything, so one that is *wrong* for the account still
+  connected, on a session somebody else authenticated. Where several principals share a process —
+  a dask worker, a notebook server, a shared ETL job — knowing a username was enough to inherit a
+  colleague's session, and no log distinguished it.
+
+  **What it costs, and who pays.** A program resolving the same password-bearing URL repeatedly
+  now spawns an `ssh` child per resolution instead of reusing one. Key-based authentication is
+  untouched and still caches per thread. Pass `skip_instance_cache=False` explicitly to share
+  anyway, in a process you know holds one principal — the old spelling still resolves the old way,
+  and there is a test that says so.
+
 ### Fixed
+
+- **The password's absence from `storage_options` rested on a private attribute of fsspec**
+  (D-177). `_strip_tokenize_options = ("password",)` is our whole contribution to that guarantee;
+  the pop that acts on it lives in fsspec's `_Cached.__call__`, and `storage_options` is the one
+  mapping `__reduce__` returns verbatim and `to_json()` serialises with `include_password`
+  defaulting to `True`. With `fsspec` declared `>=2026.7.0` and no upper bound, and every CI lane
+  resolving `--frozen`, a release that stopped honouring the attribute would have put the
+  credential into every dask worker's pickle with nothing raised anywhere. The mapping is now
+  scrubbed by `gantry_sftp.fsspec`'s own metaclass as well, so the guarantee holds whatever fsspec
+  does; `_strip_tokenize_options` stays, because it is also what keeps the password out of the
+  cache *token*, which a scrub cannot reach. No upper bound was added — with the belt in place the
+  adapter no longer needs one for this, and a cap would restrict you to buy nothing.
 
 - **A local file this library creates beside one you named could be planted at first** (D-175,
   CWE-59). `UploadJournal.compact()` wrote `<journal>.compacting` and `sync_tree`'s manifest
