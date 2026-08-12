@@ -56,6 +56,7 @@ __all__ = [
     "_DownloadState",
     "_TreeDownload",
     "_TreeUpload",
+    "_UploadWalkState",
     "_already_complete",
     "_check_local_path",
     "_check_publish_flags",
@@ -694,6 +695,40 @@ class _DownloadState:
     # of the timestamps': a directory created 0o500 cannot have files written into it, so its
     # real mode has to wait until everything inside it has arrived.
     directory_modes: list[tuple[Path, int]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _UploadWalkState:
+    """The directory-level bookkeeping every upload walk accumulates, and only that (D-179).
+
+    :class:`_DownloadState` holds a whole tree download's accumulation because there is one
+    caller. There are two here -- :meth:`Session.put_tree` and :meth:`Session.sync_tree` -- and
+    the shared part is exactly the part :meth:`Session._walk_for_upload` writes: how many
+    directories the walk made, what metadata they owe the pass after it, and what the walk
+    refused to carry.
+
+    **What is deliberately not here is each caller's results.** ``put_tree`` accumulates moved
+    and planned byte counts; ``sync_tree`` accumulates :class:`SyncOutcome` objects and appends
+    a manifest record per file. Folding those in would make one type that means two things, and
+    the duplication this card removed was two functions that each meant one thing -- trading it
+    for one function that means two would be the merge rather than the fix.
+
+    Written **only by the producer**, which runs in one task, so ``+=`` on ``directories`` is
+    safe here for the reason :class:`_DownloadState` gives about its own counters: the lost
+    update an augmented assignment produces needs two writers, and the workers write to their
+    caller's list instead.
+    """
+
+    directories: int = 0
+    # Collected during the walk and applied after it -- see `Session._set_directory_times`. A
+    # directory's mtime is changed again by every file written into it, so stamping during the
+    # walk stamps it with the walk. Local `stat` is free, so this costs nothing until the pass.
+    times: list[tuple[bytes, Times]] = field(default_factory=list)
+    # Same collection and the same pass, plus one reason the timestamps do not have: a
+    # directory created with a restrictive source mode could not have its files written into
+    # it. Only `Mode.PRESERVE` fills this -- an integer `mode=` is a file mode.
+    modes: list[tuple[bytes, int]] = field(default_factory=list)
+    skipped: list[Skipped] = field(default_factory=list)
 
 
 def _note_planned(state: _DownloadState, child: DirEntry) -> None:

@@ -370,8 +370,24 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 39
+SESSION_METHOD_CEILING = 40
 """What `Session` measures today, which is the whole of the rule.
+
+**39 to 40 by D-179**, and this is the first raise where the class got *smaller* while the count
+went up -- which is the ratchet measuring a proxy rather than the thing, and worth recording as
+that. `put_tree` and `sync_tree` each carried the same directory-level walk: `mkdir` before the
+directory's files, count it, collect its deferred times and modes, carry its skips. One
+`_walk_for_upload` now does it for both, so roughly thirty statements of duplicated orchestration
+left the two methods and twenty arrived as one.
+
+The ratchet's question -- does it belong on `Session` at all? -- was asked and has a direct
+answer: it awaits `self.mkdir`, and `_walk_for_download` is a method on this class for exactly
+that reason, being the twin this one mirrors. The alternative considered was D-128's shape, a free
+function in another module taking `mkdir` as an injected callable, and it was refused because it
+would make the two walks structurally different -- which is the asymmetry D-179 exists to remove,
+reintroduced one layer down. **The pure half had already left**: `_settle_remote_directory`,
+`_remote_directory` and `_UploadWalkState` are all `session/_policy.py`, testable with a `Path`
+and no server. What is left here is the `await`.
 
 **38 to 39 by D-166**, the upload journal, and the ratchet's question was asked rather than
 waved through. `discard_staged` removes the staging files a killed run left behind, so it needs
