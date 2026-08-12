@@ -20,6 +20,12 @@ from gantry_sftp.session._download import (
     download_handle,
     read_range_into,
 )
+from gantry_sftp.session._journal import (
+    JOURNAL_VERSION,
+    JournalEntry,
+    SourceIdentity,
+    UploadJournal,
+)
 from gantry_sftp.session._limits import (
     DEFAULT_MAX_PACKET_LENGTH,
     PREFERRED_READ_LENGTH,
@@ -148,6 +154,7 @@ __all__ = [
     "DEFAULT_REQUEST_TIMEOUT",
     "DEFAULT_SESSION_OPTIONS",
     "DOT_ENTRIES",
+    "JOURNAL_VERSION",
     "LIMITS_EXTENSION",
     "MANIFEST_VERSION",
     "MAX_STAGED_NAME_LENGTH",
@@ -171,6 +178,7 @@ __all__ = [
     "Exchange",
     "FoldedNameLedger",
     "GlobMatch",
+    "JournalEntry",
     "LocalWalkEntry",
     "ManifestEntry",
     "Mode",
@@ -188,6 +196,7 @@ __all__ = [
     "SizeCheck",
     "SkipReason",
     "Skipped",
+    "SourceIdentity",
     "SyncDecision",
     "SyncManifest",
     "SyncOutcome",
@@ -197,6 +206,7 @@ __all__ = [
     "TransferSizes",
     "TreePlan",
     "TreeResult",
+    "UploadJournal",
     "UploadResult",
     "Verify",
     "WalkEntry",

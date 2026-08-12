@@ -108,6 +108,7 @@ from gantry_sftp.session import (
     TransferSizes,
     TreePlan,
     TreeResult,
+    UploadJournal,
     UploadResult,
     Verify,
     WalkEntry,
@@ -747,6 +748,10 @@ class SyncSession:
     def rmtree(self, path: bytes | str) -> TreeResult:
         """Remove a directory and everything under it."""
         return self._run(partial(self._session.rmtree, path))
+
+    def discard_staged(self, journal: UploadJournal) -> tuple[bytes, ...]:
+        """Remove the staging files a killed run left behind, and clear their records."""
+        return self._run(partial(self._session.discard_staged, journal))
 
     # --- walking --------------------------------------------------------------------------
 

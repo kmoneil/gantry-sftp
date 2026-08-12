@@ -32,6 +32,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from gantry_sftp.session._journal import SourceIdentity, UploadJournal
 from gantry_sftp.session._verify import ContentCheck, ResumeCheck
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "TimePreservation",
     "UploadResult",
     "publish_from_legacy",
+    "resume_target",
     "split_parent",
     "staged_path",
     "staging_token",
@@ -194,6 +196,10 @@ class Publish:
         staging_name: Where to stage, instead of a generated hidden sibling. Naming it yourself
             drops the ``EXCL`` that otherwise refuses a collision, so the collision risk moves
             to you.
+        journal: A durable note of which staging file this upload chose, so a **later process**
+            can find it (D-166). This is what makes ``resume=True`` legal alongside
+            ``atomic=True``: the staging name keeps its randomness, and the journal is what
+            recovers it. See :class:`~gantry_sftp.session.UploadJournal`.
     """
 
     atomic: bool = True
@@ -201,6 +207,7 @@ class Publish:
     require_atomic: bool = False
     require_fsync: bool = False
     staging_name: bytes | str | None = None
+    journal: UploadJournal | None = None
 
 
 DEFAULT_PUBLISH = Publish()
@@ -413,6 +420,32 @@ def staging_token() -> str:
     corrupt. Only the session layer may do this -- the codec is deterministic by rule.
     """
     return os.urandom(_TOKEN_BYTES).hex()
+
+
+def resume_target(
+    journal: UploadJournal | None,
+    target: bytes,
+    source: SourceIdentity,
+    *,
+    resume: bool,
+    name: bytes | None,
+) -> bytes | None:
+    """The staging path a previous process left for ``target``, if this run may continue it.
+
+    **The whole of D-166's mechanism, in one predicate.** A fresh random token is the right
+    answer to every case except one: an upload that was interrupted, is being resumed, chose
+    its own name last time, and is sending the same bytes to the same place. Only then is the
+    old name recoverable, and only a journal can recover it.
+
+    An explicit ``staging_name`` outranks the journal rather than being merged with it: the
+    caller has named the file, so there is nothing to look up and nothing that could disagree.
+
+    Returns:
+        The path to continue into, or ``None`` to stage somewhere new.
+    """
+    if journal is None or not resume or name is not None:
+        return None
+    return journal.staged_for(target, source)
 
 
 def split_parent(path: bytes) -> tuple[bytes, bytes]:

@@ -370,8 +370,15 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 38
+SESSION_METHOD_CEILING = 39
 """What `Session` measures today, which is the whole of the rule.
+
+**38 to 39 by D-166**, the upload journal, and the ratchet's question was asked rather than
+waved through. `discard_staged` removes the staging files a killed run left behind, so it needs
+a session -- `remove` is a round trip and the whole operation is a sequence of them against a
+record. The pure half *did* leave and is the larger half: `session/_journal.py` holds the log
+format, the fold, the durability discipline and the identity comparison, all of it testable with
+a directory and no server. What is left here is the part that cannot be: iterate, remove, clear.
 
 **36 to 38 by D-164**, the mirror, and the ratchet's question was asked rather than waved
 through. `sync_tree` is an orchestration over the walk, the comparison and `put`, which is what

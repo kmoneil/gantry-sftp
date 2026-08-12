@@ -45,6 +45,7 @@ from gantry_sftp.exceptions import (
 )
 from gantry_sftp.session._download import ProgressCallback
 from gantry_sftp.session._handles import close_quietly
+from gantry_sftp.session._journal import SourceIdentity, UploadJournal
 from gantry_sftp.session._mode import CREATE_BITS, create_bits
 from gantry_sftp.session._policy import _local_size, _local_times
 from gantry_sftp.session._publish import (
@@ -264,6 +265,8 @@ async def _put_atomically(
     staged: bytes,
     *,
     require_atomic: bool,
+    journal: UploadJournal | None = None,
+    source: SourceIdentity | None = None,
 ) -> UploadResult:
     """Stage, flush, then publish -- and clean the staging file up on any failure.
 
@@ -278,6 +281,15 @@ async def _put_atomically(
     """
     if require_atomic and not session.supports(EXTENSION_POSIX_RENAME):
         await _refuse_unpublishable(session, target)
+
+    # **Before the OPEN, and before the refusals below, which is the ordering that matters**
+    # (D-166). An unanswered request must be assumed to have been performed, so the note that
+    # says where the bytes are going has to be durable before anything could create the file.
+    # Written even on the paths that then refuse: a record pointing at a file that was never
+    # opened costs one wasted `STAT` next run, and a file with no record is one nobody can ever
+    # find again.
+    if journal is not None and source is not None:
+        journal.staging(staged, target, source)
 
     start = await _upload_resume_offset(session, upload, staged)
     # Outside the try, with the sibling refusals, and that placement is the decision. A
@@ -340,7 +352,15 @@ async def _put_atomically(
         raise lost.failure from None
     except BaseException as error:
         await _discard(session, staged, error)
+        # After the discard and only when it was reached: the staging file is gone, so the
+        # record pointing at it would send the next run looking for something gone. The
+        # `_StagedIsTheOnlyCopyError` branch above deliberately does not reach here, because
+        # there the file is the only copy of the data and the record is how anybody finds it.
+        if journal is not None:
+            journal.published(target)
         raise
+    if journal is not None:
+        journal.published(target)
     return UploadResult(
         transferred,
         target,

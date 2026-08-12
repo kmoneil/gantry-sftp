@@ -188,6 +188,7 @@ def _check_publish_flags(
     require_fsync: bool,
     resume: bool,
     staging_name: bytes | str | None = None,
+    journal: object = None,
 ) -> None:
     """Refuse a combination of flags that contradict each other.
 
@@ -195,16 +196,22 @@ def _check_publish_flags(
     it is two opposite instructions, and honouring either silently would be guessing about
     the guarantee the caller cares most about.
 
-    ``resume=True, atomic=True`` with no ``staging_name`` is the same shape for a subtler
-    reason. The default staging name carries fresh randomness per call, so the file a
-    previous run left behind has a name this run cannot reconstruct: there is nothing to
-    resume *into*. Falling back to a full upload would be the silent downgrade this library
-    refuses everywhere else, so it is refused here and the message names the fix.
+    ``resume=True, atomic=True`` with neither a ``staging_name`` nor a ``journal`` is the same
+    shape for a subtler reason. The default staging name carries fresh randomness per call, so
+    the file a previous run left behind has a name this run cannot reconstruct: there is
+    nothing to resume *into*. Falling back to a full upload would be the silent downgrade this
+    library refuses everywhere else, so it is refused here and the message names both fixes.
 
     Deriving the staging name from the target instead -- making it findable -- was rejected
     rather than overlooked: a predictable staging name is what
     :func:`~gantry_sftp.session.staging_token` exists to avoid, and two publishers resuming
     into one would interleave into a single file.
+
+    **A journal satisfies this and that objection stands** (D-166). It does not make the name
+    predictable; it makes this run's own random name *recoverable*, from a file that is local
+    and private to whoever wrote it. A second publisher on another machine has a different
+    journal and a different token, so the interleaving hazard above is untouched -- which is
+    why a journal is accepted here and a derived name still is not.
 
     Raises:
         ValueError: If a ``require_*`` flag strengthens a flag that is switched off, or if
@@ -214,12 +221,13 @@ def _check_publish_flags(
         raise ValueError("require_atomic=True contradicts atomic=False")
     if require_fsync and not fsync:
         raise ValueError("require_fsync=True contradicts fsync=False")
-    if resume and atomic and staging_name is None:
+    if resume and atomic and staging_name is None and journal is None:
         raise ValueError(
-            "resume=True needs staging_name= when atomic=True: the default staging file is "
-            "named with fresh randomness each call, so a previous run's partial upload "
-            "cannot be found. Pass staging_name= to fix the name, or atomic=False to resume "
-            "the destination itself"
+            "resume=True needs journal= or staging_name= when atomic=True: the default "
+            "staging file is named with fresh randomness each call, so a previous run's "
+            "partial upload cannot be found. Pass journal= to record the name durably, "
+            "staging_name= to fix it yourself, or atomic=False to resume the destination "
+            "itself"
         )
 
 
