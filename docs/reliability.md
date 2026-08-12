@@ -144,3 +144,89 @@ the `async with open_session(...)` block ends and at no other time; cancelling t
 it happens to run in deliberately does not stop it.
 
 `examples/cancellation.py` runs this with no arguments.
+
+## Surviving the process, not just the connection
+
+Everything above survives the *connection* failing. A killed container, an OOM, a deploy or a
+laptop lid is a different failure, and until D-166 an upload did not survive it:
+
+```python
+from gantry_sftp import Publish, UploadJournal
+
+journal = UploadJournal(Path("/var/lib/myjob/uploads.journal"))
+
+await sftp.put(source, "/incoming/big.iso", resume=True, publish=Publish(journal=journal))
+```
+
+Run that again after a crash and it continues from where the killed run stopped. Without the
+journal, the same call is **refused** — and understanding why is the whole of this feature.
+
+An atomic publish writes to a hidden sibling whose name carries fresh randomness per call, so a
+killed run leaves `.big.iso.7f3a1c22.part` with a name the next run cannot reconstruct. There is
+nothing to resume *into*, and re-uploading silently would be the downgrade this library refuses
+everywhere. The obvious fix — deriving the staging name from the target so it is findable — is
+worse: a predictable name is what the randomness is *for*, and two publishers resuming into one
+would interleave into a single file.
+
+**The journal makes this run's own name recoverable without making any name predictable.** It is
+local and private to whoever wrote it, so a second publisher on another machine has a different
+journal and a different token, and the hazard is untouched.
+
+### Downloads need none of this
+
+`get(..., resume=True)` already survived a process death and still does. Its partial is a file on
+your own disk, so its length is a fact rather than a report — which is the same asymmetry
+[Resume](transfers.md#resume) describes, one level up. There is no download journal and there is
+no plan for one.
+
+### What it records, and what it deliberately does not
+
+**No offsets.** After a crash the process knows what it *intended*, not what the far end accepted,
+and an upload's remote partial is a report from a server that may have buffered and is under no
+obligation to have flushed. So the journal records a **name** — a fact about a decision made
+locally — and never a byte count. Where to resume from is still read off the server, and
+`result.resume_check` still labels how well that was proven. **The journal adds no trust**: one
+that is stale, truncated or hostile costs a wasted round trip and a full re-upload, never a wrong
+file.
+
+| it records                       | it never records                        |
+| -------------------------------- | ---------------------------------------- |
+| the staging path this run chose  | how many bytes were sent                 |
+| the target it will be published at | what the server acknowledged           |
+| the source's path, size and mtime | anything about the destination's state  |
+
+The source's size and mtime are what refuse the dangerous case: a file edited between the killed
+run and this one has a partial on the server that is a prefix of *different* bytes, and finishing
+it produces a plausible file that is a splice of two versions. A same-length rewrite is invisible
+to every other check, which is why the mtime is there.
+
+### Durability, and the shape that follows from it
+
+Each record is one line, appended and `fsync`ed before the request it describes — because an
+unanswered request must be assumed to have been performed, so the note has to be durable before
+anything could create the file. The directory entry is flushed too the first time, since a file's
+contents reaching disk says nothing about whether its *name* did.
+
+Append-only rather than a rewritten document, because `put_tree(concurrency=N)` runs N uploads
+against one journal and a read-modify-write would need a lock and would lose records. `compact()`
+is how it stops growing, and it is explicit: it is the one operation that rewrites.
+
+### Cleaning up after a crash
+
+The half you notice first is not the resume — it is the `.part` files. Every in-process failure
+path cleans up after itself, but a killed process reaches none of them:
+
+```python
+removed = await sftp.discard_staged(journal)   # returns the paths it actually deleted
+```
+
+Safe at the start of a run, and it removes **only what this journal recorded staging**. A sweep
+that globbed for `.*.part` would delete another publisher's in-flight upload.
+
+A record whose file has already gone is cleared and not reported as removed, because "removed" is
+a claim about what happened. A removal refused for any other reason propagates, and the records
+already cleared stay cleared — so a later sweep retries only what is left, which is what an
+append-only log buys.
+
+`examples/crash_resume.py` kills a real upload with a real `SIGKILL` and finishes it from a second
+process.

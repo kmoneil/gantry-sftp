@@ -12,6 +12,40 @@ changelog comes to describe a release that does not exist.
 
 ### Added
 
+- **An upload survives the process dying, not just the connection** (D-166). `UploadJournal` is a
+  durable, local, append-only note of which staging file an in-flight atomic upload chose, passed
+  as `Publish(journal=...)`. New public names: `UploadJournal`, `JournalEntry`, `SourceIdentity`,
+  `JOURNAL_VERSION`, a `journal` field on `Publish`, and `Session.discard_staged()` with its
+  blocking twin.
+
+  **What it unblocks is one specific refusal.** `put(resume=True)` with the default `atomic=True`
+  raised, because the staging name carries fresh randomness per call and a killed run leaves a
+  file nothing can find. Deriving the name from the target was rejected then and is still
+  rejected: a predictable staging name is what the randomness is *for*, and two publishers
+  resuming into one would interleave into a single file. **The journal makes this run's own name
+  recoverable without making any name predictable** — it is local and private to whoever wrote it,
+  so a second publisher elsewhere has a different journal and a different token. The old spelling
+  still raises when neither a journal nor a `staging_name` is given.
+
+  **Downloads were already fine and get nothing.** Measured across two separate interpreter
+  processes before any of this was written: a download's partial is a file on your own disk, so
+  its length is a fact rather than a report. There is no download journal and no plan for one.
+
+  **It records a name and never an offset**, which is what keeps it from being a corruption
+  engine: after a crash a process knows what it *intended*, not what the far end accepted. Where
+  to resume from is still read off the server and `resume_check` still labels how well it was
+  proven. A journal that is stale, truncated or hostile costs a wasted round trip and a full
+  re-upload, never a wrong file. The source's size and mtime are recorded so a file edited between
+  the crash and the retry is refused rather than spliced.
+
+  Each record is appended and `fsync`ed **before** the request it describes, because an unanswered
+  request must be assumed to have been performed. Append-only rather than a rewritten document,
+  because `put_tree(concurrency=N)` writes to one journal from N workers.
+
+  `discard_staged()` removes the staging files a killed run left — which nothing could do before,
+  and which is the half a user notices first. It removes only what that journal recorded, never
+  what a glob for `.*.part` would find. `docs/reliability.md` and `examples/crash_resume.py`, which
+  kills a real upload with a real `SIGKILL` and finishes it from a second process.
 - **A compatibility report, for the endpoints nobody here can reach.** `gantry_sftp.compatibility`
   runs a battery against a live server and returns, per fact, a verdict and **the exchange that
   produced it**. Reached as `python -m gantry_sftp doctor <host>`, which now runs the read-only

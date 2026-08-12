@@ -142,6 +142,10 @@ PUBLISH_DEFAULTS: dict[str, Any] = {
     "require_atomic": False,
     "require_fsync": False,
     "staging_name": None,
+    # D-166. `None` is load-bearing: a journal is durable state on the caller's disk that has
+    # to outlive the process to be worth anything, so there is nowhere this library could
+    # default it to that it would not also have to clean up.
+    "journal": None,
 }
 
 # The tunables. 64 x 255 KiB is what fills the 2 MiB channel window with room to spare (D-23),

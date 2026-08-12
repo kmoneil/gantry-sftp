@@ -21,6 +21,7 @@ python examples/dry_run.py                        # what a tree transfer would d
 python examples/mirror_tree.py                    # sync_tree(): the skip that would lose data
 python examples/resume.py                         # interrupt a transfer, then finish it
 python examples/retry.py                          # a link that drops, reconnected and resumed
+python examples/crash_resume.py                    # SIGKILL an upload, finish it from another process
 python examples/concurrent_transfers.py           # many transfers over one session
 python examples/cancellation.py                   # stop a transfer, and what it leaves behind
 python examples/incremental_ingest.py             # the scheduled ingest loop, and its two data-loss traps
@@ -48,6 +49,7 @@ python examples/recursive_download.py user@host /remote/dir
 python examples/recursive_upload.py user@host /remote/dir
 python examples/resume.py user@host /remote/dir
 python examples/retry.py user@host /remote/dir
+python examples/crash_resume.py user@host
 python examples/concurrent_transfers.py user@host /remote/dir
 python examples/cancellation.py user@host /remote/dir
 python examples/incremental_ingest.py user@host /remote/dir

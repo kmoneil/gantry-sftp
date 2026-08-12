@@ -89,6 +89,7 @@ from gantry_sftp.session._glob import (
     validate_pattern,
 )
 from gantry_sftp.session._handles import close_quietly
+from gantry_sftp.session._journal import UploadJournal, source_identity
 from gantry_sftp.session._limits import ServerLimits
 from gantry_sftp.session._listing import (
     DOT_ENTRIES,
@@ -145,6 +146,7 @@ from gantry_sftp.session._publish import (
     Publish,
     UploadResult,
     publish_from_legacy,
+    resume_target,
     split_parent,
     staged_path,
     staging_token,
@@ -2608,6 +2610,7 @@ class Session(_SessionOperations):
             require_fsync=policy.require_fsync,
             resume=resume,
             staging_name=policy.staging_name,
+            journal=policy.journal,
         )
         # Refused here only when the answer is already *known* -- this server answered
         # OP_UNSUPPORTED earlier in the session. It used to refuse on advertisement, which is a
@@ -2670,14 +2673,74 @@ class Session(_SessionOperations):
             # A staging name carrying a separator is used verbatim, so no parent is derived
             # from the target and there is nothing for a foreign namespace to break.
             await self._require_rooted_paths(target, feature=_FEATURE_ATOMIC_PUBLISH)
-        staged = staged_path(target, staging_token(), name=staged_name)
+        # Read once and used for both the lookup and the record (D-166). Two reads would leave
+        # a window in which the source changes between them, and the upload would then resume
+        # a partial of the old bytes while recording the identity of the new ones.
+        source = source_identity(upload.local_path)
+        continuing = resume_target(
+            policy.journal, target, source, resume=upload.resume, name=staged_name
+        )
+        staged = (
+            staged_path(target, staging_token(), name=staged_name)
+            if continuing is None
+            else continuing
+        )
         return await _put_atomically(
-            self, upload, target, staged, require_atomic=policy.require_atomic
+            self,
+            upload,
+            target,
+            staged,
+            require_atomic=policy.require_atomic,
+            journal=policy.journal,
+            source=source,
         )
 
     # --- put, in its two shapes ------------------------------------------------------------
 
     # --- publishing --------------------------------------------------------------------------
+
+    async def discard_staged(self, journal: UploadJournal) -> tuple[bytes, ...]:
+        """Remove the staging files a killed run left behind, and clear their records (D-166).
+
+        **Nothing could do this before the journal existed.** Every in-process failure path
+        cleans up after itself, but a process that is killed reaches none of them, and the
+        staging name it chose carries fresh randomness that nothing can reconstruct -- so the
+        file sits in the destination directory forever, hidden by its leading dot, owned by
+        nobody. A directory that slowly fills with ``.part`` files is the half of this feature
+        a user notices first.
+
+        Safe to call at the start of a run, which is the intended place: it removes only files
+        **this journal** recorded staging, never anything it merely found by listing. A sweep
+        that globbed for ``.*.part`` would delete another publisher's in-flight upload.
+
+        Args:
+            journal: The journal to sweep. Emptied of in-flight records and compacted.
+
+        Returns:
+            The staging paths this call actually deleted, in the order it deleted them. A
+            record whose file had already gone is cleared and **not** listed -- "removed" is a
+            claim about what happened, and reporting a file nobody deleted as deleted is the
+            kind of small lie this library's result objects exist to avoid.
+
+        Raises:
+            ServerError: If a removal is refused for any reason other than the file being
+                absent -- a read-only directory, a permission change. Records already cleared
+                stay cleared, because each is written as it happens, so a later sweep retries
+                only what is left. That is what an append-only log buys.
+        """
+        removed: list[bytes] = []
+        for entry in journal.in_flight().values():
+            try:
+                await self.remove(entry.staged)
+            except NoSuchFileError:
+                # Already gone -- published by a run whose `published` line was lost, or swept
+                # by hand. The record is still stale and is still worth clearing.
+                pass
+            else:
+                removed.append(entry.staged)
+            journal.published(entry.target)
+        _ = journal.compact()
+        return tuple(removed)
 
     # --- trees, the other way ------------------------------------------------------------------
 

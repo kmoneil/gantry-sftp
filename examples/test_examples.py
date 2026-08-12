@@ -373,3 +373,32 @@ def test_the_compatibility_example_shows_a_verdict_that_disagrees_with_the_adver
     # And what it declined to ask is named rather than implied.
     assert "not determined -- what this run did not ask, and why:" in stdout
     assert "not probed, because that means moving somebody's data" in stdout
+
+
+def test_the_crash_resume_example_actually_dies_and_actually_resumes():
+    """Two claims, and the example is only worth having if it keeps demonstrating both.
+
+    **That the child was killed rather than unwound** -- signal 9, not an exception -- because a
+    demonstration that raised instead would exercise the path that already worked. And that the
+    second process sent only the remainder, since an upload that silently restarted would print
+    the same "bytes match the source: True" and prove nothing.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "crash_resume.py")
+    assert returncode == 0
+    assert "child exited on signal 9 (9 = SIGKILL)" in stdout
+    # The staging file exists and the journal is the only thing that names it.
+    assert "its name carries randomness nothing could reconstruct: .big.bin." in stdout
+    assert '"event": "staged"' in stdout
+    # It resumed rather than restarting: the remainder is less than the whole file.
+    remainder = next(line for line in stdout.splitlines() if "the rest was already there" in line)
+    transferred = int(remainder.split("transferred ")[1].split(" of ")[0])
+    total = int(remainder.split(" of ")[1].split(" bytes")[0])
+    assert 0 < transferred < total, remainder
+    assert "bytes match the source: True" in stdout
+    assert "nothing left staged:    True" in stdout
+    assert "journal is clear:       True" in stdout
+    # And the sweep removed only what the journal recorded.
+    assert "after:  ['.orphan.bin.cafebabe.part']" in stdout

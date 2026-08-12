@@ -220,6 +220,11 @@ async def test_resume_with_the_default_staging_name_is_refused(tmp_path: Path):
     Not "EXCL refuses to adopt the staging file" -- EXCL never meets it, because the staging
     name carries fresh randomness on every call. The previous run's file has a name this run
     cannot reconstruct, so there is nothing to resume into and no honest answer but to say so.
+
+    **Still refused, and D-166 did not weaken it.** The message now names a third way out --
+    `journal=`, which makes this run's own random name recoverable rather than making any name
+    predictable -- but a caller who passes none of the three gets exactly the refusal they
+    always got. That is the public-API rule: the old spelling still resolves the old way.
     """
     needs_real_server()
     source = tmp_path / "payload.bin"
@@ -233,10 +238,10 @@ async def test_resume_with_the_default_staging_name_is_refused(tmp_path: Path):
             _ = await sftp.put(source, str(tmp_path / "dest.bin"), resume=True)
 
     assert exc.value.args[0] == (
-        "resume=True needs staging_name= when atomic=True: the default staging file is "
-        "named with fresh randomness each call, so a previous run's partial upload cannot "
-        "be found. Pass staging_name= to fix the name, or atomic=False to resume the "
-        "destination itself"
+        "resume=True needs journal= or staging_name= when atomic=True: the default staging "
+        "file is named with fresh randomness each call, so a previous run's partial upload "
+        "cannot be found. Pass journal= to record the name durably, staging_name= to fix it "
+        "yourself, or atomic=False to resume the destination itself"
     )
 
 
