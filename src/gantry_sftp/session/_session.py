@@ -172,13 +172,14 @@ from gantry_sftp.session._recursive import (
     join_remote,
 )
 from gantry_sftp.session._sync import (
-    ManifestEntry,
     SyncManifest,
     SyncOutcome,
     SyncResult,
     _SyncCandidate,
+    append_record,
     candidates_in,
     manifest_entry_for,
+    prepare_manifest,
     summarise,
 )
 from gantry_sftp.session._verify import (
@@ -3098,9 +3099,12 @@ class Session(_SessionOperations):
         Args:
             local_path: Local directory to mirror from.
             remote_path: Remote directory to mirror into. Created with its missing parents.
-            manifest: Where to read and write the record of what was sent. Absent, unreadable
-                or from a future version all mean "nothing is known", which costs a full
-                re-send and loses nothing.
+            manifest: Where to read and write the record of what was sent -- one JSON record
+                per line, appended **as each file lands** and compacted when the run ends, so a
+                run killed partway through keeps what it did (D-173). Absent, unreadable, torn
+                mid-line or written by a future version all mean "that much is not known",
+                which costs a re-send and loses nothing. Opened before the walk starts, so a
+                path that cannot be written raises here rather than from inside the walk.
             max_depth: Stop descending below this many levels.
             publish: How each file becomes visible, as :meth:`put` takes it.
             preserve_times: Carry each local file's times across. Independent of the comparison
@@ -3127,17 +3131,17 @@ class Session(_SessionOperations):
         policy = publish_from_legacy(publish, {}, caller="sync_tree")
         _check_tree_publish(policy, resume=False, caller="sync_tree")
         requested_mode = resolve_mode(mode, caller="sync_tree()")
+        record_file = Path(manifest)
+        # Before the first round trip, so a manifest path that cannot be written is reported as
+        # what it is rather than by the first worker to reach it (D-173).
+        prepare_manifest(record_file)
         await self._require_rooted_paths(root, feature="mirroring a tree")
         await self._mkdir_parents(root, exist_ok=True)
 
-        record_file = Path(manifest)
         recorded = SyncManifest.load(record_file)
         directories = 0
         outcomes: list[SyncOutcome] = []
         walk_skipped: list[Skipped] = []
-        # Collected rather than written into the manifest as they finish: several workers
-        # complete inside one another's awaits, and a dict is not the place to discover that.
-        written: list[tuple[bytes, ManifestEntry]] = []
         directory_times: list[tuple[bytes, Times]] = []
         directory_modes: list[tuple[bytes, int]] = []
 
@@ -3191,14 +3195,21 @@ class Session(_SessionOperations):
                 landed = await self.stat(item.remote)
                 entry = manifest_entry_for(item.source, landed)
                 if entry is not None:
-                    written.append((item.remote, entry))
+                    # **Appended as the file lands, not collected for the end** (D-173). A run
+                    # killed partway through used to keep nothing, so the next one re-sent the
+                    # whole tree -- and on a mirror large enough to be interrupted, that is
+                    # every run. One `os.write` to an `O_APPEND` descriptor, which is also why
+                    # several workers finishing inside one another's awaits is no longer
+                    # something a collected list has to protect against.
+                    append_record(record_file, item.remote, entry)
+                    recorded.record(item.remote, entry)
 
             await for_each_bounded(produce(), transfer, concurrency=concurrency)
 
             await _set_directory_times(self, directory_times)
             await _set_directory_modes(self, directory_modes)
-            for path, entry in written:
-                recorded.record(path, entry)
+            # Compaction, so the log does not grow across runs. Interrupted before here, the
+            # appended records are what the next run reads.
             recorded.save(record_file)
 
             report = summarise(outcomes, directories=directories, walk_skipped=walk_skipped)

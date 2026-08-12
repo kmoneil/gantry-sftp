@@ -12,8 +12,10 @@ module -- the decision that loses data is testable without the machinery that tr
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,7 @@ from gantry_sftp.session import (
     compare_for_sync,
     local_dir_entry,
 )
+from gantry_sftp.session._sync import append_record, manifest_line, prepare_manifest
 
 SENT = ManifestEntry(local_size=28, local_mtime=1_700_000_000, remote_size=28, remote_mtime=999)
 """One file as it was when it was last sent.
@@ -226,24 +229,34 @@ def test_an_absent_manifest_loads_as_empty(tmp_path: Path) -> None:
 
 
 def test_a_corrupt_manifest_loads_as_empty_rather_than_raising(tmp_path: Path) -> None:
-    """A truncated file costs one full re-send. Raising costs the run.
+    """A truncated file costs a re-send. Raising costs the run.
 
     The file is a cache of evidence, so "unreadable" and "nothing recorded" are the same fact,
     and the comparison already resolves the second one safely.
     """
     state = tmp_path / "state.json"
-    _ = state.write_text('{"version": 1, "entries": {"a"', encoding="utf-8")
+    _ = state.write_text('{"version": 2, "target": "/a"', encoding="utf-8")
     assert SyncManifest.load(state).entries == {}
 
 
-def test_a_manifest_from_a_future_version_is_refused(tmp_path: Path) -> None:
-    """Parsed on a best-effort basis, a field this version does not understand is a wrong skip."""
+def test_a_record_from_a_future_version_is_dropped_and_its_neighbours_are_not(
+    tmp_path: Path,
+) -> None:
+    """Per line, because the file is appended to by runs that need not share a version.
+
+    An upgrade between two runs of somebody's mirror is a deploy, so a whole-file version check
+    would throw away every record written before it. Parsed on a best-effort basis instead, a
+    field this version does not understand is a wrong skip -- so the unknown line goes and the
+    ones this version wrote stay.
+    """
     state = tmp_path / "state.json"
-    _ = state.write_text(
-        json.dumps({"version": MANIFEST_VERSION + 1, "entries": {"/a": SENT.as_json()}}),
-        encoding="utf-8",
-    )
-    assert SyncManifest.load(state).entries == {}
+    ahead = json.dumps({"version": MANIFEST_VERSION + 1, "target": "/ahead", **SENT.as_json()})
+    _ = state.write_bytes(ahead.encode() + b"\n" + manifest_line("/ok", SENT))
+
+    loaded = SyncManifest.load(state)
+
+    assert loaded.recorded(b"/ahead") is None
+    assert loaded.recorded(b"/ok") == SENT
 
 
 @pytest.mark.parametrize(
@@ -264,19 +277,115 @@ def test_one_unusable_record_is_dropped_and_the_rest_survive(
     The `bool` row is the one that would slip through a naive check: `True` is an `int` in
     Python, so it type-checks as a size, round-trips as `true`, and compares unequal against the
     1 it was meant to be.
+
+    Every row carries a **valid** `target`, which the log format made possible to get wrong: the
+    path used to be the key of the record and is now a field inside it, so a row that simply
+    omitted the broken fields would also have no target, and `recorded(b"/bad")` would answer
+    `None` for a reason that has nothing to do with the damage being tested.
     """
     state = tmp_path / "state.json"
-    _ = state.write_text(
-        json.dumps(
-            {"version": MANIFEST_VERSION, "entries": {"/bad": record, "/ok": SENT.as_json()}}
-        ),
-        encoding="utf-8",
+    bad: object = (
+        record
+        if isinstance(record, str)
+        else {"version": MANIFEST_VERSION, "target": "/bad", **record}
     )
+    _ = state.write_bytes(json.dumps(bad).encode() + b"\n" + manifest_line("/ok", SENT))
 
     loaded = SyncManifest.load(state)
 
     assert loaded.recorded(b"/bad") is None, f"kept a record that is {why}"
     assert loaded.recorded(b"/ok") == SENT
+
+
+def test_a_record_whose_target_is_not_a_string_is_dropped(tmp_path: Path) -> None:
+    """The other half of the same field, since it is now carried rather than being the key."""
+    state = tmp_path / "state.json"
+    wrong = json.dumps({"version": MANIFEST_VERSION, "target": 7, **SENT.as_json()})
+    _ = state.write_bytes(wrong.encode() + b"\n" + manifest_line("/ok", SENT))
+
+    loaded = SyncManifest.load(state)
+
+    assert loaded.entries == {"/ok": SENT}
+
+
+# --- what a killed run leaves, which is the whole of D-173 --------------------------------------
+
+
+def test_a_record_survives_without_a_save(tmp_path: Path) -> None:
+    """The card in one assertion. Appended as the file lands, readable before any compaction."""
+    state = tmp_path / "state.json"
+    append_record(state, b"/drop/report.csv", SENT)
+
+    assert SyncManifest.load(state).recorded(b"/drop/report.csv") == SENT
+
+
+def test_a_later_record_supersedes_an_earlier_one(tmp_path: Path) -> None:
+    """Which is what makes an append-only file legible without rewriting it every time."""
+    state = tmp_path / "state.json"
+    stale = ManifestEntry(local_size=1, local_mtime=1, remote_size=1, remote_mtime=1)
+    append_record(state, b"/drop/report.csv", stale)
+    append_record(state, b"/drop/report.csv", SENT)
+
+    assert SyncManifest.load(state).recorded(b"/drop/report.csv") == SENT
+
+
+@pytest.mark.parametrize(
+    ("damage", "why"),
+    [
+        (lambda blob: blob[: len(blob) // 2], "cut off mid-record, as a crash mid-write leaves it"),
+        (lambda blob: blob + b'{"version": 2, "target": "/x", "loc', "a torn record appended"),
+        (lambda blob: blob + b"\x00" * 64, "a block of zeroes, as a filesystem can expose"),
+        (lambda blob: blob + b"\xff\xfe garbage \n", "bytes that are not UTF-8 at all"),
+    ],
+)
+def test_a_damaged_tail_costs_records_and_never_invents_one(
+    tmp_path: Path, damage: Callable[[bytes], bytes], why: str
+) -> None:
+    """**The direction that matters**, and the reason this file needs no `fsync` per record.
+
+    Under-reporting costs a re-send. Over-reporting is D-164's data loss: a record this library
+    did not write, read as evidence, is a file skipped while the destination stays wrong. So a
+    damaged file has to fold to *fewer* records and never to a different one -- asserted for
+    each shape a crash or a power cut can actually leave, rather than argued from the format.
+    """
+    state = tmp_path / "state.json"
+    first = ManifestEntry(local_size=11, local_mtime=22, remote_size=11, remote_mtime=33)
+    _ = state.write_bytes(manifest_line("/first", first) + manifest_line("/second", SENT))
+    intact = SyncManifest.load(state).entries
+
+    _ = state.write_bytes(damage(state.read_bytes()))
+    after = SyncManifest.load(state).entries
+
+    assert set(after) <= set(intact), f"invented a record from {why}"
+    for target, entry in after.items():
+        assert entry == intact[target], f"changed a record from {why}"
+
+
+def test_compaction_collapses_what_the_run_appended(tmp_path: Path) -> None:
+    """Otherwise the file grows by one line per transferred file, forever."""
+    state = tmp_path / "state.json"
+    stale = ManifestEntry(local_size=1, local_mtime=1, remote_size=1, remote_mtime=1)
+    for entry in (stale, stale, SENT):
+        append_record(state, b"/drop/report.csv", entry)
+    assert len(state.read_bytes().splitlines()) == 3
+
+    loaded = SyncManifest.load(state)
+    loaded.save(state)
+
+    assert len(state.read_bytes().splitlines()) == 1
+    assert SyncManifest.load(state).recorded(b"/drop/report.csv") == SENT
+
+
+def test_preparing_an_unwritable_manifest_raises_before_anything_else(tmp_path: Path) -> None:
+    """Recording as the run goes means the path has to be usable before the run goes.
+
+    Discovered by the first worker instead, it would be reported from inside the walk, blaming a
+    file chosen by walk order for a fault that is in the request.
+    """
+    with pytest.raises(OSError) as caught:
+        prepare_manifest(tmp_path / "no-such-directory" / "state.json")
+
+    assert caught.value.errno == errno.ENOENT
 
 
 def test_saving_leaves_no_partial_file_behind(tmp_path: Path) -> None:

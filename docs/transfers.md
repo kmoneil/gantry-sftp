@@ -817,12 +817,33 @@ report.csv       1700000000      →   1786470831        ← the upload, not the
 Comparing those finds every file changed, on every run, forever. Turning `preserve_times` on to
 fix it would force on a flag that exists to be off — a landing zone whose consumer collects
 "modified since X" never picks up a file wearing last year's date — so the mirror compares
-against **its own record of what it sent**. That is the `manifest` argument: a JSON file this
-library reads at the start and writes at the end.
+against **its own record of what it sent**. That is the `manifest` argument: a file of one JSON
+record per line, appended to **as each file lands** and compacted at the end of the run.
 
-Losing it costs one full re-send and loses nothing. Absent, unreadable, or written by a future
-version all mean the same thing — nothing is known — because a record a comparison cannot trust
-is worse than no record.
+Losing it costs a re-send and loses nothing. Absent, unreadable, a torn line, or a record
+written by a future version all mean the same thing — that much is not known — because a record
+a comparison cannot trust is worse than no record. Note the granularity: the version is carried
+per record, so an upgrade between two runs costs the records the new version cannot read rather
+than the whole file.
+
+### An interrupted mirror keeps its work
+
+The record is appended as each file lands, not written when the run finishes, so a mirror killed
+partway through — a deploy, an OOM, a laptop lid — keeps everything it did. The next run sends
+only the rest. On a tree large enough to be interrupted, that is the difference between a mirror
+that converges and one that re-sends itself forever.
+
+There is **no `fsync` per record**, which is the opposite of what
+[the upload journal](reliability.md#durability-and-the-shape-that-follows-from-it) does, and the
+difference is which way each file errs when a crash costs it its tail. A journal that
+under-reports is merely slow and one that over-reports is corruption, so it pays for the flush
+on every line. A manifest record is written only after the transfer returned _and_ the
+destination was checked, so a lost tail is a record fewer — a re-send. There is one `fsync`, at
+the compaction, where it costs nothing worth measuring and turns a power cut from "lose the
+record" into "lose nothing".
+
+The manifest path is opened before the walk starts, so a directory that does not exist is
+reported then rather than by whichever file the walk happened to reach first.
 
 ### The record stores both sides
 

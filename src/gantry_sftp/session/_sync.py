@@ -30,6 +30,29 @@ It costs nothing to close: v3 returns attributes *with* a listing, so the walk a
 performs hands back the remote size and mtime with no extra round trip. The record therefore
 stores **both sides** as of the moment of writing, and the comparison checks both.
 
+Why the record is a log, and why it needs no ``fsync`` per line
+----------------------------------------------------------------
+The file is appended to as each transfer lands and compacted once at the end of the run, rather
+than written when the run finishes (D-173). Written at the end, a mirror killed at file 9,999 of
+10,000 recorded nothing and the next run re-sent the tree -- and on a tree large enough to be
+interrupted, that is every run.
+
+**It deliberately does not copy the upload journal's durability discipline**, and the difference
+is which way each file errs when a crash costs it its tail.
+:mod:`~gantry_sftp.session._journal` ``fsync``s every record because over-reporting there is
+corruption: a note that survives a crash its request did not leaves a caller resuming into a
+file that was never created. This file cannot do that. A record is appended only after ``put``
+returned *and* ``stat`` confirmed what landed, so nothing is written on the strength of an
+intention; a lost tail is a record fewer, which is a re-send; and a torn line does not parse, so
+:func:`fold_manifest` drops it. Under-reporting is the only direction available, and it is the
+safe one.
+
+That was measured rather than assumed, and the measurement removed the *expensive* design rather
+than the cheap one. Rewriting the whole document after every file -- the obvious incremental --
+is linear in entries and therefore quadratic in a run, costing more than the transfers do over a
+fast link. An append is orders of magnitude below one transferred file even on localhost. So
+there is no "checkpoint every N" knob here: it would amortise a cost that is not there.
+
 The three states, and which way the undecidable one falls
 ----------------------------------------------------------
 Every field of :class:`~gantry_sftp.codec.Attrs` is optional -- a server sends what it feels
@@ -53,9 +76,9 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 from gantry_sftp.codec import Attrs
+from gantry_sftp.session._journal import fsync_directory
 from gantry_sftp.session._listing import decode_name
 from gantry_sftp.session._localtree import (
     LocalWalkEntry,
@@ -74,21 +97,34 @@ __all__ = [
     "SyncOutcome",
     "SyncReason",
     "SyncResult",
+    "append_record",
     "candidates_in",
     "compare_for_sync",
+    "fold_manifest",
     "manifest_entry_for",
+    "manifest_line",
+    "prepare_manifest",
     "record_entry",
     "summarise",
     "write_manifest",
 ]
 
-MANIFEST_VERSION = 1
-"""What :meth:`SyncManifest.load` will read.
+MANIFEST_VERSION = 2
+"""What :meth:`SyncManifest.load` will read, carried **on every line**.
 
-A manifest from a future version is refused rather than parsed on a best-effort basis: the whole
+A record from a future version is dropped rather than parsed on a best-effort basis: the whole
 value of the file is that a comparison can trust it, and a field this version does not know
-about is a comparison this version cannot make correctly. Refusing costs one full re-send, which
-is the safe failure.
+about is a comparison this version cannot make correctly. Dropping costs a re-send of that
+entry, which is the safe failure.
+
+Per line rather than per file, and for the reason :data:`~gantry_sftp.session.JOURNAL_VERSION`
+gives: the file is appended to by runs that may not share a version, since an upgrade between
+two runs of somebody's mirror is an ordinary deploy.
+
+``2`` because D-173 replaced the single JSON document with the log below. Nothing had to be
+migrated -- ``sync_tree`` had not been released when the format changed -- but the number still
+moves, because a version field that stays put across a format change is a version field that
+has stopped answering the only question it is asked.
 """
 
 
@@ -242,34 +278,16 @@ class SyncManifest:
     def load(cls, path: Path | str) -> SyncManifest:
         """Read a manifest, or return an empty one if it is absent or unusable.
 
-        **Every failure here degrades to "we know nothing"**, which costs a full re-send and
-        loses no data. The alternative -- raising -- turns a truncated file, a version bump or a
-        stray byte into a failed mirror run, and the thing the file protects is a cost rather
-        than a correctness property. The comparison never trusts it further than the record it
-        actually parsed.
+        **Every failure here degrades to "we know less"**, which costs a re-send and loses no
+        data. The alternative -- raising -- turns a truncated file, a version bump or a stray
+        byte into a failed mirror run, and the thing the file protects is a cost rather than a
+        correctness property. The comparison never trusts it further than the records it
+        actually parsed. See :func:`fold_manifest`, which holds the body.
         """
-        try:
-            blob = Path(path).read_text(encoding="utf-8")
-        except OSError:
-            return cls.empty()
-        try:
-            document: object = json.loads(blob)
-        except json.JSONDecodeError:
-            return cls.empty()
-        if not isinstance(document, dict) or document.get("version") != MANIFEST_VERSION:
-            return cls.empty()
-        raw = document.get("entries")
-        if not isinstance(raw, dict):
-            return cls.empty()
-        entries = {
-            key: parsed
-            for key, value in raw.items()
-            if isinstance(key, str) and (parsed := ManifestEntry.from_json(value)) is not None
-        }
-        return cls(entries=entries)
+        return cls(entries=fold_manifest(path))
 
     def save(self, path: Path | str) -> None:
-        """Write this manifest, replacing whatever was there. See :func:`write_manifest`."""
+        """Rewrite the file holding only what is known now. See :func:`write_manifest`."""
         write_manifest(self.entries, path)
 
     def record(self, remote_path: bytes, entry: ManifestEntry) -> None:
@@ -366,13 +384,122 @@ def summarise(
     )
 
 
-def write_manifest(entries: Mapping[str, ManifestEntry], path: Path | str) -> None:
-    """Write a manifest, replacing whatever was there.
+def manifest_line(target: str, entry: ManifestEntry) -> bytes:
+    """One record, as the bytes written to the file.
 
-    Written to a sibling temporary file and renamed, because the failure this avoids is the one
-    the library refuses to inflict on a *remote* destination: a run interrupted mid-write leaves
-    a truncated manifest, which the loader would then discard entirely and re-send the whole
-    tree. ``os.replace`` semantics via :meth:`~pathlib.Path.replace`.
+    ``sort_keys`` so two runs recording the same facts produce the same bytes, which makes a
+    manifest diffable and a test able to assert on content rather than on a parse. One place, so
+    an append and a compaction cannot drift into two spellings of the same record -- the mistake
+    D-172 had just finished paying for one module along.
+    """
+    document: dict[str, object] = {"version": MANIFEST_VERSION, "target": target, **entry.as_json()}
+    return (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+
+
+def append_record(path: Path | str, remote_path: bytes, entry: ManifestEntry) -> None:
+    """Append one record, so a run interrupted after it keeps it.
+
+    **No ``fsync``, and that is the decision rather than an omission** (D-173). A journal
+    ``fsync``s every record because over-reporting is corruption: a note that survives a crash
+    the request did not leaves a caller resuming into a file that was never created. This file
+    errs the other way and cannot do that. A record is appended only after ``put`` returned
+    *and* ``stat`` confirmed what landed, so nothing here is written on the strength of an
+    intention; a lost tail is a record fewer, which is a re-send; and a torn final line does not
+    parse, so :func:`fold_manifest` drops it. Measured before it was argued: the flush is what
+    costs, and per file it buys nothing this file's trust model can spend.
+
+    One :func:`os.write` of a short buffer to an ``O_APPEND`` descriptor, which is what makes it
+    safe against the other workers of a concurrent mirror -- and what lets ``sync_tree`` record
+    as it goes rather than collecting into a list because "a dict is not the place to discover"
+    several workers finishing inside one another's awaits.
+
+    Args:
+        path: The manifest. Created if absent; a missing parent directory is the caller's
+            mistake, and :func:`prepare_manifest` is what reports it before the walk starts.
+        remote_path: Where the file lives on the server.
+        entry: What it looked like on both sides.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        _ = os.write(descriptor, manifest_line(decode_name(remote_path), entry))
+    finally:
+        os.close(descriptor)
+
+
+def prepare_manifest(path: Path | str) -> None:
+    """Fail now if the manifest cannot be written, rather than at the first file.
+
+    The whole point of recording as the run goes is that an interrupted mirror keeps its work,
+    and a path that cannot be opened would otherwise be discovered by the first worker -- after
+    the walk has started, with a report blaming a file chosen by walk order. Same principle as
+    :func:`_check_tree_publish` validating a policy before the walk: the fault is in the request.
+
+    Raises:
+        OSError: If the manifest cannot be opened for appending.
+    """
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+
+
+def fold_manifest(path: Path | str) -> dict[str, ManifestEntry]:
+    """Read the file and return what is known, keyed by decoded remote path.
+
+    Later lines win, so a file recorded twice reads as its most recent record -- which is what
+    an appended log means and why compaction can be deferred to the end of a run.
+
+    **Every failure degrades to "we know less"**: an unreadable file, an unparseable line, a
+    record from a schema this version does not know, a line whose fields are the wrong type.
+    Each of those costs a re-send of one entry and cannot cost a wrong skip, which is the only
+    direction that would lose data.
+
+    Bytes and a replacing decode rather than ``read_text``, for the reason fuzzing found in the
+    journal's fold: the file sits on disk between two runs of somebody's job, so it is not
+    trusted input, and a single stray byte makes ``read_text`` raise ``UnicodeDecodeError`` --
+    a ``ValueError``, not an ``OSError``, so it escapes the guard and takes down the mirror it
+    was supposed to help.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return {}
+    entries: dict[str, ManifestEntry] = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        _fold_line(entries, line)
+    return entries
+
+
+def _fold_line(entries: dict[str, ManifestEntry], line: str) -> None:
+    """Fold one line into the state, ignoring anything that is not a record we wrote."""
+    try:
+        record: object = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(record, dict):
+        return
+    # Rebuilt rather than passed along, and ty is why: `isinstance(x, dict)` narrows to
+    # `dict[Unknown, Unknown]` and `dict` is invariant, so the narrowed value is not a
+    # `dict[str, object]` however obviously JSON keys are strings.
+    fields: dict[str, object] = {str(key): value for key, value in record.items()}
+    if fields.get("version") != MANIFEST_VERSION:
+        return
+    target = fields.get("target")
+    parsed = ManifestEntry.from_json(fields)
+    if isinstance(target, str) and parsed is not None:
+        entries[target] = parsed
+
+
+def write_manifest(entries: Mapping[str, ManifestEntry], path: Path | str) -> None:
+    """Rewrite the file holding one line per entry, which is how it stops growing.
+
+    Called once at the end of a run rather than after every file: rewriting a whole manifest per
+    file is linear in entries and therefore quadratic in a run, which the D-173 recon measured
+    at more than the transfers cost over a fast link. Appending is what happens during the run;
+    this is the compaction.
+
+    Written to a sibling temporary file and renamed, because an interrupted compaction must
+    leave the log it was compacting rather than half of one -- ``os.replace`` semantics via
+    :meth:`~pathlib.Path.replace`. **The one ``fsync`` this file gets is here**, with the
+    directory entry after the rename: once per run it costs nothing worth measuring, and it
+    turns "a power cut loses the whole record" into "a power cut loses nothing".
 
     A module-level function with :meth:`SyncManifest.save` delegating to it, because
     :class:`SyncManifest` is a ``@dataclass`` and **mutmut generates no mutants for a method of a
@@ -380,13 +507,16 @@ def write_manifest(entries: Mapping[str, ManifestEntry], path: Path | str) -> No
     things a mutation would change silently, so this body is worth having the lane look at.
     """
     destination = Path(path)
-    document: dict[str, Any] = {
-        "version": MANIFEST_VERSION,
-        "entries": {key: entry.as_json() for key, entry in sorted(entries.items())},
-    }
     staging = destination.with_name(f"{destination.name}.partial")
-    _ = staging.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    lines = b"".join(manifest_line(key, entry) for key, entry in sorted(entries.items()))
+    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        _ = os.write(descriptor, lines)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     staging.replace(destination)
+    fsync_directory(destination.parent)
 
 
 def record_entry(

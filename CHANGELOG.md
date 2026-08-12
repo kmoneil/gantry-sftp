@@ -130,6 +130,25 @@ changelog comes to describe a release that does not exist.
 - **CI runs the `live` lane on macOS as well as Linux**, so the above stays fixed. Required
   status checks are now `live (ubuntu-latest)` and `live (macos-latest)` in place of `live`.
   Nothing a user installs is affected.
+- **An interrupted mirror keeps what it sent** (D-173). `sync_tree` wrote its manifest once, after
+  the transfer loop returned, so a run killed partway through recorded nothing and the next one
+  re-sent the whole tree — and on a tree large enough to be interrupted, that is every run. The
+  record is now appended as each file lands and compacted when the run ends.
+
+  **The file format changed** and `MANIFEST_VERSION` is `2`: one JSON record per line, with the
+  version carried per record so an upgrade between two runs costs only the records the new version
+  cannot read. Nothing needed migrating, since `sync_tree` had not been released. A manifest
+  written by the earlier code reads as "nothing is known" and costs one full re-send.
+
+  **No `fsync` per record, and that is the decision rather than an omission.** The upload journal
+  flushes every line because over-reporting there is corruption; a manifest record is written only
+  after the transfer returned *and* the destination was checked, so a lost tail is a record fewer —
+  a re-send. There is one `fsync`, at the compaction. Measured before it was argued: rewriting the
+  whole document per file is quadratic in a run and costs more than the transfers do over a fast
+  link, while an append is orders of magnitude below one transferred file even on localhost.
+
+  The manifest path is opened before the walk starts, so a directory that does not exist raises
+  `OSError` immediately instead of from inside the walk.
 - **A tree refuses a contradictory `publish` before it creates anything** (D-172 follow-on).
   `put_tree` and `sync_tree` restated three of `put`'s rules and not the two `require_*` ones, so
   `Publish(require_atomic=True, atomic=False)` was caught one *file* late — same exception, same
