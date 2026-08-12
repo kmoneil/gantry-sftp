@@ -70,6 +70,25 @@ invoke it. See [No cryptography, and the class of problem that removes](architec
 you made. The allowlist bounds *which* hosts a program may reach; it does not make an approved host
 untrusted.
 
+**A tree that never ends.** `walk` and `get_tree` default to `max_depth=None`, so a server
+answering `READDIR` with a fresh subdirectory every time makes the descent run for as long as you
+let it. Named here because it sits between two sentences that each look like they cover it and
+neither does: the scope puts "unbounded allocation, or crash or hang the codec" *in*, and the
+paragraph above puts a server behaving badly within its rights *out*. **It is out**, for the
+reason [streaming a large directory](listing-and-matching.md#streaming-a-directory-you-did-not-size)
+already gives about not capping one: a silent default ceiling breaks the legitimate deep tree and
+reports success while doing it, which is worse than descending.
+
+Memory is not the hazard — the walk holds one directory at a time and follows no symlink, so
+there is no cycle and nothing accumulates. What it spends is wall-clock and bytes, which a server
+you asked for a tree can spend on you anyway by answering with a large one. Pass `max_depth=`
+when pointing a recursive download at a server you would not leave unattended; it is the bound
+that makes the operation finite, and it is not described as a security control because it is not
+one.
+
+`put_tree` and `sync_tree` take the same argument and are **not** exposed to this: both walk the
+*local* tree with `walk_local`, so the depth is yours rather than the server's.
+
 **The allowlist does not pin a resolved address.** This library never resolves DNS — OpenSSH does —
 so the allowlist matches the destination as written and cannot guarantee the name it approved still
 resolves the same way at connect time. A documented limit of the control rather than a defect in it.

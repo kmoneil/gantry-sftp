@@ -61,9 +61,21 @@ link profiles. The file object has a gating row of its own, measured against our
 
 ## No cryptography, and the class of problem that removes
 
-**There is no cryptography in this package and no cryptographic dependency.** `pip install
-gantry-sftp` pulls `anyio` and nothing else. There is one optional extra, `[fsspec]`, and it does
-not change that sentence — fsspec has no required dependencies of its own.
+**There is no cryptography of this library's own and no cryptographic dependency.** No cipher,
+no key exchange, no signature, no host-key handling, no `known_hosts` parsing — none of it is
+here, and none of it is installed. `pip install gantry-sftp` pulls `anyio` and nothing else.
+There is one optional extra, `[fsspec]`, and it does not change that sentence — fsspec has no
+required dependencies of its own.
+
+**One exception, named because a page you read to rule something out should not need a second
+source.** The standard library's `hashlib` is called in three places, all of them the
+[`check-file` verification ladder](transfers.md#verifying-a-transfer): the local digest has to be
+computed locally to be compared with the server's. Every call passes `usedforsecurity=False`, and
+that flag is load-bearing rather than decorative — the server chooses the algorithm, paramiko is
+the only implementation of the extension and offers nothing but `md5` and `sha1`, and a FIPS
+build refuses to construct `md5` at all. So a FIPS-constrained deployment meets this library's
+one crypto interaction at `check_file`, and nowhere else. It is a hash over bytes you already
+have, not a primitive protecting anything, which is why the argument below is unaffected.
 
 That is the load-bearing consequence of the architecture, and what it does is *remove* a class of
 problem rather than solve it. An SSH implementation written in Python has to track a cryptography

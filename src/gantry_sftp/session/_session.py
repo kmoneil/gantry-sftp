@@ -2072,7 +2072,10 @@ class Session(_SessionOperations):
         Args:
             remote_path: Remote directory to copy.
             local_path: Local destination. Created if absent, and everything is confined to it.
-            max_depth: Levels below the root to descend, or ``None`` for no limit.
+            max_depth: Levels below the root to descend, or ``None`` for no limit. The remote
+                tree's shape is the server's to choose, so this is the bound that makes the
+                descent finite -- see :meth:`walk`, which states why, and ``docs/security.md``
+                for why no default ceiling is imposed instead.
             progress: Called with ``(transferred, total)`` per file, so ``total`` resets for
                 each one. A tree-wide total would need the whole walk up front.
 
