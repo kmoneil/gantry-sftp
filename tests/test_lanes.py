@@ -569,10 +569,13 @@ def test_the_attestation_the_sbom_decision_rests_on_is_asked_for_explicitly() ->
 
     The argument there is that for "was this artifact built by the project it claims to come
     from" a signed PEP 740 attestation beats an unsigned inventory -- which holds only while one
-    is actually produced. Two reasons the action's default is too thin to rest a documented
-    decision on: it labels the input `[EXPERIMENTAL]` in its own `action.yml`, and an
-    experimental default can move; and a default nobody wrote down is one an edit can turn off
-    with nothing reading as changed (D-149).
+    is actually produced.
+
+    D-149 gave two reasons the action's default was too thin to rest a documented decision on,
+    and **one of them expired** (D-174): it labelled the input `[EXPERIMENTAL]`, and at v1.14.2
+    it no longer does -- upstream stopped implying PEP 740 might be experimental. The reason
+    that never depended on upstream is the one this assertion rests on now: a default nobody
+    wrote down is one an edit can turn off with nothing reading as changed.
 
     Asserted over the uncommented text, because the comment above that line quotes the spelling
     it is arguing about.

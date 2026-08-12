@@ -186,11 +186,14 @@ jobs:
       # is already uploaded. That reasoning is only sound while the attestation is actually
       # produced.
       #
-      # Two things make the default too thin to rest on. The action labels the input
-      # `[EXPERIMENTAL]` in its own `action.yml` -- read at the pinned SHA, not recalled -- and
-      # an experimental default is one that can move. And a default nobody wrote down is one a
-      # future edit can turn off without anything reading as changed. Written out, `tests/
-      # test_lanes.py` can pin it, so removing it fails a test that names the page it breaks.
+      # **One of the two original reasons has expired, and the line stays for the other.** This
+      # said the action labels the input `[EXPERIMENTAL]` in its own `action.yml`; at v1.14.2 it
+      # does not, and upstream says why -- v1.14.0 "updated the mentions of PEP 740 to stop
+      # implying that it might be experimental". Re-read at the new pinned SHA, which is what
+      # "read at the pinned SHA, not recalled" obliges when the pin moves. What survives is the
+      # reason that never depended on upstream: a default nobody wrote down is one a future edit
+      # can turn off without anything reading as changed. Written out, `tests/test_lanes.py` can
+      # pin it, so removing it fails a test that names the page it breaks.
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           attestations: true
