@@ -85,6 +85,7 @@ from gantry_sftp.session import ServerLimits, raise_for_status
 from gantry_sftp.session._quirks import PROFILES, UNKNOWN
 from gantry_sftp.sync import open_local_server_transport, open_session
 from gantry_sftp.transport import find_sftp_server
+from local_filesystem import SERVER_CAN_CHMOD_A_SYMLINK
 
 CASE_FOLDS = "this server folds case in names"
 ROOT_IS_SLASH = "the root of this server's namespace is /"
@@ -1026,9 +1027,16 @@ def test_the_reference_server_answers_every_question_the_battery_asks(tmp_path: 
         ("a file's timestamps survive being set", Verdict.YES),
         ("posix-rename@openssh.com actually renames", Verdict.YES),
         ("fsync@openssh.com actually flushes", Verdict.YES),
-        # The headline: advertised by OpenSSH and unable to succeed on Linux, because there is
-        # no lchmod. Advertised and working are different questions and this is the proof.
-        ("lsetstat@openssh.com actually changes a symlink's own mode", Verdict.NO),
+        # The headline: advertised by OpenSSH, and whether it *works* is a property of the
+        # server's operating system rather than of the extension. Linux has no `lchmod`, so the
+        # permissions branch cannot succeed; macOS has one, so it does. **Both answers are the
+        # battery working** -- this row is the proof that advertised and working are different
+        # questions, and pinning either verdict unconditionally would assert one platform's
+        # answer as SFTP's, which is the mistake the whole report exists to stop.
+        (
+            "lsetstat@openssh.com actually changes a symlink's own mode",
+            Verdict.YES if SERVER_CAN_CHMOD_A_SYMLINK else Verdict.NO,
+        ),
         # The one the first draft reported as `no` because a 261 KB path hits PATH_MAX.
         ("a request as large as this session would send is accepted", Verdict.YES),
     ],

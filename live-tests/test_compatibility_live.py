@@ -44,6 +44,7 @@ from gantry_sftp.compatibility import (
 )
 from gantry_sftp.doctor import local_diagnosis, render_json, render_text, server_diagnosis
 from gantry_sftp.sync import open_session, open_ssh_transport
+from local_filesystem import SERVER_CAN_CHMOD_A_SYMLINK
 
 TYPICAL_HANDLE = b"\x00\x00\x00\x00"
 
@@ -82,9 +83,12 @@ MEASURED: dict[str, dict[str, Verdict | None]] = {
         TIMES_SURVIVE: Verdict.YES,
         POSIX_RENAME: Verdict.YES,
         FSYNC: Verdict.YES,
-        # Advertised, and refuses: Linux has no lchmod, so the permissions branch answers
-        # ENOTSUP and OpenSSH maps that to a contentless FAILURE.
-        LSETSTAT: Verdict.NO,
+        # Advertised, and what it does is a property of the *server's* operating system:
+        # Linux has no lchmod so the permissions branch answers ENOTSUP, which OpenSSH maps to
+        # a contentless FAILURE; macOS has one and the link's own mode really changes. The
+        # `live` lane runs on both, so this row is derived rather than pinned -- and it is
+        # derived from the local platform only because this server is local.
+        LSETSTAT: Verdict.YES if SERVER_CAN_CHMOD_A_SYMLINK else Verdict.NO,
         LARGEST_REQUEST: Verdict.YES,
         CHECK_FILE: NOT_ASKED,
     },
@@ -282,10 +286,20 @@ def test_what_this_server_actually_does(server: MatrixServer, tmp_path: Path, fa
 def test_advertised_is_not_the_same_question_as_working(server: MatrixServer, tmp_path: Path):
     """The card's central claim, on the row that proves it.
 
-    `lsetstat@openssh.com` is advertised by OpenSSH and by asyncssh and works on neither, on
-    this kernel -- and the two fail *differently*, which is the part no advertisement could
-    have told anybody. OpenSSH refuses with a contentless FAILURE; asyncssh answers OK and
+    `lsetstat@openssh.com` is advertised by OpenSSH and by asyncssh, and on a Linux server it
+    works on neither -- **failing differently on each**, which is the part no advertisement
+    could have told anybody. OpenSSH refuses with a contentless FAILURE; asyncssh answers OK and
     moves nothing. A report that believed the status would have called the second one working.
+
+    **On macOS the OpenSSH row is a success, and that is the same claim rather than an exception
+    to it.** `lchmod` exists there, so the extension does what it says; what stays true is that
+    the answer is a property of the *server's operating system* and cannot be read off the
+    advertisement. So the assertion is on the pair -- verdict and evidence agreeing about which
+    outcome happened -- rather than on a fixed verdict, because pinning one platform's answer as
+    SFTP's is exactly the mistake this feature exists to stop.
+
+    The asyncssh row is Linux-only in practice: the `bench` group it needs is installed on the
+    `server-matrix` job, which is `ubuntu-latest`.
     """
     if server.name == "paramiko":
         pytest.skip("paramiko advertises no lsetstat@openssh.com, so there is nothing to verify")
@@ -296,6 +310,10 @@ def test_advertised_is_not_the_same_question_as_working(server: MatrixServer, tm
         pass
 
     found = next(f for f in report.findings if f.fact == LSETSTAT)
+    if server.name == "openssh" and SERVER_CAN_CHMOD_A_SYMLINK:
+        assert found.verdict is Verdict.YES
+        assert "this server's platform has lchmod" in found.answer
+        return
     assert found.verdict is Verdict.NO
     if server.name == "openssh":
         assert "FAILURE" in found.evidence[-1]

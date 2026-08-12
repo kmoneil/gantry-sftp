@@ -52,26 +52,20 @@ from gantry_sftp.exceptions import (
 )
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
+from local_filesystem import SERVER_CAN_CHMOD_A_SYMLINK
 
 pytestmark = pytest.mark.anyio
 
 KNOWN_MTIME = 1_600_000_000
 KNOWN_ATIME = 1_600_000_007
 
-SERVER_CANNOT_CHMOD_A_SYMLINK = os.chmod not in os.supports_follow_symlinks
-"""Whether the machine running `sftp-server` refuses `chmod` on a link because it cannot do it.
+SERVER_CANNOT_CHMOD_A_SYMLINK = not SERVER_CAN_CHMOD_A_SYMLINK
+"""The inverse of the shared probe, kept as a name because both markers below read better for it.
 
-**Linux cannot; macOS can, and two tests below asserted the refusal as though it were SFTP's.**
-`os.supports_follow_symlinks` is the platform's own answer -- the documented capability set,
-rather than a `sys.platform` string or a `try`/`except` that would also swallow a real error.
-On Linux `os.chmod` is absent from it and `chmod(..., follow_symlinks=False)` raises
-`NotImplementedError`; on macOS it is present and the call works, which is why `lsetstat`'s
-permissions branch succeeds there and `DID NOT RAISE` was the first CI failure on the macOS job.
-
-**The local platform is the right proxy here because the server *is* local**: these tests drive
-`sftp-server` on this machine. It would be the wrong proxy for a remote server, which is the
-difference D-151 closed on -- a Linux client talking to a macOS server gets the success, not the
-refusal, and `docs/paths.md` and DESIGN's attribute table now say so.
+**The probe itself moved to `tests/local_filesystem.py` in D-165**, which gave it a third
+consumer: the compatibility battery pins what `lsetstat` does against a local server, and that
+answer flips on macOS exactly the way these rows do. Two copies of one probe is the shape D-157
+was closed on.
 """
 
 needs_a_server_that_cannot_chmod_a_symlink = pytest.mark.skipif(
