@@ -400,6 +400,111 @@ async def test_a_tree_still_refuses_a_staging_name_even_with_a_journal(tmp_path:
     )
 
 
+# --- the walk's own ordering, which nothing else checks -------------------------------------------
+
+
+def _local_tree(root: Path) -> None:
+    """Three levels, so the ordering below is exercised at depth rather than once."""
+    (root / "one" / "two").mkdir(parents=True)
+    _ = (root / "top.bin").write_bytes(b"t")
+    _ = (root / "one" / "middle.bin").write_bytes(b"m")
+    _ = (root / "one" / "two" / "deep.bin").write_bytes(b"d")
+
+
+def _parent_of(remote: bytes) -> bytes:
+    head, _, _ = remote.rpartition(b"/")
+    return head
+
+
+def needs_real_server() -> None:
+    """`TreeServer` implements no `mkdir` and no `write`, so this half needs the real one."""
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+
+@pytest.mark.parametrize("concurrency", [1, 4])
+@pytest.mark.parametrize("existing", [False, True], ids=["fresh", "already-there"])
+async def test_an_uploaded_directory_is_created_before_any_of_its_files(
+    tmp_path: Path, concurrency: int, existing: bool
+):
+    """D-179's characterization test, written before the extraction it exists to guard.
+
+    `put_tree`'s producer awaits the `mkdir` **in the producer**, before any of that
+    directory's files is yielded, and its own comment says why: *"so a worker never writes into
+    a directory that does not exist yet. `walk_local` is top-down, which is what makes that
+    sufficient rather than merely usual."*
+
+    That is an ordering invariant between two `await`s in one generator, and **nothing checked
+    it**. It is implied by the shape of the loop, which is exactly the kind of guarantee an
+    extraction can lose without any existing test noticing: every tree test asserts on what
+    landed, and a `mkdir` issued late still lands before the assertions run. What would break
+    is a tree against a server slow enough, or a worker scheduled early enough, for the write
+    to arrive first -- which is a flake somewhere else, on somebody else's machine.
+
+    Recorded at `Session.mkdir` and `Session.put` rather than at the wire, because those two
+    are what the producer calls and what the extraction moves. Run at both concurrencies: the
+    invariant is not "the operations are ordered" -- with four workers they interleave, and
+    they are supposed to -- it is that *each file's own parent* precedes it.
+
+    **`existing` is what makes the assertion do any work, and it was added after watching the
+    break.** Deferring the `mkdir` against a *fresh* destination fails on its own, loudly, with
+    `NO_SUCH_FILE` on the staging file -- so on that row the ordering assertion never speaks and
+    could be wrong without anybody knowing. Against a destination whose directories are already
+    there, a late `mkdir(exist_ok=True)` succeeds, every file lands, the result object is
+    correct, and the **only** thing that can report the regression is the order recorded here.
+    That is also the case a real deployment is most likely to be in: a re-run, a mirror, a tree
+    dropped into a directory somebody already made.
+    """
+    needs_real_server()
+    source = tmp_path / "src"
+    source.mkdir()
+    _local_tree(source)
+    destination = tmp_path / "dest"
+    if existing:
+        # The "remote" here is this same filesystem, so pre-creating the destination tree is
+        # what a second run of the same upload would find.
+        (destination / "one" / "two").mkdir(parents=True)
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        order: list[tuple[str, bytes]] = []
+        made, sent = sftp.mkdir, sftp.put
+
+        async def recording_mkdir(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            order.append(("mkdir", sftp._resolve(path)))  # noqa: SLF001
+            return await made(path, *args, **kwargs)
+
+        async def recording_put(local, remote, *args, **kwargs):  # type: ignore[no-untyped-def]
+            order.append(("put", sftp._resolve(remote)))  # noqa: SLF001
+            return await sent(local, remote, *args, **kwargs)
+
+        sftp.mkdir, sftp.put = recording_mkdir, recording_put
+        try:
+            result = await sftp.put_tree(source, str(destination).encode(), concurrency=concurrency)
+        finally:
+            sftp.mkdir, sftp.put = made, sent
+
+    assert result.files == 3, "the tree did not upload, so the ordering below proves nothing"
+    assert result.directories == 2
+
+    made_at = {path: index for index, (kind, path) in enumerate(order) if kind == "mkdir"}
+    puts = [(index, path) for index, (kind, path) in enumerate(order) if kind == "put"]
+    assert len(puts) == 3, f"expected three uploads, recorded {order!r}"
+
+    for index, remote in puts:
+        parent = _parent_of(remote)
+        assert parent in made_at, (
+            f"{remote!r} was uploaded into {parent!r}, which this run never created: {order!r}"
+        )
+        assert made_at[parent] < index, (
+            f"{remote!r} was uploaded at step {index} but its directory {parent!r} was only "
+            f"created at step {made_at[parent]} -- a worker wrote into a directory that did "
+            f"not exist yet. Order was {order!r}"
+        )
+
+
 # --- against a real server ----------------------------------------------------------------------
 
 
