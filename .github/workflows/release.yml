@@ -191,7 +191,7 @@ jobs:
       # an experimental default is one that can move. And a default nobody wrote down is one a
       # future edit can turn off without anything reading as changed. Written out, `tests/
       # test_lanes.py` can pin it, so removing it fails a test that names the page it breaks.
-      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           attestations: true
 
