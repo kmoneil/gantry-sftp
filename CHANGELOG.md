@@ -3,6 +3,29 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## Unreleased
+
+### Fixed
+
+- **A local file this library creates beside one you named could be planted at first** (D-175,
+  CWE-59). `UploadJournal.compact()` wrote `<journal>.compacting` and `sync_tree`'s manifest
+  compaction wrote `<manifest>.partial`, each opened `O_CREAT|O_TRUNC` with no `O_NOFOLLOW`. Both
+  names are derived from a path **you** named, in a directory this library does not own, so
+  anybody able to write there could predict one and plant a symlink at it: the file it pointed at
+  was truncated and overwritten, and the rename that followed moved the *link* onto your journal,
+  sending every later record there too. Both now go through one helper using `tempfile.mkstemp`
+  semantics — `O_CREAT | O_EXCL | O_NOFOLLOW`, mode `0600`, and a name that is not derivable.
+  `O_EXCL` is load-bearing beside `O_NOFOLLOW`: a *hard* link planted at the name is not a
+  symlink. A failed compaction now also removes its temporary instead of leaving it.
+
+  **What deliberately did not change**: the journal and manifest paths *you* name are still
+  opened following a symlink, exactly as `get` opens a download destination — `no_follow` is a
+  parameter there and off by default, because a state file that is a link to somewhere else is a
+  deployment rather than an attack. The line is who chose the name. The consequence is that these
+  files belong in a directory only your job can write to, which is now stated in
+  [Where to put the journal](docs/reliability.md#where-to-put-the-journal), on `UploadJournal`,
+  on `sync_tree`'s `manifest` argument, and as a row in the security table.
+
 ## 0.2.0 — 2026-08-12
 
 **A minor bump that breaks nothing.** While the major version is `0` a breaking change lands in the

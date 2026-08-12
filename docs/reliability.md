@@ -230,6 +230,30 @@ Append-only rather than a rewritten document, because `put_tree(concurrency=N)` 
 against one journal and a read-modify-write would need a lock and would lose records. `compact()`
 is how it stops growing, and it is explicit: it is the one operation that rewrites.
 
+### Where to put the journal
+
+**In a directory only your job can write to.** There is no default location and there will not be
+one — the file has to outlive the process to be worth anything, so it cannot go anywhere this
+library would clean up, and choosing a directory on your disk is not a decision a library gets to
+make. `/var/lib/<job>/` is the shape; `/tmp` and `/var/tmp` are not, and neither is a spool other
+accounts share.
+
+That is a real boundary rather than tidiness, and the line runs between the name you chose and the
+names this library derives:
+
+- **The path you name is opened the way `get` opens a download destination** — following a
+  symlink, because `/var/lib/myjob/uploads.journal → /mnt/state/uploads.journal` is a deployment
+  and not an attack. In a directory somebody else can write to, that means your records can be
+  appended into a file of their choosing, without the `0600` a fresh journal would have been
+  created with.
+- **The temporary file `compact()` writes is not derivable from your path** and is created with
+  `O_EXCL` and `O_NOFOLLOW` (D-175). That one is this library's to get right: you never asked for
+  it to exist. It used to be `<journal>.compacting`, opened `O_CREAT|O_TRUNC`, which anybody able
+  to write to the directory could plant a link at and have an arbitrary file truncated and
+  overwritten.
+
+The same two rules apply to `sync_tree`'s `manifest`, which is written the same way.
+
 ### Cleaning up after a crash
 
 The half you notice first is not the resume — it is the `.part` files. Every in-process failure

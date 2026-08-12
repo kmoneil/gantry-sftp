@@ -30,8 +30,10 @@ hostile journal cannot produce a wrong file.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -331,6 +333,85 @@ def test_compaction_leaves_no_partial_file_behind(tmp_path: Path):
 
     _ = journal.compact()
 
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["uploads.journal"]
+
+
+# --- the name of the file compaction writes (D-175) --------------------------------------------
+
+
+def test_compaction_does_not_write_through_a_link_planted_at_the_derived_name(tmp_path: Path):
+    """The bug, and it is about a name rather than about the journal's contents.
+
+    Compaction used to write `<journal>.compacting` -- a name derived from the caller's, in a
+    directory this library does not own -- and open it `O_CREAT|O_TRUNC` with no `O_NOFOLLOW`.
+    Anybody able to write there could predict it, so a symlink planted at it was followed: the
+    file it pointed at was truncated and overwritten with the compacted log, and the rename that
+    followed moved the *link* onto the journal path, sending every later append there too.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    victim = tmp_path / "victim.conf"
+    _ = victim.write_text("important\n" * 20)
+    planted = tmp_path / "uploads.journal.compacting"
+    planted.symlink_to(victim)
+
+    assert journal.compact() == 1
+
+    assert victim.read_text() == "important\n" * 20, "written through the planted link"
+    assert planted.is_symlink(), "the planted link was itself replaced"
+    assert not journal.path.is_symlink(), "the link was renamed over the journal"
+    assert journal.staged_for(TARGET, identity()) == STAGED
+
+
+def test_the_file_compaction_writes_is_private_and_named_unpredictably(tmp_path: Path, monkeypatch):
+    """`0o600` and a name a second run does not repeat, asserted while the file still exists.
+
+    `mkstemp` supplies both, along with the `O_EXCL | O_NOFOLLOW` no test can observe from
+    outside -- `O_EXCL` because a *hard* link planted at the name is not a symlink and would be
+    written through. What is pinned here is therefore the pair of properties a rewrite would
+    have to keep, not the call that currently provides them.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    observed: list[tuple[str, int]] = []
+    replace = os.replace
+
+    def watch(source, destination):
+        observed.append((Path(source).name, stat.S_IMODE(Path(source).stat().st_mode)))
+        replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", watch)
+    _ = journal.compact()
+    _ = journal.compact()
+
+    assert [mode for _, mode in observed] == [0o600, 0o600]
+    first, second = (name for name, _ in observed)
+    assert first != second, "a name a second run repeats is a name somebody can plant at"
+    assert not first.endswith(".compacting")
+    assert first.startswith("uploads.journal."), "still recognisable to whoever sweeps this"
+
+
+def test_a_compaction_that_cannot_rename_leaves_the_log_and_no_temporary(
+    tmp_path: Path, monkeypatch
+):
+    """The cost of an unpredictable name is paid here rather than by whoever finds the litter.
+
+    The derived name left its file behind on this path too; a random one nobody can identify
+    would be worse, so the failure cleans up after itself.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    before = journal.path.read_bytes()
+
+    def refuse(source, destination):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(OSError) as failure:
+        _ = journal.compact()
+
+    assert failure.value.errno == errno.EXDEV
+    assert journal.path.read_bytes() == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["uploads.journal"]
 
 

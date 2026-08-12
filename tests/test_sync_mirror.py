@@ -397,6 +397,31 @@ def test_saving_leaves_no_partial_file_behind(tmp_path: Path) -> None:
     assert sorted(item.name for item in tmp_path.iterdir()) == ["state.json"]
 
 
+def test_saving_does_not_write_through_a_link_planted_at_the_derived_name(tmp_path: Path) -> None:
+    """The manifest's half of D-175, and it arrived by being copied from the journal's.
+
+    That sibling used to be `<manifest>.partial`, opened `O_CREAT|O_TRUNC` with no
+    `O_NOFOLLOW` -- a name derived from the caller's, in a directory this library does not own,
+    which anybody able to write there could plant a symlink at. The record a mirror keeps is
+    what tells it not to re-send, so the file this writes is worth a caller placing somewhere
+    long-lived and shared, which is exactly where the hazard is.
+    """
+    state = tmp_path / "state.json"
+    victim = tmp_path / "victim.conf"
+    _ = victim.write_text("important\n" * 20)
+    planted = tmp_path / "state.json.partial"
+    planted.symlink_to(victim)
+    manifest = SyncManifest.empty()
+    manifest.record(b"/drop/report.csv", SENT)
+
+    manifest.save(state)
+
+    assert victim.read_text() == "important\n" * 20, "written through the planted link"
+    assert planted.is_symlink(), "the planted link was itself replaced"
+    assert not state.is_symlink(), "the link was renamed over the manifest"
+    assert SyncManifest.load(state).recorded(b"/drop/report.csv") == SENT
+
+
 def test_saving_replaces_an_earlier_record_for_the_same_path(tmp_path: Path) -> None:
     later = ManifestEntry(local_size=1, local_mtime=2, remote_size=3, remote_mtime=4)
     manifest = SyncManifest.empty()

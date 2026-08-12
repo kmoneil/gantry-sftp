@@ -78,7 +78,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from gantry_sftp.codec import Attrs
-from gantry_sftp.session._journal import fsync_directory
+from gantry_sftp.session._journal import replace_atomically
 from gantry_sftp.session._listing import decode_name
 from gantry_sftp.session._localtree import (
     LocalWalkEntry,
@@ -495,28 +495,23 @@ def write_manifest(entries: Mapping[str, ManifestEntry], path: Path | str) -> No
     at more than the transfers cost over a fast link. Appending is what happens during the run;
     this is the compaction.
 
-    Written to a sibling temporary file and renamed, because an interrupted compaction must
-    leave the log it was compacting rather than half of one -- ``os.replace`` semantics via
-    :meth:`~pathlib.Path.replace`. **The one ``fsync`` this file gets is here**, with the
-    directory entry after the rename: once per run it costs nothing worth measuring, and it
-    turns "a power cut loses the whole record" into "a power cut loses nothing".
+    Written to a temporary sibling and renamed, because an interrupted compaction must leave the
+    log it was compacting rather than half of one. **The one ``fsync`` this file gets is here**,
+    with the directory entry after the rename: once per run it costs nothing worth measuring, and
+    it turns "a power cut loses the whole record" into "a power cut loses nothing".
+
+    Both of those are :func:`~gantry_sftp.session._journal.replace_atomically`'s, shared out of
+    the journal the way ``fsync_directory`` already was rather than restated -- and the sibling's
+    name is unpredictable because this one used to be `<manifest>.partial`, which anybody able to
+    write to the caller's directory could plant a symlink at (D-175).
 
     A module-level function with :meth:`SyncManifest.save` delegating to it, because
     :class:`SyncManifest` is a ``@dataclass`` and **mutmut generates no mutants for a method of a
     decorated class** (D-107). The sort order, the version field and the trailing newline are all
     things a mutation would change silently, so this body is worth having the lane look at.
     """
-    destination = Path(path)
-    staging = destination.with_name(f"{destination.name}.partial")
     lines = b"".join(manifest_line(key, entry) for key, entry in sorted(entries.items()))
-    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        _ = os.write(descriptor, lines)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    staging.replace(destination)
-    fsync_directory(destination.parent)
+    replace_atomically(Path(path), lines)
 
 
 def record_entry(

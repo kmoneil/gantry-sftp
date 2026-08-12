@@ -3105,6 +3105,8 @@ class Session(_SessionOperations):
                 mid-line or written by a future version all mean "that much is not known",
                 which costs a re-send and loses nothing. Opened before the walk starts, so a
                 path that cannot be written raises here rather than from inside the walk.
+                Place it where only this job can write, for the reason
+                :class:`~gantry_sftp.session.UploadJournal` gives about its own file.
             max_depth: Stop descending below this many levels.
             publish: How each file becomes visible, as :meth:`put` takes it.
             preserve_times: Carry each local file's times across. Independent of the comparison
