@@ -79,6 +79,7 @@ __all__ = [
     "compact",
     "entry_matches",
     "fold",
+    "fsync_directory",
     "source_identity",
     "staged_for",
 ]
@@ -207,11 +208,15 @@ def append_record(path: Path | str, event: str, fields: dict[str, object]) -> No
     finally:
         os.close(descriptor)
     if first_time:
-        _fsync_directory(destination.parent)
+        fsync_directory(destination.parent)
 
 
-def _fsync_directory(directory: Path) -> None:
+def fsync_directory(directory: Path) -> None:
     """Flush a directory entry, ignoring a platform that will not let us.
+
+    Shared with :mod:`gantry_sftp.session._sync`, which compacts its manifest the same way and
+    needs the same guarantee once per run (D-173). One copy rather than two, because two guards
+    stating one rule is what D-172 had just finished removing one module along.
 
     Windows refuses ``O_RDONLY`` on a directory and has no equivalent call; there the file's own
     flush is all that is available. Swallowed rather than raised because the alternative is an
@@ -336,7 +341,7 @@ def compact(path: Path | str) -> int:
     finally:
         os.close(descriptor)
     staging.replace(destination)
-    _fsync_directory(destination.parent)
+    fsync_directory(destination.parent)
     return len(surviving)
 
 

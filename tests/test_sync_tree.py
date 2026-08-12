@@ -13,6 +13,7 @@ deterministic on any machine.
 
 from __future__ import annotations
 
+import errno
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -253,3 +254,89 @@ async def test_a_mirror_does_not_delete_what_is_no_longer_local(
 
     assert (destination / "report.csv").exists()
     assert result.transferred == 0
+
+
+# --- what an interrupted run keeps (D-173) ------------------------------------------------------
+
+
+async def test_the_record_exists_before_the_run_finishes(source: Path, tmp_path: Path) -> None:
+    """The mirror used to write its record once, after the transfer loop returned.
+
+    So a run killed at file 9,999 of 10,000 kept nothing and the next one re-sent the tree --
+    which, on a mirror large enough to be interrupted, is every run. Read from a `progress`
+    callback because that is the only place inside the run a test can stand: each record is
+    appended after its own `put` and `stat`, so by the time the *second* file reports bytes, the
+    first is already on disk and readable by a separate `load`.
+
+    The killed-process half needs a real `SIGKILL` in a real process and lives in
+    `live-tests/test_sync_live.py`.
+    """
+    destination = tmp_path / "destination"
+    manifest = tmp_path / "state.json"
+    seen: list[int] = []
+
+    def watch(_transferred: int, _total: int | None) -> None:
+        seen.append(len(SyncManifest.load(manifest).entries))
+
+    async with _session() as sftp:
+        result = await sftp.sync_tree(
+            source, destination.as_posix().encode(), manifest=manifest, progress=watch
+        )
+
+    assert result.transferred == 2
+    assert seen, "the progress callback never ran, so this asserts nothing"
+    assert max(seen) > 0, (
+        f"nothing was on disk at any point during the run: {seen}. The record is being "
+        f"collected and written at the end, which is what D-173 removed"
+    )
+
+
+async def test_an_interrupted_run_keeps_what_it_sent(source: Path, tmp_path: Path) -> None:
+    """A run that never reaches its compaction, spelled as the exception a crash would raise.
+
+    Not a substitute for the `SIGKILL` row -- an exception unwinds and a kill does not -- but it
+    is the half that can be asserted without a subprocess, and it pins the property the format
+    exists for: the appended records are readable by the next run with no compaction in between.
+    """
+    destination = tmp_path / "destination"
+    manifest = tmp_path / "state.json"
+
+    def die_after_the_first_file(_transferred: int, _total: int | None) -> None:
+        if SyncManifest.load(manifest).entries:
+            raise RuntimeError("the deploy happened")
+
+    async with _session() as sftp:
+        with pytest.raises(RuntimeError) as caught:
+            _ = await sftp.sync_tree(
+                source,
+                destination.as_posix().encode(),
+                manifest=manifest,
+                progress=die_after_the_first_file,
+            )
+        assert caught.value.args[0] == "the deploy happened"
+
+        kept = SyncManifest.load(manifest).entries
+        assert kept, "the interrupted run kept nothing"
+
+        result = await sftp.sync_tree(source, destination.as_posix().encode(), manifest=manifest)
+
+    assert result.skipped == len(kept), "the second run re-sent what the first one had recorded"
+    assert result.transferred + result.skipped == 2
+
+
+async def test_a_manifest_path_that_cannot_be_written_fails_before_the_walk(
+    source: Path, tmp_path: Path
+) -> None:
+    """Recording as the run goes means the path has to be usable before the run goes."""
+    destination = tmp_path / "destination"
+
+    async with _session() as sftp:
+        with pytest.raises(OSError) as caught:
+            _ = await sftp.sync_tree(
+                source,
+                destination.as_posix().encode(),
+                manifest=tmp_path / "no-such-directory" / "state.json",
+            )
+
+    assert caught.value.errno == errno.ENOENT
+    assert not destination.exists(), "a refused request created its destination"

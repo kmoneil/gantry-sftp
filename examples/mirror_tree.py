@@ -41,7 +41,7 @@ from pathlib import Path
 
 import anyio
 
-from gantry_sftp.session import SyncManifest, SyncResult, open_session
+from gantry_sftp.session import Session, SyncManifest, SyncResult, open_session
 from gantry_sftp.transport import open_local_server_transport
 
 PINNED_MTIME = 1_700_000_000
@@ -133,8 +133,49 @@ async def main() -> None:
                 "indistinguishable from this side"
             )
 
+            await interrupted_run(sftp, area, source, remote, manifest)
+
         print("\nA mirror's defining act is deciding not to transfer. Every decision above")
         print("carries the evidence it rests on, because the wrong one is silent.")
+
+
+async def interrupted_run(
+    sftp: Session, area: Path, source: Path, remote: bytes, manifest: Path
+) -> None:
+    """A run that dies partway through, and the next one picking up where it stopped.
+
+    The record is appended as each file lands rather than written when the run finishes, so this
+    is what a deploy, an OOM or a laptop lid costs: nothing but the files that had not been sent
+    yet. Written as an exception because an example should not kill itself twice --
+    `examples/crash_resume.py` is the one that uses a real `SIGKILL`, and the property here is
+    the same one: the record is on disk because it was appended, not because anything tidied up.
+    """
+    fresh = area / "second-mirror"
+    fresh.mkdir()
+    for index in range(4):
+        _ = (source / f"batch-{index}.csv").write_bytes(f"id\n{index}\n".encode())
+    log = area / "interrupted.json"
+
+    def stop_once_something_is_recorded(_transferred: int, _total: int | None) -> None:
+        if len(SyncManifest.load(log).entries) >= 2:
+            raise RuntimeError("the deploy happened")
+
+    try:
+        _ = await sftp.sync_tree(
+            source, str(fresh).encode(), manifest=log, progress=stop_once_something_is_recorded
+        )
+    except RuntimeError as interrupted:
+        print(f"\nThe mirror died partway through: {interrupted}")
+
+    kept = SyncManifest.load(log).entries
+    assert kept, "the interrupted run recorded nothing, so the next one re-sends everything"
+    print(f"  it had already recorded {len(kept)} files, with no chance to tidy up")
+
+    resumed = await sftp.sync_tree(source, str(fresh).encode(), manifest=log)
+    show("The next run sends only the rest:", resumed)
+    assert resumed.skipped == len(kept), (
+        "the record survived the interruption but the comparison did not use it"
+    )
 
 
 anyio.run(main)

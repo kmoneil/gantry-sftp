@@ -378,8 +378,20 @@ def _running_paramiko(root: Path) -> Generator[MatrixServer]:
 def _paramiko_accept_loop(
     listener: socket.socket, host_key: Any, client_key: Any, stopping: threading.Event
 ) -> None:
-    """Serve connections until told to stop. One thread per connection, which is paramiko."""
-    listener.settimeout(0.2)
+    """Serve connections until told to stop. One thread per connection, which is paramiko.
+
+    The ``settimeout`` is guarded for the same reason the ``accept`` below is, and it is the
+    same race arriving one line earlier: teardown sets ``stopping``, closes the listener, and
+    *then* joins this thread, so a thread that has not been scheduled yet meets a closed
+    descriptor on its very first call. The loop already returns on that; this line did not, and
+    an unhandled ``OSError`` in a daemon thread surfaces as an error at the teardown of whatever
+    test happened to be running. Found by D-173 adding a fourth server-matrix file, which
+    widened the window rather than created it.
+    """
+    try:
+        listener.settimeout(0.2)
+    except OSError:
+        return
     while not stopping.is_set():
         try:
             connection, _ = listener.accept()
