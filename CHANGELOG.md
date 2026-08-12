@@ -3,12 +3,17 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## Unreleased
+## 0.2.0 — 2026-08-12
 
-**`Unreleased` rather than a version heading, and that distinction is enforced rather than
-observed.** `tests/test_packaging.py` accepts this heading *or* one naming the packaged version;
-`release.yml` refuses this one on a tag. Writing a version heading before the tag exists is how a
-changelog comes to describe a release that does not exist.
+**A minor bump that breaks nothing.** While the major version is `0` a breaking change lands in the
+minor version, so a patch release is always safe to take — but the reverse does not follow, and
+this one adds three subsystems rather than fixing anything. Calling it `0.1.3` would have described
+a bug-fix release. Everything below is additive except one refusal that became *less* strict and
+one on-disk format belonging to a feature that had not been released.
+
+Written with the date because the tag follows immediately; before that it read `## Unreleased`, and
+that distinction is enforced rather than observed. `tests/test_packaging.py` accepts either heading;
+`release.yml` refuses `Unreleased` on a tag and refuses a tag that disagrees with `__version__`.
 
 ### Added
 

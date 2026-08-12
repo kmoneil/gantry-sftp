@@ -79,7 +79,7 @@ $ python -m gantry_sftp doctor
 gantry-sftp doctor
 
 local
-  library                 0.1.2 (filexfer v3)
+  library                 0.2.0 (filexfer v3)
   ssh executable          ssh -- a bare name, so PATH decides at spawn time
   ssh version             OpenSSH_10.0p2 Debian-7+deb13u4, OpenSSL 3.5.6 7 Apr 2026
   transfers               supported
@@ -181,9 +181,11 @@ performance, and it writes its figures to a report rather than to this file.
 
 ## Status
 
-**0.1.2, and beta rather than alpha: the feature set is complete and the API can still change.**
-While the major version is `0` a breaking change lands in the minor version, so everything
-released so far — `0.1.0`, `0.1.1`, `0.1.2` — is source-compatible with what came before it.
+**0.2.0, and beta rather than alpha: the feature set is complete and the API can still change.**
+While the major version is `0` a breaking change lands in the minor version, so a patch release is
+always safe to take. The reverse does not follow: **`0.2.0` breaks nothing** — it is a minor bump
+because it adds three things large enough that calling them a patch would misdescribe the release,
+and everything published so far is source-compatible with what came before it.
 
 The protocol layer is complete: all 27 filexfer v3 packet types, encoded and decoded, each with a
 byte-level fixture asserted in **both** directions, checked against `draft-ietf-secsh-filexfer-02`
