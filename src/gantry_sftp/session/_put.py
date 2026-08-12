@@ -396,8 +396,24 @@ async def _open_staging_file(
 
     ``resume`` drops ``EXCL``, because adopting the previous run's staging file is the
     entire point and ``EXCL`` exists to refuse exactly that. What is lost with it is the
-    collision check -- so this only happens when the caller named the staging file
-    themselves, which is enforced a layer up in :func:`_check_publish_flags`.
+    collision check, and **there are two ways to arrive here, not one** -- this said only
+    the first until D-180 found it stale.
+
+    A caller who passed ``staging_name`` chose the name, so its predictability is their
+    decision and they were told. A caller who passed a ``journal`` did not: D-166 amended
+    :func:`_check_publish_flags` to accept one as the alternative, and
+    :func:`~gantry_sftp.session.resume_target` then hands back the path recorded for this
+    target -- which is the **only** resume a tree has, since
+    :func:`~gantry_sftp.session._policy._check_tree_publish` refuses a ``staging_name``
+    outright. So the pre-journal reading of this paragraph missed the common case.
+
+    What makes that safe is a different argument and a stronger one. The name is still
+    :func:`~gantry_sftp.session.staging_token`'s ``os.urandom``, generated fresh when the
+    interrupted run staged the file; the journal makes this run's own name *recoverable*
+    rather than making any name guessable, and it is written by
+    :func:`~gantry_sftp.session._journal.replace_atomically` to a ``0600`` file at a path
+    nobody can derive. Unpredictable to anybody without read access to the caller's own disk,
+    which is the same line D-175 drew around those two files.
 
     ``mode`` is the *creation* mode, so the staging file is never briefly more permissive
     than the destination it is going to become. On a resume it does nothing, which is
