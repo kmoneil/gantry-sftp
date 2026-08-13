@@ -36,6 +36,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,9 @@ from gantry_sftp.session import (
     Publish,
     SourceIdentity,
     UploadJournal,
+    _journal,
 )
+from gantry_sftp.session import open_session as open_async_session
 from gantry_sftp.session._journal import (
     append_record,
     compact,
@@ -59,6 +62,7 @@ from gantry_sftp.session._policy import _check_publish_flags
 from gantry_sftp.session._publish import resume_target
 from gantry_sftp.sync import open_local_server_transport, open_session
 from gantry_sftp.transport import find_sftp_server
+from gantry_sftp.transport import open_local_server_transport as open_async_local_transport
 
 TARGET = b"/incoming/data.csv"
 STAGED = b"/incoming/.data.csv.0a1b2c3d.part"
@@ -415,6 +419,407 @@ def test_a_compaction_that_cannot_rename_leaves_the_log_and_no_temporary(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["uploads.journal"]
 
 
+# --- read once, then tailed (D-176) -------------------------------------------------------------
+
+
+def counting_preads(monkeypatch) -> list[tuple[int, int]]:
+    """Record every journal read this process performs, as ``(length asked for, offset)``.
+
+    ``os.pread`` rather than a spy on the parse, because bytes read off the disk is the
+    quantity D-176 is about and the one a regression would grow. Nothing else in these rows
+    reads through it: no transfer runs, so the only ``pread`` in the process is the fold's.
+
+    **Asked for, not returned.** ``pread`` clamps at end of file, so a length computed wrong in
+    the direction of *too large* comes back with the right bytes and costs a buffer nobody
+    needed -- invisible to a counter of what arrived. The mutation lane is what said so.
+    """
+    reads: list[tuple[int, int]] = []
+    real_pread = os.pread
+
+    def counting(fd: int, length: int, offset: int) -> bytes:
+        reads.append((length, offset))
+        return real_pread(fd, length, offset)
+
+    monkeypatch.setattr(os, "pread", counting)
+    return reads
+
+
+def test_a_tree_reads_its_journal_once_rather_than_once_per_file(tmp_path: Path, monkeypatch):
+    """**The whole of D-176**, asserted as a shape rather than as a duration.
+
+    A tree performs one lookup per file against a log it appends two records to per file, so a
+    lookup that folds from byte zero reads the whole log once per file -- quadratic in the tree,
+    in the case this module's docstring names. Reading only what was appended since makes the
+    run's total what the file ends up holding, which is the definition of paying for it once.
+
+    Bytes rather than seconds, because a timing threshold on a shared runner is a flake and
+    this is not a claim about speed: it is a claim about how many times each byte is read.
+    """
+    files = 200
+    journal = journal_at(tmp_path)
+    read = counting_preads(monkeypatch)
+
+    for index in range(files):
+        target = f"/incoming/file{index}.dat".encode()
+        source = identity(path=f"/local/file{index}.dat")
+        _ = journal.staged_for(target, source)
+        journal.staging(target + b".part", target, source)
+        journal.published(target)
+
+    log = journal.path.stat().st_size
+    asked = sum(length for length, _ in read)
+    # Every byte of the log asked for at most once across the whole tree, plus the one byte
+    # per lookup that re-reads the newline the fold stopped at. The old shape read the log at
+    # every lookup, so it moved about `files / 2` times this much -- two orders of magnitude
+    # here, which is why the bound can be this tight without being brittle.
+    assert asked <= log + files, (
+        f"{asked} bytes read from a {log}-byte log over {files} files: a lookup is folding "
+        f"more than the tail it has not seen"
+    )
+    assert len(read) == files - 1, "one read per lookup, less the one before the file existed"
+
+
+def test_a_lookup_asks_for_exactly_the_tail_and_the_newline_before_it(tmp_path: Path, monkeypatch):
+    """The read arithmetic, pinned to the byte rather than bounded.
+
+    A length computed too large is invisible to any assertion about what came back, because
+    ``pread`` clamps at end of file -- so the bound in the row above cannot see it and the
+    mutation lane can. Spelling out both numbers is what makes the off-by-one deliberate: the
+    extra byte is the newline the fold ended on, re-read to prove the bytes under the offset
+    have not moved.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+    folded_to = journal.path.stat().st_size
+
+    read = counting_preads(monkeypatch)
+    journal.staging(b"/incoming/.next.part", b"/incoming/next", identity())
+    grown = journal.path.stat().st_size
+
+    assert journal.staged_for(b"/incoming/next", identity()) == b"/incoming/.next.part"
+    assert read == [(grown - folded_to + 1, folded_to - 1)]
+
+
+def test_a_second_lookup_with_nothing_appended_reads_no_further(tmp_path: Path, monkeypatch):
+    """A fold that has reached the end of the log is at the end of it, not one byte short.
+
+    The common shape in a tree that skips files: two lookups with no record written between
+    them. Reading the whole log again because the offset happens to equal the length is the
+    defect this card is about, arriving through an off-by-one instead of through a design.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+    log = journal.path.stat().st_size
+
+    read = counting_preads(monkeypatch)
+    for _ in range(3):
+        assert journal.staged_for(TARGET, identity()) == STAGED
+
+    assert [length for length, _ in read] == [1, 1, 1], (
+        f"three lookups against an unchanged {log}-byte log should re-read only the newline "
+        f"the fold stopped at"
+    )
+
+
+def test_a_journal_path_that_is_a_directory_folds_to_nothing(tmp_path: Path):
+    """A read that fails *after* the open, which is the other half of the failure path.
+
+    ``os.open`` accepts a directory and ``os.pread`` refuses it, so this is the one ordinary
+    way to reach the second guard -- and without a row for it that whole branch is unexecuted,
+    which the mutation lane reports as an arity error nobody can trigger rather than as a gap.
+    """
+    misplaced = tmp_path / "uploads.journal"
+    misplaced.mkdir()
+    journal = UploadJournal(misplaced)
+
+    assert fold(misplaced) == {}
+    assert journal.staged_for(TARGET, identity()) is None
+
+
+def test_a_record_another_process_appended_is_found_by_a_primed_lookup(tmp_path: Path):
+    """The property a fold-at-open cache would have lost, and the reason this one tails.
+
+    The journal exists to survive a killed run, so a second process appending to the same log
+    is the case it is for -- and a lookup answering from a snapshot taken at construction would
+    be reading a file that has since moved on.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+
+    elsewhere = UploadJournal(journal.path)  # another run, sharing only the file
+    elsewhere.staging(b"/incoming/.later.part", b"/incoming/later", identity(path="/local/later"))
+
+    assert journal.staged_for(b"/incoming/later", identity(path="/local/later")) == (
+        b"/incoming/.later.part"
+    )
+
+
+def test_a_publish_by_another_process_clears_a_primed_entry(tmp_path: Path):
+    """Later lines win **through** the fold, not only within one read of it.
+
+    The other direction of the row above, and the one that decides whether a lookup can go
+    stale in the way that costs: an entry this process folded and another process has since
+    published must stop being offered.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+
+    UploadJournal(journal.path).published(TARGET)
+
+    assert journal.staged_for(TARGET, identity()) is None
+
+
+def replacement_log(tmp_path: Path, records: list[tuple[bytes, bytes]]) -> Path:
+    """A whole log built elsewhere, ready to be moved or written over a journal.
+
+    Takes ``(staged, target)`` spelled out rather than deriving one from the other, because
+    the rows below turn on a record's **width** to the byte.
+    """
+    built = tmp_path / "replacement"
+    writer = UploadJournal(built)
+    for staged, target in records:
+        writer.staging(staged, target, identity())
+    return built
+
+
+def test_a_log_replaced_by_one_that_lines_up_is_folded_again(tmp_path: Path):
+    """The identity check, on a case no other guard here can see.
+
+    Constructed so every cheaper check says "carry on": the replacement is **longer**, so a
+    length test finds nothing, and its records are the same width as the original's, so the
+    byte before the fold is still a newline and the framing test finds nothing either. Only
+    ``(st_dev, st_ino)`` can tell that the file the fold describes has been renamed away.
+
+    Written this way deliberately. Against an arbitrary replacement all three guards fire, and
+    a row like that passes with any two of them deleted.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+    folded_to = journal.path.stat().st_size
+
+    # Names chosen the same width as the originals, so the replacement's first record ends
+    # exactly where the fold stopped. The assertions are what make that a fact, not a hope.
+    built = replacement_log(
+        tmp_path,
+        [
+            (b"/incoming/.aaaa.csv.0a1b2c3d.part", b"/incoming/aaaa.csv"),
+            (b"/incoming/.bbbb.csv.0a1b2c3d.part", b"/incoming/bbbb.csv"),
+        ],
+    )
+    assert built.stat().st_size > folded_to, "longer, so the length check cannot fire"
+    assert built.read_bytes()[folded_to - 1 : folded_to] == b"\n", (
+        "aligned, so the framing check cannot fire either"
+    )
+    _ = built.replace(journal.path)
+
+    assert journal.staged_for(b"/incoming/aaaa.csv", identity()) == (
+        b"/incoming/.aaaa.csv.0a1b2c3d.part"
+    )
+    assert journal.staged_for(TARGET, identity()) is None, "the old log's records are gone"
+
+
+def test_a_log_rewritten_in_place_is_folded_again(tmp_path: Path):
+    """The framing check, on the case neither of the other two can see.
+
+    A rotation, a shell redirect or an operator truncating this file keeps the **inode**, and
+    if the log comes back at least as long as it was there is no shrink to notice either. What
+    is left is that the fold claims to have stopped at a newline, so reading that byte back is
+    what says the bytes underneath it moved.
+
+    The recovery is what the row asserts: fold the whole file again and answer from it. Reading
+    on at the old offset would skip the records before it and mis-frame the ones after.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+    folded_to = journal.path.stat().st_size
+
+    rewritten = replacement_log(
+        tmp_path,
+        [
+            (b"/incoming/.a.csv.part", b"/incoming/a.csv"),
+            (b"/incoming/.bb.csv.part", b"/incoming/bb.csv"),
+        ],
+    ).read_bytes()
+    assert len(rewritten) >= folded_to, "at least as long, so the length check cannot fire"
+    assert rewritten[folded_to - 1 : folded_to] != b"\n", "misaligned, which is what is noticed"
+    with journal.path.open("r+b") as handle:
+        _ = handle.truncate(0)
+        _ = handle.write(rewritten)
+
+    assert journal.staged_for(b"/incoming/a.csv", identity()) == b"/incoming/.a.csv.part"
+    assert journal.staged_for(TARGET, identity()) is None, "the old log's records are gone"
+
+
+def test_a_log_truncated_to_nothing_is_never_read_at_a_negative_length(tmp_path: Path, monkeypatch):
+    """The length condition, pinned on what it prevents rather than on the answer.
+
+    A fold that has read further than the file now reaches would ask ``os.pread`` for a
+    negative number of bytes. The answer would still come out right -- the kernel says
+    ``EINVAL``, which lands in the same "nothing is in flight" restart as every other read
+    failure -- and that is exactly why it needs its own row: an outcome reached through an
+    errno nobody intended is one that stops being right the moment the arithmetic moves.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+    real_pread = os.pread
+
+    def refusing_negative(fd: int, length: int, offset: int) -> bytes:
+        assert length >= 0, (
+            f"asked for {length} bytes at {offset}: a fold that has read past the end of its "
+            f"log must be restarted, not handed to the kernel to reject"
+        )
+        return real_pread(fd, length, offset)
+
+    monkeypatch.setattr(os, "pread", refusing_negative)
+    with journal.path.open("r+b") as handle:
+        handle.truncate(0)
+
+    assert journal.staged_for(TARGET, identity()) is None
+    journal.staging(b"/incoming/.fresh.part", b"/incoming/fresh", identity())
+    assert journal.staged_for(b"/incoming/fresh", identity()) == b"/incoming/.fresh.part"
+
+
+def test_a_compacted_log_is_still_read_correctly(tmp_path: Path):
+    """The rewrite this module actually performs, end to end through a primed fold."""
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    journal.staging(b"/incoming/.gone.part", b"/incoming/gone", identity())
+    journal.published(b"/incoming/gone")
+    assert journal.staged_for(TARGET, identity()) == STAGED, "prime the fold"
+
+    assert journal.compact() == 1
+
+    assert journal.staged_for(TARGET, identity()) == STAGED
+    assert journal.staged_for(b"/incoming/gone", identity()) is None
+
+
+def test_a_record_whose_newline_never_arrived_is_still_offered(tmp_path: Path):
+    """Two readers of one log that disagree would be the bug this row exists to prevent.
+
+    ``fold`` reads every line including a final one the file does not terminate, so the lookup
+    has to see it too. It is answered from without being consumed -- see the row below for the
+    half that decides.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    _ = journal.path.write_bytes(journal.path.read_bytes().rstrip(b"\n"))
+
+    assert UploadJournal(journal.path).staged_for(TARGET, identity()) == STAGED
+    assert list(fold(journal.path)) == [TARGET.decode()]
+
+
+def test_a_line_completed_after_it_was_read_is_not_lost(tmp_path: Path):
+    """Why the unterminated tail is answered from and never folded into the state.
+
+    A state that had consumed the half-written line would resume from after it, fold the bytes
+    that finish it as a fragment, and drop the record for good -- the direction a crash mid-
+    append makes real, since ``append_record`` is what leaves one.
+
+    **The offset is the assertion, not the answer.** Both spellings end up returning the entry,
+    because a fold that over-advanced is noticed by the framing check on the next read and
+    recovers by re-reading the whole log -- which is correct and is also this card's defect
+    coming back for any journal with a torn tail. What must hold is that nothing past the last
+    complete line was ever consumed.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    torn = journal.path.read_bytes().rstrip(b"\n")
+    _ = journal.path.write_bytes(torn)
+    assert journal.staged_for(TARGET, identity()) == STAGED, "answered from the tail"
+    # The offset is the assertion here and it has no public spelling -- adding one would be
+    # publishing an implementation detail to make a test look tidier.
+    assert journal._folded.offset == 0, (  # noqa: SLF001  # see the comment above
+        "an unterminated line is not a line the fold has read"
+    )
+
+    with journal.path.open("ab") as handle:
+        _ = handle.write(b"\n")
+
+    assert journal.staged_for(TARGET, identity()) == STAGED, "the completed line was still folded"
+    assert journal._folded.offset == len(torn) + 1, (  # noqa: SLF001  # as above
+        "and now the whole of it has been"
+    )
+
+
+def test_the_fold_advances_under_its_own_lock(tmp_path: Path, monkeypatch):
+    """What keeps a concurrent tree from consuming one region twice and skipping the next.
+
+    The lookup runs in a worker thread and ``put_tree(concurrency=N)`` has N of them against
+    one journal. Two reads starting from the same ``offset`` fold the same records and then
+    advance past the ones neither of them read.
+
+    Asserted by watching the lock at the moment of the read rather than by racing threads: a
+    race that usually passes is not a proof, and this is the exact instant that must be
+    exclusive.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    held: list[bool] = []
+    real_pread = os.pread
+
+    def watching(fd: int, length: int, offset: int) -> bytes:
+        # Whether the lock is held at the instant of the read *is* the property, and it is not
+        # observable from outside the object that owns it.
+        held.append(journal._folded.lock.locked())  # noqa: SLF001  # see the comment above
+        return real_pread(fd, length, offset)
+
+    monkeypatch.setattr(os, "pread", watching)
+
+    assert journal.staged_for(TARGET, identity()) == STAGED
+    assert held == [True]
+
+
+@pytest.mark.anyio
+async def test_the_lookup_does_not_read_the_journal_on_the_event_loop(tmp_path: Path, monkeypatch):
+    """The other half of D-176: what the loop was doing while it folded.
+
+    A 20 000-file tree stalled the loop for longer than a 200 ms round trip on every file, with
+    every concurrent sibling frozen for it -- which is the same argument
+    :class:`~gantry_sftp.session.DescriptorSource` makes one module over about ``os.pread``,
+    arriving at the module that had not taken it.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    loop_thread = threading.get_ident()
+    reading_threads: list[int] = []
+    real_pread = os.pread
+
+    def recording(fd: int, length: int, offset: int) -> bytes:
+        reading_threads.append(threading.get_ident())
+        return real_pread(fd, length, offset)
+
+    monkeypatch.setattr(os, "pread", recording)
+
+    assert (await resume_target(journal, TARGET, identity(), resume=True, name=None)) == STAGED
+    assert reading_threads, "the lookup did not read the journal at all"
+    assert loop_thread not in reading_threads
+
+
+@pytest.mark.anyio
+async def test_the_refusals_reach_no_thread_at_all(tmp_path: Path, monkeypatch):
+    """The three cases that answer from arguments must not pay for a worker.
+
+    Most uploads pass no journal, and an upload that does mostly is not resuming. Sending those
+    to a thread pool would make D-176's fix cost something on the path it was not about.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+    read = counting_preads(monkeypatch)
+
+    assert (await resume_target(None, TARGET, identity(), resume=True, name=None)) is None
+    assert (await resume_target(journal, TARGET, identity(), resume=False, name=None)) is None
+    assert (await resume_target(journal, TARGET, identity(), resume=True, name=b"x.part")) is None
+
+    assert read == []
+
+
 # --- the policy the journal changes ------------------------------------------------------------
 
 
@@ -448,15 +853,19 @@ def test_a_journal_satisfies_the_check_that_a_staging_name_used_to(tmp_path: Pat
     )
 
 
-def test_a_named_staging_file_outranks_the_journal(tmp_path: Path):
+@pytest.mark.anyio
+async def test_a_named_staging_file_outranks_the_journal(tmp_path: Path):
     """Nothing to look up when the caller named the file, so nothing that could disagree."""
     journal = journal_at(tmp_path)
     journal.staging(STAGED, TARGET, identity())
 
-    assert resume_target(journal, TARGET, identity(), resume=True, name=b"chosen.part") is None
+    assert (
+        await resume_target(journal, TARGET, identity(), resume=True, name=b"chosen.part")
+    ) is None
 
 
-def test_nothing_is_continued_when_resume_was_not_asked_for(tmp_path: Path):
+@pytest.mark.anyio
+async def test_nothing_is_continued_when_resume_was_not_asked_for(tmp_path: Path):
     """A journal on a non-resuming upload records where the bytes went and adopts nothing.
 
     Worth pinning because the opposite would be a silent behaviour change: passing a journal
@@ -465,11 +874,25 @@ def test_nothing_is_continued_when_resume_was_not_asked_for(tmp_path: Path):
     journal = journal_at(tmp_path)
     journal.staging(STAGED, TARGET, identity())
 
-    assert resume_target(journal, TARGET, identity(), resume=False, name=None) is None
+    assert (await resume_target(journal, TARGET, identity(), resume=False, name=None)) is None
 
 
-def test_without_a_journal_nothing_is_continued():
-    assert resume_target(None, TARGET, identity(), resume=True, name=None) is None
+@pytest.mark.anyio
+async def test_without_a_journal_nothing_is_continued():
+    assert (await resume_target(None, TARGET, identity(), resume=True, name=None)) is None
+
+
+@pytest.mark.anyio
+async def test_the_journal_is_adopted_when_every_refusal_declines(tmp_path: Path):
+    """The one case that reaches the disk, so the three refusals above are not vacuous.
+
+    Without this row each of them could be asserting on a predicate that never says yes -- a
+    guard needs the values it admits as well as the ones it turns away.
+    """
+    journal = journal_at(tmp_path)
+    journal.staging(STAGED, TARGET, identity())
+
+    assert (await resume_target(journal, TARGET, identity(), resume=True, name=None)) == STAGED
 
 
 # --- against a real server ---------------------------------------------------------------------
@@ -498,6 +921,42 @@ def test_a_journal_records_where_the_bytes_went_and_clears_it_after(tmp_path: Pa
         "out.csv",
         "uploads.journal",
     ]
+
+
+@pytest.mark.anyio
+async def test_a_real_upload_writes_its_journal_off_the_event_loop(tmp_path: Path, monkeypatch):
+    """The whole path, against a real server, with the loop watching what runs on it (D-176).
+
+    The rows above prove the *lookup* went to a worker. This one covers the two writes -- and
+    they are the half that carries an ``fsync``, which is the longest stall the journal has and
+    the one this ``fakeowner`` mount cannot even measure. A fake could not answer this: what is
+    being asserted is which thread ran, through the real ``put`` that arranges it.
+    """
+    needs_real_server()
+    source = tmp_path / "data.csv"
+    _ = source.write_bytes(b"id,total\n" + b"7,42\n" * 500)
+    journal = journal_at(tmp_path)
+    loop_thread = threading.get_ident()
+    writing_threads: list[int] = []
+    real_append = _journal.append_record
+
+    def recording(path, event: str, fields: dict[str, object]) -> None:
+        writing_threads.append(threading.get_ident())
+        real_append(path, event, fields)
+
+    monkeypatch.setattr(_journal, "append_record", recording)
+
+    async with (
+        open_async_local_transport(cwd=tmp_path) as transport,
+        open_async_session(transport) as sftp,
+    ):
+        result = await sftp.put(
+            source, str(tmp_path / "out.csv").encode(), publish=Publish(journal=journal)
+        )
+
+    assert result.staged_at is not None
+    assert len(writing_threads) == 2, "one `staged` record and one `published` record"
+    assert loop_thread not in writing_threads
 
 
 def test_an_upload_that_fails_before_the_open_leaves_a_stale_record(tmp_path: Path):

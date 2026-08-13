@@ -59,13 +59,49 @@ nothing", because under-reporting costs a re-send and loses no data, and it is w
 the end of a run. Both properties are wrong here. A journal must be written *as* progress
 happens, and while under-reporting is merely slow, over-reporting is corruption -- so the
 manifest's most carefully argued property is the one this must not have.
+
+## Read once, then tailed -- because append-only is what makes that safe (D-176)
+
+An append-only log read whole on every lookup is quadratic in the tree it is describing, and
+``put`` performs exactly one lookup per file. Folding the log from byte zero once per file, in a
+tree that appends two records per file to it, was measured at about fifteen minutes of CPU for
+20,000 files -- **on the event-loop thread**, so every concurrent sibling was frozen for each of
+them. The lookup now remembers how far into the file it has folded and reads only what was
+appended since; :func:`_fold_tail` is that, and :class:`_Folded` is where it remembers.
+
+**The freshness argument is the whole of why this is allowed**, because ``staged_for`` decides
+whether bytes are appended to a file that already exists on a server. Three things carry it.
+Every writer here appends to the *file* and none of them updates the folded state, so there is no
+path on which the two can disagree about a record this process wrote. Every lookup re-opens the
+file and reads to its current end, so a record **another** process appended is folded on the next
+lookup rather than missed -- the property a fold-at-open cache would have lost, and the reason
+this is incremental rather than cached. And the fold is keyed to the file it read: a log that was
+replaced (:func:`compact` renames a new one over it) or truncated is a different file, is
+detected as one, and is folded again from its first byte.
+
+Two shapes fall out of that and are load-bearing rather than incidental. The state advances only
+to the **last complete line**, so a torn write at the tail is re-read until the bytes that finish
+it arrive, instead of being consumed as garbage and skipped forever. And a log with no newline in
+it at all never advances, so it is re-read whole every time -- the cost this section exists to
+remove, kept for a file that is not one this module wrote, which is the direction that cannot
+produce a wrong answer.
+
+**And the fold re-reads the byte it stopped at, which is what makes the argument a check.**
+Identity and length between them cannot see a log truncated and rewritten *in place* back to at
+least the length it had: same inode, no shrink to catch. Requiring the byte before the offset to
+still be the newline the fold ended on is what notices, and it costs one byte of a read that was
+already happening. Worth stating that even the undetected version of this could not have cost a
+wrong file -- a misframed read yields lines that do not parse and records that are still checked
+against :func:`entry_matches` -- but "it would have been safe anyway" is the argument this module
+makes about a *lying* journal, and it should not have to make it about our own reader.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import mkstemp
 
@@ -283,6 +319,116 @@ def replace_atomically(destination: Path, payload: bytes) -> None:
     fsync_directory(destination.parent)
 
 
+@dataclass(slots=True)
+class _Folded:
+    """How much of one log has been folded, into what, and which file it was (D-176).
+
+    Pure state and no methods, for the reason :meth:`JournalEntry.matches` gives: a
+    ``@dataclass`` hides its methods from the mutation lane, and every decision here -- which
+    file this describes, whether to keep it, how far it got -- is one a dropped comparison
+    would get silently wrong. The functions that read and advance it are module-level.
+
+    Attributes:
+        lock: Held across a read-and-advance. The lookup runs in a worker thread and a
+            concurrent tree has one per file, so two of them advancing ``offset`` from the same
+            starting value would consume one region twice and skip the next.
+        device: ``st_dev`` of the file this was folded from, or ``-1`` before anything was.
+        inode: ``st_ino`` of the same, and the pair is what makes a replaced log detectable.
+        offset: How many bytes have been folded, always ending at a newline.
+        entries: What those bytes said is still in flight, keyed by decoded target path.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    device: int = -1
+    inode: int = -1
+    offset: int = 0
+    entries: dict[str, JournalEntry] = field(default_factory=dict)
+
+
+def _restart(state: _Folded, device: int, inode: int) -> None:
+    """Forget a fold that cannot describe this file, so the next read starts at byte zero.
+
+    Called for a log that was replaced or truncated, and for one that could not be read at all
+    -- the second because a cache kept across a failure would answer from bytes nobody can
+    still see. Both land on "nothing is in flight", which is a full upload and never a wrong
+    file.
+    """
+    state.device, state.inode, state.offset, state.entries = device, inode, 0, {}
+
+
+def _read_tail(state: _Folded, descriptor: int) -> bytes:
+    """The bytes after the fold, having proved the fold still describes this file.
+
+    Three things have to hold before a byte range can be read as "what was appended since", and
+    a log that fails any of them is read whole from the start instead. One ``_restart`` rather
+    than one per condition, because resetting the fold sets the offset to zero and every
+    condition then routes to the same full read -- an earlier version had a second call above
+    and the mutation lane is what showed it could not change an answer.
+
+    **It is the same file.** ``(st_dev, st_ino)``, which is what :func:`compact` breaks: it
+    renames a new log over this one, so the fold of the old one describes an inode nothing can
+    reach any more.
+
+    **The fold ended where a record ends.** The byte before the offset is read back and must
+    be the newline the fold stopped at. That is the one check that can notice a log truncated
+    and rewritten *in place* -- a rotation, a shell redirect, an operator -- which keeps the
+    inode and can come back longer than it was, so neither the identity nor the length has
+    anything to say about it. Costing one byte on a read that was happening anyway.
+
+    The length condition is doing a second job worth naming: it is what keeps ``st_size -
+    offset`` from going negative on a log that shrank, which ``os.pread`` reports as ``EINVAL``
+    -- an answer of the right shape, arrived at by accident, which is the kind that stops being
+    right when the arithmetic moves.
+    """
+    status = os.fstat(descriptor)
+    same_file = (status.st_dev, status.st_ino) == (state.device, state.inode)
+    if same_file and 0 < state.offset <= status.st_size:
+        chunk = os.pread(descriptor, status.st_size - state.offset + 1, state.offset - 1)
+        if chunk.startswith(b"\n"):
+            return chunk[1:]
+    _restart(state, status.st_dev, status.st_ino)
+    return os.pread(descriptor, status.st_size, 0)
+
+
+def _fold_tail(state: _Folded, path: Path | str) -> str:
+    """Fold whatever was appended since last time, and hand back the unterminated tail.
+
+    Opened once and measured through that descriptor rather than stat-then-open, so the file
+    whose size and identity decide what to read is provably the file the bytes come from --
+    a :func:`compact` renaming a new log over this one in between would otherwise have us
+    reading the new file at the old file's offset.
+
+    Returns:
+        The bytes after the last newline, decoded. Empty for a log that ends the way this
+        module writes them.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        _restart(state, -1, -1)
+        return ""
+    try:
+        chunk = _read_tail(state, descriptor)
+    except OSError:
+        # Reached by a path that is a directory, which `os.open` accepts and `os.pread` does
+        # not, and by a read that fails after the open. Both are "nothing is in flight".
+        _restart(state, -1, -1)
+        return ""
+    finally:
+        os.close(descriptor)
+    boundary = chunk.rfind(b"\n") + 1
+    # Bytes and a replacing decode, not `read_text`. **Found by fuzzing this function**: the
+    # file sits on disk between two runs of somebody's job, so it is not trusted input, and a
+    # single stray byte made `read_text` raise `UnicodeDecodeError` -- which is a `ValueError`,
+    # not an `OSError`, so it escaped the guard above and took down the upload it was supposed
+    # to help. A replaced character makes its line unparseable as JSON, which folds to nothing,
+    # which is the honest answer to garbage.
+    for line in chunk[:boundary].decode("utf-8", "replace").splitlines():
+        _apply(state.entries, line)
+    state.offset += boundary
+    return chunk[boundary:].decode("utf-8", "replace")
+
+
 def fold(path: Path | str) -> dict[str, JournalEntry]:
     """Read the log and return what is still in flight, keyed by decoded target path.
 
@@ -296,26 +442,24 @@ def fold(path: Path | str) -> dict[str, JournalEntry]:
     it is safe here for a different reason: the manifest degrades towards re-sending, and so
     does this, because the only thing a lost record can do is fail to point at a partial.
 
+    Reads the whole file every time, deliberately: this is what :meth:`UploadJournal.in_flight`
+    and :func:`compact` call, both of them once per run against a log nothing else is using.
+    The per-file lookup is :func:`staged_for`, and it is the one that tails.
+
     Args:
         path: The journal file.
 
     Returns:
         Decoded target path to the entry describing its in-flight staging file.
     """
-    try:
-        raw = Path(path).read_bytes()
-    except OSError:
-        return {}
-    # Bytes and a replacing decode, not `read_text`. **Found by fuzzing this function**: the
-    # file sits on disk between two runs of somebody's job, so it is not trusted input, and a
-    # single stray byte made `read_text` raise `UnicodeDecodeError` -- which is a `ValueError`,
-    # not an `OSError`, so it escaped the guard above and took down the upload it was supposed
-    # to help. A replaced character makes its line unparseable as JSON, which folds to nothing,
-    # which is the honest answer to garbage.
-    entries: dict[str, JournalEntry] = {}
-    for line in raw.decode("utf-8", "replace").splitlines():
-        _apply(entries, line)
-    return entries
+    state = _Folded()
+    # The unterminated tail is folded here and not in `staged_for`'s cached state, which is the
+    # one difference between the two readers and it is not a difference in what they see: a
+    # fold that keeps nothing can consume a half-written line, because there is no next call
+    # for the rest of it to arrive before.
+    for line in _fold_tail(state, path).splitlines():
+        _apply(state.entries, line)
+    return state.entries
 
 
 def _apply(entries: dict[str, JournalEntry], line: str) -> None:
@@ -406,14 +550,46 @@ def entry_matches(entry: JournalEntry, source: SourceIdentity) -> bool:
     )
 
 
-def staged_for(path: Path | str, target: bytes, source: SourceIdentity) -> bytes | None:
+def _tail_says(entry: JournalEntry | None, key: str, tail: str) -> JournalEntry | None:
+    """What an unterminated tail says about one target, without committing it to the fold.
+
+    A line the log does not yet end with is folded for this answer only: the bytes finishing it
+    may still be on their way, and a state that had already consumed it would fold the
+    remainder as garbage and lose the record for good.
+
+    One entry is the whole overlay because one line can only reach the target it names --
+    :func:`_apply` either replaces that key or removes it -- so seeding a scratch dictionary
+    with just the key being asked about gives the same answer as folding into a copy of the
+    whole state, at no cost that grows with it.
+    """
+    scratch = {} if entry is None else {key: entry}
+    for line in tail.splitlines():
+        _apply(scratch, line)
+    return scratch.get(key)
+
+
+def staged_for(
+    path: Path | str, target: bytes, source: SourceIdentity, folded: _Folded
+) -> bytes | None:
     """The staging path a previous run left for ``target``, or ``None``.
 
     Module-level for the reason :func:`entry_matches` is: the negation and the ``None`` check
     below decide whether a resume happens at all, and inverting either would either resume
     across a changed file or never resume anything.
+
+    Args:
+        path: The journal file.
+        target: The remote path being uploaded to.
+        source: The bytes being sent, so a record for a different or changed file is refused.
+        folded: How far this journal has been read. Advanced in place, under its own lock, and
+            the module docstring is where the argument that it cannot go stale lives.
     """
-    entry = fold(path).get(decode_name(target))
+    key = decode_name(target)
+    with folded.lock:
+        tail = _fold_tail(folded, path)
+        entry = folded.entries.get(key)
+        if tail:
+            entry = _tail_says(entry, key, tail)
     if entry is None or not entry_matches(entry, source):
         return None
     return entry.staged
@@ -463,6 +639,19 @@ class UploadJournal:
     """
 
     path: Path
+    _folded: _Folded = field(default_factory=_Folded, init=False, repr=False, compare=False)
+    """How far :meth:`staged_for` has read this log, so a tree pays for it once (D-176).
+
+    **On the journal rather than on the run**, because the log is what it describes and two of
+    these over one file would each miss what the other appended. It is state with a lifetime,
+    so the lifetime is stated: nothing here is remembered across a *file*, only across reads of
+    the same one, and every read re-opens it and checks that it is still the file the fold came
+    from. Held across runs by a caller who holds the journal, which costs nothing and is
+    already the case for a repeated job.
+
+    Excluded from ``repr`` and from comparison, so two journals over one path stay equal and
+    ``repr()`` keeps naming the one thing a caller chose.
+    """
 
     def __post_init__(self) -> None:
         """Normalise a ``str``, so a caller need not care which this takes."""
@@ -476,7 +665,7 @@ class UploadJournal:
         always safe, and none of them means "resume anyway". See :func:`staged_for`, which holds
         the body for the reason :meth:`JournalEntry.matches` gives.
         """
-        return staged_for(self.path, target, source)
+        return staged_for(self.path, target, source, self._folded)
 
     def staging(self, staged: bytes, target: bytes, source: SourceIdentity) -> None:
         """Record that bytes are about to be written to ``staged``.
