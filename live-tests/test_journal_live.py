@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -31,6 +32,52 @@ from gantry_sftp.session._journal import source_identity
 from gantry_sftp.sync import open_session, open_ssh_transport
 
 PAYLOAD = bytes(range(256)) * 4000
+
+
+def settled_size(path: Path, *, quiet_for: float = 0.5, timeout: float = 30.0) -> int:
+    """The staging file's size once it has stopped growing, which is not the size it is now.
+
+    **The client is SIGKILLed; the server is not** (D-181). A ``WRITE`` already on the wire is
+    applied by the far end after the process that sent it is gone, so a ``stat`` taken the moment
+    ``subprocess.run`` returns can be short by up to ``depth`` requests. The rows below then
+    compare a resume against a number that was already stale when it was read.
+
+    That is measured rather than feared. On 2026-08-13 the tree row failed on a macOS runner with
+    the staging file **261120 bytes larger at resume than when it was measured** -- exactly
+    ``PREFERRED_WRITE_LENGTH``, one request, to the byte -- and the transfer it reported was
+    correct for the file's real size. The library resumed properly and the expectation was wrong.
+
+    Args:
+        path: The staging file, which the far end may still be extending.
+        quiet_for: How long the size must hold still to count as settled. Generous against a
+            local ``sftp-server`` writing 255 KiB at a time; the timeout is what bounds the
+            pathological case rather than this.
+        timeout: Give up after this long. **A bound rather than a sleep**: a file that never
+            settles is a server that never stopped, which is a finding and must fail loudly
+            instead of hanging the lane until the job's own timeout kills it.
+
+    Returns:
+        The size, once two reads ``quiet_for`` apart agree.
+
+    Raises:
+        AssertionError: If it is still changing when ``timeout`` expires.
+    """
+    deadline = time.monotonic() + timeout
+    size = path.stat().st_size
+    unchanged_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        current = path.stat().st_size
+        if current != size:
+            size, unchanged_since = current, time.monotonic()
+        elif time.monotonic() - unchanged_since >= quiet_for:
+            return size
+    raise AssertionError(
+        f"{path} was still growing {timeout:g}s after the writer was killed (now {size} "
+        f"bytes); the far end never stopped applying requests, which is a finding rather than "
+        f"a slow runner"
+    )
+
 
 KILLED_UPLOAD = """
 import json, os, signal, sys
@@ -148,14 +195,21 @@ def test_an_upload_killed_mid_transfer_resumes_against_this_server(
     assert killed.returncode == -9, killed.stderr.decode("utf-8", "replace")
     staged = [p for p in server.root.iterdir() if p.name.endswith(".part")]
     assert len(staged) == 1, f"{server.name} left no staging file to resume"
-    partial = staged[0].stat().st_size
+    # Settled, not snapshotted: see `settled_size` for the request that lands after the kill.
+    partial = settled_size(staged[0])
     assert 0 < partial < len(PAYLOAD)
     assert journal.staged_for(target.encode(), source_identity(source)) == str(staged[0]).encode()
 
     with connected(server) as transport, open_session(transport) as sftp:
         result = sftp.put(source, target.encode(), resume=True, publish=Publish(journal=journal))
 
-    assert result.transferred == len(PAYLOAD) - partial, "it restarted rather than resuming"
+    assert result.transferred == len(PAYLOAD) - partial, (
+        f"resume moved {result.transferred} bytes, expected {len(PAYLOAD) - partial} "
+        f"({len(PAYLOAD)} payload minus the {partial} already staged). **More** means it "
+        f"restarted the file it should have continued. **Fewer** means it adopted more than "
+        f"was measured, which before D-181 was a race rather than a finding -- `settled_size` "
+        f"is what rules that out, so fewer now means the resume offset is wrong"
+    )
     assert Path(target).read_bytes() == PAYLOAD
     # No exact listing: `server.root` is the test's own `tmp_path` for this fixture, so it also
     # holds the script, the keys and the journal. The claim is about staging files.
@@ -214,7 +268,9 @@ def test_a_tree_killed_mid_file_resumes_against_this_server(server: MatrixServer
         "a.bin",
         "b.bin",
     ]
-    partial = staged[0].stat().st_size
+    # Settled, not snapshotted. This is the row D-181 was filed for: it failed on a macOS
+    # runner with the file exactly one `PREFERRED_WRITE_LENGTH` larger at resume than here.
+    partial = settled_size(staged[0])
     assert 0 < partial < len(PAYLOAD)
     in_flight = journal.in_flight()
     assert len(in_flight) == 1, "the killed file is the only one that should still be in flight"
@@ -234,7 +290,13 @@ def test_a_tree_killed_mid_file_resumes_against_this_server(server: MatrixServer
     # The small files are sent again in full and the big one continues, so the difference from
     # the whole tree is exactly the prefix that was already staged. Anything else means it
     # restarted the file it was supposed to resume.
-    assert result.transferred == total - partial, "it restarted rather than resuming"
+    assert result.transferred == total - partial, (
+        f"resume moved {result.transferred} bytes, expected {total - partial} (tree total "
+        f"{total} minus the {partial} already staged). **More** means it restarted the file it "
+        f"should have continued. **Fewer** means it adopted more than was measured, which "
+        f"before D-181 was a race rather than a finding -- `settled_size` is what rules that "
+        f"out, so fewer now means the resume offset is wrong"
+    )
     for name in ("a.bin", "b.bin", "big.bin"):
         assert (destination / name).read_bytes() == (source / name).read_bytes()
     assert [path.name for path in destination.iterdir() if path.name.endswith(".part")] == []
