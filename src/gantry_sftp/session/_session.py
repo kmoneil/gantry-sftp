@@ -43,6 +43,7 @@ from types import TracebackType
 from typing import Literal, overload, override
 
 import anyio
+from anyio.to_thread import run_sync
 
 from gantry_sftp._logging import operation, session_logger
 from gantry_sftp.codec import (
@@ -2752,7 +2753,7 @@ class Session(_SessionOperations):
         # a window in which the source changes between them, and the upload would then resume
         # a partial of the old bytes while recording the identity of the new ones.
         source = source_identity(upload.local_path)
-        continuing = resume_target(
+        continuing = await resume_target(
             policy.journal, target, source, resume=upload.resume, name=staged_name
         )
         staged = (
@@ -2804,7 +2805,11 @@ class Session(_SessionOperations):
                 only what is left. That is what an append-only log buys.
         """
         removed: list[bytes] = []
-        for entry in journal.in_flight().values():
+        # Every journal read, append and `fsync` goes to a worker thread (D-176). This one is
+        # a sweep rather than a per-file cost, so it is not what that card measured -- but it
+        # writes one `fsync`ed record per stale entry, and a killed tree is exactly when there
+        # are thousands of them, on a loop that is already carrying the run that follows.
+        for entry in (await run_sync(journal.in_flight)).values():
             try:
                 await self.remove(entry.staged)
             except NoSuchFileError:
@@ -2813,8 +2818,8 @@ class Session(_SessionOperations):
                 pass
             else:
                 removed.append(entry.staged)
-            journal.published(entry.target)
-        _ = journal.compact()
+            await run_sync(journal.published, entry.target)
+        _ = await run_sync(journal.compact)
         return tuple(removed)
 
     # --- trees, the other way ------------------------------------------------------------------

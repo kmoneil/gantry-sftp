@@ -25,6 +25,23 @@ and while the major version is `0` the minor version is where a breaking change 
 
 ### Fixed
 
+- **An upload journal was re-read from the start once per file, on the event loop** (D-176).
+  `put` performs one lookup per file — which staging file, if any, a previous run left for this
+  target — and a tree appends two records per file to that same journal, so the cost of reading it
+  grew with the tree in the exact case the feature exists for: thousands of files over a bad link.
+  The lookup now reads only what has been appended since the last one, so a run pays for its log
+  once however long the log has grown, and the shape no longer depends on tree size. Nothing is
+  cached across the *file*: every lookup re-opens the journal, reads to its current end and checks
+  it is still the file it read before, so a record another process appended is still seen and a
+  log that was compacted, rotated or truncated underneath a running job is read again from the
+  start.
+
+  **The reading and writing also left the event-loop thread.** The lookup, both records and their
+  `fsync`s now run on a worker, which is what `put` already did with local file reads: a transfer's
+  job is to keep the link busy, and a wait on the local disk stopped every *other* file in a
+  concurrent tree as well. No API changed; `compact()` keeps the reasons it already had, which are
+  disk space and the sweep.
+
 - **The password's absence from `storage_options` rested on a private attribute of fsspec**
   (D-177). `_strip_tokenize_options = ("password",)` is our whole contribution to that guarantee;
   the pop that acts on it lives in fsspec's `_Cached.__call__`, and `storage_options` is the one

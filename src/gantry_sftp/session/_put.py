@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
+from anyio.to_thread import run_sync
 
 from gantry_sftp.codec import (
     EXTENSION_FSYNC,
@@ -288,8 +289,13 @@ async def _put_atomically(
     # Written even on the paths that then refuse: a record pointing at a file that was never
     # opened costs one wasted `STAT` next run, and a file with no record is one nobody can ever
     # find again.
+    #
+    # In a worker thread (D-176), which does not weaken that ordering by a byte: the `await`
+    # returns only once the record is written *and* `fsync`ed, so nothing below it can run
+    # before the note is durable. What moves is which thread waits for the disk -- and this
+    # one waits for an `fsync`, so on the loop thread it is the longest stall the journal has.
     if journal is not None and source is not None:
-        journal.staging(staged, target, source)
+        await run_sync(journal.staging, staged, target, source)
 
     start = await _upload_resume_offset(session, upload, staged)
     # Outside the try, with the sibling refusals, and that placement is the decision. A
@@ -356,11 +362,18 @@ async def _put_atomically(
         # record pointing at it would send the next run looking for something gone. The
         # `_StagedIsTheOnlyCopyError` branch above deliberately does not reach here, because
         # there the file is the only copy of the data and the record is how anybody finds it.
+        #
+        # Shielded for the reason `_discard` above it is (D-176). Moving this write to a
+        # worker made it an `await`, and an `await` in the cleanup path of a *cancelled*
+        # upload is one that raises instead of running -- which is exactly the failure this
+        # clears the record for, and the one place a plain `await` would have silently
+        # stopped clearing it.
         if journal is not None:
-            journal.published(target)
+            with anyio.CancelScope(shield=True):
+                await run_sync(journal.published, target)
         raise
     if journal is not None:
-        journal.published(target)
+        await run_sync(journal.published, target)
     return UploadResult(
         transferred,
         target,

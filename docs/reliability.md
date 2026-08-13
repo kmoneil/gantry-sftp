@@ -230,6 +230,27 @@ Append-only rather than a rewritten document, because `put_tree(concurrency=N)` 
 against one journal and a read-modify-write would need a lock and would lose records. `compact()`
 is how it stops growing, and it is explicit: it is the one operation that rewrites.
 
+### What a big journal costs, and what it does not
+
+**A tree reads its journal once, not once per file.** Each upload needs one lookup — which staging
+file, if any, a previous run left for this target — and that lookup reads only what has been
+appended since the last one. So the cost of the log over a run is the cost of reading it once,
+however many files the tree has and however long the log has grown. It does not become a reason to
+split a tree up, and it does not make `compact()` something you have to schedule.
+
+Nothing is cached across the *file*, only across reads of the same one: every lookup re-opens the
+journal, reads to its current end, and checks it is still looking at the file it read before. A
+record another process appended is seen. A journal that was compacted, rotated or truncated
+underneath a running job is noticed and read again from the start.
+
+**None of that reading or writing happens on the event loop.** The lookup, the two records and
+their `fsync`s all run on a worker thread, for the same reason local file reads in the data path
+do: a transfer's job is to keep the link busy, and time spent waiting for a local disk on the loop
+thread is time every *other* file in a concurrent tree is stopped too.
+
+`compact()` is still worth calling, and its reasons are unchanged: a log nobody compacts grows
+without limit on disk, and [`discard_staged`](#cleaning-up-after-a-crash) compacts as it sweeps.
+
 ### Where to put the journal
 
 **In a directory only your job can write to.** There is no default location and there will not be

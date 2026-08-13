@@ -32,6 +32,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from anyio.to_thread import run_sync
+
 from gantry_sftp.session._journal import SourceIdentity, UploadJournal
 from gantry_sftp.session._verify import ContentCheck, ResumeCheck
 
@@ -431,7 +433,7 @@ def staging_token() -> str:
     return os.urandom(_TOKEN_BYTES).hex()
 
 
-def resume_target(
+async def resume_target(
     journal: UploadJournal | None,
     target: bytes,
     source: SourceIdentity,
@@ -449,12 +451,20 @@ def resume_target(
     An explicit ``staging_name`` outranks the journal rather than being merged with it: the
     caller has named the file, so there is nothing to look up and nothing that could disagree.
 
+    **Async only for the lookup, and only the lookup reaches the disk** (D-176). The three
+    refusals above answer from arguments, so the common cases -- no journal, not resuming, a
+    named staging file -- cost no thread and no ``await`` that can suspend. The one that reads
+    a file goes to a worker, for the reason
+    :class:`~gantry_sftp.session.DescriptorSource` gives one module over: this runs once per
+    file of a concurrent tree, and a local read on the event-loop thread stalls every sibling
+    that is trying to keep the link busy.
+
     Returns:
         The path to continue into, or ``None`` to stage somewhere new.
     """
     if journal is None or not resume or name is not None:
         return None
-    return journal.staged_for(target, source)
+    return await run_sync(journal.staged_for, target, source)
 
 
 def split_parent(path: bytes) -> tuple[bytes, bytes]:
