@@ -72,8 +72,14 @@ under deep pipelining.
 
 **`get` retries such a refusal, up to three attempts, with a short doubling delay** — and it does
 so on the session you already have, without reconnecting. `get_tree` inherits it, because it
-transfers by calling `get` per file. Nothing is switched on: there is no parameter, and there is
-nothing to configure.
+transfers by calling `get` per file. **Both verification rungs retry too**, which matters more than
+it sounds: without it a busy server could let the transfer succeed and then fail the check on the
+file it just delivered, which reads exactly like a corrupt transfer of a file that is correct.
+Nothing is switched on: there is no parameter, and there is nothing to configure.
+
+One read-open deliberately never retries — the compatibility battery's. A report that says what a
+server does must not retry until the server behaves, or a server refusing one open in three is
+reported as healthy.
 
 **It is a per-server capability, and it is off wherever the server does not explain itself.** The
 retry fires only when the profile in `session.profile` says this server's `STATUS` text carries

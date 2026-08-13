@@ -26,9 +26,10 @@ from gantry_sftp.session._transient import (
     TRANSIENT_BACKOFF,
     TRANSIENT_BACKOFF_MAX,
     is_transient_refusal,
-    open_for_download,
+    open_for_read,
     with_transient_retry,
 )
+from gantry_sftp.session._verify import hashes_agree
 
 pytestmark = pytest.mark.anyio
 
@@ -306,7 +307,7 @@ async def test_nothing_is_recorded_when_no_retry_happens(caplog: pytest.LogCaptu
 
 
 async def test_the_download_open_retries_and_asks_for_read(caplog: pytest.LogCaptureFixture):
-    """``open_for_download`` itself, which until now only the live lane exercised.
+    """``open_for_read`` itself, which until now only the live lane exercised.
 
     The mutation lane is what asked for this: blanking the ``profile`` it forwards, and the
     ``what`` it labels the record with, both survived — because every fast-suite test drove
@@ -324,7 +325,7 @@ async def test_the_download_open_retries_and_asks_for_read(caplog: pytest.LogCap
         return b"handle"
 
     with caplog.at_level(logging.WARNING, logger="gantry_sftp.session"):
-        handle = await open_for_download(opener, b"/remote/file", ASYNCSSH)
+        handle = await open_for_read(opener, b"/remote/file", ASYNCSSH)
 
     assert handle == b"handle"
     assert calls == 2, "the transient refusal was retried"
@@ -345,8 +346,106 @@ async def test_the_download_open_honours_the_servers_profile():
         raise refusal(EXHAUSTED)
 
     with pytest.raises(ServerError):
-        _ = await open_for_download(opener, b"/remote/file", OPENSSH)
+        _ = await open_for_read(opener, b"/remote/file", OPENSSH)
     assert calls == 1, "OpenSSH's constant message must not buy a second attempt"
+
+
+async def test_a_verification_open_retries_and_is_recorded_as_verify(
+    caplog: pytest.LogCaptureFixture,
+):
+    """D-182. Both rungs open a handle for reading, and neither retried until now.
+
+    The defect this closes is not that verification was slow — it is that against a busy
+    server a `get(verify=...)` **transferred the file, retrying its own OPEN, and then failed
+    verifying it**, which reads to a caller as a corrupt transfer of a file that is correct.
+
+    The label is asserted as well as the retry: it is the only place the operation name appears,
+    and a verification recorded as ``get`` points the one record of a swallowed refusal at the
+    wrong request.
+    """
+    calls = 0
+
+    async def opener(path: bytes, pflags: OpenFlag) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise refusal(EXHAUSTED)
+        return b"handle"
+
+    with caplog.at_level(logging.WARNING, logger="gantry_sftp.session"):
+        handle = await open_for_read(opener, b"/f", ASYNCSSH, what="verify")
+
+    assert handle == b"handle"
+    assert calls == 2
+    record = next(r for r in caplog.records if r.levelno == logging.WARNING)
+    assert getattr(record, LOG_FIELDS)["operation"] == "verify"
+    assert record.getMessage().startswith("verify refused as transient")
+
+
+async def test_a_verification_open_still_gives_up_on_a_terminal_refusal():
+    """Retrying is for a resource, not for a permission problem, on this path too."""
+    calls = 0
+
+    async def opener(path: bytes, pflags: OpenFlag) -> bytes:
+        nonlocal calls
+        calls += 1
+        raise refusal(b"Permission denied")
+
+    with pytest.raises(ServerError):
+        _ = await open_for_read(opener, b"/f", ASYNCSSH, what="verify")
+    assert calls == 1
+
+
+class _RefusingOnce:
+    """The smallest thing ``hashes_agree`` will drive: a session whose first ``OPEN`` is refused.
+
+    Deliberately not a ``MemoryTransport`` or a real server. What is under test is one wire in
+    ``_verify.py`` -- that the rung's open goes through the retry rather than straight to
+    ``session.open`` -- and a fake that answers three calls proves that wire without a lane
+    that cannot run in ``fast``.
+    """
+
+    profile = ASYNCSSH
+
+    def __init__(self) -> None:
+        self.opens = 0
+        self.closed: list[bytes] = []
+
+    def refuses(self, extension: bytes | str) -> bool:
+        return False
+
+    async def open(self, path: bytes, pflags: OpenFlag) -> bytes:
+        self.opens += 1
+        if self.opens == 1:
+            raise refusal(EXHAUSTED)
+        return b"handle"
+
+    async def check_file(self, handle: bytes, **kwargs: object) -> tuple[bytes, list[bytes]]:
+        raise refusal(b"No algorithm in common")
+
+    async def close(self, handle: bytes) -> None:
+        self.closed.append(handle)
+
+
+async def test_the_hash_rung_really_routes_its_open_through_the_retry(tmp_path):
+    """The wiring in ``_verify.py``, not the helper — which the rows above already cover.
+
+    Removing the retry from that module leaves every direct test of ``open_for_read`` green,
+    because they call the helper. Only this row and the live one see the wire, and the live one
+    does not run in the ``fast`` lane.
+    """
+    local = tmp_path / "f"
+    local.write_bytes(b"payload")
+    session = _RefusingOnce()
+
+    agreed = await hashes_agree(session, b"/f", local, start=0, length=7)  # type: ignore[arg-type]
+
+    assert session.opens == 2, "the transient refusal on the rung's own OPEN must be retried"
+    assert agreed is None, (
+        "and the rung still degrades to 'could not ask' when check-file itself is refused -- "
+        "the retry must not have changed that third state"
+    )
+    assert session.closed == [b"handle"], "the probe handle is still closed"
 
 
 async def test_the_shipped_delays_are_what_the_docstrings_claim():

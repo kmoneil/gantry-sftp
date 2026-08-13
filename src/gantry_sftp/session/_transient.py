@@ -45,7 +45,7 @@ __all__ = [
     "TRANSIENT_BACKOFF",
     "TRANSIENT_BACKOFF_MAX",
     "is_transient_refusal",
-    "open_for_download",
+    "open_for_read",
     "with_transient_retry",
 ]
 
@@ -77,23 +77,25 @@ tree walk.
 """
 
 
-async def open_for_download(
+async def open_for_read(
     opener: Callable[[bytes, OpenFlag], Awaitable[bytes]],
     path: bytes,
     profile: ServerProfile,
+    *,
+    what: str = "get",
 ) -> bytes:
     """``OPEN`` for reading, repeated while the server says its refusal was transient.
 
-    The one site D-30's retry is wired to, and both download entry points reach it: the
-    concurrent ``STAT``/``OPEN`` pair, and the resume path that opens later. ``get_tree`` needs
-    no wiring of its own because it transfers by calling ``get`` per file.
+    Every read-open on a path a caller asked about goes through here: a download's concurrent
+    ``STAT``/``OPEN`` pair, its resume path, and both verification rungs. ``get_tree`` needs no
+    wiring of its own because it transfers by calling ``get`` per file.
 
     **It lives here rather than on ``Session`` deliberately.** The class is under a method
     ceiling that ``tests/test_layer_discipline.py`` enforces, and that rule's own advice is that
     an orchestration belongs beside the responsibility it orchestrates. This module is that
-    responsibility, so the retry's mechanism and its single application stay together and
-    ``Session`` stays the size it was. The opener is passed in rather than the session, which
-    also keeps this importable by the module ``Session`` itself imports.
+    responsibility, so the retry's mechanism and its applications stay together and ``Session``
+    stays the size it was. The opener is passed in rather than the session, which also keeps this
+    importable by the module ``Session`` itself imports.
 
     **Why the open and not the read.** The condition that made this buildable is descriptor
     exhaustion, and a ``READ`` runs against a descriptor the server already holds -- it cannot
@@ -101,15 +103,24 @@ async def open_for_download(
     the downloader's shortfall re-queue is a different mechanism for a different failure. A
     transient mid-transfer ``READ`` is something nothing in the matrix has been made to produce.
 
-    **Repeating an ``OPEN`` for reading is safe**, which is why this is the download side only.
-    It acquires no exclusive claim, creates nothing and truncates nothing; an attempt whose reply
+    **Repeating an ``OPEN`` for reading is safe**, and that is what bounds this to reads. It
+    acquires no exclusive claim, creates nothing and truncates nothing; an attempt whose reply
     was lost leaks a handle the reaper already owns (D-75). The upload side's ``WRITE`` has none
     of those properties and deliberately does not call this.
+
+    **Two read-opens deliberately do not come here** (D-182), because "everything that opens for
+    reading" would be the wrong rule. ``compatibility.py``'s probe must report what the server
+    did, since retrying would paper over the behaviour the battery exists to observe; and
+    ``fsspec.py``'s two opens reach the session through the blocking portal, which is its own
+    change rather than a call this signature can absorb.
 
     Args:
         opener: The session's ``open``, bound.
         path: Remote path to open, already encoded and prefix-resolved.
         profile: Fingerprint of the server, which decides what counts as transient.
+        what: Operation name for the log record. It is the only place this appears, and it must
+            name the operation the *caller* is performing -- a verification retry recorded as
+            ``get`` makes the one record of a swallowed refusal point at the wrong request.
 
     Returns:
         The handle.
@@ -119,7 +130,7 @@ async def open_for_download(
             classify as transient is raised on the first attempt.
     """
     return await with_transient_retry(
-        lambda: opener(path, OpenFlag.READ), profile=profile, what="get"
+        lambda: opener(path, OpenFlag.READ), profile=profile, what=what
     )
 
 
