@@ -1,0 +1,224 @@
+"""Retrying one request inside a live connection, for the servers that say why they refused.
+
+This is the half :mod:`gantry_sftp.session._retry` names as *not* being there. That module
+reconnects a whole operation against a fresh session when the link dies; this one repeats a
+single request on the session already open, when the server's own message says the refusal was
+about a resource rather than about the file.
+
+**Why this could not be built until now, and what changed.** v3's ``FAILURE`` is the catch-all
+that a permission problem, a full disk, a name collision and a momentary appliance hiccup all
+arrive as, so "transient" is undecidable from the status code. It stays undecidable on OpenSSH,
+whose message for every one of those is the constant word ``Failure`` -- measured against five
+terminal conditions, and now against a genuinely transient one too, which is the row that closes
+the argument rather than merely supporting it. It becomes decidable on a server that puts a
+``strerror`` in the message, and D-30 measured one: with the server under a descriptor limit, an
+``OPEN`` past the ceiling is refused ``FAILURE`` / ``Too many open files``, and the identical
+request succeeds once one descriptor is released.
+
+That condition is exactly what DESIGN.md 7 means by appliance servers that "degrade rather than
+error under deep pipelining", and it is the reason the retry goes where it does. Three properties
+of the design are load-bearing:
+
+* **It repeats, it never reinterprets.** The worst a misclassification can do is spend the
+  attempts and raise the server's original error, unchanged.
+* **It is bounded, and the bound is the point.** Descriptor exhaustion is precisely the failure
+  where every client retrying without limit is what keeps the server exhausted. Three attempts
+  and a short doubling delay, not a loop that waits for the server to recover.
+* **Only the caller's own read side uses it.** A ``WRITE`` whose reply was lost may or may not
+  have landed, so re-sending at the same offset is idempotent only on a server that behaves like
+  a filesystem. That decision is deliberately not made here; the upload path does not call this.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+
+import anyio
+
+from gantry_sftp._logging import fields_of, session_logger, summarise
+from gantry_sftp.codec import OpenFlag, StatusCode
+from gantry_sftp.exceptions import ServerError
+from gantry_sftp.session._quirks import ServerProfile
+
+__all__ = [
+    "TRANSIENT_ATTEMPTS",
+    "TRANSIENT_BACKOFF",
+    "TRANSIENT_BACKOFF_MAX",
+    "is_transient_refusal",
+    "open_for_download",
+    "with_transient_retry",
+]
+
+TRANSIENT_ATTEMPTS = 3
+"""Total tries, not retries: one attempt and two more after it.
+
+The same number :data:`~gantry_sftp.session.DEFAULT_ATTEMPTS` uses, for a different reason.
+There, each attempt costs a fresh ``ssh`` fork and key exchange, so the bound is about expense.
+Here an attempt costs one more request on a connection that is already open, and the bound is
+about *the server*: the condition this exists for is resource exhaustion, and a client that
+retries until it succeeds is a client helping to keep the resource exhausted.
+"""
+
+TRANSIENT_BACKOFF = 0.25
+"""Seconds before the second attempt, doubling from there.
+
+Shorter than :data:`~gantry_sftp.session.DEFAULT_BACKOFF`, and deliberately. That one waits out
+a link that dropped, where a fresh connection is a fork and a handshake away. Recovery here is
+another transfer on the same server closing a descriptor, which is neither -- the probe that
+measured this condition saw the identical request succeed immediately once one was released.
+"""
+
+TRANSIENT_BACKOFF_MAX = 2.0
+"""Ceiling on the doubling.
+
+With :data:`TRANSIENT_ATTEMPTS` at 3 this is never reached, and it is here so that raising the
+attempt count cannot silently turn a per-file retry into a multi-second stall per file in a
+tree walk.
+"""
+
+
+async def open_for_download(
+    opener: Callable[[bytes, OpenFlag], Awaitable[bytes]],
+    path: bytes,
+    profile: ServerProfile,
+) -> bytes:
+    """``OPEN`` for reading, repeated while the server says its refusal was transient.
+
+    The one site D-30's retry is wired to, and both download entry points reach it: the
+    concurrent ``STAT``/``OPEN`` pair, and the resume path that opens later. ``get_tree`` needs
+    no wiring of its own because it transfers by calling ``get`` per file.
+
+    **It lives here rather than on ``Session`` deliberately.** The class is under a method
+    ceiling that ``tests/test_layer_discipline.py`` enforces, and that rule's own advice is that
+    an orchestration belongs beside the responsibility it orchestrates. This module is that
+    responsibility, so the retry's mechanism and its single application stay together and
+    ``Session`` stays the size it was. The opener is passed in rather than the session, which
+    also keeps this importable by the module ``Session`` itself imports.
+
+    **Why the open and not the read.** The condition that made this buildable is descriptor
+    exhaustion, and a ``READ`` runs against a descriptor the server already holds -- it cannot
+    hit ``EMFILE``. So the refusal lands here, on the request that acquires the resource, and
+    the downloader's shortfall re-queue is a different mechanism for a different failure. A
+    transient mid-transfer ``READ`` is something nothing in the matrix has been made to produce.
+
+    **Repeating an ``OPEN`` for reading is safe**, which is why this is the download side only.
+    It acquires no exclusive claim, creates nothing and truncates nothing; an attempt whose reply
+    was lost leaks a handle the reaper already owns (D-75). The upload side's ``WRITE`` has none
+    of those properties and deliberately does not call this.
+
+    Args:
+        opener: The session's ``open``, bound.
+        path: Remote path to open, already encoded and prefix-resolved.
+        profile: Fingerprint of the server, which decides what counts as transient.
+
+    Returns:
+        The handle.
+
+    Raises:
+        ServerError: The last refusal, unchanged. A refusal this server's profile does not
+            classify as transient is raised on the first attempt.
+    """
+    return await with_transient_retry(
+        lambda: opener(path, OpenFlag.READ), profile=profile, what="get"
+    )
+
+
+def is_transient_refusal(error: BaseException, profile: ServerProfile) -> bool:
+    """Whether ``error`` is a refusal ``profile`` says will pass on its own.
+
+    Three conditions, and each excludes a way of being wrong:
+
+    * a :class:`~gantry_sftp.exceptions.ServerError` -- a local failure, a protocol error or a
+      cancellation is not the server refusing anything;
+    * carrying ``FAILURE`` specifically, so a ``NO_SUCH_FILE`` whose message happens to contain
+      a marker cannot match. v3's catch-all is the only code whose meaning is unknown enough to
+      need the message read;
+    * whose message this server's profile classifies, which is itself gated on the profile
+      having measured messages at all.
+
+    Args:
+        error: The exception an attempt raised.
+        profile: The fingerprint of the server that raised it.
+
+    Returns:
+        Whether one more attempt is warranted on the same session.
+    """
+    if not isinstance(error, ServerError):
+        return False
+    if error.code != StatusCode.FAILURE:
+        return False
+    return profile.classifies_transient(error.message)
+
+
+async def with_transient_retry[T](
+    request: Callable[[], Awaitable[T]],
+    *,
+    profile: ServerProfile,
+    what: str,
+    attempts: int = TRANSIENT_ATTEMPTS,
+    backoff: float = TRANSIENT_BACKOFF,
+    backoff_max: float = TRANSIENT_BACKOFF_MAX,
+) -> T:
+    """Run ``request``, repeating it while the server says its refusal was transient.
+
+    The request must be safe to issue more than once. Every caller today is an ``OPEN`` for
+    reading, which is; nothing here makes an unsafe one safe.
+
+    Args:
+        request: Zero-argument callable issuing the request, awaited once per attempt.
+        profile: Fingerprint of the server, which decides what counts as transient.
+        what: Short name of the request, for the log record only.
+        attempts: Total tries, including the first.
+        backoff: Seconds before the second attempt, doubled after each refusal.
+        backoff_max: Ceiling on that doubling.
+
+    Returns:
+        Whatever ``request`` returned.
+
+    Raises:
+        ValueError: If ``attempts`` is less than 1.
+        ServerError: The last refusal, unchanged. A refusal the profile does not classify is
+            re-raised immediately, without waiting out a backoff nobody wanted.
+    """
+    if attempts < 1:
+        raise ValueError(f"attempts must be at least 1, got {attempts}")
+
+    delay = backoff
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await request()
+        except Exception as error:
+            # `Exception`, never `BaseException`, matching `with_reconnect` -- but note what
+            # actually keeps a cancelled transfer cancelled here, because the two are not the
+            # same line. There, the narrowing *is* the guard. Here `is_transient_refusal`
+            # refuses anything that is not a `ServerError`, and `ServerError` derives from
+            # `Exception`, so widening this to `BaseException` is currently unobservable:
+            # a cancellation would be caught and immediately re-raised by the check below.
+            # Verified rather than assumed -- the mutation stays green against this file's
+            # suite. It is kept narrow as defence in depth: a future classifier that grew a
+            # broader rule would make this line load-bearing without anyone editing it.
+            if not is_transient_refusal(error, profile) or attempt >= attempts:
+                raise
+            # Logged for the same reason `with_reconnect` logs: this failure is about to be
+            # swallowed, and without a record a server that refuses every second OPEN is
+            # indistinguishable at runtime from a healthy one.
+            session_logger.warning(
+                "%s refused as transient (attempt %d of %d), retrying in %.2fs",
+                what,
+                attempt,
+                attempts,
+                delay,
+                extra=fields_of(
+                    operation=what,
+                    event="retrying_transient",
+                    attempt=attempt,
+                    attempts=attempts,
+                    error=summarise(error),
+                    delay=delay,
+                    profile=profile.label,
+                ),
+            )
+        await anyio.sleep(delay)
+        delay = min(delay * 2, backoff_max)

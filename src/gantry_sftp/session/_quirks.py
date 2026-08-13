@@ -8,13 +8,24 @@ overrides that section proposes has a case to fix**. Advertisement plus a docume
 already covers extensions; nothing in the matrix needs a pipeline cap; and the error-mapping
 rules turn out to have almost nothing to read (see :attr:`ServerProfile.informative_messages`).
 
-So a profile carries identity, and identity is **diagnostic only**. Nothing here changes what
-a request does or how a reply is interpreted. That is a deliberate safety property, not a
-stage we have not reached yet: a fingerprint is a guess about an opaque peer, and a wrong
-guess must cost a wrong name in a log line rather than a wrong answer in a file. When a
-behavioural rule earns its place, it arrives with the fixture that proves it -- CLAUDE.md's
-"a quirks profile without a passing test against that server is a rumor", and the matrix is
-what makes honouring that possible.
+So a profile carries identity, and identity was **diagnostic only** for four releases: nothing
+here changed what a request did or how a reply was interpreted. That was a deliberate safety
+property rather than a stage we had not reached -- a fingerprint is a guess about an opaque
+peer, and a wrong guess must cost a wrong name in a log line rather than a wrong answer in a
+file.
+
+**One behavioural rule now exists, and it arrived the way this docstring said it would have
+to** -- with the fixture that proves it, per CLAUDE.md's "a quirks profile without a passing
+test against that server is a rumor". :attr:`ServerProfile.transient_messages` names the
+message text a server sends for a condition that will pass, and D-30's bounded retry is gated
+on it. Three things keep the old safety property intact where it matters:
+
+* It can only ever cause a request to be **repeated**, never reinterpreted. A wrong guess
+  costs a duplicated ``OPEN``, which is what the bound is for.
+* It is gated on :attr:`~ServerProfile.informative_messages`, so a server we have not measured
+  cannot match however its text reads -- :data:`UNKNOWN` is inert by construction.
+* The list holds only conditions provoked from a **server's own behaviour** and measured, not
+  errno text read out of a header file.
 
 **Fingerprinting does not use the SSH banner**, which §7 assumed it would. We never see it --
 ``ssh`` consumes it -- and recovering it costs ``LogLevel=DEBUG1`` and about 3.4 KB of stderr
@@ -54,17 +65,70 @@ class ServerProfile:
             decimal point in it.
         informative_messages: Whether this server's ``STATUS`` message text tells you
             anything the status code does not. **Measured, and mostly false.**
+        transient_messages: Message substrings this server sends for a condition that will
+            pass on its own. Empty for every server but one, and read only through
+            :meth:`classifies_transient`, which refuses to match unless
+            ``informative_messages`` is also true.
     """
 
     name: str
     description: str
     version: str | None = None
     informative_messages: bool = False
+    transient_messages: tuple[bytes, ...] = ()
 
     @property
     def label(self) -> str:
         """``name/version`` where a version is known, else just the name. For ``repr``."""
         return f"{self.name}/{self.version}" if self.version else self.name
+
+    def classifies_transient(self, message: bytes) -> bool:
+        """Whether this server's ``FAILURE`` text names a condition that will pass.
+
+        The gate on :attr:`informative_messages` is not redundant with an empty
+        :attr:`transient_messages`. It is what makes the *rule* safe rather than the current
+        data: a profile whose text is a constant must never match, so adding a marker to a
+        server whose messages are uninformative cannot silently start retrying. The two are
+        set together or the profile is wrong.
+
+        **Matching is on English ``strerror`` text**, which is what CPython and OpenSSH both
+        produce under the C locale. A server running under another locale sends text this
+        cannot match, and the consequence is that it is not retried -- the same behaviour as
+        before this rule existed. Failing to the un-retried side is the only acceptable
+        direction, because the alternative is retrying a terminal error.
+
+        **The body is a module-level function and this delegates to it**, which is D-129's rule
+        rather than a style choice: ``ServerProfile`` is a ``@dataclass``, and mutmut declines to
+        instrument the methods of a decorated class, so a predicate written inline here would be
+        invisible to the mutation lane with nothing reporting its absence. The decorator stays
+        because equality is load-bearing -- ``identify`` returns shared instances and the tests
+        compare them.
+
+        Args:
+            message: The server's ``STATUS`` message, verbatim and undecoded.
+
+        Returns:
+            Whether the caller may treat the refusal as worth one more attempt.
+        """
+        return classifies_transient(self, message)
+
+
+def classifies_transient(profile: ServerProfile, message: bytes) -> bool:
+    """Whether ``profile``'s server sends ``message`` for a condition that will pass.
+
+    The body of :meth:`ServerProfile.classifies_transient`, out here so the mutation lane can
+    see it -- see that method's docstring for why, and for what the gate is doing.
+
+    Args:
+        profile: Fingerprint of the server that sent the message.
+        message: The server's ``STATUS`` message, verbatim and undecoded.
+
+    Returns:
+        Whether the refusal is worth one more attempt.
+    """
+    if not profile.informative_messages:
+        return False
+    return any(marker in message for marker in profile.transient_messages)
 
 
 UNKNOWN = ServerProfile(
@@ -121,6 +185,15 @@ PROFILES: Mapping[str, ServerProfile] = {
         # "Is a directory", "Directory not empty" -- strerror text, genuinely classifiable.
         # The only implementation of the three where a message-based rule could ever work.
         informative_messages=True,
+        # Measured 2026-08-13 (D-30), with the server under a 96-descriptor limit in a
+        # subprocess: an OPEN past the ceiling is refused FAILURE / "Too many open files", and
+        # the identical request succeeds once one descriptor is released. EMFILE is in none of
+        # asyncssh's errno branches, so it falls to its generic `else: code = FX_FAILURE` with
+        # `reason` still carrying `exc.strerror` -- which is the funnel that makes this legible
+        # at all. One entry, because one is what has been provoked from the server's own
+        # behaviour; the transient errnos asyncssh does not map (EAGAIN, EINTR) would arrive
+        # the same way and are deliberately absent until something provokes them.
+        transient_messages=(b"Too many open files",),
     ),
     "paramiko": ServerProfile(
         name="paramiko",
