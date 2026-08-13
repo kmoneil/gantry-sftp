@@ -38,7 +38,7 @@ from matrix import unavailable_reason
 
 from gantry_sftp.codec import OpenFlag, StatusCode
 from gantry_sftp.exceptions import ServerError
-from gantry_sftp.session import PROFILES
+from gantry_sftp.session import PROFILES, ContentCheck, Verify
 from gantry_sftp.session._transient import is_transient_refusal
 from gantry_sftp.sync import open_local_server_transport, open_session, open_ssh_transport
 
@@ -207,6 +207,48 @@ def test_a_download_survives_a_descriptor_shortage_that_would_have_failed_it(
             timer.cancel()
             timer.join()
             for handle in handles[:-2]:
+                sftp.close(handle)
+
+
+def test_a_verified_download_survives_the_shortage_that_used_to_fail_it_after_transferring(
+    asyncssh_under_a_descriptor_limit: tuple[object, Path], tmp_path: Path
+):
+    """D-182, and it is the row that shows why that card was ranked above the rest of `later`.
+
+    Before it, this sequence *transferred the file* — retrying its own `OPEN` through D-30's
+    ladder — and then raised while verifying it, because the verification's own `OPEN` had no
+    retry. A caller saw a verification failure on a file that was in fact byte-correct, which is
+    the most misleading shape this library can produce: it is the exact reading a corrupt
+    transfer would give.
+
+    `Verify.REREAD` rather than `HASH` because asyncssh advertises no `check-file`, so the hash
+    rung would report UNAVAILABLE and never open anything.
+    """
+    transport, root = asyncssh_under_a_descriptor_limit
+    source = root / "verified"
+    source.write_bytes(b"bytes that must arrive and be checked" * 200)
+
+    with open_session(transport) as sftp:  # type: ignore[arg-type]  # fixture yields a transport
+        handles, _ = exhaust(sftp, root)
+
+        def release() -> None:
+            for handle in handles[-4:]:
+                sftp.close(handle)
+
+        timer = threading.Timer(0.4, release)
+        timer.start()
+        try:
+            destination = tmp_path / "arrived"
+            result = sftp.get(str(source).encode(), destination, verify=Verify.REREAD)
+            assert destination.read_bytes() == source.read_bytes()
+            assert result.content_check is ContentCheck.REREAD, (
+                "the verification must have actually run -- an UNAVAILABLE here would make this "
+                "row pass without ever opening a handle to verify with"
+            )
+        finally:
+            timer.cancel()
+            timer.join()
+            for handle in handles[:-4]:
                 sftp.close(handle)
 
 

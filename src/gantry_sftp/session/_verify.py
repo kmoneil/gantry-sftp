@@ -29,9 +29,10 @@ from typing import TYPE_CHECKING
 
 from anyio.to_thread import run_sync
 
-from gantry_sftp.codec import EXTENSION_CHECK_FILE, OpenFlag
+from gantry_sftp.codec import EXTENSION_CHECK_FILE
 from gantry_sftp.exceptions import ServerError, TransferError
 from gantry_sftp.session._handles import close_quietly
+from gantry_sftp.session._transient import open_for_read
 
 if TYPE_CHECKING:
     from gantry_sftp.session._operations import _SessionOperations
@@ -351,7 +352,7 @@ async def hashes_agree(
         return None
     if length == 0:
         return True
-    handle = await session.open(path, OpenFlag.READ)
+    handle = await open_for_read(session.open, path, session.profile, what="verify")
     try:
         algorithm, theirs = await session.check_file(
             handle, start_offset=start, length=length, block_size=CHECK_FILE_BLOCK_SIZE
@@ -396,7 +397,7 @@ async def reread_agrees(
     """
     if length == 0:
         return True
-    handle = await session.open(path, OpenFlag.READ)
+    handle = await open_for_read(session.open, path, session.profile, what="verify")
     try:
         with tempfile.NamedTemporaryFile(prefix="gantry-verify-") as scratch:
             _ = await session.download_into(

@@ -931,6 +931,11 @@ def _probe_check_file(sftp: SyncSession, scratch: _Scratch) -> Finding:
     """
     path = scratch.claim("check-file")
     _create(sftp, path, _CHECK_FILE_PAYLOAD)
+    # Deliberately NOT `_transient.open_for_read` (D-182). Every other read-open on a path a
+    # caller named retries a refusal the server's profile calls transient; this one must not.
+    # A battery exists to report what the server did, and retrying until it succeeds would
+    # paper over exactly the behaviour being measured -- a server that refuses one open in
+    # three would be reported as healthy. Stated here because a missing retry is invisible.
     handle = sftp.open(path, OpenFlag.READ)
     try:
         algorithm, digests = sftp.check_file(handle)
