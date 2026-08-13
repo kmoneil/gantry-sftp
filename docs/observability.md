@@ -273,8 +273,14 @@ non-empty directory, and `REMOVE` of a directory) produce this:
 
 **On OpenSSH the error message is a constant function of the error code.** So telling a
 transient failure from a permanent one by reading the message, which is the standard proposal
-and the thing v3's catch-all `FAILURE` would need, cannot work on the reference server at all.
-That is why retry classifies on exception type rather than on message text.
+and the thing v3's catch-all `FAILURE` would need, cannot work on the reference server at all —
+and that now includes a condition which genuinely *is* transient, not only the five terminal
+ones above: under a descriptor limit, `sftp-server` refuses an `OPEN` with the same single word
+and answers the identical request once one is released.
+
+That is why reconnect-and-retry classifies on exception type rather than on message text. Where
+a server's message does carry information, the profile says so and a narrower rule uses it —
+see [a refusal that clears](reliability.md#a-refusal-that-clears).
 
 `examples/server_capabilities.py` prints the profile, the advertised extension list and the
 session `repr` against whatever you point it at.

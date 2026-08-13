@@ -49,7 +49,9 @@ progressively locked out, so a retry loop turns one wrong key into a host that s
 for everything behind that IP. And **`FAILURE` is terminal**, even though it is sometimes
 transient: v3's catch-all is what a permission problem, a full disk, a name collision and a
 momentary appliance hiccup all arrive as, so retrying it would turn every fast clear failure
-into three slow ones. That changes when the quirks layer can match a server's message text.
+into three slow ones. That is still true of `is_retryable()` and of `with_reconnect`, which
+reconnect a whole operation; a narrower rule that repeats a *single request* on the session you
+already have is described under [A refusal that clears](#a-refusal-that-clears) below.
 
 **A status code v3 has no name for also arrives as `FAILURE`**, and that is a decision rather
 than a coincidence. A server answering an extension from the v6-era draft may legally reply with
@@ -60,16 +62,50 @@ as-is. This client now produces the same thing either way: `FAILURE`, with the n
 are talking to. It used to raise instead, and because a protocol error is terminal, a conformant
 server answering conformantly dropped the connection.
 
-**And against OpenSSH it cannot change, at any layer.** That is worth stating plainly rather
-than reading as a to-do: a transient `FAILURE` mid-transfer kills the transfer, and no amount
-of work here fixes it for the reference server. OpenSSH's `STATUS` message is a constant
-function of the status code. Five distinct conditions, from a full disk to a name collision,
-all send the single word `Failure`, measured, so there is nothing in the reply to classify on.
-Retrying an individual request inside a live connection therefore needs a server whose message
-text carries information (asyncssh's does; OpenSSH's does not), and until one is in the test
-matrix this stays unbuilt rather than half-built. What you get today is `with_reconnect`, which
-re-runs the whole operation when the _link_ drops. An eight-hour transfer to an appliance that
-hiccups once still starts again from the top, or with `resume=True`, from where it got to.
+## A refusal that clears
+
+Some refusals are about a resource rather than about your file, and they pass on their own. The
+one this library has measured is descriptor exhaustion: a server that has run out of file
+descriptors refuses the next `OPEN`, and answers the identical request once another transfer
+closes one. That is what DESIGN §7 means about appliance servers degrading rather than erroring
+under deep pipelining.
+
+**`get` retries such a refusal, up to three attempts, with a short doubling delay** — and it does
+so on the session you already have, without reconnecting. `get_tree` inherits it, because it
+transfers by calling `get` per file. Nothing is switched on: there is no parameter, and there is
+nothing to configure.
+
+**It is a per-server capability, and it is off wherever the server does not explain itself.** The
+retry fires only when the profile in `session.profile` says this server's `STATUS` text carries
+information (`informative_messages`) *and* the message matches a condition measured against that
+server. Of the three implementations in the test matrix, asyncssh is the only one that qualifies.
+A server this library has no fingerprint for gets the conservative answer and is never retried.
+
+Three limits, each deliberate:
+
+- **Downloads only.** A `WRITE` whose reply was lost may or may not have landed, so re-sending
+  the same bytes at the same offset is idempotent only on a server that behaves like a
+  filesystem. Uploads are not retried this way, and `resume=True` remains the answer there.
+- **The open, not the transfer.** The refusal lands on the request that acquires the descriptor.
+  A `READ` runs against one the server already holds, so a mid-transfer `READ` failure is a
+  different condition, and this does not claim to cover it.
+- **Bounded, on purpose.** Resource exhaustion is exactly the failure where every client
+  retrying without limit is what keeps the resource exhausted. Three attempts, then the server's
+  own error reaches you unchanged.
+
+Each retry is logged at `WARNING` — the same reasoning as `with_reconnect`'s, in
+[observability](observability.md): a swallowed failure that nothing records makes a server that
+refuses every second open indistinguishable from a healthy one.
+
+**Against OpenSSH none of this applies, and it cannot at any layer.** OpenSSH's `STATUS` message
+is a constant function of the status code: five distinct conditions, from a full disk to a name
+collision, all send the single word `Failure`. That was already measured for those five, and it
+has now been measured for a *transient* condition too — the reference server reaches the same
+descriptor ceiling, recovers the same way, and still says only `Failure`, so there is nothing in
+the reply to classify on. The claim is closed rather than merely well-supported. Against
+`sftp-server`, a transient `FAILURE` mid-transfer still kills the transfer, and what you get is
+`with_reconnect` re-running the whole operation when the _link_ drops — from the top, or with
+`resume=True`, from where it got to.
 
 **`BAD_MESSAGE` is terminal too, and it does not mean what its name says.** It reads as "the
 frame you sent was malformed", which would make it a bug in this library rather than an answer

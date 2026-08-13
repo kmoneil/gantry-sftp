@@ -184,6 +184,7 @@ from gantry_sftp.session._sync import (
     prepare_manifest,
     summarise,
 )
+from gantry_sftp.session._transient import open_for_download
 from gantry_sftp.session._verify import (
     Verify,
     gate_resume,
@@ -1304,7 +1305,7 @@ class Session(_SessionOperations):
             described.append(await self.stat(path))
 
         async def _open() -> None:
-            opened.append(await self.open(path, OpenFlag.READ))
+            opened.append(await open_for_download(self.open, path, self._profile))
 
         try:
             async with anyio.create_task_group() as pair:
@@ -1534,7 +1535,11 @@ class Session(_SessionOperations):
                 # Already open on the default path -- the concurrent pair above returns the handle.
                 # The resume path opens here instead, after the gate and after the early return that
                 # must not open anything at all.
-                handle = opened if opened is not None else await self.open(encoded, OpenFlag.READ)
+                handle = (
+                    opened
+                    if opened is not None
+                    else await open_for_download(self.open, encoded, self._profile)
+                )
                 try:
                     transferred = await self._download_into(
                         local_path,

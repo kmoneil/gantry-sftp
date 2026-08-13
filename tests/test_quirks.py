@@ -1,9 +1,14 @@
 """Fingerprinting a server from what it advertised, and the bound on what that may cost.
 
-The identification here is **diagnostic only** -- nothing in the library changes behaviour
-because of it -- and these tests exist as much to pin that bound as to pin the matching. A
-fingerprint is a guess about an opaque peer, so a wrong guess has to cost a wrong name in a
-log line rather than a wrong answer in a file.
+The identification here was **diagnostic only** for four releases, and these tests exist as much
+to pin the bound as to pin the matching. A fingerprint is a guess about an opaque peer, so a
+wrong guess has to cost a wrong name in a log line rather than a wrong answer in a file.
+
+**One behavioural rule now reads a profile** -- D-30's bounded retry, gated on
+``transient_messages`` and on ``informative_messages`` together. It does not weaken the bound
+above: the worst a wrong fingerprint can do through it is repeat an ``OPEN`` that was going to
+fail anyway. The rule and its gate are tested in ``tests/test_transient.py``, against the server
+that produced the message in ``live-tests/test_transient_live.py``.
 
 The extension sets below are the ones ``live-tests/matrix.py`` actually measured. They are
 duplicated here rather than imported, on purpose: ``live-tests/`` needs real servers and this

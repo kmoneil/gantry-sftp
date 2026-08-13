@@ -19,14 +19,20 @@ than implied: **the operation must be idempotent or resumable**, and the docstri
 which spellings are which. Write safety comes from ``resume``'s own checks -- a known-good
 offset, and a refusal when it cannot establish one -- not from new machinery here.
 
-What is *not* here: retrying an individual request inside a live connection. A server that
-answers one READ with a transient ``FAILURE`` still fails the transfer, and the reason is not
-that nobody got to it. v3's ``FAILURE`` is a catch-all: a permission problem, a full disk, a
-name collision and a momentary appliance hiccup all arrive as the same code, and OpenSSH's
-message for every one of them is the constant word ``Failure``. So "transient" is undecidable
-on the reference server, not merely undecided, and a retry that guessed would turn every
-terminal error into three slow ones with the same message. It becomes decidable for the subset
-of servers that put a ``strerror`` in the message -- see :func:`is_retryable`.
+What is *not* here: retrying an individual request inside a live connection. That lives in
+:mod:`gantry_sftp.session._transient`, and the split is worth understanding rather than
+guessing at. v3's ``FAILURE`` is a catch-all -- a permission problem, a full disk, a name
+collision and a momentary appliance hiccup all arrive as the same code, and OpenSSH's message
+for every one of them is the constant word ``Failure``. So "transient" is undecidable *here*,
+where all this module knows is the exception, and :func:`is_retryable` keeps ``FAILURE``
+terminal for that reason.
+
+It becomes decidable for the subset of servers that put a ``strerror`` in the message, which is
+a question about the *server* rather than about the exception -- so it needs the fingerprint,
+and the rule that reads it repeats one request on the session already open rather than
+reconnecting. A transient refusal of a download's ``OPEN`` is retried there. A transient
+``FAILURE`` mid-transfer on a ``READ`` still fails the transfer, and on OpenSSH it still cannot
+be fixed at any layer.
 """
 
 from __future__ import annotations

@@ -133,7 +133,7 @@ task rather than by module:
 | [Listing and matching](docs/listing-and-matching.md) | `listdir` / `scandir`, streaming a directory you did not size, and the `glob` dialect |
 | [Concurrency and byte ranges](docs/concurrency.md) | Many transfers over one connection, `concurrency=`, `open_file`, and reading part of a file |
 | [Connecting and authenticating](docs/connecting.md) | Keys, agents, `ssh_config`, passwords, restricting where a connection may go, which `ssh_config` settings this library overrides, and what a failure tells you |
-| [Reconnecting and timeouts](docs/reliability.md) | `with_reconnect`, deadlines on every wait, and stopping a transfer cleanly |
+| [Reconnecting and timeouts](docs/reliability.md) | `with_reconnect`, retrying a refusal that clears, deadlines on every wait, and stopping a transfer cleanly |
 | [Seeing what it is doing](docs/observability.md) | Structured logs, session counters, the frame dump, credential redaction, and `doctor` |
 | [Does this work against my server?](docs/compatibility.md) | The compatibility battery, what a finding carries, the write probes and how to nominate a directory for them |
 | [fsspec, pandas and dask](docs/integrations.md) | `pd.read_parquet("gantry-sftp://…")`, and the two things to know before deploying it |
