@@ -3,7 +3,19 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## Unreleased
+## 0.3.0 — 2026-08-13
+
+**A minor bump because one documented default changed, and that is the whole of why it is not
+`0.2.1`.** While the major version is `0` a breaking change lands in the minor version, so a patch
+release is always safe to take — and this one is not a patch: a `gantry-sftp` filesystem built with
+a `password=` is no longer shared out of fsspec's instance cache. Nothing was added and no
+signature moved; everything else below is a fix. But a caller relying on that instance being reused
+gets a different object and an `ssh` child per resolution, and a release that delivers that under a
+patch number delivers it silently.
+
+Written with the date because the tag follows immediately; before that it read `## Unreleased`, and
+that distinction is enforced rather than observed. `tests/test_packaging.py` accepts either heading;
+`release.yml` refuses `Unreleased` on a tag and refuses a tag that disagrees with `__version__`.
 
 ### Changed
 
