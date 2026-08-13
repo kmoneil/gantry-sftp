@@ -124,6 +124,12 @@ MEASURED: dict[str, dict[str, Verdict | None]] = {
         # discards the request as the one where the extension works. Pinned rather than
         # derived: asyncssh needs the `bench` group, which only the ubuntu-only
         # `server-matrix` job installs, so this row never runs on a kernel with lchmod.
+        # Reported as https://github.com/ronf/asyncssh/issues/827 -- `_setstat` swallows the
+        # NotImplementedError that `os.chmod(follow_symlinks=False)` raises where there is no
+        # lchmod, so the handler returns and the server answers OK. Note this row cannot see
+        # that fix: a refusal is Verdict.NO too, so both outcomes pin the same value here. The
+        # row that fails when it lands is in `test_advertised_is_not_the_same_question_as_
+        # working`, which asserts the evidence text rather than the verdict.
         LSETSTAT: Verdict.NO,
         LARGEST_REQUEST: Verdict.YES,
         CHECK_FILE: NOT_ASKED,

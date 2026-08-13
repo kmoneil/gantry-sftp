@@ -87,6 +87,12 @@ checks the *result*, not the status — the `posix-rename` probe confirms the so
 `check-file` probe compares the digest against one computed locally, and the `lsetstat` probe
 looks at both the link and its target.
 
+The second row is reported upstream as
+[asyncssh#827](https://github.com/ronf/asyncssh/issues/827), where it is narrower than the table
+has room for: only the permissions flag is discarded, and the timestamp flag over the same request
+works. If that is fixed the row becomes a refusal rather than a silent success, and this page is
+where to correct it.
+
 ## Safe to point at production
 
 The people who can run this will run it against a system their employer depends on, so the
