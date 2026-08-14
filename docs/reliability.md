@@ -86,15 +86,24 @@ Nothing is switched on: there is no parameter, and there is nothing to configure
 | `open_file(…)`, and `SFTPPath.open` / `read_bytes` over it | yes, when the flags change nothing |
 | `open_for_read(path)` | yes — that is what it is for |
 | the fsspec adapter's `cat_file` and `fs.open(…, "rb")` | yes |
+| `put(…, publish=Publish(atomic=False))` | yes |
+| `put(…, resume=True)`, and `put_tree` / `sync_tree` resuming | yes |
+| `put(…)` — the default atomic publish, first attempt | **no**, see below |
 | `open(path, pflags)` | **no**, whatever the flags |
 | the compatibility battery's probe | **no**, deliberately |
 
 `open_for_read(path)` is the plain spelling when you want the handle yourself: it is `open` for
 reading, on the retry ladder, and it takes no flags because there is no flag whose retry it would
-be willing to make. `open` stays a single attempt so that a write is never repeated by accident —
-an `OPEN` carrying `CREAT | TRUNC` may have emptied the file before its reply went missing, so a
-second attempt is not a repeat of the first. `open_file` splits on the same line: it retries when
-the flags you passed change nothing, and issues exactly one request when they do.
+be willing to make.
+
+**`open` and `open_file` keep the stricter rule than `put` does, and the difference is knowledge
+rather than caution.** Those two hand you a handle and have no idea what you will do with it, so
+they will not repeat an `OPEN` that changes anything — `open` never retries, and `open_file`
+retries only when the flags you passed mutate nothing. `put` may repeat a truncating open because
+it knows what comes next: it rewrites the whole file from an offset it computed beforehand, so
+the retry lands on the same end state. If you are driving a handle yourself and want that
+guarantee, you are the one who has it — reach for `open_for_read` when you are reading, and retry
+your own write however your application defines "the same state".
 
 One read-open deliberately never retries — the compatibility battery's. A report that says what a
 server does must not retry until the server behaves, or a server refusing one open in three is
@@ -108,11 +117,27 @@ A server this library has no fingerprint for gets the conservative answer and is
 
 Three limits, each deliberate:
 
-- **Reads only.** A `WRITE` whose reply was lost may or may not have landed, so re-sending
-  the same bytes at the same offset is idempotent only on a server that behaves like a
-  filesystem. Uploads are not retried this way, and `resume=True` remains the answer there.
-  The line is drawn on the `OPEN`'s own flags rather than on which method you called, so
-  nothing on the write side can acquire a retry by being reached from a new direction.
+- **Opens only, and only those that can be repeated.** The line is drawn on the `OPEN`'s own
+  flags rather than on the direction, so nothing acquires a retry by being reached from a new
+  place. Reads qualify because they change nothing. An upload's open qualifies for a different
+  reason: it rewrites the file from an offset computed before it, so even a server that
+  truncated and *then* refused leaves a state the retry reproduces.
+
+  **The exception is an exclusive create**, which is what the default atomic publish opens its
+  staging file with. `EXCL` is a claim about a precondition rather than an action: if a first
+  attempt created the file and then refused, a retry collides with our own leftover, and no
+  client can tell its own orphan from somebody else's file. So a fresh atomic `put` gets one
+  attempt and the server's refusal reaches you. `atomic=False` and every `resume=True` upload
+  do get the ladder.
+
+  **What makes any of this safe is that the ladder never sees a lost reply.** A request that
+  goes unanswered raises `TransferTimeoutError` and a dropped link raises `CONNECTION_LOST`;
+  neither is a `ServerError` carrying `FAILURE`, so both are re-raised on sight and belong to
+  [reconnect-and-resume](#reconnect-and-retry) instead. Every refusal retried here is one the
+  server *chose to send* — a statement that it did not perform the request, rather than the
+  absence of a statement. That distinction is why an upload's open can be retried at all, and
+  it is the one this page got wrong until now: "a `WRITE` whose reply was lost may or may not
+  have landed" is true, and is about the other mechanism.
 - **The open, not the transfer.** The refusal lands on the request that acquires the descriptor.
   A `READ` runs against one the server already holds, so a mid-transfer `READ` failure is a
   different condition, and this does not claim to cover it.
@@ -344,7 +369,7 @@ The half you notice first is not the resume — it is the `.part` files. Every i
 path cleans up after itself, but a killed process reaches none of them:
 
 ```python
-removed = await sftp.discard_staged(journal)   # returns the paths it actually deleted
+removed = await sftp.discard_staged(journal)  # returns the paths it actually deleted
 ```
 
 Safe at the start of a run, and it removes **only what this journal recorded staging**. A sweep

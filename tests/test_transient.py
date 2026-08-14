@@ -20,10 +20,16 @@ import pytest
 
 from gantry_sftp._logging import LOG_FIELDS
 from gantry_sftp.codec import OpenFlag, StatusCode
-from gantry_sftp.exceptions import NoSuchFileError, ProtocolError, ServerError
+from gantry_sftp.exceptions import (
+    NoSuchFileError,
+    ProtocolError,
+    ServerError,
+    TransferTimeoutError,
+)
 from gantry_sftp.session import (
     PROFILES,
     UNKNOWN,
+    Publish,
     RemoteFile,
     ServerProfile,
     identify,
@@ -35,6 +41,7 @@ from gantry_sftp.session._transient import (
     TRANSIENT_BACKOFF,
     TRANSIENT_BACKOFF_MAX,
     is_repeatable_open,
+    is_repeatable_upload_open,
     is_transient_refusal,
     open_for_read,
     with_transient_retry,
@@ -547,6 +554,74 @@ async def test_an_open_that_changes_something_is_issued_once(pflags: OpenFlag):
     assert is_repeatable_open(pflags) is False
 
 
+async def test_a_lost_reply_is_not_a_refusal_and_never_reaches_the_ladder():
+    """The premise the upload half rests on, asserted rather than reasoned about (D-30).
+
+    "A ``WRITE`` whose reply was lost may or may not have landed" kept the upload side out for
+    two releases, and it is about a *different mechanism*. This ladder cannot see a lost reply:
+    a request that goes unanswered raises ``TransferTimeoutError``, which is a ``TransferError``
+    and not a ``ServerError``, so the classifier re-raises it on the first check. Every refusal
+    that reaches a retry is one the server chose to send.
+
+    Pinned here because if ``TransferTimeoutError`` were ever reparented under ``ServerError``,
+    every flag-based argument above it would quietly become wrong.
+    """
+    assert not issubclass(TransferTimeoutError, ServerError)
+    timeout = TransferTimeoutError("Open was not answered within 30s", remote_path=b"/f")
+    assert is_transient_refusal(timeout, ASYNCSSH) is False
+
+
+@pytest.mark.parametrize(
+    "pflags",
+    [
+        OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC,
+        OpenFlag.WRITE | OpenFlag.CREAT,
+        OpenFlag.WRITE,
+        OpenFlag.WRITE | OpenFlag.APPEND,
+        OpenFlag.READ,
+    ],
+    ids=["truncate", "resume", "write", "append", "read"],
+)
+async def test_an_upload_open_without_an_exclusive_claim_may_be_repeated(pflags: OpenFlag):
+    """``TRUNC`` is repeatable *here* and not on ``open_file``, which is the point of two rules.
+
+    The upload path knows what follows its open -- it rewrites the file from an offset computed
+    before it -- so even a server that truncated and then refused leaves a state the retry
+    reproduces. ``open_file`` does not know that about its caller, so it keeps the stricter rule.
+    """
+    assert is_repeatable_upload_open(pflags) is True
+
+
+@pytest.mark.parametrize(
+    "pflags",
+    [
+        OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL,
+        OpenFlag.EXCL,
+        OpenFlag.READ | OpenFlag.EXCL,
+    ],
+    ids=["staging", "excl-alone", "read-excl"],
+)
+async def test_an_exclusive_create_is_issued_once_however_it_is_spelled(pflags: OpenFlag):
+    """``EXCL`` is a claim about a precondition, not an action, so a repeat is not a repeat.
+
+    If the first attempt created the file and then refused, the second collides with our own
+    orphan and no client can tell that from somebody else's file. D-187 is the fresh-name design.
+    """
+    assert is_repeatable_upload_open(pflags) is False
+
+
+async def test_the_two_repeatability_rules_disagree_and_that_is_deliberate():
+    """A guard against the two predicates being 'simplified' into one later.
+
+    They answer different questions on different premises: one is asked of caller-supplied
+    flags where nothing knows what happens next, the other of the upload path's own flags where
+    it does. ``CREAT | TRUNC`` is exactly where they must differ.
+    """
+    truncating = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
+    assert is_repeatable_open(truncating) is False, "open_file must not repeat a truncation"
+    assert is_repeatable_upload_open(truncating) is True, "put may, and for a stated reason"
+
+
 async def test_a_bit_this_protocol_version_does_not_define_is_not_repeatable():
     """The direction the allowlist was chosen for, and the reason it is not ``~OpenFlag.READ``.
 
@@ -622,6 +697,88 @@ async def test_the_public_read_open_returns_a_handle_a_real_server_will_read(tmp
             assert await sftp.read_at(handle, 0, 7) == b"payload"
         finally:
             await sftp.close(handle)
+
+
+async def _refusing_once(sftp, monkeypatch: pytest.MonkeyPatch) -> list[OpenFlag]:  # type: ignore[no-untyped-def]
+    """Make the session's first ``OPEN`` a transient refusal, and record the flags of each.
+
+    Injected rather than provoked, and against a *real* ``sftp-server`` rather than a fake: what
+    is under test is the wire from ``_put.py``, and every unit row of the helper stays green if
+    that wire is removed. The live lane proves the same path against a server genuinely out of
+    descriptors; this one runs in ``fast``.
+    """
+    monkeypatch.setattr(sftp, "_profile", ASYNCSSH)
+    asked: list[OpenFlag] = []
+    real = sftp.open
+
+    async def spy(path, pflags=OpenFlag.READ, *, mode=None):  # type: ignore[no-untyped-def]
+        asked.append(pflags)
+        if len(asked) == 1:
+            raise refusal(EXHAUSTED)
+        return await real(path, pflags, mode=mode)
+
+    monkeypatch.setattr(sftp, "open", spy)
+    return asked
+
+
+async def test_an_in_place_upload_retries_its_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """D-30's upload slice, end to end through the real ``put``.
+
+    ``atomic=False`` opens with ``CREAT | TRUNC`` -- no exclusive claim -- so a refusal the
+    server chose to send is repeated, and the file arrives. Before this slice the upload failed
+    where a download on the same connection recovered.
+    """
+    needs_real_server()
+    source = tmp_path / "payload"
+    _ = source.write_bytes(b"the bytes that must arrive")
+    target = tmp_path / "arrived"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        asked = await _refusing_once(sftp, monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="gantry_sftp.session"):
+            result = await sftp.put(source, str(target).encode(), publish=Publish(atomic=False))
+
+    assert target.read_bytes() == source.read_bytes()
+    assert result.transferred == source.stat().st_size
+    assert asked == [OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC] * 2, (
+        "the in-place open was retried, with the same flags both times"
+    )
+    record = next(r for r in caplog.records if r.levelno == logging.WARNING)
+    assert getattr(record, LOG_FIELDS)["operation"] == "put"
+
+
+async def test_an_atomic_uploads_staging_open_is_issued_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The asymmetry, from the side that has to stay refused.
+
+    ``EXCL`` is a claim about a precondition rather than an action: if the first attempt created
+    the staging file and then refused, a retry collides with our own orphan and no client can
+    tell that from somebody else's file. So the default atomic publish does **not** get the
+    ladder, and the server's refusal reaches the caller -- which is a worse outcome than a
+    retry and a better one than a wrong file. D-187 is the fresh-name design that closes it.
+    """
+    needs_real_server()
+    source = tmp_path / "payload"
+    _ = source.write_bytes(b"bytes")
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        asked = await _refusing_once(sftp, monkeypatch)
+        with pytest.raises(ServerError) as raised:
+            _ = await sftp.put(source, str(tmp_path / "arrived").encode())
+
+    assert raised.value.message == EXHAUSTED, "the server's own refusal, unchanged"
+    assert asked == [OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL], (
+        "exactly one attempt: an exclusive create is never repeated"
+    )
 
 
 class _FileSession:

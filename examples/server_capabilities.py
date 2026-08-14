@@ -49,9 +49,10 @@ async def describe_server(sftp: Session) -> None:
     # list. `supports()` answers the first question only, and says so.
     print(f"\nadvertises check-file: {sftp.supports(EXTENSION_CHECK_FILE)}")
     # The one thing in the fingerprint that changes what this library *does* rather than what it
-    # reports. A download's OPEN is retried only where the server explains its refusals well
-    # enough to tell a passing condition from a permanent one, which is a property of the server
-    # and not a setting -- so it is worth being able to see for the endpoint in front of you.
+    # reports. An OPEN that can be repeated -- every read, and an upload's whose flags carry no
+    # exclusive claim -- is retried only where the server explains its refusals well enough to
+    # tell a passing condition from a permanent one, which is a property of the server and not a
+    # setting, so it is worth being able to see for the endpoint in front of you.
     retries = "yes" if sftp.profile.transient_messages else "no"
     print(f"retries a transient refusal: {retries}")
     if sftp.profile.transient_messages:

@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,7 @@ from gantry_sftp.session._publish import (
     UploadResult,
 )
 from gantry_sftp.session._quirks import server_note
+from gantry_sftp.session._transient import is_repeatable_upload_open, with_transient_retry
 from gantry_sftp.session._verify import Verify, gate_resume, verify_content
 
 if TYPE_CHECKING:
@@ -200,6 +202,40 @@ async def _confirm_size(session: _SessionOperations, path: bytes, expected: int)
     return SizeCheck.MATCHED
 
 
+async def _open_for_upload(
+    session: _SessionOperations, path: bytes, pflags: OpenFlag, *, mode: int | None
+) -> bytes:
+    """``OPEN`` a destination for writing, repeating it only where repeating is sound.
+
+    The upload direction's counterpart to
+    :func:`~gantry_sftp.session._transient.open_for_read`, and the difference between them is
+    the whole of D-30's upload decision:
+    :func:`~gantry_sftp.session._transient.is_repeatable_upload_open` gates on the *flags*, so
+    an exclusive create is issued exactly once and everything else gets the ladder. The
+    argument for why a refusal here is a statement rather than a silence is on that predicate.
+
+    One helper for both call sites rather than a wrapper at each, because the gate and the
+    reason for it are one decision -- and because the staging path picks its flags at runtime,
+    so the site cannot answer the question by inspection.
+
+    Args:
+        session: The live session.
+        path: Where the bytes are going, already resolved.
+        pflags: The flags this upload path chose.
+        mode: Creation mode, forwarded unchanged.
+
+    Returns:
+        The handle.
+
+    Raises:
+        ServerError: The server's refusal, unchanged -- the last one, where it was retried.
+    """
+    opening = partial(session.open, path, pflags, mode=mode)
+    if not is_repeatable_upload_open(pflags):
+        return await opening()
+    return await with_transient_retry(opening, profile=session.profile, what="put")
+
+
 async def _put_in_place(
     session: _SessionOperations, upload: _Upload, target: bytes
 ) -> UploadResult:
@@ -220,11 +256,13 @@ async def _put_in_place(
     # The sibling refusals in `_upload_resume_offset` are at this same point for the same
     # reason, and a gate that first truncates what it is about to reject is not a gate.
     resume_check = await gate_resume(session, target, upload.local_path, start, upload.verify)
-    handle = await session.open(
-        target,
-        _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS,
-        mode=create_bits(upload.mode),
-    )
+    # Retried while the server says its refusal was transient (D-30's upload slice). Neither
+    # flag set carries `EXCL`, so repeating reaches the same state even against a server that
+    # truncated and *then* refused: the retry truncates again and this writes the whole file
+    # from `start`. `atomic=False` has already accepted that a failed in-place write leaves a
+    # truncated destination, so the repeat costs this path nothing new.
+    flags = _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS
+    handle = await _open_for_upload(session, target, flags, mode=create_bits(upload.mode))
     if upload.mode is not None:
         # **Before the first byte, and only on this path.** `open(2)` applies its mode
         # argument to a file it *creates* and ignores it for one that already exists, so
@@ -434,7 +472,13 @@ async def _open_staging_file(
     one that does, and the exact bits land on the handle before the publish either way.
     """
     try:
-        return await session.open(staged, _RESUME_FLAGS if resume else _STAGE_FLAGS, mode=mode)
+        # `_RESUME_FLAGS` retries a transient refusal; `_STAGE_FLAGS` does not, because `EXCL`
+        # is a claim the first attempt may already have taken and the retry would collide with
+        # our own orphan. `is_repeatable_upload_open` is what draws that line, and D-187 is the
+        # fresh-name design that would close the gap.
+        return await _open_for_upload(
+            session, staged, _RESUME_FLAGS if resume else _STAGE_FLAGS, mode=mode
+        )
     except SFTPError as refusal:
         refusal.add_note(
             f"{staged!r} is the staging file for {target!r}. Publishing atomically needs "

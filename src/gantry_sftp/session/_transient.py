@@ -24,12 +24,24 @@ of the design are load-bearing:
 * **It is bounded, and the bound is the point.** Descriptor exhaustion is precisely the failure
   where every client retrying without limit is what keeps the server exhausted. Three attempts
   and a short doubling delay, not a loop that waits for the server to recover.
-* **Only the caller's own read side uses it.** A ``WRITE`` whose reply was lost may or may not
-  have landed, so re-sending at the same offset is idempotent only on a server that behaves like
-  a filesystem. That decision is deliberately not made here; the upload path does not call this.
-  Where the flags are the *caller's* rather than ours -- ``open_file`` and everything built on
-  it -- that boundary is a predicate rather than a convention, and it is
-  :func:`is_repeatable_open`.
+* **It never sees a reply that went missing, and that is what the rest rests on.**
+  :func:`is_transient_refusal` re-raises anything that is not a
+  :class:`~gantry_sftp.exceptions.ServerError` carrying ``FAILURE``; a lost reply is a
+  :class:`~gantry_sftp.exceptions.TransferTimeoutError` and a dropped link is
+  ``CONNECTION_LOST``, both of which belong to :mod:`gantry_sftp.session._retry`. So every
+  refusal here is one the server *chose to send* -- a statement that the request was not
+  performed, rather than the absence of a statement.
+
+  **This is the distinction that kept the upload side out for two releases**, and it was a
+  category error rather than a bound: "a ``WRITE`` whose reply was lost may or may not have
+  landed" is true and is about the other mechanism. What an upload's ``OPEN`` needs from this
+  one is only that repeating it reaches the same state, which depends on its *flags* --
+  :func:`is_repeatable_upload_open`. The one flag that fails it is ``EXCL``, because an
+  exclusive create is a claim about a precondition the first attempt may have taken.
+
+  Two predicates, deliberately, and they are not interchangeable:
+  :func:`is_repeatable_open` is asked of the *caller's* flags on ``open_file``, where nothing
+  knows what happens next, so it admits only an open that mutates nothing.
 """
 
 from __future__ import annotations
@@ -49,6 +61,7 @@ __all__ = [
     "TRANSIENT_BACKOFF",
     "TRANSIENT_BACKOFF_MAX",
     "is_repeatable_open",
+    "is_repeatable_upload_open",
     "is_transient_refusal",
     "open_for_read",
     "with_transient_retry",
@@ -189,6 +202,48 @@ def is_repeatable_open(pflags: OpenFlag) -> bool:
         Whether the retry ladder may repeat this open.
     """
     return not int(pflags) & ~int(REPEATABLE_FLAGS)
+
+
+def is_repeatable_upload_open(pflags: OpenFlag) -> bool:
+    """Whether an upload's ``OPEN`` may be repeated after the server *refused* it.
+
+    A second predicate rather than a widening of :func:`is_repeatable_open`, because it answers
+    a different question on weaker premises, and the two must not be confused:
+
+    * :func:`is_repeatable_open` asks *does repeating this change anything*. It is asked of
+      **caller-supplied** flags on ``open_file``, where nothing knows what the caller will do
+      with the handle next, so it admits only an open that mutates nothing.
+    * this one asks *will repeating this reach the same state*. It is sound only because the
+      upload path knows what happens next: it rewrites the file from an offset it computed
+      before the open.
+
+    So a ``TRUNC`` is repeatable here and not there. Even against a server that truncated and
+    *then* refused, the retry truncates again and the upload writes the whole file, so the end
+    state matches a clean first attempt -- and ``atomic=False`` already documents that a failed
+    in-place write leaves a truncated destination, so this costs that path nothing it has not
+    accepted.
+
+    **``EXCL`` is the one flag that is neither, and the reason is structural.** It is the only
+    flag that makes an ``OPEN`` a *claim about a precondition* rather than an action. If the
+    first attempt created the file and then refused, the retry's ``EXCL`` fails on our own
+    orphan -- and no client can tell its own orphan from somebody else's file. The fix is a
+    fresh staging name per attempt, which lands inside D-166's journal ordering and is D-187
+    rather than a line here.
+
+    **What makes any of this safe is upstream of the flags** (D-30): this ladder never sees a
+    reply that went missing. :func:`is_transient_refusal` re-raises anything that is not a
+    :class:`~gantry_sftp.exceptions.ServerError`, and a lost reply is a
+    :class:`~gantry_sftp.exceptions.TransferTimeoutError` while a dropped link is
+    ``CONNECTION_LOST``. Every refusal reaching here is one the server *chose to send*, so it
+    is a statement that the request was not performed rather than an absence of one.
+
+    Args:
+        pflags: The flags the upload path is opening with.
+
+    Returns:
+        Whether the retry ladder may repeat this open.
+    """
+    return not pflags & OpenFlag.EXCL
 
 
 def is_transient_refusal(error: BaseException, profile: ServerProfile) -> bool:
