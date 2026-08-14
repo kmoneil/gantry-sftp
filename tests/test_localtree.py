@@ -85,6 +85,71 @@ def test_the_windows_rules_do_not_apply_in_this_direction():
         assert remote_component(name) == name
 
 
+# --- and no walk can reach that refusal (D-184) ---------------------------------------------
+#
+# The rows above call `remote_component` directly, which is the only way to reach it: every
+# name it is asked about in production comes out of `os.scandir`, and none of the four refusals
+# is producible from there. These three pin that finding from the side that can regress -- a
+# future name source that is *not* `os.scandir` would fail one of them. `put_tree` and
+# `sync_tree` dropped `UnsafePathError` from their **Raises** on the strength of it.
+
+
+def test_a_separator_becomes_structure_rather_than_a_name(tmp_path: Path):
+    """The refusal that looks reachable and is not.
+
+    Creating ``a/b`` with the parent missing fails for the wrong reason -- the path did not
+    exist, which says nothing about names. With the parent present the call *succeeds*: it
+    makes a directory ``a`` holding a file ``b``, so the separator became structure the walk
+    descends through, and neither name carries it.
+    """
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "b").touch()
+
+    seen = [name for entry in walk_local(tmp_path) for name in (*entry.directories, *entry.files)]
+
+    assert seen == [b"a", b"b"], "the separator is a directory boundary, never part of a name"
+    for name in seen:
+        assert remote_component(name) == name
+
+
+def test_scandir_is_what_keeps_the_dot_names_out_rather_than_the_filesystem(tmp_path: Path):
+    """The arm of the argument that rests on CPython rather than on POSIX.
+
+    Every POSIX directory contains `.` and `..` as real entries and `readdir(2)` returns both;
+    what keeps them out of the walk is `os.scandir`'s documented contract. Asserted here
+    because the docstring on `remote_component` reasons from it -- if this ever changed, a
+    guard we describe as unreachable would become reachable with nothing else failing.
+    """
+    (tmp_path / "child").mkdir()
+    (tmp_path / "file").touch()
+
+    listed = {os.fsencode(item.name) for item in os.scandir(tmp_path)}
+
+    assert listed == {b"child", b"file"}
+    assert b"." not in listed
+    assert b".." not in listed
+
+
+def test_a_walk_over_the_nastiest_legal_names_never_refuses_one(tmp_path: Path):
+    """The admitted side of the guard, which is the half a `return False` would pass.
+
+    Names chosen to sit next to each refusal without being one: a client-side separator, one
+    dot more than `..`, `..` with a space and with a non-UTF-8 byte, and a name that is not
+    valid UTF-8 at all.
+    """
+    hostile = [rb"a\b", b"...", b" ..", b"-rf", b"name with spaces"]
+    if HOLDS_NON_UTF8_NAMES:
+        hostile += [b"..\xff", b"\xff\xfe"]
+    for name in hostile:
+        (tmp_path / os.fsdecode(name)).touch()
+
+    walked = [name for entry in walk_local(tmp_path) for name in (*entry.directories, *entry.files)]
+
+    assert sorted(walked) == sorted(hostile), "every name was held by the filesystem and walked"
+    for name in walked:
+        assert remote_component(name) == name, f"{name!r} must upload, not be refused"
+
+
 # --- the walk ------------------------------------------------------------------------------
 
 

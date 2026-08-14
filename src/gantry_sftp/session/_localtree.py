@@ -63,6 +63,31 @@ def remote_component(name: bytes) -> bytes:
     *written locally*, and applying them here would refuse to upload files that exist and are
     perfectly legal on the machine they are being read from.
 
+    **No caller can reach the refusal, and that is measured rather than assumed (D-184).**
+    Every name this is asked about comes from :func:`_scan`, which is ``os.scandir`` plus
+    ``os.fsencode``, and each of the four refusals is unreachable from there for its own
+    reason:
+
+    * ``.`` and ``..`` -- **``os.scandir``'s documented contract**, not the filesystem. Every
+      POSIX directory really does contain both, and ``readdir(2)`` returns them; CPython
+      filters them out. This arm is the one a rewrite could break, so it is named rather than
+      lumped in with the others.
+    * a path separator -- a name cannot hold one. Creating ``a/b`` with the parent present
+      *succeeds* and makes a directory holding a file, so the separator becomes structure the
+      walk descends through and neither name carries it.
+    * a NUL byte -- CPython raises ``ValueError`` before the syscall.
+    * the empty name -- no directory entry is empty, and ``touch("")`` is not a create.
+
+    Nor can an encoding smuggle one in: no byte ``os.fsencode`` emits for a surrogate is
+    ``0x2F`` or ``0x00``, since every UTF-8 continuation byte is ``>= 0x80``.
+
+    **So this stays as an assertion about our own joining, and it is documented as one.** It is
+    one comparison per name, it is the predicate the direction where names *are*
+    attacker-controlled already needs, and a second copy of that predicate would drift.
+    ``put_tree`` and ``sync_tree`` no longer list ``UnsafePathError`` under **Raises**, because
+    a documented exception a caller cannot trigger reads as a hazard they have to handle.
+    Probe: ``_plans/probes/d184_unreachable_upload_guard.py``.
+
     Args:
         name: One local filename, already encoded with :func:`os.fsencode`.
 
@@ -70,7 +95,8 @@ def remote_component(name: bytes) -> bytes:
         ``name`` unchanged, so this reads as a pass-through at the call site.
 
     Raises:
-        UnsafePathError: If the name could not be one remote path component.
+        UnsafePathError: If the name could not be one remote path component. Reachable by
+            calling this directly, which is how it is tested; not reachable through a walk.
     """
     reason = remote_component_reason(name)
     if reason is None:

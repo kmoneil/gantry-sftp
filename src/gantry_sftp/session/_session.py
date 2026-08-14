@@ -3043,9 +3043,10 @@ class Session(_SessionOperations):
                 **The contract is that it makes no writes** -- no ``MKDIR``, no ``OPEN``, no
                 ``SETSTAT`` -- and it reads only what the upload would read anyway, which for
                 this direction is the local filesystem alone. So the plan is complete about
-                everything local: every file, every byte, every skipped entry with its reason,
-                and every name that could not be a remote path component, which still raises
-                :exc:`UnsafePathError` here exactly as it would in a real run.
+                everything local: every file, every byte, and every skipped entry with its
+                reason. Whatever a real run would refuse locally, this refuses identically --
+                which as of D-184 is measured to be nothing, since no name ``os.scandir``
+                yields can fail the remote-component check.
 
                 **It is silent about the destination on purpose.** Whether those directories
                 already exist, and which files are already there, would cost a round trip per
@@ -3066,7 +3067,6 @@ class Session(_SessionOperations):
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O -- today,
                 Windows. Raised before the walk starts; see :mod:`._platform`.
-            UnsafePathError: If a local name could not be a remote path component.
             ValueError: If ``publish`` carries a ``staging_name``, which one tree's many files
                 cannot share; if ``resume`` is asked for with atomic publishing and no journal,
                 which leaves nothing findable to resume into; if ``publish`` contradicts itself
@@ -3247,7 +3247,6 @@ class Session(_SessionOperations):
 
         Raises:
             NotImplementedError: On a platform without offset-addressed local I/O.
-            UnsafePathError: If a local name cannot be one remote path component.
             ValueError: If ``publish`` carries a ``staging_name`` or contradicts itself the way
                 :meth:`put` refuses, or if ``concurrency`` is below 1 or is above 1 with a
                 ``progress`` callback. Raised before the walk starts.
