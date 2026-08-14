@@ -210,14 +210,24 @@ class SyncDirectoryScan:
     :class:`~gantry_sftp.exceptions.StateError`, again from the object underneath rather than
     from a second check here.
 
+    **It holds the session rather than the portal** (D-186), so every call it makes goes
+    through the same readiness check :class:`SyncSession`'s own methods do. See
+    :attr:`SyncRemoteFile._portal` for the whole argument -- these two classes are the same
+    shape and get the same answer, including the one place it is deliberately *not* a refusal.
+
     Args:
-        portal: The portal whose thread owns the loop.
+        facade: The session this scan belongs to, whose liveness gates every call.
         scan: The async scan to drive.
     """
 
-    def __init__(self, portal: BlockingPortal, scan: DirectoryScan) -> None:
-        self._portal = portal
+    def __init__(self, facade: SyncSession, scan: DirectoryScan) -> None:
+        self._facade = facade
         self._scan = scan
+
+    @property
+    def _portal(self) -> BlockingPortal:
+        """The portal, refusing if the session's block has ended. See :class:`SyncRemoteFile`."""
+        return _portal_of(self._facade)
 
     @override
     def __repr__(self) -> str:
@@ -234,7 +244,15 @@ class SyncDirectoryScan:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the directory handle, whichever way the block ended."""
+        """Close the directory handle, whichever way the block ended.
+
+        Quiet when the session is already closed, for the reason
+        :meth:`SyncRemoteFile.__exit__` gives: the handle went with the connection, so there is
+        nothing here to release and raising would only replace a real exception with news about
+        a cleanup nobody can perform.
+        """
+        if not _still_open(self._facade):
+            return
         _ = self._portal.call(self._scan.__aexit__, exc_type, exc, traceback)
 
     def __iter__(self) -> Self:
@@ -274,13 +292,37 @@ class SyncRemoteFile:
     one file from several threads.
 
     Args:
-        portal: The portal whose thread owns the loop.
+        facade: The session this file belongs to, whose liveness gates every call.
         remote: The async file object to drive.
     """
 
-    def __init__(self, portal: BlockingPortal, remote: RemoteFile) -> None:
-        self._portal = portal
+    def __init__(self, facade: SyncSession, remote: RemoteFile) -> None:
+        self._facade = facade
         self._remote = remote
+
+    @property
+    def _portal(self) -> BlockingPortal:
+        """The portal, refusing if the session's ``with`` block has ended (D-186).
+
+        **A property rather than a field, and that is the whole fix.** These objects used to be
+        handed the raw :class:`~anyio.from_thread.BlockingPortal` at construction, so every
+        method here called it directly and none of them passed through
+        :meth:`SyncSession._ready`. A caller holding one past the session's block therefore got
+        anyio's ``RuntimeError: This portal is not running`` -- a message about a thread they
+        never asked for -- where every :class:`SyncSession` method in the same situation says
+        *this session is closed; its ``with`` block has ended*.
+
+        :meth:`SyncSession.open_file`'s own docstring already promised this: the check is there
+        *"for the same reason ``scandir``'s is -- a file asked for after the session's block has
+        ended should name the block rather than the portal"*. It was placed at the call that
+        hands the object back, and never on the object itself, so the promise held for one call
+        and not for anything you then did with it.
+
+        Reading it through here costs one attribute lookup per call and needs no edit to any of
+        the methods below, which is why it is the shape it is: a per-method check is a rule
+        somebody has to remember for the next method.
+        """
+        return _portal_of(self._facade)
 
     @override
     def __repr__(self) -> str:
@@ -302,7 +344,21 @@ class SyncRemoteFile:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the handle, whichever way the block ended."""
+        """Close the handle, whichever way the block ended.
+
+        **The one place a closed session is not a refusal**, and the asymmetry is deliberate.
+        Everything else here raises :class:`~gantry_sftp.exceptions.StateError`, because the
+        caller asked for something that cannot be done. An exit is not a request: the handle
+        this would release went with the connection, so there is nothing left to close, and
+        raising would announce a cleanup nobody can perform -- worse, from ``__exit__`` it
+        would *replace* whatever exception was already propagating, which is the rule
+        :meth:`~gantry_sftp.session.RemoteFile.__aexit__` states one layer down.
+
+        Concretely, this is what a ``__del__`` reaches: an object finalised after its session
+        ended has an exit to run and nothing to run it against.
+        """
+        if not _still_open(self._facade):
+            return
         _ = self._portal.call(self._remote.__aexit__, exc_type, exc, traceback)
 
     def tell(self) -> int:
@@ -655,7 +711,11 @@ class SyncSession:
         :meth:`scandir`'s does -- a file asked for after the session's block has ended should
         name the block rather than the portal.
         """
-        return SyncRemoteFile(self._ready(), self._session.open_file(path, pflags, mode=mode))
+        # `_ready()` eagerly as well as through the object's own property: this call sends
+        # nothing, so without it the refusal would surface at `__enter__` instead of here,
+        # which is what this method's docstring promises against (D-186).
+        _ = self._ready()
+        return SyncRemoteFile(self, self._session.open_file(path, pflags, mode=mode))
 
     def opendir(self, path: bytes | str) -> bytes:
         """Open a directory and return its handle."""
@@ -719,7 +779,8 @@ class SyncSession:
         liveness check still happens here rather than at ``__enter__``, so a scan asked for
         after the session's block has ended names the block rather than the portal.
         """
-        return SyncDirectoryScan(self._ready(), self._session.scandir(path))
+        _ = self._ready()  # eagerly, for the reason `open_file` gives (D-186)
+        return SyncDirectoryScan(self, self._session.scandir(path))
 
     def listdir(self, path: bytes | str) -> list[DirEntry]:
         """List a directory, following the batches to the end."""
@@ -1335,8 +1396,9 @@ class SyncSFTPPath:
 
     def open(self, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None) -> SyncRemoteFile:
         """Open this file as a cursor-bearing object, for ranges and streaming."""
-        portal = _portal_of(self._required())
-        return SyncRemoteFile(portal, self._path.open(pflags, mode=mode))
+        facade = self._required()
+        _ = _portal_of(facade)  # eagerly, for the reason `SyncSession.open_file` gives
+        return SyncRemoteFile(facade, self._path.open(pflags, mode=mode))
 
     def read_bytes(self) -> bytes:
         """The whole file."""
@@ -1589,6 +1651,19 @@ def _wrapped_session(facade: SyncSession) -> Session:
 def _portal_of(facade: SyncSession) -> BlockingPortal:
     """The live portal, refusing a session whose ``with`` block has ended."""
     return facade._ready()  # noqa: SLF001  # one facade, two classes; see above
+
+
+def _still_open(facade: SyncSession) -> bool:
+    """Whether the session is usable, asked *without* raising to find out.
+
+    The one caller that needs the question rather than the refusal is a ``__exit__`` releasing
+    a handle that the session already took with it (D-186). Deliberately not a public
+    ``is_open`` on :class:`SyncSession`: ``tests/test_sync_facade.py`` derives the blocking
+    surface from :class:`~gantry_sftp.session.Session` by name, so a public member here is a
+    member the async class then owes -- and "is this facade still live" is a question about the
+    facade, which the async side does not have.
+    """
+    return facade._live  # noqa: SLF001  # one facade, two classes; see above
 
 
 def _driven[T](facade: SyncSession, factory: Callable[[], AsyncGenerator[T]]) -> Iterator[T]:

@@ -870,6 +870,98 @@ def test_the_session_refuses_calls_after_its_block_has_ended(tmp_path: Path):
     assert deferred.value.args[0] == "this session is closed; its `with` block has ended"
 
 
+# --- the objects a session hands out say it too (D-186) --------------------------------------
+#
+# The row above covers the call that *hands the object back*. It was the whole of the check
+# until now, and `SyncSession.open_file`'s docstring reads as though it were the whole promise:
+# "a file asked for after the session's block has ended should name the block rather than the
+# portal". An object obtained while the session was live and used after it closed reached
+# anyio's `RuntimeError: This portal is not running` instead -- every method on both classes,
+# because they were handed the raw portal at construction and never passed `_ready()`.
+#
+# Both classes, and all three families of method, because they are the same shape: covering one
+# leaves an invariant that is stated rather than spread.
+
+
+@pytest.fixture
+def objects_outliving_their_session(tmp_path: Path):  # type: ignore[no-untyped-def]
+    """A file and a scan obtained from a live session, handed back after it closed."""
+    needs_real_server()
+    _ = (tmp_path / "f.txt").write_bytes(b"payload")
+    with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        remote_file = sftp.open_file(str(tmp_path / "f.txt").encode())
+        scan = sftp.scandir(str(tmp_path).encode())
+    return remote_file, scan
+
+
+def test_a_file_from_a_closed_session_names_the_block_not_the_portal(
+    objects_outliving_their_session,  # type: ignore[no-untyped-def]
+):
+    """Entering and reading both refuse, and they refuse in this library's words."""
+    remote_file, _ = objects_outliving_their_session
+    ended = "this session is closed; its `with` block has ended"
+
+    with pytest.raises(StateError) as entering, remote_file:
+        pass  # pragma: no cover -- entering is what raises
+    assert entering.value.args[0] == ended
+
+    with pytest.raises(StateError) as reading:
+        _ = remote_file.read(4)
+    assert reading.value.args[0] == ended
+
+    with pytest.raises(StateError) as seeking:
+        _ = remote_file.seek(0)
+    assert seeking.value.args[0] == ended
+
+    # Pure, and deliberately still answerable: the cursor is local state and reading it crosses
+    # no thread boundary, so refusing it would be inventing a failure the session cannot cause.
+    assert remote_file.tell() == 0
+    assert remote_file.path.endswith(b"f.txt")
+
+
+def test_a_scan_from_a_closed_session_names_the_block_not_the_portal(
+    objects_outliving_their_session,  # type: ignore[no-untyped-def]
+):
+    """The twin, because one class fixed is an invariant stated rather than spread."""
+    _, scan = objects_outliving_their_session
+    ended = "this session is closed; its `with` block has ended"
+
+    with pytest.raises(StateError) as entering, scan:
+        pass  # pragma: no cover -- entering is what raises
+    assert entering.value.args[0] == ended
+
+    with pytest.raises(StateError) as advancing:
+        _ = next(scan)
+    assert advancing.value.args[0] == ended
+
+
+def test_leaving_the_block_of_a_dead_session_is_quiet_on_both(
+    objects_outliving_their_session,  # type: ignore[no-untyped-def]
+):
+    """The one place a closed session is not a refusal, and it is not an oversight.
+
+    An exit is not a request: the handle it would release went with the connection, so there is
+    nothing to close. Raising here would announce a cleanup nobody can perform and -- from
+    `__exit__` -- would *replace* whatever exception was already propagating.
+
+    This is the shape a `__del__` reaches, which is how it was found: D-185 tried routing the
+    fsspec adapter's read handle through this object, and `AbstractBufferedFile.__del__` ran the
+    exit after the portal had stopped, turning a quiet degradation into a traceback.
+    """
+    remote_file, scan = objects_outliving_their_session
+
+    assert remote_file.__exit__(None, None, None) is None
+    assert scan.__exit__(None, None, None) is None
+
+    # And with an exception in flight, which is the case that would mask a real failure.
+    boom = ValueError("the real failure")
+    assert remote_file.__exit__(ValueError, boom, None) is None
+    assert scan.__exit__(ValueError, boom, None) is None
+
+
 def test_the_repr_says_which_session_and_whether_it_is_spent(tmp_path: Path):
     """A facade that hid the session it wraps would make every bug report one step longer."""
     needs_real_server()
