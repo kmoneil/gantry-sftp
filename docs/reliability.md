@@ -77,6 +77,25 @@ it sounds: without it a busy server could let the transfer succeed and then fail
 file it just delivered, which reads exactly like a corrupt transfer of a file that is correct.
 Nothing is switched on: there is no parameter, and there is nothing to configure.
 
+**Every way of opening a file for reading gets it**, not only the transfers:
+
+| what you call | retries a transient refusal |
+| --- | --- |
+| `get`, `get_tree` | yes |
+| `get(verify=…)`, both rungs | yes |
+| `open_file(…)`, and `SFTPPath.open` / `read_bytes` over it | yes, when the flags change nothing |
+| `open_for_read(path)` | yes — that is what it is for |
+| the fsspec adapter's `cat_file` and `fs.open(…, "rb")` | yes |
+| `open(path, pflags)` | **no**, whatever the flags |
+| the compatibility battery's probe | **no**, deliberately |
+
+`open_for_read(path)` is the plain spelling when you want the handle yourself: it is `open` for
+reading, on the retry ladder, and it takes no flags because there is no flag whose retry it would
+be willing to make. `open` stays a single attempt so that a write is never repeated by accident —
+an `OPEN` carrying `CREAT | TRUNC` may have emptied the file before its reply went missing, so a
+second attempt is not a repeat of the first. `open_file` splits on the same line: it retries when
+the flags you passed change nothing, and issues exactly one request when they do.
+
 One read-open deliberately never retries — the compatibility battery's. A report that says what a
 server does must not retry until the server behaves, or a server refusing one open in three is
 reported as healthy.
@@ -89,9 +108,11 @@ A server this library has no fingerprint for gets the conservative answer and is
 
 Three limits, each deliberate:
 
-- **Downloads only.** A `WRITE` whose reply was lost may or may not have landed, so re-sending
+- **Reads only.** A `WRITE` whose reply was lost may or may not have landed, so re-sending
   the same bytes at the same offset is idempotent only on a server that behaves like a
   filesystem. Uploads are not retried this way, and `resume=True` remains the answer there.
+  The line is drawn on the `OPEN`'s own flags rather than on which method you called, so
+  nothing on the write side can acquire a retry by being reached from a new direction.
 - **The open, not the transfer.** The refusal lands on the request that acquires the descriptor.
   A `READ` runs against one the server already holds, so a mid-transfer `READ` failure is a
   different condition, and this does not claim to cover it.

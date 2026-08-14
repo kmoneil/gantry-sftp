@@ -148,6 +148,25 @@ and safe to fan out. Writes are not
 retried and never will be blindly, because two tasks writing the same range is a race no client can
 arbitrate, exactly as with two processes and `pwrite`.
 
+#### `open_for_read` when you are holding the handle
+
+`open(path)` sends one `OPEN` and gives you whatever came back. `open_for_read(path)` sends the
+same request on the [transient-refusal ladder](reliability.md#a-refusal-that-clears), so a server
+that is momentarily out of a resource is retried instead of raising — the same recovery `get()`
+has, for a handle you hold yourself:
+
+```python
+handle = await sftp.open_for_read("/data/big.parquet")
+```
+
+It takes no `pflags`, and that is the design rather than an omission: repeating an `OPEN` for
+reading acquires no exclusive claim, creates nothing and truncates nothing, while a write-flagged
+one may have landed before its reply went missing. An open that changes something is spelled
+`open()` and is issued exactly once. `open_file()` splits the same way on the flags you give it.
+
+Nothing is switched on and nothing is configurable; on a server whose refusals carry no
+information — OpenSSH's are the constant word `Failure` — the two calls behave identically.
+
 ### Moving a whole file through a handle you opened
 
 The three above hand the range back in memory, which is not what you want for a large file. The

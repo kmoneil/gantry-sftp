@@ -75,7 +75,13 @@ async def demonstrate(sftp: Session, directory: bytes) -> None:
     # --- fanning out over one file, which the cursor form cannot do --------------------------
     # Four tasks, one handle, four disjoint ranges, no shared position. This is the shape to
     # reach for when the ranges are independent -- a `RemoteFile` here would interleave.
-    handle = await sftp.open(log)
+    #
+    # `open_for_read` rather than `open`: same request, on the transient-refusal ladder, so a
+    # server that is momentarily out of descriptors is retried instead of raising. It takes no
+    # flags, because the retry is only ever safe for an open that changes nothing -- an open
+    # that creates or truncates is spelled `open()` and is issued exactly once. On a server
+    # whose refusals carry no message the two behave identically, which is most of them.
+    handle = await sftp.open_for_read(log)
     ranges: dict[int, bytes] = {}
 
     async def fetch(index: int) -> None:

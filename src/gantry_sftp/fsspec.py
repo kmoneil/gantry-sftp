@@ -1028,10 +1028,15 @@ class GantrySFTPFileSystem(
 
         A negative ``start`` or ``end`` is measured back from the end of the file, as in a
         Python slice; resolving one costs the ``FSTAT`` this already performs.
+
+        ``open_for_read`` rather than ``open`` (D-185), so a server that refuses because it is
+        momentarily out of a resource is retried here exactly as it is under ``get()``. It is
+        the read spelling and not a flag: nothing on the write side of this adapter may retry
+        an ``OPEN``.
         """
         remote = self._strip_protocol(path)
         with _translated(remote):
-            handle = self.sftp.open(remote, OpenFlag.READ)
+            handle = self.sftp.open_for_read(remote)
             try:
                 begin, length = _range(self.sftp.fstat(handle), start, end)
                 return b"" if length <= 0 else self.sftp.read_at(handle, begin, length)
@@ -1285,10 +1290,15 @@ class GantrySFTPFile(AbstractBufferedFile):  # type: ignore[misc]  # fsspec ship
         super().__init__(fs, path, *args, **kwargs)
 
     def _read_handle(self) -> bytes:
-        """The read handle, opened once and kept."""
+        """The read handle, opened once and kept.
+
+        ``open_for_read`` rather than ``open`` (D-185): this handle is acquired once and held
+        for the object's lifetime, so a refusal here fails every subsequent block rather than
+        one call, which makes it the read-open in this adapter with the most riding on it.
+        """
         if self._handle is None:
             with _translated(self._remote):
-                self._handle = self._fs.sftp.open(self._remote, OpenFlag.READ)
+                self._handle = self._fs.sftp.open_for_read(self._remote)
         return self._handle
 
     def _fetch_range(self, start: int, end: int) -> bytes:

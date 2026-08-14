@@ -370,8 +370,33 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 40
+SESSION_METHOD_CEILING = 41
 """What `Session` measures today, which is the whole of the rule.
+
+**40 to 41 by D-185**, and it is the raise this docstring's own rule asks to be argued rather
+than taken -- because the card before it hit this same ceiling and answered the opposite way.
+D-30's `open_for_read` fired the ratchet at 41 and moved *off* the class, to
+`session/_transient.py`, where it still is. So the membership question arrives here already
+answered, and the answer is different for a reason that is not convenience: D-30's caller was
+this library, and D-185's is not.
+
+`fsspec.py` holds a read handle for the lifetime of a file object and reaches the session
+**through the blocking portal**. A module-level helper taking an opener and a profile cannot be
+called from there without the adapter reaching past the facade for both -- and the sync surface
+is derived from this class by name (`tests/test_sync_facade.py`), so a blocking spelling exists
+only if an async method does. The thing being added is not an orchestration that drifted onto
+`Session`; it is the *public API* for "open this for reading, and mean it", and a public API is
+what this class is for. The mechanism did not move: the method is one line of forwarding and
+every constant, bound and log field stays in `_transient.py`.
+
+The other two answers were costed and are worse. A `retry_transient=` flag on `open` keeps the
+count and puts a retry knob on the one method that must never grow one -- a caller could pass it
+with `CREAT | TRUNC` -- and flattens the log's operation label, which D-182 added precisely so a
+swallowed refusal names the right request. Routing fsspec through `open_file` keeps the count
+too, and was built before being reverted: the blocking file object is a context manager, fsspec's
+file lifetime is `close()`-driven, and driving one by hand surfaced a `RuntimeError` from
+`__del__` after the portal stops, where the raw handle had degraded quietly to a `StateError`.
+A ceiling raise that is recorded is cheaper than a regression that is not.
 
 **39 to 40 by D-179**, and this is the first raise where the class got *smaller* while the count
 went up -- which is the ratchet measuring a proxy rather than the thing, and worth recording as
