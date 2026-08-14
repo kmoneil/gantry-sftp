@@ -162,7 +162,11 @@ Four things to know about the thread boundary:
   ordinary Python generators, and a generator driven from two threads at once raises
   `ValueError: generator already executing`. Iterate one per thread, or list it first.
 - **Using a session after its block has ended** raises `StateError` naming the block, rather
-  than anyio's complaint about a portal you never asked for.
+  than anyio's complaint about a portal you never asked for. **So do the objects it hands
+  out** — a file from `open_file()` or a scan from `scandir()` that outlives the session says
+  the same thing when you enter it, read from it or advance it. Leaving one's `with` block is
+  the exception and is quiet: the handle went with the connection, so there is nothing to
+  release, and raising on the way out would replace whatever error you were already handling.
 - **`with_reconnect` has no blocking form yet.** It takes a callable that receives a session,
   so a blocking version has to run _your_ function on the portal's thread and therefore needs a
   third thread to re-enter from. That is a mechanism decision rather than a wrapper, and not one
