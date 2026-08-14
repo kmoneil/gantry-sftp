@@ -62,6 +62,7 @@ from gantry_sftp.session import (
     open_session,
     parse_vendor_id,
 )
+from gantry_sftp.session._transient import is_transient_refusal
 from gantry_sftp.transport import open_ssh_transport
 
 pytestmark = pytest.mark.anyio
@@ -1047,6 +1048,33 @@ async def test_the_words_for_an_existing_file_are_the_profiles_evidence(server: 
 
     assert exc.value.message, "the STATUS tail is absent, and D-6's original worry was real"
     assert exc.value.message == EXPECTED_EXCL_TEXT[server.name]
+
+
+async def test_no_servers_word_for_a_taken_name_is_one_this_library_would_retry(
+    server: MatrixServer,
+):
+    """What bounds D-187's retry, asked of every server rather than of the one it was found on.
+
+    ``put``'s staging ``OPEN`` is repeated while the profile says the refusal was transient, and
+    the objection to allowing that was a first attempt which created the file and then refused,
+    leaving the retry to collide with its own leftover. The ladder cannot reach that collision
+    **only because a taken name is refused with a message no profile classifies** -- so it is
+    terminal on sight and the retry never runs.
+
+    The row above pins each server's exact word. This one pins the property those words have to
+    have, which is a different assertion: a profile that grew a marker matching a collision would
+    leave every word unchanged and turn a terminal refusal into three attempts. Asked of the
+    whole matrix because a future profile is a future server, and a guarantee measured against
+    one of them is that one's behaviour rather than a rule.
+    """
+    skip_where_the_handler_is_ours(server)
+    target = server.root / "excl-not-retried.bin"
+    target.write_bytes(b"already here")
+
+    async with connected(server) as sftp:
+        with pytest.raises(ServerError) as exc:
+            _ = await sftp.open(str(target), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL)
+        assert is_transient_refusal(exc.value, sftp.profile) is False
 
 
 async def test_a_failure_tail_is_present_on_every_server_including_the_wrapped_one(

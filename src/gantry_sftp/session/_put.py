@@ -58,7 +58,7 @@ from gantry_sftp.session._publish import (
     UploadResult,
 )
 from gantry_sftp.session._quirks import server_note
-from gantry_sftp.session._transient import is_repeatable_upload_open, with_transient_retry
+from gantry_sftp.session._transient import with_transient_retry
 from gantry_sftp.session._verify import Verify, gate_resume, verify_content
 
 if TYPE_CHECKING:
@@ -205,18 +205,32 @@ async def _confirm_size(session: _SessionOperations, path: bytes, expected: int)
 async def _open_for_upload(
     session: _SessionOperations, path: bytes, pflags: OpenFlag, *, mode: int | None
 ) -> bytes:
-    """``OPEN`` a destination for writing, repeating it only where repeating is sound.
+    """``OPEN`` a destination for writing, repeating it while the server says to.
 
     The upload direction's counterpart to
-    :func:`~gantry_sftp.session._transient.open_for_read`, and the difference between them is
-    the whole of D-30's upload decision:
-    :func:`~gantry_sftp.session._transient.is_repeatable_upload_open` gates on the *flags*, so
-    an exclusive create is issued exactly once and everything else gets the ladder. The
-    argument for why a refusal here is a statement rather than a silence is on that predicate.
+    :func:`~gantry_sftp.session._transient.open_for_read`, and **every** open on this path comes
+    through it -- in place or staged, fresh or resumed, whatever flags the caller's publish
+    policy produced. One helper rather than the ladder at each site, so the retry and the
+    argument for it stay in one place.
 
-    One helper for both call sites rather than a wrapper at each, because the gate and the
-    reason for it are one decision -- and because the staging path picks its flags at runtime,
-    so the site cannot answer the question by inspection.
+    **Why repeating an upload's open is sound, whatever the flags.** The ladder never sees a
+    reply that went missing (:func:`~gantry_sftp.session._transient.is_transient_refusal`
+    re-raises anything that is not a ``ServerError``, a lost reply is a ``TransferTimeoutError``
+    and a dropped link is ``CONNECTION_LOST``), so every refusal reaching here is one the server
+    *chose to send* -- a statement that it did not perform the request. And this path knows what
+    follows its open: it rewrites the file from an offset computed before it, so even a server
+    that truncated and *then* refused leaves a state the retry reproduces.
+
+    **``EXCL`` was excepted from that for one release, and D-187 admitted it.** The objection was
+    that an exclusive create is a claim about a precondition, so a first attempt that created the
+    staging file and then refused would leave the retry colliding with our own orphan. What that
+    argument missed is that the ladder cannot reach the collision: a name that is genuinely taken
+    is refused with a message no profile classifies as transient, so it is terminal on the first
+    sight of it and the caller gets the same ``ServerError`` they got before. The name does not
+    change between attempts either, so such an orphan is exactly where it would have been without
+    the ladder -- and under a journal, at the one name it recorded. The measurement is
+    ``_plans/probes/d187_excl_orphan_probe.py``: under the one condition any profile classifies,
+    the file is not created at all, and the identical open succeeds once a descriptor is freed.
 
     Args:
         session: The live session.
@@ -231,8 +245,6 @@ async def _open_for_upload(
         ServerError: The server's refusal, unchanged -- the last one, where it was retried.
     """
     opening = partial(session.open, path, pflags, mode=mode)
-    if not is_repeatable_upload_open(pflags):
-        return await opening()
     return await with_transient_retry(opening, profile=session.profile, what="put")
 
 
@@ -256,11 +268,11 @@ async def _put_in_place(
     # The sibling refusals in `_upload_resume_offset` are at this same point for the same
     # reason, and a gate that first truncates what it is about to reject is not a gate.
     resume_check = await gate_resume(session, target, upload.local_path, start, upload.verify)
-    # Retried while the server says its refusal was transient (D-30's upload slice). Neither
-    # flag set carries `EXCL`, so repeating reaches the same state even against a server that
-    # truncated and *then* refused: the retry truncates again and this writes the whole file
-    # from `start`. `atomic=False` has already accepted that a failed in-place write leaves a
-    # truncated destination, so the repeat costs this path nothing new.
+    # Retried while the server says its refusal was transient (D-30's upload slice). Repeating
+    # reaches the same state even against a server that truncated and *then* refused: the retry
+    # truncates again and this writes the whole file from `start`. `atomic=False` has already
+    # accepted that a failed in-place write leaves a truncated destination, so the repeat costs
+    # this path nothing new.
     flags = _RESUME_FLAGS if upload.resume else _TRUNCATE_FLAGS
     handle = await _open_for_upload(session, target, flags, mode=create_bits(upload.mode))
     if upload.mode is not None:
@@ -472,10 +484,10 @@ async def _open_staging_file(
     one that does, and the exact bits land on the handle before the publish either way.
     """
     try:
-        # `_RESUME_FLAGS` retries a transient refusal; `_STAGE_FLAGS` does not, because `EXCL`
-        # is a claim the first attempt may already have taken and the retry would collide with
-        # our own orphan. `is_repeatable_upload_open` is what draws that line, and D-187 is the
-        # fresh-name design that would close the gap.
+        # Both flag sets retry a classified refusal, `_STAGE_FLAGS` included since D-187. The
+        # name does not change between attempts, so D-166's one-record-before-the-OPEN ordering
+        # is untouched and a leftover, if a server ever managed to leave one, is at the name the
+        # journal recorded. `_open_for_upload` carries the argument.
         return await _open_for_upload(
             session, staged, _RESUME_FLAGS if resume else _STAGE_FLAGS, mode=mode
         )

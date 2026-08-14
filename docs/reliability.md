@@ -77,7 +77,8 @@ it sounds: without it a busy server could let the transfer succeed and then fail
 file it just delivered, which reads exactly like a corrupt transfer of a file that is correct.
 Nothing is switched on: there is no parameter, and there is nothing to configure.
 
-**Every way of opening a file for reading gets it**, not only the transfers:
+**Every open this library chooses the flags for gets it**, in both directions. Where *you* choose
+them the rule is stricter, and one open refuses the ladder deliberately:
 
 | what you call | retries a transient refusal |
 | --- | --- |
@@ -88,7 +89,7 @@ Nothing is switched on: there is no parameter, and there is nothing to configure
 | the fsspec adapter's `cat_file` and `fs.open(…, "rb")` | yes |
 | `put(…, publish=Publish(atomic=False))` | yes |
 | `put(…, resume=True)`, and `put_tree` / `sync_tree` resuming | yes |
-| `put(…)` — the default atomic publish, first attempt | **no**, see below |
+| `put(…)` — the default atomic publish, and `put_tree` over it | yes |
 | `open(path, pflags)` | **no**, whatever the flags |
 | the compatibility battery's probe | **no**, deliberately |
 
@@ -99,11 +100,11 @@ be willing to make.
 **`open` and `open_file` keep the stricter rule than `put` does, and the difference is knowledge
 rather than caution.** Those two hand you a handle and have no idea what you will do with it, so
 they will not repeat an `OPEN` that changes anything — `open` never retries, and `open_file`
-retries only when the flags you passed mutate nothing. `put` may repeat a truncating open because
-it knows what comes next: it rewrites the whole file from an offset it computed beforehand, so
-the retry lands on the same end state. If you are driving a handle yourself and want that
-guarantee, you are the one who has it — reach for `open_for_read` when you are reading, and retry
-your own write however your application defines "the same state".
+retries only when the flags you passed mutate nothing. `put` may repeat its own opens, truncating
+and exclusive alike, because it knows what comes next: it rewrites the whole file from an offset
+it computed beforehand, so the retry lands on the same end state. If you are driving a handle
+yourself and want that guarantee, you are the one who has it — reach for `open_for_read` when you
+are reading, and retry your own write however your application defines "the same state".
 
 One read-open deliberately never retries — the compatibility battery's. A report that says what a
 server does must not retry until the server behaves, or a server refusing one open in three is
@@ -117,18 +118,22 @@ A server this library has no fingerprint for gets the conservative answer and is
 
 Three limits, each deliberate:
 
-- **Opens only, and only those that can be repeated.** The line is drawn on the `OPEN`'s own
-  flags rather than on the direction, so nothing acquires a retry by being reached from a new
-  place. Reads qualify because they change nothing. An upload's open qualifies for a different
-  reason: it rewrites the file from an offset computed before it, so even a server that
-  truncated and *then* refused leaves a state the retry reproduces.
+- **Opens only, and only those that can be repeated.** The line is drawn on the `OPEN` rather
+  than on the direction, so nothing acquires a retry by being reached from a new place. Reads
+  qualify because they change nothing. An upload's open qualifies for a different reason: it
+  rewrites the file from an offset computed before it, so even a server that truncated and
+  *then* refused leaves a state the retry reproduces.
 
-  **The exception is an exclusive create**, which is what the default atomic publish opens its
-  staging file with. `EXCL` is a claim about a precondition rather than an action: if a first
-  attempt created the file and then refused, a retry collides with our own leftover, and no
-  client can tell its own orphan from somebody else's file. So a fresh atomic `put` gets one
-  attempt and the server's refusal reaches you. `atomic=False` and every `resume=True` upload
-  do get the ladder.
+  **Every upload path is covered, the default atomic publish included.** That last one was the
+  exception for one release, on the argument that its staging file is opened `CREAT|EXCL` — a
+  claim about a precondition rather than an action, so a first attempt that created the file and
+  then refused would leave the retry colliding with our own leftover. It cannot: a name that is
+  genuinely in the way is refused with a message this library does not classify as transient, so
+  it is terminal on the first sight of it and you get the same error you would have got without
+  the ladder. Measured, too — under the condition that *is* classified, the server answers
+  before creating anything, and the identical open succeeds once a descriptor is released. The
+  staging name does not change between attempts, so nothing about the
+  [crash journal](#surviving-the-process-not-just-the-connection) changes either.
 
   **What makes any of this safe is that the ladder never sees a lost reply.** A request that
   goes unanswered raises `TransferTimeoutError` and a dropped link raises `CONNECTION_LOST`;
