@@ -246,10 +246,22 @@ class _SessionCore:
     def profile(self) -> ServerProfile:
         """Which SFTP implementation this looks like, from what it advertised.
 
-        Identification only: nothing in the library changes behaviour based on it, and
-        :mod:`gantry_sftp.session._quirks` explains why that bound is deliberate. Useful for
-        a log line, a bug report, and for a caller who *does* want to special-case a server
-        and would otherwise fingerprint it themselves, worse.
+        Useful for a log line, a bug report, and for a caller who *does* want to special-case
+        a server and would otherwise fingerprint it themselves, worse.
+
+        **Almost identification only, and the exception is one field.** This used to say
+        "nothing in the library changes behaviour based on it", which stopped being true when
+        D-30 shipped and was not corrected then; the same sentence was found in DESIGN.md and
+        struck at the same time. What changed: ``transient_messages`` decides whether a
+        ``FAILURE`` whose text this server's profile classifies causes an ``OPEN`` to be
+        *repeated* -- same request, same session, three attempts. Only asyncssh carries
+        markers, and a server this library has no fingerprint for carries none.
+
+        The bound that matters survives, which is why the correction is narrow: a profile
+        still cannot change how a reply is *read*. The mechanism repeats a request and never
+        reinterprets one, so a wrong guess costs attempts and raises the server's own error
+        unchanged rather than producing a wrong answer in a file.
+        :mod:`gantry_sftp.session._quirks` explains why that bound is deliberate.
         """
         return self._profile
 
