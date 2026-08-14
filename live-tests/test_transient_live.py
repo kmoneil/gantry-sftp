@@ -363,29 +363,24 @@ def test_an_in_place_upload_survives_the_shortage_that_used_to_kill_it(
                 sftp.close(handle)
 
 
-def test_an_atomic_upload_still_fails_on_the_same_shortage(
+def test_the_default_atomic_upload_survives_the_same_shortage(
     asyncssh_under_a_descriptor_limit: tuple[object, Path], tmp_path: Path
 ):
-    """The asymmetry, measured rather than only documented.
+    """D-187, and the upload almost everybody performs.
 
-    The staging open carries `EXCL`, which is a claim about a precondition rather than an
-    action: had the first attempt created the file and then refused, a retry would collide with
-    our own orphan and no client can tell that from somebody else's file. So this path is
-    issued once and the refusal reaches the caller.
+    This row asserted the opposite for one release: the staging open carries `EXCL`, and the
+    argument was that a first attempt which created the file and then refused would leave the
+    retry colliding with our own orphan. Both halves of that are answered by the two rows below
+    -- the file is not created, and a genuine collision is refused with a message this library
+    does not classify, so the ladder cannot loop on one.
 
-    **The descriptors are released on a timer, and that is what makes this row discriminate.**
-    The first draft simply left the server exhausted and asserted that the upload failed -- which
-    it does whether or not the gate exists, because a retried open against a *permanently* full
-    server exhausts its attempts and raises anyway. It passed with the gate deleted. Releasing
-    on the same schedule the row above uses puts the two paths in the identical situation, so
-    what is being asserted is the *asymmetry* rather than a failure: same server, same moment,
-    in-place succeeds and atomic does not.
-
-    It is what D-187 will delete when it closes.
+    **The descriptors are released on a timer**, exactly as the in-place row above does it, so
+    the two paths are in the identical situation. Before this card, in-place succeeded here and
+    the default did not.
     """
     transport, root = asyncssh_under_a_descriptor_limit
     source = tmp_path / "payload"
-    source.write_bytes(b"bytes")
+    source.write_bytes(b"bytes that must arrive even when the server is busy" * 100)
 
     with open_session(transport) as sftp:  # type: ignore[arg-type]  # fixture yields a transport
         handles, _ = exhaust(sftp, root)
@@ -397,17 +392,50 @@ def test_an_atomic_upload_still_fails_on_the_same_shortage(
         timer = threading.Timer(0.4, release)
         timer.start()
         try:
-            with pytest.raises(ServerError) as raised:
-                sftp.put(source, str(root / "atomic").encode())
-            assert is_transient_refusal(raised.value, sftp.profile), (
-                "the refusal really is the classified one -- otherwise this row would pass for "
-                "an unrelated reason and say nothing about the gate"
-            )
+            target = root / "atomic"
+            result = sftp.put(source, str(target).encode())
+            assert target.read_bytes() == source.read_bytes()
+            assert result.staged_at is not None, "it really did go through the staged path"
         finally:
             timer.cancel()
             timer.join()
             for handle in handles[:-2]:
                 sftp.close(handle)
+
+
+def test_a_refused_exclusive_create_does_not_leave_the_file_behind(
+    asyncssh_under_a_descriptor_limit: tuple[object, Path],
+):
+    """The measurement D-187 rests on, and it is a claim about a server rather than about us.
+
+    The objection to retrying a staging open was that the first attempt might have created the
+    file before refusing. Under the one condition any profile here classifies as transient it
+    does not: `open(2)` answers `EMFILE` before it creates anything, so there is no orphan for
+    the retry to collide with. Asserted rather than reasoned, because "a refusal creates
+    nothing" is a property of somebody else's error path and could change under us.
+    """
+    transport, root = asyncssh_under_a_descriptor_limit
+    staging = root / ".payload.deadbeef.part"
+
+    with open_session(transport) as sftp:  # type: ignore[arg-type]  # fixture yields a transport
+        handles, _ = exhaust(sftp, root)
+        try:
+            with pytest.raises(ServerError) as raised:
+                sftp.open(str(staging).encode(), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL)
+            assert is_transient_refusal(raised.value, sftp.profile), (
+                "the refusal really is the classified one -- otherwise this row would say "
+                "nothing about the condition the retry exists for"
+            )
+            assert not staging.exists(), "a refused exclusive create left the file behind"
+        finally:
+            for handle in handles:
+                sftp.close(handle)
+
+
+# The other half of D-187's bound -- that a name genuinely taken is refused with a word this
+# library will *not* retry, so the ladder cannot spin on a collision -- is asked of every server
+# in `test_matrix.py` rather than of this one. A guarantee written against a single server is
+# that server's behaviour wearing a contract's authority (D-114).
 
 
 def test_the_reference_server_produces_the_same_condition_and_says_nothing_about_it(

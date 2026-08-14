@@ -35,13 +35,24 @@ of the design are load-bearing:
   **This is the distinction that kept the upload side out for two releases**, and it was a
   category error rather than a bound: "a ``WRITE`` whose reply was lost may or may not have
   landed" is true and is about the other mechanism. What an upload's ``OPEN`` needs from this
-  one is only that repeating it reaches the same state, which depends on its *flags* --
-  :func:`is_repeatable_upload_open`. The one flag that fails it is ``EXCL``, because an
-  exclusive create is a claim about a precondition the first attempt may have taken.
+  one is only that repeating it reaches the same state, and every set of flags the upload path
+  opens with does -- it rewrites the file from an offset computed before the open, so even a
+  server that truncated and *then* refused leaves a state the retry reproduces.
 
-  Two predicates, deliberately, and they are not interchangeable:
-  :func:`is_repeatable_open` is asked of the *caller's* flags on ``open_file``, where nothing
-  knows what happens next, so it admits only an open that mutates nothing.
+  ``EXCL`` was held back from that for one release and is admitted by D-187, because the
+  argument against it was about a case the ladder cannot reach. An exclusive create is a claim
+  about a precondition, so a first attempt that created the file and then refused would leave the
+  retry colliding with our own orphan -- but a collision is refused with a message no profile
+  classifies (``File exists`` on the one server that explains itself at all), so it is terminal
+  on the first sight of it. The retry cannot loop on one and cannot turn one into anything but
+  the raise that happened without it. Measured rather than reasoned:
+  ``_plans/probes/d187_excl_orphan_probe.py`` finds the file is not created at all under the
+  condition this classifies, and the identical open succeeds once a descriptor is released.
+
+  :func:`is_repeatable_open` is a separate predicate and stays that way. It is asked of the
+  *caller's* flags on ``open_file``, where nothing knows what happens next, so it admits only an
+  open that mutates nothing -- a stricter rule for a surface with less information, not an
+  older version of the same one.
 """
 
 from __future__ import annotations
@@ -61,7 +72,6 @@ __all__ = [
     "TRANSIENT_BACKOFF",
     "TRANSIENT_BACKOFF_MAX",
     "is_repeatable_open",
-    "is_repeatable_upload_open",
     "is_transient_refusal",
     "open_for_read",
     "with_transient_retry",
@@ -147,7 +157,9 @@ async def open_for_read(
     **Repeating an ``OPEN`` for reading is safe**, and that is what bounds this to reads. It
     acquires no exclusive claim, creates nothing and truncates nothing; an attempt whose reply
     was lost leaks a handle the reaper already owns (D-75). The upload side's ``WRITE`` has none
-    of those properties and deliberately does not call this.
+    of those properties, so it does not come through here -- it retries too, on a different
+    argument its own opener carries (``_put._open_for_upload``), which is why this signature
+    hard-codes ``READ`` instead of growing a flags parameter that would erase the distinction.
 
     **One read-open deliberately does not retry at all** (D-182), because "everything that opens
     for reading" would be the wrong rule: ``compatibility.py``'s probe must report what the
@@ -204,48 +216,6 @@ def is_repeatable_open(pflags: OpenFlag) -> bool:
     return not int(pflags) & ~int(REPEATABLE_FLAGS)
 
 
-def is_repeatable_upload_open(pflags: OpenFlag) -> bool:
-    """Whether an upload's ``OPEN`` may be repeated after the server *refused* it.
-
-    A second predicate rather than a widening of :func:`is_repeatable_open`, because it answers
-    a different question on weaker premises, and the two must not be confused:
-
-    * :func:`is_repeatable_open` asks *does repeating this change anything*. It is asked of
-      **caller-supplied** flags on ``open_file``, where nothing knows what the caller will do
-      with the handle next, so it admits only an open that mutates nothing.
-    * this one asks *will repeating this reach the same state*. It is sound only because the
-      upload path knows what happens next: it rewrites the file from an offset it computed
-      before the open.
-
-    So a ``TRUNC`` is repeatable here and not there. Even against a server that truncated and
-    *then* refused, the retry truncates again and the upload writes the whole file, so the end
-    state matches a clean first attempt -- and ``atomic=False`` already documents that a failed
-    in-place write leaves a truncated destination, so this costs that path nothing it has not
-    accepted.
-
-    **``EXCL`` is the one flag that is neither, and the reason is structural.** It is the only
-    flag that makes an ``OPEN`` a *claim about a precondition* rather than an action. If the
-    first attempt created the file and then refused, the retry's ``EXCL`` fails on our own
-    orphan -- and no client can tell its own orphan from somebody else's file. The fix is a
-    fresh staging name per attempt, which lands inside D-166's journal ordering and is D-187
-    rather than a line here.
-
-    **What makes any of this safe is upstream of the flags** (D-30): this ladder never sees a
-    reply that went missing. :func:`is_transient_refusal` re-raises anything that is not a
-    :class:`~gantry_sftp.exceptions.ServerError`, and a lost reply is a
-    :class:`~gantry_sftp.exceptions.TransferTimeoutError` while a dropped link is
-    ``CONNECTION_LOST``. Every refusal reaching here is one the server *chose to send*, so it
-    is a statement that the request was not performed rather than an absence of one.
-
-    Args:
-        pflags: The flags the upload path is opening with.
-
-    Returns:
-        Whether the retry ladder may repeat this open.
-    """
-    return not pflags & OpenFlag.EXCL
-
-
 def is_transient_refusal(error: BaseException, profile: ServerProfile) -> bool:
     """Whether ``error`` is a refusal ``profile`` says will pass on its own.
 
@@ -284,8 +254,13 @@ async def with_transient_retry[T](
 ) -> T:
     """Run ``request``, repeating it while the server says its refusal was transient.
 
-    The request must be safe to issue more than once. Every caller today is an ``OPEN`` for
-    reading, which is; nothing here makes an unsafe one safe.
+    The request must be safe to issue more than once, and **nothing here makes an unsafe one
+    safe** -- that judgement belongs to the caller, which is the only code that knows what
+    follows its own request. Every caller today is an ``OPEN``: for reading, where repeating
+    acquires nothing and changes nothing, or one of the upload path's, where the argument is
+    that the same file is rewritten from an offset computed beforehand. This sentence said
+    *"every caller today is an ``OPEN`` for reading"* until D-187, and D-30's upload slice had
+    already made that false.
 
     Args:
         request: Zero-argument callable issuing the request, awaited once per attempt.

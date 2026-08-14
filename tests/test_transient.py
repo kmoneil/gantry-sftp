@@ -41,7 +41,6 @@ from gantry_sftp.session._transient import (
     TRANSIENT_BACKOFF,
     TRANSIENT_BACKOFF_MAX,
     is_repeatable_open,
-    is_repeatable_upload_open,
     is_transient_refusal,
     open_for_read,
     with_transient_retry,
@@ -578,48 +577,24 @@ async def test_a_lost_reply_is_not_a_refusal_and_never_reaches_the_ladder():
         OpenFlag.WRITE | OpenFlag.CREAT,
         OpenFlag.WRITE,
         OpenFlag.WRITE | OpenFlag.APPEND,
-        OpenFlag.READ,
-    ],
-    ids=["truncate", "resume", "write", "append", "read"],
-)
-async def test_an_upload_open_without_an_exclusive_claim_may_be_repeated(pflags: OpenFlag):
-    """``TRUNC`` is repeatable *here* and not on ``open_file``, which is the point of two rules.
-
-    The upload path knows what follows its open -- it rewrites the file from an offset computed
-    before it -- so even a server that truncated and then refused leaves a state the retry
-    reproduces. ``open_file`` does not know that about its caller, so it keeps the stricter rule.
-    """
-    assert is_repeatable_upload_open(pflags) is True
-
-
-@pytest.mark.parametrize(
-    "pflags",
-    [
         OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL,
-        OpenFlag.EXCL,
         OpenFlag.READ | OpenFlag.EXCL,
     ],
-    ids=["staging", "excl-alone", "read-excl"],
+    ids=["truncate", "resume", "write", "append", "staging", "read-excl"],
 )
-async def test_an_exclusive_create_is_issued_once_however_it_is_spelled(pflags: OpenFlag):
-    """``EXCL`` is a claim about a precondition, not an action, so a repeat is not a repeat.
+async def test_open_file_still_refuses_to_repeat_any_mutating_open(pflags: OpenFlag):
+    """The half of the old two-predicate pair that survives, and what it is guarding.
 
-    If the first attempt created the file and then refused, the second collides with our own
-    orphan and no client can tell that from somebody else's file. D-187 is the fresh-name design.
+    ``is_repeatable_upload_open`` is gone (D-187): every flag set ``put`` opens with is
+    repeatable, so a predicate that could not say no was a guard that had stopped guarding.
+    ``is_repeatable_open`` is **not** that rule under another name and must not be widened to
+    match. It is asked of *caller-supplied* flags on ``open_file``, where nothing knows what the
+    caller does with the handle next, so it admits only an open that mutates nothing -- three of
+    these are flag sets ``put`` now repeats on its own knowledge of what follows, and this rule
+    refuses them anyway. ``READ | EXCL`` is the one that pins it is about the mutating bits
+    rather than about ``READ`` being present.
     """
-    assert is_repeatable_upload_open(pflags) is False
-
-
-async def test_the_two_repeatability_rules_disagree_and_that_is_deliberate():
-    """A guard against the two predicates being 'simplified' into one later.
-
-    They answer different questions on different premises: one is asked of caller-supplied
-    flags where nothing knows what happens next, the other of the upload path's own flags where
-    it does. ``CREAT | TRUNC`` is exactly where they must differ.
-    """
-    truncating = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
-    assert is_repeatable_open(truncating) is False, "open_file must not repeat a truncation"
-    assert is_repeatable_upload_open(truncating) is True, "put may, and for a stated reason"
+    assert is_repeatable_open(pflags) is False
 
 
 async def test_a_bit_this_protocol_version_does_not_define_is_not_repeatable():
@@ -699,20 +674,25 @@ async def test_the_public_read_open_returns_a_handle_a_real_server_will_read(tmp
             await sftp.close(handle)
 
 
-async def _refusing_once(sftp, monkeypatch: pytest.MonkeyPatch) -> list[OpenFlag]:  # type: ignore[no-untyped-def]
-    """Make the session's first ``OPEN`` a transient refusal, and record the flags of each.
+async def _refusing_once(sftp, monkeypatch: pytest.MonkeyPatch) -> list[tuple[bytes, OpenFlag]]:  # type: ignore[no-untyped-def]
+    """Make the session's first ``OPEN`` a transient refusal, recording the path and flags.
 
     Injected rather than provoked, and against a *real* ``sftp-server`` rather than a fake: what
     is under test is the wire from ``_put.py``, and every unit row of the helper stays green if
     that wire is removed. The live lane proves the same path against a server genuinely out of
     descriptors; this one runs in ``fast``.
+
+    **The path is recorded as well as the flags, and that is D-187 rather than thoroughness.**
+    Retrying the staging open is sound because the attempts share one name -- one journal record,
+    one place a leftover can be -- so a row asserting only the flags would stay green against the
+    fresh-name-per-attempt design this library deliberately does not have.
     """
     monkeypatch.setattr(sftp, "_profile", ASYNCSSH)
-    asked: list[OpenFlag] = []
+    asked: list[tuple[bytes, OpenFlag]] = []
     real = sftp.open
 
     async def spy(path, pflags=OpenFlag.READ, *, mode=None):  # type: ignore[no-untyped-def]
-        asked.append(pflags)
+        asked.append((path, pflags))
         if len(asked) == 1:
             raise refusal(EXHAUSTED)
         return await real(path, pflags, mode=mode)
@@ -745,24 +725,61 @@ async def test_an_in_place_upload_retries_its_open(
 
     assert target.read_bytes() == source.read_bytes()
     assert result.transferred == source.stat().st_size
-    assert asked == [OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC] * 2, (
-        "the in-place open was retried, with the same flags both times"
+    in_place = (str(target).encode(), OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC)
+    assert asked == [in_place] * 2, (
+        "the in-place open was retried, at the same destination and with the same flags"
     )
     record = next(r for r in caplog.records if r.levelno == logging.WARNING)
     assert getattr(record, LOG_FIELDS)["operation"] == "put"
 
 
-async def test_an_atomic_uploads_staging_open_is_issued_exactly_once(
+async def test_an_atomic_uploads_staging_open_is_retried_at_the_same_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-    """The asymmetry, from the side that has to stay refused.
+    """D-187: the default publish, which is the upload almost everybody performs.
 
-    ``EXCL`` is a claim about a precondition rather than an action: if the first attempt created
-    the staging file and then refused, a retry collides with our own orphan and no client can
-    tell that from somebody else's file. So the default atomic publish does **not** get the
-    ladder, and the server's refusal reaches the caller -- which is a worse outcome than a
-    retry and a better one than a wrong file. D-187 is the fresh-name design that closes it.
+    This row asserted the opposite for one release -- exactly one attempt, on the argument that
+    a retry might collide with an orphan the first attempt created. It is the *same name* both
+    times, which is what keeps D-166's one-record-before-the-OPEN ordering untouched, and it is
+    the flags that carry ``EXCL``, which is what the old rule refused.
     """
+    needs_real_server()
+    source = tmp_path / "payload"
+    _ = source.write_bytes(b"the bytes that must arrive")
+    target = tmp_path / "arrived"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        asked = await _refusing_once(sftp, monkeypatch)
+        result = await sftp.put(source, str(target).encode())
+
+    assert target.read_bytes() == source.read_bytes()
+    assert result.staged_at is not None, "it really did go through the staged path"
+    assert asked == [(result.staged_at, OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL)] * 2, (
+        "the staging open was retried at the same generated name, with the same flags -- the "
+        "name is the half a fresh-name-per-attempt design would change"
+    )
+
+
+async def test_a_collision_is_not_classified_so_the_staging_retry_cannot_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Why admitting ``EXCL`` to the ladder is bounded rather than merely bounded-by-three.
+
+    The objection to retrying an exclusive create was that a first attempt which created the
+    file and then refused leaves the second colliding with our own orphan. The ladder cannot
+    reach that collision: a name genuinely in the way is refused with a message no profile
+    classifies, so it is terminal on sight and ``put`` issues exactly one attempt -- the
+    behaviour the whole path had before D-187, kept for the case it was written for.
+
+    ``File exists`` is asyncssh's text, and that it really says it is
+    ``live-tests/test_transient_live.py``'s to prove; what is pinned here is that this library
+    does not treat it as transient.
+    """
+    assert is_transient_refusal(refusal(b"File exists"), ASYNCSSH) is False
+
     needs_real_server()
     source = tmp_path / "payload"
     _ = source.write_bytes(b"bytes")
@@ -771,13 +788,23 @@ async def test_an_atomic_uploads_staging_open_is_issued_exactly_once(
         open_local_server_transport(cwd=tmp_path) as transport,
         open_session(transport) as sftp,
     ):
-        asked = await _refusing_once(sftp, monkeypatch)
+        monkeypatch.setattr(sftp, "_profile", ASYNCSSH)
+        asked: list[OpenFlag] = []
+        real = sftp.open
+
+        async def colliding(path, pflags=OpenFlag.READ, *, mode=None):  # type: ignore[no-untyped-def]
+            asked.append(pflags)
+            if pflags & OpenFlag.EXCL:
+                raise refusal(b"File exists")
+            return await real(path, pflags, mode=mode)
+
+        monkeypatch.setattr(sftp, "open", colliding)
         with pytest.raises(ServerError) as raised:
             _ = await sftp.put(source, str(tmp_path / "arrived").encode())
 
-    assert raised.value.message == EXHAUSTED, "the server's own refusal, unchanged"
+    assert raised.value.message == b"File exists", "the server's own refusal, unchanged"
     assert asked == [OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.EXCL], (
-        "exactly one attempt: an exclusive create is never repeated"
+        "exactly one attempt: a collision is terminal, so the ladder never runs"
     )
 
 
