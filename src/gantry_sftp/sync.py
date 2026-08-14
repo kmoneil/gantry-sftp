@@ -577,6 +577,10 @@ class SyncSession:
         """Open a file and return its handle."""
         return self._run(partial(self._session.open, path, pflags, mode=mode))
 
+    def open_for_read(self, path: bytes | str) -> bytes:
+        """Open a file for reading, repeating the ``OPEN`` if the server says to."""
+        return self._run(partial(self._session.open_for_read, path))
+
     def readinto_at(self, handle: bytes, buffer: bytearray | memoryview, offset: int) -> int:
         """Read ``len(buffer)`` bytes from ``offset`` into ``buffer``. The zero-copy primitive."""
         return self._run(partial(self._session.readinto_at, handle, buffer, offset))

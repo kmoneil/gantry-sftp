@@ -27,6 +27,9 @@ of the design are load-bearing:
 * **Only the caller's own read side uses it.** A ``WRITE`` whose reply was lost may or may not
   have landed, so re-sending at the same offset is idempotent only on a server that behaves like
   a filesystem. That decision is deliberately not made here; the upload path does not call this.
+  Where the flags are the *caller's* rather than ours -- ``open_file`` and everything built on
+  it -- that boundary is a predicate rather than a convention, and it is
+  :func:`is_repeatable_open`.
 """
 
 from __future__ import annotations
@@ -41,13 +44,29 @@ from gantry_sftp.exceptions import ServerError
 from gantry_sftp.session._quirks import ServerProfile
 
 __all__ = [
+    "REPEATABLE_FLAGS",
     "TRANSIENT_ATTEMPTS",
     "TRANSIENT_BACKOFF",
     "TRANSIENT_BACKOFF_MAX",
+    "is_repeatable_open",
     "is_transient_refusal",
     "open_for_read",
     "with_transient_retry",
 ]
+
+REPEATABLE_FLAGS = OpenFlag.READ
+"""The only ``pflags`` bit whose presence leaves an ``OPEN`` safe to issue twice.
+
+Stated as what may be set rather than as what may not, and the difference is not stylistic.
+``WRITE``, ``APPEND``, ``CREAT``, ``TRUNC`` and ``EXCL`` are the five that change something
+today, so the two spellings agree on every flag v3 defines -- but they disagree on a bit v3 does
+not, and they disagree in opposite directions. An allowlist refuses it; a denylist of the five
+admits it, and ``~OpenFlag.READ`` is a denylist however it reads, because ``IntFlag`` inverts
+over its *defined* members and yields exactly those five.
+
+The failure directions are not symmetric, which is what settles it: too narrow costs a retry
+nobody notices, too wide replays an ``OPEN`` that may have truncated a file.
+"""
 
 TRANSIENT_ATTEMPTS = 3
 """Total tries, not retries: one attempt and two more after it.
@@ -86,16 +105,25 @@ async def open_for_read(
 ) -> bytes:
     """``OPEN`` for reading, repeated while the server says its refusal was transient.
 
-    Every read-open on a path a caller asked about goes through here: a download's concurrent
-    ``STAT``/``OPEN`` pair, its resume path, and both verification rungs. ``get_tree`` needs no
+    Every read-open this library issues *on flags of its own choosing* goes through here: a
+    download's concurrent ``STAT``/``OPEN`` pair, its resume path, both verification rungs, and
+    :meth:`~gantry_sftp.session.Session.open_for_read`, which is this function with a session
+    bound and the only spelling of it a caller outside the library has. ``get_tree`` needs no
     wiring of its own because it transfers by calling ``get`` per file.
 
-    **It lives here rather than on ``Session`` deliberately.** The class is under a method
-    ceiling that ``tests/test_layer_discipline.py`` enforces, and that rule's own advice is that
-    an orchestration belongs beside the responsibility it orchestrates. This module is that
-    responsibility, so the retry's mechanism and its applications stay together and ``Session``
-    stays the size it was. The opener is passed in rather than the session, which also keeps this
-    importable by the module ``Session`` itself imports.
+    The one place that opens on flags the *caller* chose is
+    :meth:`~gantry_sftp.session.RemoteFile.__aenter__`, which reaches
+    :func:`with_transient_retry` directly under :func:`is_repeatable_open` rather than coming
+    through here -- this function's whole signature is the assertion that the flags are ``READ``,
+    and a variant taking them as an argument would be that assertion deleted (D-185).
+
+    **The mechanism lives here rather than on ``Session`` deliberately**, and the public method
+    above does not contradict that. ``Session`` is under a method ceiling that
+    ``tests/test_layer_discipline.py`` enforces, whose advice is that an orchestration belongs
+    beside the responsibility it orchestrates; this module is that responsibility, so the retry,
+    its bound, its classifier and its log record stay together and the method on the class is
+    one line of forwarding. The opener is passed in rather than the session, which also keeps
+    this importable by the module ``Session`` itself imports.
 
     **Why the open and not the read.** The condition that made this buildable is descriptor
     exhaustion, and a ``READ`` runs against a descriptor the server already holds -- it cannot
@@ -108,11 +136,18 @@ async def open_for_read(
     was lost leaks a handle the reaper already owns (D-75). The upload side's ``WRITE`` has none
     of those properties and deliberately does not call this.
 
-    **Two read-opens deliberately do not come here** (D-182), because "everything that opens for
-    reading" would be the wrong rule. ``compatibility.py``'s probe must report what the server
-    did, since retrying would paper over the behaviour the battery exists to observe; and
-    ``fsspec.py``'s two opens reach the session through the blocking portal, which is its own
-    change rather than a call this signature can absorb.
+    **One read-open deliberately does not retry at all** (D-182), because "everything that opens
+    for reading" would be the wrong rule: ``compatibility.py``'s probe must report what the
+    server did, since retrying would paper over the behaviour the battery exists to observe. It
+    calls :meth:`~gantry_sftp.session.Session.open` directly, so that stays true without an
+    opt-out anybody has to remember -- and it says so at the site, because a missing retry is
+    invisible.
+
+    ``fsspec.py``'s two were the other exception and are not one any more (D-185). They reach
+    the session through the blocking portal, which this signature cannot cross -- so the
+    crossing is made once, by :meth:`~gantry_sftp.session.Session.open_for_read` and the twin
+    the portal derives from it, rather than by the adapter reaching past the facade for a
+    profile and a private ``_run``.
 
     Args:
         opener: The session's ``open``, bound.
@@ -132,6 +167,28 @@ async def open_for_read(
     return await with_transient_retry(
         lambda: opener(path, OpenFlag.READ), profile=profile, what=what
     )
+
+
+def is_repeatable_open(pflags: OpenFlag) -> bool:
+    """Whether an ``OPEN`` with these flags is safe to issue more than once.
+
+    The property is *acquires no exclusive claim, creates nothing, truncates nothing* -- which
+    is a statement about the mutating bits and not about ``READ`` being present. ``OpenFlag(0)``
+    is a legal thing to pass and a degenerate open that servers refuse; repeating it is as safe
+    as repeating a read, so an equality test against ``READ`` would classify it as a write.
+
+    Compared as plain integers rather than with :class:`~gantry_sftp.codec.OpenFlag`'s own
+    inversion, because ``~OpenFlag.READ`` is bounded to the members the enum defines and lets an
+    undefined bit through as repeatable. A bit v3 does not define is a caller error either way;
+    it costs nothing to have it fall on the safe side of one.
+
+    Args:
+        pflags: The flags the caller asked to open with.
+
+    Returns:
+        Whether the retry ladder may repeat this open.
+    """
+    return not int(pflags) & ~int(REPEATABLE_FLAGS)
 
 
 def is_transient_refusal(error: BaseException, profile: ServerProfile) -> bool:

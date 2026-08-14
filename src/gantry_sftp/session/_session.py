@@ -38,6 +38,7 @@ from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, overload, override
@@ -184,7 +185,11 @@ from gantry_sftp.session._sync import (
     prepare_manifest,
     summarise,
 )
-from gantry_sftp.session._transient import open_for_read
+from gantry_sftp.session._transient import (
+    is_repeatable_open,
+    open_for_read,
+    with_transient_retry,
+)
 from gantry_sftp.session._verify import (
     Verify,
     gate_resume,
@@ -491,6 +496,13 @@ class RemoteFile:
     async def __aenter__(self) -> RemoteFile:
         """Open the file.
 
+        **A read-only open is repeated when the server says its refusal was transient** (D-185),
+        on the same ladder :meth:`Session.get` uses, so a busy server is not a different failure
+        depending on which surface asked. The gate is :func:`~gantry_sftp.session._transient
+        .is_repeatable_open` and it is on the *flags*: an open carrying ``WRITE``, ``CREAT``,
+        ``TRUNC``, ``APPEND`` or ``EXCL`` may have landed before the reply was lost, so it is
+        issued exactly once, whatever the server says about why it refused.
+
         Raises:
             StateError: If this object has already been entered. One file object is one
                 handle; a second ``async with`` would silently reopen at position zero.
@@ -500,7 +512,12 @@ class RemoteFile:
         if self._entered:
             raise StateError("this open_file() has already been used; call open_file() again")
         self._entered = True
-        self._handle = await self._session.open(self._path, self._pflags, mode=self._mode)
+        opening = partial(self._session.open, self._path, self._pflags, mode=self._mode)
+        self._handle = (
+            await with_transient_retry(opening, profile=self._session.profile, what="open_file")
+            if is_repeatable_open(self._pflags)
+            else await opening()
+        )
         return self
 
     async def __aexit__(
@@ -1091,6 +1108,45 @@ class Session(_SessionOperations):
         )
         refusal.add_note(self._server_note())
         raise refusal
+
+    async def open_for_read(self, path: bytes | str) -> bytes:
+        """Open a file for reading, repeating the ``OPEN`` if the server says to.
+
+        :meth:`open` issues exactly one request whatever the answer. This one runs the same
+        ladder :meth:`get` uses: on a server whose refusals carry a ``strerror`` and whose
+        profile classifies the message as transient -- descriptor exhaustion is the measured
+        case -- the identical request is tried up to
+        :data:`~gantry_sftp.session._transient.TRANSIENT_ATTEMPTS` times with a short doubling
+        delay, and any other refusal is raised on the first attempt, unchanged. On a server
+        whose message for every condition is the same word, nothing is ever retried, which is
+        most of them::
+
+            handle = await sftp.open_for_read(b"/incoming/report.csv")
+
+        **Reading is the whole of it, and the signature is the reason.** Repeating an ``OPEN``
+        for reading acquires no exclusive claim, creates nothing and truncates nothing, so a
+        second attempt is free of consequence; a ``WRITE``-flagged open has none of those
+        properties, and a reply that was lost may or may not have landed. There is no ``pflags``
+        argument here because there is no flag whose retry this method would be willing to
+        make -- an open that changes something is spelled :meth:`open` and issued once.
+
+        Reach for it where a caller holds the handle itself: the whole-file transfers,
+        :meth:`open_file` and :class:`~gantry_sftp.path.SFTPPath` already retry their own opens
+        and need nothing from here. The one caller in this distribution that does is the fsspec
+        adapter, which holds a handle for the lifetime of a file object (D-185).
+
+        Args:
+            path: What to open, resolved against the working directory as everywhere else.
+
+        Returns:
+            The handle.
+
+        Raises:
+            NoSuchFileError: If the path does not exist.
+            PermissionDeniedError: If the server will not open it.
+            ServerError: For any other refusal, including a transient one that never cleared.
+        """
+        return await open_for_read(self.open, self._resolve(path), self._profile, what="open")
 
     def open_file(
         self, path: bytes | str, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None

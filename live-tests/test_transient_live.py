@@ -252,6 +252,78 @@ def test_a_verified_download_survives_the_shortage_that_used_to_fail_it_after_tr
                 sftp.close(handle)
 
 
+def test_the_file_object_survives_the_shortage_that_the_transfers_already_did(
+    asyncssh_under_a_descriptor_limit: tuple[object, Path],
+):
+    """D-185, and the surface D-182's sweep could not see.
+
+    ``open_file`` opens with the flags its *caller* passed, held in a variable whose default is
+    ``READ`` -- so the sweep that counted read-opens by their ``OpenFlag.READ`` literal reached
+    the five it knew about and not this one. Before this card, ``get()`` recovered from a busy
+    server and ``with sftp.open_file(...)`` raised, on the same connection, in the same second.
+
+    The same shape as the two rows above on purpose: the shortage is relieved from outside the
+    call, which is what a concurrent sibling finishing does.
+    """
+    transport, root = asyncssh_under_a_descriptor_limit
+    source = root / "streamed"
+    source.write_bytes(b"bytes read through the cursor" * 100)
+
+    with open_session(transport) as sftp:  # type: ignore[arg-type]  # fixture yields a transport
+        handles, _ = exhaust(sftp, root)
+
+        def release() -> None:
+            for handle in handles[-2:]:
+                sftp.close(handle)
+
+        timer = threading.Timer(0.4, release)
+        timer.start()
+        try:
+            with sftp.open_file(str(source).encode()) as remote:
+                assert remote.read(29) == b"bytes read through the cursor"
+        finally:
+            timer.cancel()
+            timer.join()
+            for handle in handles[:-2]:
+                sftp.close(handle)
+
+
+def test_the_public_read_open_survives_the_shortage_through_the_portal(
+    asyncssh_under_a_descriptor_limit: tuple[object, Path],
+):
+    """The spelling the fsspec adapter calls, against a server that is genuinely out (D-185).
+
+    ``sftp`` here *is* a :class:`~gantry_sftp.sync.SyncSession`, so this is the blocking half
+    end to end -- the retry, its ``anyio.sleep`` and its log record all run on the portal's
+    thread while this one blocks. ``tests/test_fsspec.py`` pins that the adapter asks for this
+    spelling; what cannot be shown there is that the spelling survives a real refusal.
+    """
+    transport, root = asyncssh_under_a_descriptor_limit
+    source = root / "read-open"
+    source.write_bytes(b"payload")
+
+    with open_session(transport) as sftp:  # type: ignore[arg-type]  # fixture yields a transport
+        handles, _ = exhaust(sftp, root)
+
+        def release() -> None:
+            for handle in handles[-2:]:
+                sftp.close(handle)
+
+        timer = threading.Timer(0.4, release)
+        timer.start()
+        try:
+            opened = sftp.open_for_read(str(source).encode())
+            try:
+                assert sftp.read_at(opened, 0, 7) == b"payload"
+            finally:
+                sftp.close(opened)
+        finally:
+            timer.cancel()
+            timer.join()
+            for handle in handles[:-2]:
+                sftp.close(handle)
+
+
 def test_the_reference_server_produces_the_same_condition_and_says_nothing_about_it(
     tmp_path: Path,
 ):

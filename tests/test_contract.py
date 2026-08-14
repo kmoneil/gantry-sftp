@@ -68,6 +68,8 @@ UNVERIFIABLE: dict[str, str] = {
         "implements the versions it implements and cannot be asked for another"
     ),
     "Recipe": "a script of failures for the retry ladder, not a server",
+    "_RefusingOnce": "refuses its first OPEN and answers the second, on demand",
+    "_FileSession": "refuses a chosen number of opens and answers the rest, on demand",
     "Wire": "a transport-level fake, below the protocol entirely",
     "Rendezvous": "a barrier proving two requests overlapped; it models no server",
     "TripCounter": "counts packets, does not answer them",

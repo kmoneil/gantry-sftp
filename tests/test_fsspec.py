@@ -42,7 +42,7 @@ from fsspec.registry import (
 )
 
 from gantry_sftp import fsspec as gantry_fsspec
-from gantry_sftp.codec import Attrs
+from gantry_sftp.codec import Attrs, OpenFlag
 from gantry_sftp.exceptions import CapabilityError, NoSuchFileError, ServerError
 from gantry_sftp.fsspec import (
     _AUTHORITY_ONLY,
@@ -1054,6 +1054,84 @@ def test_the_handle_is_released_when_the_file_closes(fs, drop: str):
     assert handle._handle is not None  # noqa: SLF001
     handle.close()
     assert handle._handle is None  # noqa: SLF001
+
+
+# --- the transient retry reaches this adapter too (D-185) -----------------------------------
+#
+# The row this closes was filed as "fsspec's two read-opens do not retry, so `fs.open()` fails
+# where `get()` recovers". Both are spied rather than provoked: no server refuses on demand, and
+# the live proof against one that has run out of descriptors is `live-tests/test_fsspec_live.py`.
+# What these assert is the wire -- that the adapter asks for the retrying spelling at all -- and
+# each fails if its call site is put back to `sftp.open(remote, OpenFlag.READ)`.
+
+
+def _spy_on_read_opens(fs, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every path the adapter asks the session to open *for reading*."""
+    session = fs.sftp
+    asked: list[str] = []
+    real = session.open_for_read
+
+    def spy(path: bytes | str) -> bytes:
+        asked.append(path if isinstance(path, str) else path.decode())
+        return real(path)
+
+    monkeypatch.setattr(session, "open_for_read", spy)
+    return asked
+
+
+def test_cat_file_opens_through_the_retrying_spelling(fs, drop: str, monkeypatch):
+    asked = _spy_on_read_opens(fs, monkeypatch)
+    assert fs.cat_file(f"{drop}/report.csv") == b"id,total\n1,42\n"
+    assert asked == [f"{drop}/report.csv"], "cat_file's open must carry the retry"
+
+
+def test_the_file_objects_read_handle_opens_through_the_retrying_spelling(
+    fs, drop: str, monkeypatch
+):
+    """The one with the most riding on it: this handle is held for the object's lifetime.
+
+    A refusal here fails every later block rather than one call, which is why it is the read-open
+    in this adapter that most wanted the retry.
+    """
+    asked = _spy_on_read_opens(fs, monkeypatch)
+    with fs.open(f"{drop}/report.csv", "rb") as handle:
+        assert handle.read(8) == b"id,total"
+    assert asked == [f"{drop}/report.csv"], "the file object's handle must carry the retry"
+
+
+def test_a_written_file_does_not_go_near_the_retrying_spelling(fs, drop: str, monkeypatch):
+    """The other direction, and it is the one that would be a data-loss bug.
+
+    An ``OPEN`` carrying ``CREAT | TRUNC`` may have emptied the file before its reply was lost,
+    so a second attempt is not a repeat of the first. The write path must reach ``open``.
+
+    **What the decoy showed, recorded because it is not what was expected.** Routing this call
+    through ``open_for_read`` is caught -- but by a ``NoSuchFileError`` from the server, not by
+    either assertion below, because an open for *reading* cannot create the destination and the
+    write fails before any bookkeeping is read. Strengthening the row with the positive
+    assertion did not change that and it was kept anyway: it pins the flags this path sends, so
+    a later edit to ``WRITE_FLAGS`` that quietly drops ``TRUNC`` fails here rather than in a
+    test about permissions. The negative half is a guard against a future "fix", and a guard
+    whose violation is impossible to reach silently is doing its job.
+    """
+    asked = _spy_on_read_opens(fs, monkeypatch)
+    session = fs.sftp
+    written: list[OpenFlag] = []
+    real_open = session.open
+
+    def spy(path: bytes | str, pflags: OpenFlag = OpenFlag.READ, **kwargs: object) -> bytes:
+        written.append(pflags)
+        return real_open(path, pflags, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session, "open", spy)
+
+    with fs.open(f"{drop}/written.csv", "wb") as handle:
+        _ = handle.write(b"id\n7\n")
+
+    assert asked == [], "a write-open must never be issued through a retrying call"
+    assert written == [OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC], (
+        "and it reaches the single-attempt spelling, with the flags that make it single-attempt"
+    )
 
 
 def test_get_file_and_put_file_use_this_librarys_transfer_path(fs, drop: str, tmp_path: Path):

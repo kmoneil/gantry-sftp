@@ -13,6 +13,7 @@ exercised: an attempt count that is off by one still passes a "it eventually suc
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import anyio
 import pytest
@@ -20,22 +21,37 @@ import pytest
 from gantry_sftp._logging import LOG_FIELDS
 from gantry_sftp.codec import OpenFlag, StatusCode
 from gantry_sftp.exceptions import NoSuchFileError, ProtocolError, ServerError
-from gantry_sftp.session import PROFILES, UNKNOWN, ServerProfile, identify
+from gantry_sftp.session import (
+    PROFILES,
+    UNKNOWN,
+    RemoteFile,
+    ServerProfile,
+    identify,
+    open_session,
+)
 from gantry_sftp.session._transient import (
+    REPEATABLE_FLAGS,
     TRANSIENT_ATTEMPTS,
     TRANSIENT_BACKOFF,
     TRANSIENT_BACKOFF_MAX,
+    is_repeatable_open,
     is_transient_refusal,
     open_for_read,
     with_transient_retry,
 )
 from gantry_sftp.session._verify import hashes_agree
+from gantry_sftp.transport import find_sftp_server, open_local_server_transport
 
 pytestmark = pytest.mark.anyio
 
 ASYNCSSH = PROFILES["asyncssh"]
 OPENSSH = PROFILES["openssh"]
 EXHAUSTED = b"Too many open files"
+
+
+def needs_real_server() -> None:
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
 
 
 def vendor_id(vendor: bytes, product: bytes, version: bytes, build: int = 0) -> bytes:
@@ -484,3 +500,200 @@ async def test_cancellation_is_not_retried():
         _ = await with_transient_retry(request, profile=ASYNCSSH, what="get", backoff=0)
     assert scope.cancelled_caught
     assert calls == 1
+
+
+# --- which flags may be repeated at all (D-185) -------------------------------------------------
+#
+# Both directions, deliberately. A guard tested only on what it rejects is a guard that could be
+# `return False` -- and here that spelling would pass every "a write is not retried" row in this
+# file while silently costing `open_file` the feature.
+
+
+@pytest.mark.parametrize(
+    "pflags",
+    [OpenFlag.READ, OpenFlag(0)],
+    ids=["read", "no-flags"],
+)
+async def test_an_open_that_changes_nothing_may_be_repeated(pflags: OpenFlag):
+    """``OpenFlag(0)`` is in here because the predicate is about mutation, not about ``READ``.
+
+    A server refuses it, which is fine: repeating a request that creates nothing and truncates
+    nothing is safe whatever the server answers, and an equality test against ``READ`` would
+    have classified it as a write.
+    """
+    assert is_repeatable_open(pflags) is True
+
+
+@pytest.mark.parametrize(
+    "pflags",
+    [
+        OpenFlag.WRITE,
+        OpenFlag.APPEND,
+        OpenFlag.CREAT,
+        OpenFlag.TRUNC,
+        OpenFlag.EXCL,
+        OpenFlag.READ | OpenFlag.WRITE,
+        OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC,
+        OpenFlag.READ | OpenFlag.EXCL,
+    ],
+    ids=["write", "append", "creat", "trunc", "excl", "read-write", "create-trunc", "read-excl"],
+)
+async def test_an_open_that_changes_something_is_issued_once(pflags: OpenFlag):
+    """Every mutating bit on its own, and two of the combinations that carry ``READ`` with it.
+
+    The combinations are the ones that matter: ``READ | WRITE`` and ``READ | EXCL`` both *look*
+    like reads to anything that asks whether ``READ`` is set.
+    """
+    assert is_repeatable_open(pflags) is False
+
+
+async def test_a_bit_this_protocol_version_does_not_define_is_not_repeatable():
+    """The direction the allowlist was chosen for, and the reason it is not ``~OpenFlag.READ``.
+
+    ``IntFlag`` inverts over its *defined* members, so ``~OpenFlag.READ`` is exactly the five
+    mutating bits and an undefined one slips past it as repeatable. v3 defines six flags and a
+    seventh is a caller error either way; this pins which way it falls.
+    """
+    assert is_repeatable_open(OpenFlag(0x40)) is False
+    assert REPEATABLE_FLAGS is OpenFlag.READ
+
+
+# --- the public read-open, and the file object it does not cover (D-185) ------------------------
+
+
+async def test_the_public_read_open_retries_and_is_recorded_as_open(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+):
+    """``Session.open_for_read``'s wire, which is the half no test of the helper can see.
+
+    Third card running where the function that *wires* a feature needed its own row: every test
+    above drives ``open_for_read`` with an opener of its own, and all of them stay green if this
+    method forwards to ``self.open`` instead. The refusal is injected rather than provoked
+    because no real server refuses on demand; what the real server proves is the row below.
+    """
+    needs_real_server()
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        monkeypatch.setattr(sftp, "_profile", ASYNCSSH)
+        calls = 0
+        real = sftp.open
+
+        async def refusing_once(path, pflags=OpenFlag.READ, *, mode=None):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise refusal(EXHAUSTED)
+            return await real(path, pflags, mode=mode)
+
+        monkeypatch.setattr(sftp, "open", refusing_once)
+        target = tmp_path / "data.bin"
+        _ = target.write_bytes(b"payload")
+
+        with caplog.at_level(logging.WARNING, logger="gantry_sftp.session"):
+            handle = await sftp.open_for_read(str(target).encode())
+        try:
+            assert calls == 2, "the transient refusal on the public read-open must be retried"
+        finally:
+            await sftp.close(handle)
+
+    record = next(r for r in caplog.records if r.levelno == logging.WARNING)
+    assert getattr(record, LOG_FIELDS)["operation"] == "open", (
+        "the label names the operation the caller asked for, not the one that wired it"
+    )
+
+
+async def test_the_public_read_open_returns_a_handle_a_real_server_will_read(tmp_path: Path):
+    """End to end on the reference server, which is the half the injected row cannot show.
+
+    Nothing here is transient -- the point is that the retry wrapper did not change what the
+    call *is*: same path resolution, same handle, readable.
+    """
+    needs_real_server()
+    target = tmp_path / "data.bin"
+    _ = target.write_bytes(b"payload")
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        handle = await sftp.open_for_read(str(target).encode())
+        try:
+            assert await sftp.read_at(handle, 0, 7) == b"payload"
+        finally:
+            await sftp.close(handle)
+
+
+class _FileSession:
+    """A session with the two members ``RemoteFile.__aenter__`` reaches for.
+
+    Deliberately not a real one: what is under test is which of two branches the entry takes,
+    and a real server cannot be made to refuse the first ``OPEN`` and answer the second.
+    """
+
+    profile = ASYNCSSH
+
+    def __init__(self, *, refusals: int) -> None:
+        self.attempts: list[OpenFlag] = []
+        self.closed: list[bytes] = []
+        self._refusals = refusals
+
+    async def open(
+        self, path: bytes, pflags: OpenFlag = OpenFlag.READ, *, mode: int | None = None
+    ) -> bytes:
+        self.attempts.append(pflags)
+        if len(self.attempts) <= self._refusals:
+            raise refusal(EXHAUSTED)
+        return b"handle"
+
+    async def close(self, handle: bytes) -> None:
+        self.closed.append(handle)
+
+
+async def test_the_file_objects_open_retries_when_nothing_would_change(
+    caplog: pytest.LogCaptureFixture,
+):
+    """``open_file`` is the surface D-182's sweep could not see, and it is the larger half.
+
+    The sweep counted read-opens by their ``OpenFlag.READ`` literal. This one opens with
+    ``self._pflags`` -- a variable whose default *is* ``READ`` -- so no grep for the constant
+    reached it, and ``Session.open_file``, ``SyncSession.open_file``, ``SFTPPath.open`` and
+    ``SFTPPath.read_bytes`` all sat behind it without the retry ``get()`` has had since D-30.
+
+    **The label is asserted because the mutation lane asked for it**, three cards running now:
+    blanking ``what``, upper-casing it and emptying it all survived a version of this row that
+    checked only the attempt count. It is the sole place the operation name appears, so a
+    file-object retry recorded as anything else points the one record of a swallowed refusal at
+    the wrong request -- which is the whole reason D-182 added the parameter.
+    """
+    session = _FileSession(refusals=1)
+    remote = RemoteFile(session, b"/f", OpenFlag.READ)  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.WARNING, logger="gantry_sftp.session"):
+        async with remote as opened:
+            assert opened is remote
+
+    assert session.attempts == [OpenFlag.READ, OpenFlag.READ], "the read-only entry retried"
+    assert session.closed == [b"handle"], "and the handle the second attempt won is released"
+    record = next(r for r in caplog.records if r.levelno == logging.WARNING)
+    assert getattr(record, LOG_FIELDS)["operation"] == "open_file"
+    assert record.getMessage().startswith("open_file refused as transient")
+
+
+async def test_the_file_objects_open_is_issued_once_when_it_would_change_something():
+    """The gate, from the side that matters: an ``OPEN`` that may have landed is not repeated.
+
+    ``CREAT | TRUNC`` is the combination with the worst version of the failure -- an attempt
+    whose reply was lost may already have emptied the file, so a second one is not a repeat of
+    the first.
+    """
+    session = _FileSession(refusals=1)
+    flags = OpenFlag.WRITE | OpenFlag.CREAT | OpenFlag.TRUNC
+    remote = RemoteFile(session, b"/f", flags)  # type: ignore[arg-type]
+
+    with pytest.raises(ServerError) as raised:
+        async with remote:
+            pass  # pragma: no cover -- the entry raises
+
+    assert session.attempts == [flags], "a mutating open gets exactly one attempt"
+    assert raised.value.message == EXHAUSTED, "and the server's own refusal is what surfaces"

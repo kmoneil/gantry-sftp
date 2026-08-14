@@ -69,6 +69,14 @@ respectively. An upload from
 a stream would be a second transfer path with none of the guarantees `put` exists for. Write the
 bytes to a file, or use fsspec's `pipe_file(path, value)` for a value already in memory.
 
+**Reads through this adapter get the transient-refusal retry.** `fs.cat_file(...)` and the read
+handle behind `fs.open(url, "rb")` both open through
+[`open_for_read`](reliability.md#a-refusal-that-clears), so a server that is momentarily out of a
+resource is retried here exactly as it is under `get()`. The file object's handle is the one with
+the most riding on it: it is acquired once and held for the object's lifetime, so a refusal there
+fails every later block rather than one call. Writes go the other way and stay a single attempt —
+an `OPEN` carrying `CREAT | TRUNC` may have emptied the destination before its reply went missing.
+
 **Errors change shape at this boundary, deliberately.** fsspec's contract is `FileNotFoundError`
 — `AbstractFileSystem.info` is documented to raise it, `exists` is written around it, and pandas
 tests for it by name — so the adapter translates: `NoSuchFileError` becomes `FileNotFoundError`
