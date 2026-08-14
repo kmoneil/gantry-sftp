@@ -3,6 +3,99 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## 0.4.0 — 2026-08-14
+
+**A minor bump, and it would be one for either half of what follows.** Under this project's `0.x`
+rule — the minor version is where a break lands — one behaviour a caller could have written against
+changed: a `SyncRemoteFile` or `SyncDirectoryScan` used after its session's `with` block has ended
+now raises this library's `StateError` where it raised anyio's `RuntimeError`, so a handler catching
+`RuntimeError` around one stops catching. And the release adds a subsystem rather than fixing one,
+which is the argument 0.2.0 made for not being `0.1.3`: every `OPEN` this library chooses the flags
+for now survives a refusal the server says will clear. Calling this `0.3.1` would have described a
+bug-fix release.
+
+Written with the date because the tag follows immediately; before that it read `## Unreleased`, and
+that distinction is enforced rather than observed. `tests/test_packaging.py` accepts either heading;
+`release.yml` refuses `Unreleased` on a tag and refuses a tag that disagrees with `__version__`.
+
+### Added
+
+- **A refusal that clears is now retried, on the session you already have** (D-30, D-182, D-185,
+  D-187). Some refusals are about a resource rather than about your file and pass on their own. The
+  measured one is descriptor exhaustion: a server out of file descriptors refuses the next `OPEN`
+  and answers the identical request once another transfer closes one. Before this release that
+  ended your transfer.
+
+  **Every `OPEN` this library chooses the flags for is covered**, in both directions — `get` and
+  `get_tree`, both rungs of `get(verify=...)`, `open_file` and `SFTPPath.open` / `read_bytes` when
+  the flags you passed mutate nothing, the fsspec adapter's `cat_file` and `fs.open(…, "rb")`, and
+  every upload path including the default atomic publish. Three attempts, a short doubling delay,
+  and then the server's own error unchanged. There is no parameter and nothing to configure.
+
+  **It is a per-server capability and it is off wherever the server does not explain itself.**
+  `ServerProfile` gains `transient_messages` and `classifies_transient()`, read only together with
+  the existing `informative_messages`, so a server this library has no fingerprint for is never
+  retried however its text reads. Of the three implementations in the test matrix only asyncssh
+  qualifies; OpenSSH's `STATUS` message is the constant word `Failure` for every condition
+  including this one, which is measured rather than assumed.
+
+  **Two limits are deliberate and documented.** The open rather than the transfer — a `READ` runs
+  against a descriptor the server already holds, so it cannot reach this condition — and bounded at
+  three attempts, because resource exhaustion is exactly the failure where a client retrying
+  without limit is what keeps the resource exhausted. The one read-open that deliberately never
+  retries is the compatibility battery's: a report of what a server does must not retry until it
+  behaves. `docs/reliability.md` carries the whole table under "A refusal that clears".
+
+- **`Session.open_for_read(path)`, with the blocking twin `SyncSession.open_for_read(path)`**
+  (D-185). The plain read-open for when you want the handle yourself, on the same ladder `get()`
+  uses. It takes no `pflags`, and that is the design rather than an omission: there is no flag
+  whose retry it would be willing to make. An open that changes something is still spelled
+  `open()` and is still issued exactly once, whatever the server says about why it refused.
+
+### Changed
+
+- **A `SyncRemoteFile` or `SyncDirectoryScan` used after its session's block has ended now names
+  the block rather than the portal** (D-186). Every `SyncSession` method already went through a
+  readiness check raising `StateError("this session is closed; its `with` block has ended")`; these
+  two classes held the raw `BlockingPortal` and called it directly, so not one of their methods
+  passed through it and a caller got anyio's `RuntimeError: This portal is not running` — a message
+  about a thread they never asked for.
+
+  **This is the release's one break, and it is on a path a caller has already got wrong.** If you
+  catch `RuntimeError` around a file object or a directory scan used past its session, catch
+  `StateError` (or its base `SFTPError`) instead. `__exit__` is the deliberate exception and still
+  returns quietly: the handle went with the connection, so there is nothing to release, and raising
+  from an exit would replace whatever exception was already propagating.
+
+### Fixed
+
+- **`get(verify=...)` could report a verification failure on a file that was byte-correct**
+  (D-182). Both verification rungs open a handle for reading, and neither open had the retry the
+  transfer's own had. Against a server momentarily out of descriptors the file transferred and then
+  failed its check — which is exactly how a corrupt transfer reads, and so the most misleading shape
+  this library can produce.
+
+- **The default `put()` failed where `put(atomic=False)` recovered** (D-187). The atomic publish's
+  staging file is opened `CREAT|EXCL`, and an exclusive create was held out of the ladder on the
+  argument that a first attempt which created the file and then refused would leave the retry
+  colliding with our own leftover. It cannot: a name genuinely in the way is refused with a message
+  this library does not classify as transient, so it is terminal on the first sight of it and you
+  get the same error you would have got without the ladder. Measured too — under the condition that
+  *is* classified, the server answers before creating anything. The staging name does not change
+  between attempts, so nothing about `UploadJournal` or `discard_staged()` changes with it.
+
+- **`put_tree` and `sync_tree` documented an `UnsafePathError` neither can raise** (D-184). Every
+  name the guard is asked about comes from `os.scandir` plus `os.fsencode`, and each of its five
+  refusals is unreachable from there — built rather than reasoned about. `put_tree(dry_run=True)`
+  also claimed the refusal happens "exactly as it would in a real run", which was a positive claim
+  about an impossible behaviour used to argue a dry run is complete. The guard stays, documented as
+  the assertion it is.
+
+- **`docs/compatibility.md` now cites `ronf/asyncssh#827`** for the row recording that asyncssh
+  answers `OK` to an `lsetstat` chmod and changes nothing. The citation narrows the claim in a way
+  the table has no room for: only the permissions flag is discarded, and the timestamp flag over
+  the same request works.
+
 ## 0.3.0 — 2026-08-13
 
 **A minor bump because one documented default changed, and that is the whole of why it is not
