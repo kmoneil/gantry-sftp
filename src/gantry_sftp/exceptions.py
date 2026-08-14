@@ -262,12 +262,24 @@ class DestinationNotAllowedError(ConnectError):
 
 
 class UnsafePathError(SFTPError):
-    """A server-supplied name was refused rather than written to the filesystem.
+    """A name was refused rather than joined onto a path or written to the filesystem.
 
-    Names from ``READDIR`` and ``READLINK`` are chosen by the far end. A server answering with
-    ``../../etc/cron.d/x`` during a recursive download is the zip-slip pattern, and it is a
-    real and exploited vulnerability class in file-transfer clients rather than a theoretical
-    one. This is raised **before** anything is opened, so nothing was written.
+    **The case it exists for is a server-supplied name.** Names from ``READDIR`` and
+    ``READLINK`` are chosen by the far end. A server answering with ``../../etc/cron.d/x``
+    during a recursive download is the zip-slip pattern, and it is a real and exploited
+    vulnerability class in file-transfer clients rather than a theoretical one. This is raised
+    **before** anything is opened, so nothing was written.
+
+    **A caller can also produce one**, and that half is worth knowing because it is the half
+    reachable from ordinary code: :class:`~gantry_sftp.path.SFTPPath` refuses a joined
+    component that is not one component, so ``base / "a/b"`` and ``base.with_name("..")``
+    raise this rather than quietly resolving somewhere else.
+
+    The third caller is neither, and it is documented here so the list is not read as
+    exhaustive by omission: the upload walk asks the same predicate of every local filename.
+    **That one cannot fire** -- measured in D-184, since no name ``os.scandir`` yields can fail
+    it -- so it is an assertion about this library's own joining, and ``put_tree`` / ``sync_tree``
+    deliberately do not list this exception under **Raises**.
 
     Not a :class:`ServerError`: the server did not refuse anything, and the request was not
     even sent. It is closer to a protocol violation than to a refusal, but it is not that
