@@ -40,7 +40,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from gantry_sftp.exceptions import SFTPError
@@ -1081,6 +1081,39 @@ with open_local_server_transport(cwd=root) as t, open_session(t, depth=2) as s:
 """
 
 
+def _first_difference(actual: bytes, expected: bytes) -> str | None:
+    """Describe how two payloads differ, or `None` when they do not.
+
+    D-188. The published file is a megabyte, and asserting `actual == expected` on it hands
+    pytest two megabyte-long `bytes` to render when it fails -- which is a second way to lose a
+    failure that has nothing to do with anybody piping the run into `tail`. Comparing here and
+    asserting on this string keeps the payload out of the assertion's repr entirely.
+    """
+    if actual == expected:
+        return None
+    if len(actual) != len(expected):
+        return f"published {len(actual)} bytes, the source is {len(expected)}"
+    offset = next(i for i, (a, b) in enumerate(zip(actual, expected, strict=True)) if a != b)
+    window = slice(max(0, offset - 8), offset + 8)
+    return (
+        f"same length ({len(actual)}) and the bytes differ from offset {offset}: "
+        f"published {actual[window]!r}, source {expected[window]!r}"
+    )
+
+
+def test_the_payload_comparison_names_the_difference_without_rendering_the_payload():
+    """D-188. This helper runs only when the row below fails, and a path that runs only on a
+    failure is the shape that hides defects -- the `lsetstat` swallow this project reported
+    upstream sat under a `# pragma: no cover` for exactly that reason. So its three answers are
+    pinned now rather than read for the first time on the day it fires.
+    """
+    assert _first_difference(b"abc", b"abc") is None
+    assert _first_difference(b"abc", b"abcdef") == "published 3 bytes, the source is 6"
+    assert _first_difference(b"abcX", b"abcY") == (
+        "same length (4) and the bytes differ from offset 3: published b'abcX', source b'abcY'"
+    )
+
+
 def test_an_upload_killed_mid_transfer_is_resumed_by_a_different_process(tmp_path: Path):
     """The card, proved rather than described: a real SIGKILL and a real second process.
 
@@ -1105,15 +1138,33 @@ def test_an_upload_killed_mid_transfer_is_resumed_by_a_different_process(tmp_pat
         check=False,
     )
 
-    assert killed.returncode == -9, killed.stderr.decode("utf-8", "replace")
+    assert killed.returncode == -9, (
+        f"the child exited {killed.returncode} instead of dying of SIGKILL"
+        + (
+            " -- the upload finished before the progress callback crossed the threshold, so "
+            "there was nothing left to kill"
+            if killed.returncode == 0
+            else " -- it failed on its own before reaching the kill"
+        )
+        + f"\nstderr:\n{killed.stderr.decode('utf-8', 'replace')}"
+    )
     staged = [p for p in root.iterdir() if p.name.endswith(".part")]
-    assert len(staged) == 1, "the killed run left no staging file, so there is nothing to resume"
+    assert len(staged) == 1, (
+        f"expected one .part file to resume from and found {len(staged)}; the directory holds "
+        f"{sorted(p.name for p in root.iterdir())}"
+    )
     partial = staged[0].stat().st_size
-    assert 0 < partial < source.stat().st_size
+    complete = source.stat().st_size
+    assert 0 < partial < complete, (
+        f"the staging file is {partial} bytes of {complete}, which leaves nothing partial to "
+        "resume: 0 means the kill landed before any write was on disk, and the whole size means "
+        "it landed after the last one"
+    )
     # The record is on disk because it was written before the OPEN, which is the whole design.
-    assert (
-        journal.staged_for(str(root / "out.bin").encode(), source_identity(source))
-        == str(staged[0]).encode()
+    recorded = journal.staged_for(str(root / "out.bin").encode(), source_identity(source))
+    assert recorded == str(staged[0]).encode(), (
+        f"the journal names {recorded!r} as the staging file and the one on disk is "
+        f"{str(staged[0]).encode()!r}"
     )
 
     with (
@@ -1124,10 +1175,26 @@ def test_an_upload_killed_mid_transfer_is_resumed_by_a_different_process(tmp_pat
             source, str(root / "out.bin").encode(), resume=True, publish=Publish(journal=journal)
         )
 
-    assert result.transferred == source.stat().st_size - partial, "it did not resume, it restarted"
-    assert (root / "out.bin").read_bytes() == source.read_bytes()
-    assert sorted(p.name for p in root.iterdir()) == ["out.bin"]
-    assert journal.in_flight() == {}
+    # D-188: every message below carries the numbers rather than a diagnosis. "It did not
+    # resume, it restarted" was one reading of this failing, and a resume from an offset other
+    # than the one measured above is another, which the same assertion cannot tell apart.
+    assert result.transferred == complete - partial, (
+        f"the resuming run moved {result.transferred} bytes; {complete - partial} was what "
+        f"remained after {partial} of {complete} had been staged. {complete} would mean it "
+        "restarted, and anything else means it resumed from a different offset"
+    )
+    difference = _first_difference((root / "out.bin").read_bytes(), source.read_bytes())
+    assert difference is None, f"the published file is not the source: {difference}"
+    names = sorted(p.name for p in root.iterdir())
+    assert names == ["out.bin"], (
+        f"publishing should leave the destination and nothing beside it, and the directory "
+        f"holds {names}"
+    )
+    in_flight = journal.in_flight()
+    assert in_flight == {}, (
+        f"the journal still lists {len(in_flight)} upload(s) in flight after a successful "
+        f"publish: {in_flight}"
+    )
 
 
 RESUMED_DOWNLOAD = """
@@ -1174,6 +1241,13 @@ def test_a_download_still_needs_no_journal_at_all(tmp_path: Path):
 # --- fuzzing the fold ----------------------------------------------------------------------------
 
 
+# No deadline, because every example here makes a directory and writes and reads a real file,
+# so hypothesis's per-example clock is measuring the machine rather than this code. It is a tail
+# and not a mean: typical examples run a few tens of milliseconds against a 200 ms default, and a
+# contended run produced one at 262.88 ms which took 36.63 ms on the retry -- reported as
+# `FlakyFailure`, on `fast`, which is a required check. Nothing is given up by dropping it. The
+# pathology a deadline would have caught here is a record costing more than one write, and
+# `test_an_appended_record_is_one_write` asserts that by counting, which no amount of load moves.
 @given(
     staged=st.binary(min_size=1, max_size=60),
     target=st.binary(min_size=1, max_size=60),
@@ -1181,6 +1255,7 @@ def test_a_download_still_needs_no_journal_at_all(tmp_path: Path):
     size=st.integers(min_value=0, max_value=2**40),
     mtime=st.integers(min_value=0, max_value=2**32 - 1),
 )
+@settings(deadline=None)
 def test_a_record_survives_being_written_and_folded_back(
     tmp_path_factory, staged: bytes, target: bytes, local: str, size: int, mtime: int
 ):
@@ -1198,7 +1273,9 @@ def test_a_record_survives_being_written_and_folded_back(
     assert journal.staged_for(target, source) == staged
 
 
+# No deadline, for the reason given on the row above: the per-example work is a real file.
 @given(blob=st.binary(max_size=400))
+@settings(deadline=None)
 def test_folding_arbitrary_bytes_never_raises(tmp_path_factory, blob: bytes):
     """The file is on disk between two runs of somebody's job, so it is not trusted input.
 

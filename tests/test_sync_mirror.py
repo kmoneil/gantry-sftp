@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from gantry_sftp.codec import Attrs, Times
@@ -432,6 +432,9 @@ def test_saving_replaces_an_earlier_record_for_the_same_path(tmp_path: Path) -> 
     assert SyncManifest.load(tmp_path / "state.json").recorded(b"/a") == later
 
 
+# No deadline: every example saves and loads a real manifest file, so hypothesis's per-example
+# clock measures the machine's tail rather than this code, and on a contended runner that tail
+# reaches the 200 ms default. The same call in `tests/test_journal.py` has the measurement.
 @given(
     local_size=st.integers(min_value=0, max_value=2**63 - 1),
     local_mtime=st.integers(min_value=0, max_value=2**32 - 1),
@@ -439,6 +442,7 @@ def test_saving_replaces_an_earlier_record_for_the_same_path(tmp_path: Path) -> 
     remote_mtime=st.integers(min_value=0, max_value=2**32 - 1),
     name=st.binary(min_size=1, max_size=40).filter(lambda raw: b"\x00" not in raw),
 )
+@settings(deadline=None)
 def test_any_entry_survives_the_json_round_trip(
     tmp_path_factory: pytest.TempPathFactory,
     local_size: int,
