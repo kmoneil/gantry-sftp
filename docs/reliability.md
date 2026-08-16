@@ -33,6 +33,44 @@ rather than guessed at.
 That is also why "writes are never blindly replayed" needs no machinery: it is `resume`'s
 own check, and its weaker claim on the upload side is made once per attempt.
 
+### The blocking form
+
+`gantry_sftp.sync.with_reconnect` is the same function without the `await`, and it takes a
+plain function where the async one takes a coroutine:
+
+```python
+from functools import partial
+
+from gantry_sftp.sync import with_reconnect
+from gantry_sftp.transport import open_ssh_transport
+
+moved = with_reconnect(
+    partial(open_ssh_transport, "example.com", user="bob"),
+    lambda sftp: sftp.get("/incoming/big.iso", "big.iso", resume=True),
+    attempts=3,
+)
+```
+
+Two things about it are worth knowing before you use it, and both follow from what it is.
+
+**Your function runs on a third thread.** `with_reconnect` hands you a session, and the portal's
+own thread is the one thread that cannot use one — anyio refuses re-entry from there. So the
+blocking form puts your function on a worker borrowed from anyio's pool, which is why it can
+call the session it was given. An exception you raise arrives back as itself and is classified
+by the same `is_retryable()` above.
+
+**The `connect` recipe is the async one**, imported from `gantry_sftp.transport` rather than
+from `gantry_sftp.sync`. A transport is opened per attempt on the portal's loop, so the
+blocking entry point of the same name is the wrong half — and passing it raises a `TypeError`
+naming the fix rather than letting anyio report a missing `__aenter__`.
+
+The session you are handed lives for one attempt. Keeping it and using it afterwards raises
+`StateError`, the same as a session used after its `with` block, because the next attempt's
+session is a different object behind the same name.
+
+`BoundPortal.with_reconnect` is the same call on a portal you own, for the reasons in
+[Getting started](getting-started.md#how-the-blocking-surface-works).
+
 `is_retryable()` is the classification, and it is public because you may want to disagree
 with it:
 

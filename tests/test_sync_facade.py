@@ -24,9 +24,12 @@ from __future__ import annotations
 import inspect
 import os
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -36,6 +39,7 @@ import gantry_sftp
 import gantry_sftp.session
 import gantry_sftp.sync as sync_module
 from gantry_sftp import (
+    ConnectError,
     DownloadResult,
     NoSuchFileError,
     OpenFlag,
@@ -60,6 +64,7 @@ from gantry_sftp.sync import (
     open_local_server_transport,
     open_session,
     open_ssh_transport,
+    with_reconnect,
 )
 from gantry_sftp.transport import (
     find_sftp_server,
@@ -194,6 +199,84 @@ def test_the_facade_invents_nothing_of_its_own():
     """
     extra = sorted(set(SYNC_MEMBERS) - set(ASYNC_MEMBERS))
     assert extra == [], f"SyncSession has public members Session does not: {extra}"
+
+
+# --- the half a class-shaped gate cannot see ------------------------------------------------
+
+
+def public_module_functions(module: ModuleType) -> dict[str, Any]:
+    """Every public callable a module exports that is not a class.
+
+    `__all__` rather than `dir`, because that is the surface the package documents and the one
+    a `from ... import *` reaches.
+    """
+    exported = (getattr(module, name, None) for name in getattr(module, "__all__", ()))
+    return {
+        obj.__name__: obj
+        for obj in exported
+        if callable(obj) and not inspect.isclass(obj) and hasattr(obj, "__name__")
+    }
+
+
+def needs_a_blocking_form(obj: Any) -> bool:
+    """Whether a module-level function is one a blocking caller could not use as it is.
+
+    `unwrap` first: `connect` and the transport entry points are `@asynccontextmanager`, so
+    the async generator function is one layer down behind the decorator's wrapper.
+    """
+    unwrapped = inspect.unwrap(obj)
+    return inspect.iscoroutinefunction(unwrapped) or inspect.isasyncgenfunction(unwrapped)
+
+
+ASYNC_FUNCTIONS = public_module_functions(gantry_sftp)
+SYNC_FUNCTIONS = public_module_functions(sync_module)
+
+
+def test_every_async_module_function_has_a_blocking_form():
+    """D-85. The parity above derives from classes, and the public surface is not all classes.
+
+    `with_reconnect` is a module-level function, so `test_every_session_method_has_a_blocking_
+    form` could not see it and did not: it went two releases without a blocking form while a
+    gate claiming to enforce exactly that invariant passed. A gate shaped like a class cannot
+    report a function, and the answer is not to remember -- it is this.
+    """
+    missing = sorted(
+        name
+        for name, obj in ASYNC_FUNCTIONS.items()
+        if needs_a_blocking_form(obj) and name not in SYNC_FUNCTIONS
+    )
+    assert missing == [], f"module-level async functions with no blocking form: {missing}"
+
+
+def test_the_module_level_check_discriminates_by_what_a_function_is():
+    """The must-not-flag half, and the reason the obvious version of this test is wrong.
+
+    Comparing the two `__all__`s by name reports six gaps that are not gaps: `allowed_hosts`,
+    `check_listed_name`, `is_retryable`, `join_remote`, `local_child` and `record_fields` are
+    ordinary synchronous functions, identical from either surface, and giving each a blocking
+    twin would be six aliases and a maintenance obligation for nothing. So the discriminator
+    is what the object *is* rather than whether its name appears twice -- and this asserts the
+    two answers differ, because the day they stop differing this test is measuring nothing.
+    """
+    absent_by_name = sorted(set(ASYNC_FUNCTIONS) - set(SYNC_FUNCTIONS))
+    assert absent_by_name != [], (
+        "every async-surface function is now named in gantry_sftp.sync, which makes the "
+        "discrimination below untested rather than satisfied"
+    )
+    wrongly_flagged = [
+        name for name in absent_by_name if needs_a_blocking_form(ASYNC_FUNCTIONS[name])
+    ]
+    assert wrongly_flagged == [], (
+        f"these are async and genuinely missing, so the headline test above should have "
+        f"caught them first: {wrongly_flagged}"
+    )
+
+
+def test_the_module_level_parity_check_is_not_vacuous():
+    """A discriminator that matched nothing would make the headline test pass by emptiness."""
+    detected = sorted(name for name, obj in ASYNC_FUNCTIONS.items() if needs_a_blocking_form(obj))
+    assert "with_reconnect" in detected, detected
+    assert len(detected) >= 4, f"the async surface should have more than {detected}"
 
 
 @pytest.mark.parametrize(
@@ -1154,3 +1237,144 @@ def test_the_blocking_file_object_writes_from_several_threads_by_offset(tmp_path
 
     assert written == [4, 4, 4, 4]
     assert target.read_bytes() == b"".join(bytes([index]) * 4 for index in range(4))
+
+
+# --- with_reconnect, the one entry point a class-shaped gate could not see (D-85) -------------
+
+
+def _recipe(root: Path) -> Callable[[], Any]:
+    """The async transport recipe a blocking caller passes, against a local server."""
+    return partial(async_open_local_server_transport, cwd=root)
+
+
+def test_the_blocking_with_reconnect_returns_what_the_operation_returned(tmp_path: Path):
+    """The headline, and the reason the signature takes an operation rather than yielding."""
+    needs_real_server()
+    _ = (tmp_path / "payload.bin").write_bytes(b"gantry" * 100)
+
+    names = with_reconnect(
+        _recipe(tmp_path),
+        lambda sftp: sorted(entry.name for entry in sftp.listdir(str(tmp_path).encode())),
+    )
+
+    assert names == ["payload.bin"]
+
+
+def test_the_operation_runs_off_the_portal_thread(tmp_path: Path):
+    """The mechanism, asserted rather than described.
+
+    A function handed a `SyncSession` and run on the portal's own thread could not use it --
+    anyio refuses re-entry from there, loudly. So the whole of this feature is that the
+    caller's function lands somewhere else, and this is what says so.
+    """
+    needs_real_server()
+    seen: dict[str, int] = {}
+
+    def operation(sftp: SyncSession) -> int:
+        seen["caller"] = threading.get_ident()
+        seen["portal"] = sftp.realpath(b".") and threading.get_ident()
+        return len(sftp.listdir(str(tmp_path).encode()))
+
+    with start_blocking_portal() as portal:
+        portal_thread = portal.call(threading.get_ident)
+        _ = BoundPortal(portal).with_reconnect(_recipe(tmp_path), operation)
+
+    assert seen["caller"] != portal_thread, (
+        "the operation ran on the portal's own thread, which is the one thread that cannot "
+        "call back into the portal"
+    )
+    assert seen["caller"] != threading.get_ident(), "it ran on the calling thread, not a worker"
+
+
+def test_a_retryable_failure_reconnects_and_re_runs_the_operation(tmp_path: Path):
+    """Retry is the point, and the failure has to cross the thread hop to be classified."""
+    needs_real_server()
+    attempts: list[int] = []
+
+    def flaky(sftp: SyncSession) -> str:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise ConnectError("the link dropped on attempt one")
+        return "second attempt"
+
+    outcome = with_reconnect(_recipe(tmp_path), flaky, attempts=3, backoff=0.01)
+
+    assert outcome == "second attempt"
+    assert attempts == [1, 2], "it did not retry exactly once"
+
+
+def test_a_terminal_failure_is_not_retried(tmp_path: Path):
+    """The other half of the classifier, and the one that costs something when it is wrong.
+
+    `is_retryable` is what decides, and it decides on the exception that came back through
+    `to_thread.run_sync` -- so a wrapper anywhere on that path would turn every terminal
+    refusal into `attempts` of them.
+    """
+    needs_real_server()
+    attempts: list[int] = []
+
+    def refused(sftp: SyncSession) -> list[Any]:
+        attempts.append(len(attempts) + 1)
+        # A real refusal from a real server rather than a constructed one, so the exception
+        # being classified is the one the library actually raises and carries what it carries.
+        return sftp.listdir(str(tmp_path / "absent").encode())
+
+    with pytest.raises(NoSuchFileError) as exc:
+        _ = with_reconnect(_recipe(tmp_path), refused, attempts=3, backoff=0.01)
+
+    assert exc.value.args[0] == "server returned NO_SUCH_FILE: No such file"
+    assert exc.value.code == 2, "the status code did not survive the thread hop"
+    assert attempts == [1], f"a terminal refusal was retried {len(attempts)} times"
+
+
+def test_the_session_is_spent_once_the_attempt_ends(tmp_path: Path):
+    """D-186's discipline, which matters more here than it does for a `with` block.
+
+    The next attempt's session is a different object behind the same name, so a facade kept
+    past its attempt is not merely closed -- it is the wrong one. Reaching it has to be this
+    library's `StateError` rather than anyio's complaint about a portal.
+    """
+    needs_real_server()
+    escaped: list[SyncSession] = []
+
+    _ = with_reconnect(_recipe(tmp_path), escaped.append)
+
+    with pytest.raises(StateError) as exc:
+        _ = escaped[0].listdir(str(tmp_path).encode())
+
+    assert exc.value.args[0] == "this session is closed; its `with` block has ended"
+
+
+def test_a_blocking_transport_recipe_is_refused_and_the_message_names_the_fix(tmp_path: Path):
+    """The one confusion this signature invites, caught where it was made.
+
+    Both surfaces export `open_local_server_transport`, and only one of them is the right
+    half here. Unguarded this is anyio reporting a missing `__aenter__`, which names the
+    protocol rather than the mistake.
+    """
+    needs_real_server()
+
+    with pytest.raises(TypeError) as exc:
+        _ = with_reconnect(partial(open_local_server_transport, cwd=tmp_path), lambda sftp: None)
+
+    assert exc.value.args[0] == (
+        "the connect recipe returned _GeneratorContextManager, which is not an async context "
+        "manager -- with_reconnect opens a transport per attempt on the portal's own loop, so "
+        "it takes the async entry points (gantry_sftp.transport.open_ssh_transport) rather "
+        "than the blocking ones in this module"
+    )
+
+
+def test_the_bound_form_neither_starts_nor_stops_the_caller_s_portal(tmp_path: Path):
+    """What `BoundPortal` is for: the module-level form starts a portal and stops it again."""
+    needs_real_server()
+
+    with start_blocking_portal() as portal:
+        before = portal.call(threading.get_ident)
+        gantry = BoundPortal(portal)
+
+        first = gantry.with_reconnect(_recipe(tmp_path), lambda sftp: sftp.realpath(b"."))
+        second = gantry.with_reconnect(_recipe(tmp_path), lambda sftp: sftp.realpath(b"."))
+
+        assert first == second
+        assert portal.call(threading.get_ident) == before, "the portal was replaced mid-test"

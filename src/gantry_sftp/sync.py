@@ -57,17 +57,19 @@ called from the event loop thread`` -- loudly rather than as a deadlock, which i
 worth ruling out and is tested. Keep a callback to what it is for: counting bytes, updating a
 bar, and returning.
 
-**Two things are deliberately not here.**
+**:func:`with_reconnect` runs the caller's function on a third thread**, and that is the whole
+of what it adds (D-85). It takes a callable that receives a session, so a blocking form cannot
+run that callable on the portal's thread -- the one thread that cannot call back into the
+portal -- and :func:`anyio.to_thread.run_sync` is where it goes instead. A borrowed pool
+worker rather than a thread per call, and an exception raised there arrives back as itself.
+Its ``connect`` argument is the **async** transport recipe, because a transport is opened per
+attempt on the portal's loop; passing the blocking twin of the same name is refused with a
+``TypeError`` that says so.
 
-- :func:`~gantry_sftp.session.with_reconnect` takes a callable that receives a session, so a
-  blocking form would have to run the caller's function on the portal's thread -- which is the
-  one thread that cannot call back into the portal -- and therefore needs a third thread to
-  re-enter from. That is a mechanism decision of its own rather than a wrapper, and it is
-  carded rather than half-built.
-- A ``backend=`` argument. The module-level entry points start an asyncio portal, which is the
-  right default for a caller who has no loop at all. Trio is reached by owning the portal --
-  see :class:`BoundPortal`, which is also the answer for anyone who wants several sessions on
-  one loop instead of a thread apiece.
+**One thing is deliberately not here.** A ``backend=`` argument. The module-level entry points
+start an asyncio portal, which is the right default for a caller who has no loop at all. Trio
+is reached by owning the portal -- see :class:`BoundPortal`, which is also the answer for
+anyone who wants several sessions on one loop instead of a thread apiece.
 """
 
 from __future__ import annotations
@@ -81,6 +83,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self, overload, override
 
+from anyio import to_thread
 from anyio.from_thread import BlockingPortal, start_blocking_portal
 
 from gantry_sftp._connect import connect as _async_connect
@@ -88,6 +91,9 @@ from gantry_sftp.codec import Attrs, OpenFlag, Request, Response
 from gantry_sftp.exceptions import StateError
 from gantry_sftp.path import DEFAULT_WRITE_MODE, SFTPPath
 from gantry_sftp.session import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_BACKOFF,
+    DEFAULT_BACKOFF_MAX,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PIPELINE_DEPTH,
     DEFAULT_REQUEST_TIMEOUT,
@@ -114,6 +120,7 @@ from gantry_sftp.session import (
     WalkEntry,
 )
 from gantry_sftp.session import open_session as _async_open_session
+from gantry_sftp.session import with_reconnect as _async_with_reconnect
 from gantry_sftp.transport import Secret, Transport
 from gantry_sftp.transport import open_local_server_transport as _async_open_local_server_transport
 from gantry_sftp.transport import open_ssh_transport as _async_open_ssh_transport
@@ -129,6 +136,7 @@ __all__ = [
     "open_local_server_transport",
     "open_session",
     "open_ssh_transport",
+    "with_reconnect",
 ]
 
 
@@ -150,6 +158,39 @@ def _sync_context[T](
         A context manager whose ``__enter__`` and ``__exit__`` run on the portal's thread.
     """
     return portal.wrap_async_context_manager(portal.call(factory))
+
+
+def _async_recipe(
+    recipe: Callable[[], AbstractAsyncContextManager[Transport]],
+) -> Callable[[], AbstractAsyncContextManager[Transport]]:
+    """Refuse a blocking transport recipe at the call that made it, not three frames in.
+
+    :meth:`BoundPortal.with_reconnect` opens a transport per attempt *on the portal's loop*,
+    so it needs the async entry points while everything else a blocking caller touches is the
+    pair in this module with the same names. Passing the wrong half is the one confusion this
+    signature invites, and unguarded it surfaces as anyio complaining that a `SyncTransport`
+    context manager has no ``__aenter__`` -- which names the protocol rather than the mistake.
+
+    Args:
+        recipe: The caller's zero-argument callable.
+
+    Returns:
+        The same callable, with its result checked on each attempt.
+    """
+
+    def checked() -> AbstractAsyncContextManager[Transport]:
+        opened = recipe()
+        if not hasattr(opened, "__aenter__"):
+            raise TypeError(
+                f"the connect recipe returned {type(opened).__name__}, which is not an async "
+                "context manager -- with_reconnect opens a transport per attempt on the "
+                "portal's own loop, so it takes the async entry points "
+                "(gantry_sftp.transport.open_ssh_transport) rather than the blocking ones in "
+                "this module"
+            )
+        return opened
+
+    return checked
 
 
 class SyncTransport:
@@ -1860,6 +1901,77 @@ class BoundPortal:
         with _sync_context(self._portal, factory) as opened:
             yield from self._hold(opened)
 
+    def with_reconnect[T](
+        self,
+        connect: Callable[[], AbstractAsyncContextManager[Transport]],
+        operation: Callable[[SyncSession], T],
+        *,
+        attempts: int = DEFAULT_ATTEMPTS,
+        backoff: float = DEFAULT_BACKOFF,
+        backoff_max: float = DEFAULT_BACKOFF_MAX,
+        request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+        idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
+        depth: int = DEFAULT_PIPELINE_DEPTH,
+    ) -> T:
+        """Run ``operation`` against a fresh session, reconnecting if the link drops.
+
+        Blocking form of :func:`gantry_sftp.session.with_reconnect`, whose docstring documents
+        every argument, which failures are retried, and -- the part worth reading before using
+        either -- what it means that ``operation`` is re-run from the beginning.
+
+        **``operation`` runs on a worker thread, not on the portal's.** It has to: the portal's
+        own thread is the one thread that cannot call back into the portal, so a function
+        handed a :class:`SyncSession` and run there could not use it. That thread comes from
+        anyio's pool via :func:`anyio.to_thread.run_sync`, so it is a borrowed worker rather
+        than a thread per call, and a raised exception arrives back here as itself.
+
+        Args:
+            connect: Zero-argument callable returning a **new async** transport context
+                manager per attempt --
+                ``functools.partial(gantry_sftp.transport.open_ssh_transport, host, ...)``.
+                The async one, deliberately: this opens a transport per attempt on the
+                portal's loop, so the blocking entry points in this module are the wrong half
+                and say so if passed.
+            operation: Called with a :class:`SyncSession` that lives for one attempt. Stashing
+                it and using it afterwards raises :class:`~gantry_sftp.exceptions.StateError`,
+                the same as a session used after its ``with`` block.
+            attempts: Total tries, including the first.
+            backoff: Seconds before the second attempt, doubling thereafter.
+            backoff_max: Ceiling for that doubling.
+            request_timeout: Seconds for the handshake and each one-shot request.
+            idle_timeout: Seconds of total silence during a bulk transfer.
+            depth: Default requests in flight per transfer.
+
+        Returns:
+            Whatever ``operation`` returned, from the attempt that succeeded.
+
+        Raises:
+            TypeError: If ``connect`` returns something that is not an async context manager.
+        """
+
+        async def attempt(session: Session) -> T:
+            facade = SyncSession(self._portal, session)
+            try:
+                return await to_thread.run_sync(operation, facade)
+            finally:
+                # Spent for the same reason `_hold` spends one, and it matters more here:
+                # the next attempt's session is a different object behind the same name.
+                facade._finish()  # noqa: SLF001  # the facade's own lifecycle, not another object's
+
+        return self._portal.call(
+            partial(
+                _async_with_reconnect,
+                _async_recipe(connect),
+                attempt,
+                attempts=attempts,
+                backoff=backoff,
+                backoff_max=backoff_max,
+                request_timeout=request_timeout,
+                idle_timeout=idle_timeout,
+                depth=depth,
+            )
+        )
+
     def _hold(self, session: Session) -> Iterator[SyncSession]:
         """Yield the facade and mark it spent afterwards, however the block ended.
 
@@ -2030,3 +2142,69 @@ def open_session(
         depth=depth,
     ) as sftp:
         yield sftp
+
+
+def with_reconnect[T](
+    connect: Callable[[], AbstractAsyncContextManager[Transport]],
+    operation: Callable[[SyncSession], T],
+    *,
+    attempts: int = DEFAULT_ATTEMPTS,
+    backoff: float = DEFAULT_BACKOFF,
+    backoff_max: float = DEFAULT_BACKOFF_MAX,
+    request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+    idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
+    depth: int = DEFAULT_PIPELINE_DEPTH,
+) -> T:
+    """Run ``operation`` against a fresh session, reconnecting if the link drops.
+
+    ::
+
+        from functools import partial
+
+        from gantry_sftp.sync import with_reconnect
+        from gantry_sftp.transport import open_ssh_transport
+
+        moved = with_reconnect(
+            partial(open_ssh_transport, "example.com", user="bob"),
+            lambda sftp: sftp.get("/incoming/big.iso", "big.iso", resume=True),
+        )
+
+    Blocking form of :func:`gantry_sftp.session.with_reconnect`, whose docstring documents
+    every argument and which failures are retried, and of which the part to read first is that
+    ``operation`` is **re-run from the beginning** against a session that did not exist before.
+    :meth:`BoundPortal.with_reconnect` documents the one thing this surface adds, which is
+    where the caller's function runs.
+
+    An asyncio portal is started for the duration of the call and stopped when it returns;
+    :class:`BoundPortal` is how to own that portal instead.
+
+    Args:
+        connect: Zero-argument callable returning a new **async** transport context manager
+            per attempt. ``partial(gantry_sftp.transport.open_ssh_transport, ...)`` is the
+            spelling; the blocking entry points in this module are refused with a ``TypeError``
+            that says so.
+        operation: Called with a :class:`SyncSession` that lives for one attempt.
+        attempts: Total tries, including the first.
+        backoff: Seconds before the second attempt, doubling thereafter.
+        backoff_max: Ceiling for that doubling.
+        request_timeout: Seconds for the handshake and each one-shot request.
+        idle_timeout: Seconds of total silence during a bulk transfer.
+        depth: Default requests in flight per transfer.
+
+    Returns:
+        Whatever ``operation`` returned, from the attempt that succeeded.
+
+    Raises:
+        TypeError: If ``connect`` returns something that is not an async context manager.
+    """
+    with start_blocking_portal() as portal:
+        return BoundPortal(portal).with_reconnect(
+            connect,
+            operation,
+            attempts=attempts,
+            backoff=backoff,
+            backoff_max=backoff_max,
+            request_timeout=request_timeout,
+            idle_timeout=idle_timeout,
+            depth=depth,
+        )
