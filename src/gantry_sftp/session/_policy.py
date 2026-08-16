@@ -49,22 +49,23 @@ from gantry_sftp.session._localtree import LocalWalkEntry, remote_component, tim
 from gantry_sftp.session._mode import PERMISSION_BITS, Mode, local_mode
 from gantry_sftp.session._platform import NO_FOLLOW
 from gantry_sftp.session._publish import Publish, SizeCheck, TimePreservation
-from gantry_sftp.session._recursive import Skipped, SkipReason, TreeResult, WalkEntry, join_remote
+from gantry_sftp.session._recursive import Skipped, SkipReason, WalkEntry, join_remote
 from gantry_sftp.session._verify import ContentCheck, ResumeCheck, Verify
 
 __all__ = [
     "_DownloadState",
-    "_TreeDownload",
-    "_TreeUpload",
+    "_SettledDownload",
+    "_SettledUpload",
     "_UploadWalkState",
     "_already_complete",
     "_check_local_path",
     "_check_publish_flags",
-    "_check_tree_concurrency",
+    "_check_transfer_concurrency",
     "_check_tree_publish",
     "_chmod_local",
     "_chmod_local_directories",
     "_claim_directory",
+    "_claim_local_destination",
     "_collision_error",
     "_confirm_download_size",
     "_download_mode",
@@ -158,17 +159,23 @@ def _claim_directory(
 
 
 def _collision_error(
-    collisions: list[PathCollision], destination: Path, result: TreeResult
+    collisions: list[PathCollision], destination: Path, *, files: int, transferred: int
 ) -> DestinationCollisionError:
-    """Build the error that ends a tree the destination could not keep the names apart in."""
+    """Build the error that ends a download the destination could not keep the names apart in.
+
+    Takes the two counts rather than a :class:`~gantry_sftp.session.TreeResult` so that a
+    *list* download can raise the same error: ``get_many`` returns per-file results and has no
+    ``TreeResult`` to hand over, and the alternative -- building one purely to be taken apart
+    here -- would put a ``directories`` count that means nothing into the argument list.
+    """
     noun, verb = ("path", "was") if len(collisions) == 1 else ("paths", "were")
     return DestinationCollisionError(
         f"{len(collisions)} remote {noun} resolved onto a local file this download had "
         f"already written, and {verb} refused rather than overwriting it",
         collisions=tuple(collisions),
         destination=str(destination),
-        files=result.files,
-        transferred=result.transferred,
+        files=files,
+        transferred=transferred,
     )
 
 
@@ -753,16 +760,20 @@ def _note_planned(state: _DownloadState, child: DirEntry) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class _TreeDownload:
-    """One file a tree download has settled a destination for, waiting to be transferred."""
+class _SettledDownload:
+    """One file a download has settled a destination for, waiting to be transferred.
+
+    Named for the settling rather than for the tree because both producers make one: the walk
+    in :meth:`Session.get_tree` and the caller's own list in :meth:`Session.get_many`.
+    """
 
     remote: bytes
     target: Path
 
 
 @dataclass(frozen=True, slots=True)
-class _TreeUpload:
-    """One file a tree upload has settled a destination for, waiting to be transferred."""
+class _SettledUpload:
+    """One file an upload has settled a destination for, waiting to be transferred."""
 
     source: Path
     remote: bytes
@@ -870,6 +881,53 @@ def _touch_destination(target: Path) -> None:
     os.close(os.open(target, os.O_CREAT | os.O_WRONLY | NO_FOLLOW, 0o600))
 
 
+def _claim_local_destination(
+    target: Path,
+    remote: bytes,
+    *,
+    ledger: DestinationLedger | FoldedNameLedger,
+    dry_run: bool = False,
+) -> PathCollision | None:
+    """Reserve one local destination for one remote path, or report what already holds it.
+
+    **The collision rule, in one place, for both producers** -- the walk behind
+    :meth:`Session.get_tree` and the caller's list behind :meth:`Session.get_many`. A second
+    copy of it would be a second answer to "are these two names one file", and the two would
+    drift in exactly the direction that loses a file quietly.
+
+    **The destination is created here, empty, before the check, and that is what makes the
+    check mean anything.** A collision is two remote names the *filesystem* resolves to one
+    file, which it can only be asked about once an inode exists. The check originally ran
+    before the transfer that created it, so it detected a collision only because the previous
+    file's transfer had already finished -- which stopped being true the moment workers ran
+    concurrently, and two colliding names would both have opened the same file ``O_TRUNC``, the
+    second destroying the first while the call reported success.
+
+    ``O_CREAT`` without ``O_TRUNC``: an existing file keeps its bytes, so a ``resume=True`` run
+    still finds the partial it left last time. ``O_NOFOLLOW`` because the containment check the
+    caller has already made resolves symlinks and this must not undo it.
+
+    Args:
+        target: The local path, already validated as a component and contained.
+        remote: The remote path claiming it.
+        ledger: Where the claims are recorded.
+        dry_run: Skip the reservation. A preview must leave no file behind, which is what
+            forces it to carry a :class:`FoldedNameLedger` instead -- with no file there is no
+            inode, and the inode is the only thing that answers this for certain.
+
+    Returns:
+        ``None`` when the destination was free and is now claimed, or the collision that
+        refuses it.
+    """
+    if not dry_run:
+        _touch_destination(target)
+    first = ledger.collides_with(target)
+    if first is not None:
+        return PathCollision(str(target), remote, first)
+    ledger.claim(target, remote)
+    return None
+
+
 def refuses_the_name(error: OSError) -> bool:
     """Is this the local filesystem saying the *name* cannot exist here, rather than an I/O error?
 
@@ -893,10 +951,15 @@ def refuses_the_name(error: OSError) -> bool:
     return error.errno == errno.EILSEQ
 
 
-def _check_tree_concurrency(
-    concurrency: int, *, progress: ProgressCallback | None, caller: str
+def _check_transfer_concurrency(
+    concurrency: int, *, progress: ProgressCallback | None, caller: str, unit: str, report: str
 ) -> None:
     """Refuse a concurrency argument that cannot mean what the caller wants.
+
+    ``unit`` and ``report`` have **no defaults**, deliberately: every caller states which noun
+    its message should carry and where its counts can be read instead. A default here would be
+    a tree's vocabulary inherited silently by a list, and an argument that merely restates a
+    default is one nobody sees at the call site.
 
     ``progress`` is the interesting half. :class:`~gantry_sftp.session.ProgressCallback` is
     ``(transferred, total)`` and carries **no file identity** -- deliberately, so one reporter
@@ -917,7 +980,7 @@ def _check_tree_concurrency(
     if concurrency < 1:
         raise ValueError(
             f"{caller}() concurrency must be at least 1, got {concurrency}; "
-            f"1 transfers the tree one file at a time"
+            f"1 transfers the {unit} one file at a time"
         )
     if concurrency > 1 and progress is not None:
         raise ValueError(
@@ -925,7 +988,7 @@ def _check_tree_concurrency(
             f"(transferred, total) per file and carries no file identity, so several workers "
             f"reporting at once produce one stream of counters that reset unpredictably. Use "
             f"concurrency=1 to keep per-file progress, or drop progress= to keep the "
-            f"concurrency and read the counts from the returned TreeResult"
+            f"concurrency and read the counts from {report}"
         )
 
 

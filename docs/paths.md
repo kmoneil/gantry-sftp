@@ -41,13 +41,13 @@ you.
 `pathlib`'s shape over a remote name, bound to a session:
 
 ```python
-from gantry_sftp import SFTPPath, connect
+from gantry_sftp import SFTPPath, connect, local_child
 
 async with connect("example.com", user="bob") as sftp:
     incoming = SFTPPath("/incoming", session=sftp)
 
     async for csv in incoming.glob("2026/*.csv"):
-        await csv.download(local_dir / os.fsdecode(csv.name))
+        await csv.download(local_child(local_dir, csv.name))
 
     receipt = incoming / "receipt.txt"          # one validated component
     await receipt.write_text("done\n")          # created 0600, not 0666

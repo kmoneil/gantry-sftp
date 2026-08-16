@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -107,6 +107,7 @@ from gantry_sftp.session._localpath import (
     local_child,
 )
 from gantry_sftp.session._localtree import LocalWalkEntry, remote_component, walk_local
+from gantry_sftp.session._many import settle_downloads, settle_uploads
 from gantry_sftp.session._mode import (
     Mode,
     local_mode,
@@ -118,9 +119,10 @@ from gantry_sftp.session._policy import (
     _already_complete,
     _check_local_path,
     _check_publish_flags,
-    _check_tree_concurrency,
+    _check_transfer_concurrency,
     _check_tree_publish,
     _chmod_local_directories,
+    _claim_local_destination,
     _collision_error,
     _confirm_download_size,
     _download_mode,
@@ -136,11 +138,10 @@ from gantry_sftp.session._policy import (
     _remote_directory,
     _settle_directory,
     _settle_remote_directory,
+    _SettledDownload,
+    _SettledUpload,
     _skip_reason,
     _stamp_local_directories,
-    _touch_destination,
-    _TreeDownload,
-    _TreeUpload,
     _UploadWalkState,
     refuses_the_name,
 )
@@ -2242,7 +2243,13 @@ class Session(_SessionOperations):
         """
         require_local_io("get_tree()")
         _check_local_path(local_path, method="get_tree()")
-        _check_tree_concurrency(concurrency, progress=progress, caller="get_tree")
+        _check_transfer_concurrency(
+            concurrency,
+            progress=progress,
+            caller="get_tree",
+            unit="tree",
+            report="the returned TreeResult",
+        )
         requested_mode = resolve_mode(mode, caller="get_tree()")
         destination = (
             Path(local_path) if dry_run else _ensure_directory(Path(local_path), parents=True)
@@ -2253,7 +2260,7 @@ class Session(_SessionOperations):
             session_logger, "get_tree", remote=self._resolve(remote_path), local=destination
         ) as record:
 
-            async def transfer(item: _TreeDownload) -> None:
+            async def transfer(item: _SettledDownload) -> None:
                 if dry_run:
                     return
                 # Appended rather than `state.transferred += ...`: augmented assignment loads
@@ -2337,8 +2344,162 @@ class Session(_SessionOperations):
             record["bytes"] = result.transferred
             record["skipped"] = len(result.skipped)
             if state.collisions:
-                raise _collision_error(state.collisions, destination, result)
+                raise _collision_error(
+                    state.collisions,
+                    destination,
+                    files=result.files,
+                    transferred=result.transferred,
+                )
             return result
+
+    async def get_many(
+        self,
+        remote_paths: Iterable[bytes | str],
+        local_path: Path | str,
+        *,
+        progress: ProgressCallback | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
+    ) -> tuple[DownloadResult, ...]:
+        """Download an explicit list of remote files into one local directory.
+
+        The shape :meth:`get_tree` is not: the caller chose these files, so nothing is walked,
+        nothing is skipped, and each one keeps only its **basename** at the destination. That
+        flattening is the whole difference and it is where both hazards live -- see below.
+
+        **Every destination name is derived and checked here rather than at your call site**,
+        which is the reason to prefer this over a task group of :meth:`get` calls. A remote
+        path's basename becomes a local filename, and the remote and local name rules are not
+        the same rule: ``check_listed_name`` and :func:`~gantry_sftp.session.check_component`
+        share four refusals before the local one adds the Windows superset. Passing one is not
+        passing the other, so a hand-written ``local_dir / name`` is a join this library
+        already removed from its own README once.
+
+        **A list can collide where a tree cannot.** Two remote paths with the same basename
+        name one local file, and unchecked the second download would overwrite the first with
+        the call reporting success. Byte-identical basenames are refused up front, before
+        anything is transferred, because that is arithmetic on your own arguments. Names the
+        *filesystem* merges -- ``README.md`` and ``readme.md`` on APFS -- can only be found by
+        writing the file and asking, so those are raised at the end exactly as
+        :meth:`get_tree` raises them, with everything transferable already transferred.
+
+        Args:
+            remote_paths: The files to download, in any order you like. **Materialised**, which
+                is the premise rather than an incidental: an explicit list is yours and is
+                already in memory, which is exactly what separates it from a tree whose size
+                the server chooses.
+            local_path: Local directory everything is placed in. Created if absent.
+            progress: Called with ``(transferred, total)`` per file, so ``total`` resets at
+                each one. **Refused above ``concurrency=1``** for the reason
+                :meth:`get_tree` gives: the callback carries no file identity.
+            preserve_times: Carry each file's remote timestamps onto its local copy. Costs no
+                round trip -- the times come from the ``STAT`` :meth:`get` already makes.
+            mode: Permission bits for each downloaded file, as :meth:`get` describes them.
+                ``None`` leaves every file at the ``0o600`` a download creates.
+            resume: Forwarded to :meth:`get` per file, inheriting that method's guarantees
+                exactly.
+            concurrency: Files transferred at once. ``1`` -- the default -- is the sequential
+                path. Above 1 the list feeds the same bounded worker pool the trees use, the
+                order files are transferred in is not the list's, and a failure part-way leaves
+                an unpredictable subset transferred. **The results still come back in the
+                order you supplied**, which is what makes the list form worth having.
+
+        Returns:
+            One :class:`~gantry_sftp.session.DownloadResult` per input, **in input order** --
+            not a summary. A tree drops these because its size is the server's choice and a
+            hundred thousand files should not cost a hundred thousand objects; a list is
+            already yours and already in memory, so the per-file answers cost nothing and say
+            more. ``sum(r.transferred for r in results)`` is the byte total.
+
+        Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O -- today,
+                Windows. Raised before anything is transferred; see :mod:`._platform`.
+            UnsafePathError: If a remote path's basename could not be a local filename.
+            ValueError: If two remote paths share a basename, or if ``concurrency`` is below 1
+                or is above 1 with a ``progress`` callback. All three are refused before
+                anything is transferred.
+            DestinationCollisionError: If two basenames the filesystem merged reached one local
+                file. Raised at the end, so everything transferable still transfers.
+            NoSuchFileError: If a remote file does not exist.
+            ServerError: If the server refuses.
+            TransferError: If a transfer fails partway.
+        """
+        require_local_io("get_many()")
+        _check_local_path(local_path, method="get_many()")
+        _check_transfer_concurrency(
+            concurrency,
+            progress=progress,
+            caller="get_many",
+            unit="list",
+            report="the returned results",
+        )
+        requested_mode = resolve_mode(mode, caller="get_many()")
+        destination = _ensure_directory(Path(local_path), parents=True)
+        settled = settle_downloads(remote_paths, destination=destination)
+        ledger = DestinationLedger()
+        collisions: list[PathCollision] = []
+        finished: list[tuple[int, DownloadResult]] = []
+
+        with operation(
+            session_logger, "get_many", local=destination, requested=len(settled)
+        ) as record:
+
+            async def produce() -> AsyncGenerator[tuple[int, _SettledDownload]]:
+                """Reserve each destination in list order, before its transfer is queued.
+
+                Same placement as :meth:`_claim_download`, and for the same reason: every
+                check and every claim happens in this one task, in the caller's order, so
+                which of a colliding pair is refused is the list's answer rather than the
+                scheduler's.
+
+                **What that placement is not is the thing keeping the ledger correct**, and
+                the difference was measured rather than assumed. Moving the claim into the
+                worker was tried as a deliberate break and *passed* every row: the pool's
+                stream has a zero buffer, so a worker receives item N only after the producer
+                has sent it, and each worker claims before its first await. The ordering
+                survives either way. Keeping it here makes that ordering a property of this
+                function instead of a property of `_pool.py`'s buffering, which is a
+                dependency nothing in the pool's contract promises to keep.
+                """
+                for index, item in enumerate(settled):
+                    collision = _claim_local_destination(item.target, item.remote, ledger=ledger)
+                    if collision is None:
+                        yield index, item
+                    else:
+                        collisions.append(collision)
+
+            async def transfer(pair: tuple[int, _SettledDownload]) -> None:
+                index, item = pair
+                result = await self.get(
+                    item.remote,
+                    item.target,
+                    progress=progress,
+                    resume=resume,
+                    preserve_times=preserve_times,
+                    mode=requested_mode,
+                )
+                # Appended with its index rather than assigned into a preallocated slot, and
+                # never accumulated with `+=`: augmented assignment loads before it evaluates,
+                # which is the lost update `get_tree` documents. The order is restored by
+                # sorting once, below, where every worker has finished.
+                finished.append((index, result))
+
+            await for_each_bounded(produce(), transfer, concurrency=concurrency)
+
+            results = tuple(result for _, result in sorted(finished, key=lambda pair: pair[0]))
+            record["files"] = len(results)
+            record["bytes"] = sum(result.transferred for result in results)
+            if collisions:
+                record["collisions"] = len(collisions)
+                raise _collision_error(
+                    collisions,
+                    destination,
+                    files=len(results),
+                    transferred=sum(result.transferred for result in results),
+                )
+            return results
 
     async def _walk_for_upload(
         self,
@@ -2420,7 +2581,7 @@ class Session(_SessionOperations):
         mode: int | Mode | None,
         state: _DownloadState,
         dry_run: bool = False,
-    ) -> AsyncGenerator[_TreeDownload]:
+    ) -> AsyncGenerator[_SettledDownload]:
         """Walk the remote tree and hand out one settled file at a time.
 
         **Everything that touches the ledger happens here**, in one task and in walk order,
@@ -2468,7 +2629,7 @@ class Session(_SessionOperations):
         child: DirEntry,
         state: _DownloadState,
         dry_run: bool,
-    ) -> _TreeDownload | None:
+    ) -> _SettledDownload | None:
         """Settle one walked file and record whatever stopped it, or hand it back to transfer.
 
         The reporting half of :meth:`_claim_download`, split from it so that one decides a
@@ -2529,7 +2690,7 @@ class Session(_SessionOperations):
         child: DirEntry,
         ledger: DestinationLedger | FoldedNameLedger,
         dry_run: bool = False,
-    ) -> tuple[_TreeDownload | None, PathCollision | None]:
+    ) -> tuple[_SettledDownload | None, PathCollision | None]:
         """Settle one walked file's destination, or report the collision that refuses it.
 
         Synchronous and called only from the producer, which is what makes the ledger safe
@@ -2554,18 +2715,10 @@ class Session(_SessionOperations):
         """
         target = check_contained(destination, local_child(local_directory, child.filename))
         remote = join_remote(entry.path, child.filename)
-        # The local write in this builder, and it is easy to miss because the name does not
-        # say it writes: `O_CREAT` reserves the destination so two remote names cannot race
-        # onto it. A preview must not leave that file behind, and skipping it is what forces
-        # `dry_run` to carry a `FoldedNameLedger` -- with no file there is no inode, and the
-        # inode is the only thing that can answer this question for certain.
-        if not dry_run:
-            _touch_destination(target)
-        first = ledger.collides_with(target)
-        if first is not None:
-            return None, PathCollision(str(target), remote, first)
-        ledger.claim(target, remote)
-        return _TreeDownload(remote, target), None
+        collision = _claim_local_destination(target, remote, ledger=ledger, dry_run=dry_run)
+        if collision is not None:
+            return None, collision
+        return _SettledDownload(remote, target), None
 
     async def put(
         self,
@@ -3082,7 +3235,13 @@ class Session(_SessionOperations):
         """
         require_local_io("put_tree()")
         _check_local_path(local_path, method="put_tree()")
-        _check_tree_concurrency(concurrency, progress=progress, caller="put_tree")
+        _check_transfer_concurrency(
+            concurrency,
+            progress=progress,
+            caller="put_tree",
+            unit="tree",
+            report="the returned TreeResult",
+        )
         root = self._resolve(remote_path)
         policy = publish_from_legacy(publish, legacy, caller="put_tree")
         _check_tree_publish(policy, resume=resume, caller="put_tree")
@@ -3096,7 +3255,7 @@ class Session(_SessionOperations):
 
         with operation(session_logger, "put_tree", local=local_path, remote=root) as record:
 
-            async def produce() -> AsyncGenerator[_TreeUpload]:
+            async def produce() -> AsyncGenerator[_SettledUpload]:
                 """Hand out one file at a time, from a walk that has already made its directory.
 
                 Every directory-level decision -- the ``mkdir`` and its ordering, the count, the
@@ -3121,12 +3280,12 @@ class Session(_SessionOperations):
                 ) as walker:
                     async for entry, remote_directory in walker:
                         for name in entry.files:
-                            yield _TreeUpload(
+                            yield _SettledUpload(
                                 entry.path / os.fsdecode(name),
                                 join_remote(remote_directory, remote_component(name)),
                             )
 
-            async def transfer(item: _TreeUpload) -> None:
+            async def transfer(item: _SettledUpload) -> None:
                 if dry_run:
                     # A local `stat`, which is free and needs no server -- so an upload plan
                     # reports its byte total in full where a download plan can only report
@@ -3176,6 +3335,117 @@ class Session(_SessionOperations):
             record["bytes"] = sum(moved)
             record["skipped"] = len(state.skipped)
             return TreeResult(len(moved), state.directories, sum(moved), tuple(state.skipped))
+
+    async def put_many(
+        self,
+        local_paths: Iterable[Path | str],
+        remote_path: bytes | str,
+        *,
+        publish: Publish | None = None,
+        progress: ProgressCallback | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
+    ) -> tuple[UploadResult, ...]:
+        """Upload an explicit list of local files into one remote directory.
+
+        The mirror of :meth:`get_many`, and the same two properties are what make it more than
+        a loop: each file keeps only its **basename** on the far end, and a list flattens where
+        a tree keeps the directories that told two same-named files apart. ``a/x.txt`` and
+        ``b/x.txt`` are two files in a tree and one remote name here, so they are refused up
+        front rather than one silently overwriting the other.
+
+        **The remote-side collision cannot be checked the way the download's is.** A download
+        asks the local filesystem which names it merged; here the equivalent question belongs
+        to the server, whose folding rules are its own and which this library will not guess
+        at. So what is refused is what can be *proved* from the arguments -- byte-identical
+        basenames -- and a server that folds two names this call let through will merge them.
+        That asymmetry is real and is why it is written here rather than implied.
+
+        Args:
+            local_paths: The files to upload. **Materialised**, as :meth:`get_many` describes.
+            remote_path: Remote directory everything is placed in. Created if absent, with its
+                missing parents.
+            publish: How each file is published, as :meth:`put` describes it. Applies per file:
+                a list is not a transaction and no tree-level atomicity is available over this
+                protocol.
+            progress: Per file, and **refused above ``concurrency=1``**, exactly as
+                :meth:`get_many`.
+            preserve_times: Carry each local file's timestamps onto its remote copy.
+            mode: Permission bits for each uploaded file, as :meth:`put` describes them.
+            resume: Forwarded to :meth:`put` per file.
+            concurrency: Files transferred at once, as :meth:`get_many` describes. Results come
+                back in the order you supplied whatever this is set to.
+
+        Returns:
+            One :class:`~gantry_sftp.session.UploadResult` per input, **in input order** --
+            which mechanism published each file, not just a count.
+
+        Raises:
+            NotImplementedError: On a platform without offset-addressed local I/O.
+            UnsafePathError: If a local path's basename could not be one remote path component.
+                **Reachable here where it is not from a tree** (D-184): every other caller
+                takes its names from ``os.scandir``, which cannot produce ``.``, ``..``, a
+                separator or an empty name, and a caller-supplied ``Path("dir/..")`` can.
+            ValueError: If two local paths share a basename, or if ``concurrency`` is below 1
+                or is above 1 with a ``progress`` callback, or if the publish policy cannot be
+                given to a whole list. Refused before anything is transferred.
+            NoSuchFileError: If a local file does not exist.
+            ServerError: If the server refuses.
+            TransferError: If a transfer fails partway.
+        """
+        require_local_io("put_many()")
+        _check_transfer_concurrency(
+            concurrency,
+            progress=progress,
+            caller="put_many",
+            unit="list",
+            report="the returned results",
+        )
+        root = self._resolve(remote_path)
+        # No `**legacy`: `put` and `put_tree` carry it to absorb the five publish arguments
+        # under their pre-`Publish` names, and this method has no pre-`Publish` era to absorb.
+        # Carrying the bag would invent a deprecated spelling for an API that never had one --
+        # and swallow every misspelled keyword on the way. `sync_tree` is the precedent.
+        policy = publish_from_legacy(publish, {}, caller="put_many")
+        _check_tree_publish(policy, resume=resume, caller="put_many")
+        requested_mode = resolve_mode(mode, caller="put_many()")
+        settled = settle_uploads(local_paths, remote_directory=root)
+        for item in settled:
+            _check_local_path(item.source, method="put_many()")
+        finished: list[tuple[int, UploadResult]] = []
+
+        await self._require_rooted_paths(root, feature="uploading a list of files")
+        await self._mkdir_parents(root, exist_ok=True)
+
+        with operation(session_logger, "put_many", remote=root, requested=len(settled)) as record:
+
+            async def produce() -> AsyncGenerator[tuple[int, _SettledUpload]]:
+                """Hand out the settled list, in the caller's order, one at a time."""
+                for pair in enumerate(settled):
+                    yield pair
+
+            async def transfer(pair: tuple[int, _SettledUpload]) -> None:
+                index, item = pair
+                result = await self.put(
+                    item.source,
+                    item.remote,
+                    publish=policy,
+                    preserve_times=preserve_times,
+                    mode=requested_mode,
+                    progress=progress,
+                    resume=resume,
+                )
+                # By index, never `+=` -- see `get_many` for the lost update.
+                finished.append((index, result))
+
+            await for_each_bounded(produce(), transfer, concurrency=concurrency)
+
+            results = tuple(result for _, result in sorted(finished, key=lambda pair: pair[0]))
+            record["files"] = len(results)
+            record["bytes"] = sum(result.transferred for result in results)
+            return results
 
     async def sync_tree(
         self,
@@ -3253,7 +3523,13 @@ class Session(_SessionOperations):
         """
         require_local_io("sync_tree()")
         _check_local_path(local_path, method="sync_tree()")
-        _check_tree_concurrency(concurrency, progress=progress, caller="sync_tree")
+        _check_transfer_concurrency(
+            concurrency,
+            progress=progress,
+            caller="sync_tree",
+            unit="tree",
+            report="the returned TreeResult",
+        )
         root = self._resolve(remote_path)
         policy = publish_from_legacy(publish, {}, caller="sync_tree")
         _check_tree_publish(policy, resume=False, caller="sync_tree")

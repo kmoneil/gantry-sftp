@@ -506,7 +506,14 @@ result.complete  # False -- read result.skipped
 `UploadResult`s. `skipped` is carried in full because it is bounded by the number of
 _problems_; per-file results are bounded by the number of _files_, and a tree of a hundred
 thousand of them should not cost a hundred thousand objects for a report almost nobody reads.
-If you need the per-file verdicts, call `get` or `put` yourself over a `walk` or a `glob`.
+
+**A list is the other case, and it answers the other way.**
+[`get_many` / `put_many`](concurrency.md#a-list-of-files-get_many-and-put_many) return one
+result per file, in the order you supplied — the argument above is about a set whose size is
+the *server's* choice, and an explicit list is already yours and already in memory, so the
+per-file verdicts cost nothing. That is the call to reach for after a `glob`. Over a `walk`,
+where you want the tree's structure preserved rather than flattened into one directory, `get`
+or `put` per entry is still the spelling.
 
 **Every name the server supplies is validated before it becomes a local path**, and the
 finished path is re-checked against the destination once symlinks are resolved. A server

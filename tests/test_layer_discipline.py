@@ -370,8 +370,23 @@ def test_the_hashlib_scan_finds_the_calls_it_is_meant_to_guard() -> None:
 # --- how much may live in one class (D-128) ---------------------------------------------------
 
 
-SESSION_METHOD_CEILING = 41
+SESSION_METHOD_CEILING = 43
 """What `Session` measures today, which is the whole of the rule.
+
+**41 to 43 by D-26**, two at once -- `get_many` and `put_many` -- and the membership question is
+answered the same way D-185's was and the opposite way D-30's was. These are public API, not
+orchestration that drifted here: the sync surface is derived from this class by name
+(`tests/test_sync_facade.py`), so a blocking `put_many` exists only if an async one does, and the
+blocking one is the entire reason the card was built -- a blocking caller has no task group.
+
+**The pure half did move, which is what this ratchet is really asking.** `session/_many.py` holds
+the name derivation and the duplicate refusal, and it needs no session, no server and no event
+loop; what stays on the class is the two orchestrations. Two further reuses came out of it rather
+than a third copy: `_claim_local_destination` is now the one collision rule both the walk and the
+list ask, and `_check_transfer_concurrency` is the one refusal both shapes share.
+
+The alternative costed and rejected was a free function taking a `Session` -- which keeps the
+count, moves nothing real, and loses the blocking twin the parity gate derives from the class.
 
 **40 to 41 by D-185**, and it is the raise this docstring's own rule asks to be argued rather
 than taken -- because the card before it hit this same ceiling and answered the opposite way.
