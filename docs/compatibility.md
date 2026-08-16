@@ -93,6 +93,28 @@ has room for: only the permissions flag is discarded, and the timestamp flag ove
 works. If that is fixed the row becomes a refusal rather than a silent success, and this page is
 where to correct it.
 
+**The fix under discussion there changes what a failing `SETSTAT` means, which is worth knowing
+before it lands.** One request carries several attribute flags and v3 answers all of them with a
+single `STATUS`, so a server applying them in sequence has to decide what a failure part-way
+through does to the rest. The
+[proposal](https://github.com/ronf/asyncssh/issues/827#issuecomment-5308095955) is to attempt
+every requested attribute and report an error at the end, naming the ones that failed in the
+message. It fails in the right direction — toward _go and look_ rather than toward `OK` — and it
+converges with OpenSSH, whose `process_setstat` already applies every flag and reports the last
+failure. The cost is that an error stops meaning nothing happened: a multi-flag request can fail
+and still have applied part of itself, and which part is described only in a string written for a
+human to read. This library never meets that case, because `chmod`, `chown`, `utime` and
+`truncate` each send one flag per request for exactly this reason — see
+[Paths and names](paths.md#these-follow-symlinks-by-default).
+
+**A narrower shape was suggested for the condition that prompted the report.** The two failures in
+scope — `os.chmod` without `follow_symlinks` support, and an `os` function missing outright on
+Windows — are facts about the server's platform rather than about the file being changed, so both
+can be answered before anything is touched. Checked up front, the request is refused having
+changed nothing, which is the only place an all-or-nothing answer is available over a protocol
+with no transaction. Whichever shape lands, nothing on this page moves: a status is not a result,
+and the probe reads the link and the target either way.
+
 ## Safe to point at production
 
 The people who can run this will run it against a system their employer depends on, so the

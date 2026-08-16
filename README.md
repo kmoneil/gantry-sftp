@@ -34,7 +34,7 @@ one and never a half-written one. `result` says which mechanism it actually got,
 step of it is an optional server extension.
 
 **No event loop is needed for any of that.** The core is async, written against `anyio` so it runs
-on asyncio *and* trio, and `gantry_sftp.sync` is a blocking facade over the same code rather than
+on asyncio _and_ trio, and `gantry_sftp.sync` is a blocking facade over the same code rather than
 a second implementation of it. If you are writing a script, stay here. If you are writing a
 service, drop the `.sync` and add `async` / `await`:
 
@@ -125,22 +125,22 @@ If `ssh` is missing, you get a `ConnectError` whose `hint` says all of the above
 Start with **[Getting started](docs/getting-started.md)**. After that the guides are shaped by
 task rather than by module:
 
-| Guide | What is in it |
-| --- | --- |
-| [Getting started](docs/getting-started.md) | Install, the `ssh` prerequisite, your first transfer, and the same code with and without an event loop |
-| [Transferring files](docs/transfers.md) | `get` / `put`, atomic publish, resume, content verification, timestamps, permissions, whole trees, previewing one with `dry_run`, mirroring one with `sync_tree`, and the incremental-ingest loop |
-| [Paths, predicates and attributes](docs/paths.md) | `SFTPPath`, the bytes-versus-`Path` rule, `exists` / `is_dir` / `is_file`, a working directory, symlinks and `chmod` |
-| [Listing and matching](docs/listing-and-matching.md) | `listdir` / `scandir`, streaming a directory you did not size, and the `glob` dialect |
-| [Concurrency and byte ranges](docs/concurrency.md) | Many transfers over one connection, `concurrency=`, `open_file`, and reading part of a file |
-| [Connecting and authenticating](docs/connecting.md) | Keys, agents, `ssh_config`, passwords, restricting where a connection may go, which `ssh_config` settings this library overrides, and what a failure tells you |
-| [Reconnecting and timeouts](docs/reliability.md) | `with_reconnect`, retrying a refusal that clears, deadlines on every wait, and stopping a transfer cleanly |
-| [Seeing what it is doing](docs/observability.md) | Structured logs, session counters, the frame dump, credential redaction, and `doctor` |
-| [Does this work against my server?](docs/compatibility.md) | The compatibility battery, what a finding carries, the write probes and how to nominate a directory for them |
-| [fsspec, pandas and dask](docs/integrations.md) | `pd.read_parquet("gantry-sftp://…")`, and the two things to know before deploying it |
-| [Tunables, and what things cost](docs/tuning.md) | Every knob and its default, round trips per operation, memory per transfer |
-| [Why this exists](docs/architecture.md) | The design argument, the failures it prevents, and where this library is behind |
-| [Development](docs/development.md) | The suite, the lanes, and what each one exists to catch |
-| [The security model](docs/security.md) | The trust boundary, what is deliberately not defended, and where each control is proved |
+| Guide                                                      | What is in it                                                                                                                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Getting started](docs/getting-started.md)                 | Install, the `ssh` prerequisite, your first transfer, and the same code with and without an event loop                                                                                            |
+| [Transferring files](docs/transfers.md)                    | `get` / `put`, atomic publish, resume, content verification, timestamps, permissions, whole trees, previewing one with `dry_run`, mirroring one with `sync_tree`, and the incremental-ingest loop |
+| [Paths, predicates and attributes](docs/paths.md)          | `SFTPPath`, the bytes-versus-`Path` rule, `exists` / `is_dir` / `is_file`, a working directory, symlinks and `chmod`                                                                              |
+| [Listing and matching](docs/listing-and-matching.md)       | `listdir` / `scandir`, streaming a directory you did not size, and the `glob` dialect                                                                                                             |
+| [Concurrency and byte ranges](docs/concurrency.md)         | Many transfers over one connection, `concurrency=`, `open_file`, and reading part of a file                                                                                                       |
+| [Connecting and authenticating](docs/connecting.md)        | Keys, agents, `ssh_config`, passwords, restricting where a connection may go, which `ssh_config` settings this library overrides, and what a failure tells you                                    |
+| [Reconnecting and timeouts](docs/reliability.md)           | `with_reconnect`, retrying a refusal that clears, deadlines on every wait, and stopping a transfer cleanly                                                                                        |
+| [Seeing what it is doing](docs/observability.md)           | Structured logs, session counters, the frame dump, credential redaction, and `doctor`                                                                                                             |
+| [Does this work against my server?](docs/compatibility.md) | The compatibility battery, what a finding carries, the write probes and how to nominate a directory for them                                                                                      |
+| [fsspec, pandas and dask](docs/integrations.md)            | `pd.read_parquet("gantry-sftp://…")`, and the two things to know before deploying it                                                                                                              |
+| [Tunables, and what things cost](docs/tuning.md)           | Every knob and its default, round trips per operation, memory per transfer                                                                                                                        |
+| [Why this exists](docs/architecture.md)                    | The design argument, the failures it prevents, and where this library is behind                                                                                                                   |
+| [Development](docs/development.md)                         | The suite, the lanes, and what each one exists to catch                                                                                                                                           |
+| [The security model](docs/security.md)                     | The trust boundary, what is deliberately not defended, and where each control is proved                                                                                                           |
 
 **[`examples/`](examples/README.md) is the other half of the documentation**, and it is executed
 rather than described: one runnable example per user-facing feature, each of which works with **no
@@ -202,10 +202,9 @@ written down rather than left for you to find.
 
 ## How this was built
 
-**This library was built with AI assistance.** Most of the code and prose here was written by a
-language model, directed, reviewed and accepted by a human author who is responsible for the
-result. It is stated because you would reasonably want to know, not because it is an excuse or a
-selling point.
+**This library was built with AI assistance.** This work is a collaboration between human writing
+and AI generation. It was directed, reviewed, and accepted by a human author who takes full
+responsibility for the final result.
 
 **Humans and models produce slop in roughly equal measure.** Neither one is the reason software is
 good or bad. What decides that is the verification: what is actually tested, what is measured
@@ -220,7 +219,7 @@ docstring reads exactly like a fallback somebody tested.
 
 - **Byte layouts are validated against the source, never from memory:**
   `draft-ietf-secsh-filexfer-02` and OpenSSH's own `PROTOCOL` and `sftp.h`. Every one of the 27
-  packet types carries a byte-level fixture asserted on encode *and* decode, because a codec
+  packet types carries a byte-level fixture asserted on encode _and_ decode, because a codec
   tested only against its own encoder is tested against nothing.
 - **Claims about servers are measured, not remembered.** Extension behaviour, status codes, and
   the argument order of `SYMLINK` (which the reference server reverses relative to the draft) were
@@ -235,7 +234,7 @@ docstring reads exactly like a fallback somebody tested.
 - **Mutation testing on the codec**, because a passing suite proves the tests ran, not that they
   would have noticed.
 
-None of that makes the code correct. It makes the *claims* checkable, which is the part you cannot
+None of that makes the code correct. It makes the _claims_ checkable, which is the part you cannot
 verify by reading a diff, and it is the standard this project should be held to no matter who or
 what typed it.
 
@@ -284,7 +283,7 @@ kevin@oneil.xyz if you would rather not use GitHub.
 [the security model](docs/security.md) has the trust boundary in full. The scope is worth
 reading before you start: this
 library contains no cryptography and does not implement SSH, so a finding about ciphers or
-host-key algorithms belongs to OpenSSH rather than here. What *is* ours is everything a hostile
+host-key algorithms belongs to OpenSSH rather than here. What _is_ ours is everything a hostile
 server can send us, how we build the `ssh` argument vector, and where a credential can end up.
 
 ## License
