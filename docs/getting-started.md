@@ -141,16 +141,40 @@ with start_blocking_portal(backend="trio") as portal:  # or asyncio, the default
         two.get("/data.csv", "b.csv")
 ```
 
-**Many transfers over one connection is spelled with threads here.** A blocking caller has no
-task group, and a `SyncSession` is safe to share across one. Each call posts to the same loop,
-so the fan-out lands on the one reader that already routes replies by request id:
+**For a list of files, there is no pool to stand up.** `get_many` and `put_many` overlap the
+transfers on the portal's own loop, derive each destination name for you and hand the results
+back in the order you asked for them:
+
+```python
+with connect("example.com", user="bob") as sftp:
+    results = sftp.get_many(paths, "downloads/", concurrency=8)
+```
+
+That is the shape worth reaching for first, and it is a bigger difference here than on the
+async surface — see [A list of files](concurrency.md#a-list-of-files-get_many-and-put_many).
+
+**Anything else is spelled with threads.** A blocking caller has no task group, and a
+`SyncSession` is safe to share across one. Each call posts to the same loop, so the fan-out
+lands on the one reader that already routes replies by request id:
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
 
+from gantry_sftp import check_listed_name, join_remote, local_child
+
 with connect("example.com", user="bob") as sftp, ThreadPoolExecutor(8) as pool:
-    pool.map(lambda name: sftp.get(f"/incoming/{name}", local / name), names)
+    pool.map(
+        lambda name: sftp.get(
+            join_remote(b"/incoming", check_listed_name(name, directory=b"/incoming")),
+            local_child(local, name),
+        ),
+        names,
+    )
 ```
+
+Both joins, always, if `names` came from the server — a name that cleared the remote check has
+not cleared the local one, and `local / name` is the spelling this project has had to remove
+from its own documentation more than once.
 
 Four things to know about the thread boundary:
 

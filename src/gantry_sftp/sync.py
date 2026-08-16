@@ -75,7 +75,15 @@ anyone who wants several sessions on one loop instead of a thread apiece.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+)
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, contextmanager
 from datetime import datetime
 from functools import partial
@@ -1023,6 +1031,37 @@ class SyncSession:
             )
         )
 
+    def get_many(
+        self,
+        remote_paths: Iterable[bytes | str],
+        local_path: Path | str,
+        *,
+        progress: ProgressCallback | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
+    ) -> tuple[DownloadResult, ...]:
+        """Download a list of remote files into one local directory.
+
+        **This is the surface where the list form earns its place** rather than merely
+        matching the async one. A blocking caller has no task group: the documented spelling
+        for overlapping transfers is a ``ThreadPoolExecutor``, and ``concurrency=`` here runs
+        them on the portal's own loop with no pool to stand up and no thread per file.
+        """
+        return self._run(
+            partial(
+                self._session.get_many,
+                remote_paths,
+                local_path,
+                progress=progress,
+                preserve_times=preserve_times,
+                mode=mode,
+                resume=resume,
+                concurrency=concurrency,
+            )
+        )
+
     @overload
     def put_tree(
         self,
@@ -1104,6 +1143,36 @@ class SyncSession:
                 concurrency=concurrency,
                 dry_run=dry_run,
                 **legacy,
+            )
+        )
+
+    def put_many(
+        self,
+        local_paths: Iterable[Path | str],
+        remote_path: bytes | str,
+        *,
+        publish: Publish | None = None,
+        progress: ProgressCallback | None = None,
+        preserve_times: bool = False,
+        mode: int | Mode | str | None = None,
+        resume: bool = False,
+        concurrency: int = 1,
+    ) -> tuple[UploadResult, ...]:
+        """Upload a list of local files into one remote directory.
+
+        See :meth:`get_many` for why the blocking surface is the one this shape was built for.
+        """
+        return self._run(
+            partial(
+                self._session.put_many,
+                local_paths,
+                remote_path,
+                publish=publish,
+                progress=progress,
+                preserve_times=preserve_times,
+                mode=mode,
+                resume=resume,
+                concurrency=concurrency,
             )
         )
 

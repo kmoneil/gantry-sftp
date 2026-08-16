@@ -3,19 +3,66 @@
 One connection carries many transfers at once. This is also where the async core is the
 point rather than an implementation detail.
 
-## Many transfers, one connection
+## A list of files: `get_many` and `put_many`
+
+When you already have the files in a list, this is the one call:
 
 ```python
+results = await sftp.get_many(paths, "downloads/", concurrency=4)
+print(sum(result.transferred for result in results))
+```
+
+Each file keeps its **basename** at the destination, and the results come back **in the order
+you supplied**, one [`DownloadResult`](transfers.md#verifying-a-transfer) per input, whatever
+the concurrency. `put_many(paths, b"/drop")` is the other direction and returns an
+`UploadResult` each, so you can see which mechanism published each file rather than only a
+count.
+
+Two things it does that a loop of `get` does not, and they are the reason to prefer it:
+
+- **It builds the destination name for you, with both checks.** A remote path's basename has
+  to become a local filename, and the remote and local name rules are not the same rule — see
+  [the two joins](listing-and-matching.md#when-the-filter-is-not-a-pattern).
+- **It refuses a list that flattens onto one name.** `a/x.csv` and `b/x.csv` are two files in
+  a tree and one name in a flat directory. Unchecked, the second transfer overwrites the
+  first and the call reports success; instead you get a `ValueError` naming both, before
+  anything moves. Names the *destination filesystem* merges — `README.md` and `readme.md` on
+  a Mac — cannot be known without writing, so those raise
+  `DestinationCollisionError` at the end, exactly as [`get_tree`](transfers.md#two-remote-names-one-local-file) does.
+
+The remote side of `put_many` is the asymmetric half and is worth knowing: this library will
+not guess a server's folding rules, so what it refuses there is only what it can prove from
+your arguments — byte-identical basenames. A server that folds two names this call let through
+will merge them.
+
+`progress=` is refused above `concurrency=1`, for the reason given under `concurrency=` below.
+
+## Many transfers, one connection
+
+When the pairing is not "a list into a directory" — different destinations, names you compute,
+work interleaved with other calls — fan out yourself:
+
+```python
+from gantry_sftp import check_listed_name, join_remote, local_child
+
 async with anyio.create_task_group() as group:
     for name in names:
-        group.start_soon(sftp.get, f"/incoming/{name}", local / name)
+        remote = join_remote(b"/incoming", check_listed_name(name, directory=b"/incoming"))
+        group.start_soon(sftp.get, remote, local_child(local, name))
 ```
+
+**Both joins, always** — that is not defensiveness about this snippet, it is the spelling this
+project has twice had to remove from its own documentation. If `names` came from a listing they
+are the server's, and `local / name` is a directory traversal waiting for a server that answers
+with `..\evil`; a name that cleared the remote check has not cleared the local one.
+[When the filter is not a pattern](listing-and-matching.md#when-the-filter-is-not-a-pattern)
+is the reference for the pair, and `get_many` above is the version where the library owns it.
 
 SFTP correlates replies by request id, so one channel carries as many operations as you care
 to start. This library reads that channel in exactly one task and hands each reply to the
 operation that asked for it, which is what makes the above safe. There is no `concurrency=`
-knob: how many transfers to have in flight is a decision about the far end, about its handle
-limits, its patience and its disks, and a task group already expresses it.
+knob on `get` itself: how many transfers to have in flight is a decision about the far end,
+about its handle limits, its patience and its disks, and a task group already expresses it.
 
 Three things worth knowing before you fan out:
 
@@ -32,7 +79,8 @@ Three things worth knowing before you fan out:
 - **One operation is one consumer.** Two tasks may each run a `get`; two tasks driving _the
   same_ `get` is not a thing.
 
-`get_tree()`, `put_tree()` and `sync_tree()` take `concurrency=`, defaulting to `1`:
+`get_many()`, `put_many()`, `get_tree()`, `put_tree()` and `sync_tree()` all take
+`concurrency=`, defaulting to `1`:
 
 ```python
 result = await sftp.get_tree("/incoming", "downloads/", concurrency=8)

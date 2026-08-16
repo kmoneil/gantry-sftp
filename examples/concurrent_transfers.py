@@ -5,10 +5,16 @@
 
 One session, many transfers. SFTP correlates replies by request id, so a single channel can
 carry several operations at once; this library reads that channel in one task and hands each
-reply to whichever transfer asked for it. For individual files, concurrency is the caller's to
-choose -- an `anyio` task group -- rather than something the library decides for you. For a
-*tree*, `get_tree(concurrency=)` does it for you, and the last section here shows why that is
-a separate thing rather than the same thing with a loop around it.
+reply to whichever transfer asked for it.
+
+Three shapes, and picking the wrong one is the point of this file:
+
+* **A list of files into one directory** -- `get_many` / `put_many`. The library derives each
+  destination name and refuses a list that flattens onto one of them.
+* **Anything else you can enumerate** -- your own `anyio` task group, where the concurrency
+  limit is the group and the two path joins are yours to make.
+* **A tree** -- `get_tree(concurrency=)`, because you do not have the list; the server does,
+  and its size is the server's choice.
 
 That argument bounds **one call** and nothing adds the calls up, so the total across a program
 is the caller's either way: three `get_tree(concurrency=8)` in your task group is twenty-four
@@ -141,11 +147,53 @@ async def run(sftp: Session, remotes: list[str], workdir: Path) -> None:
     await show_how_a_failure_arrives(sftp, remotes[0], workdir)
 
 
+async def show_list_transfers(sftp: Session, remotes: list[str], workdir: Path) -> None:
+    """A list of files into one directory, where the library owns the destination name.
+
+    This is the shape the task group above is *not* the best answer to. Two things happen here
+    that a hand-written fan-out has to get right itself:
+
+    * **The destination name is derived and checked.** A remote path's basename becomes a local
+      filename, and the remote and local name rules are not the same rule -- a name that
+      cleared the remote check can still be `..\\evil` or `C:evil` or `CON`.
+    * **A list that flattens onto one name is refused.** `a/x.csv` and `b/x.csv` are two files
+      in a tree and one file in a flat directory, so the second would overwrite the first with
+      the call reporting success.
+
+    And the results come back in the order they were asked for, whatever the concurrency, which
+    is what lets you zip them against your own list.
+    """
+    into = workdir / "list"
+    results = await sftp.get_many(remotes, into, concurrency=4)
+
+    print(f"\n{len(results)} files by list, concurrency=4")
+    print(f"  {sum(result.transferred for result in results)} bytes")
+    assert [result.transferred for result in results] == [FILE_SIZE] * len(remotes), (
+        "get_many returned its results out of the order they were asked for"
+    )
+    print("  results in the order they were asked for, one per input")
+
+    # The refusal, which is the half worth demonstrating: two different files whose basenames
+    # are equal cannot both land in one directory. Refused before anything is transferred.
+    first = workdir / "a" / "same.csv"
+    second = workdir / "b" / "same.csv"
+    for path in (first, second):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"x")
+    try:
+        _ = await sftp.put_many([first, second], str(workdir / "drop").encode())
+    except ValueError as error:
+        print(f"\n  two sources, one name -- refused before anything moved:\n    {error}")
+    assert not (workdir / "drop").exists(), (
+        "put_many created the destination directory for a list it then refused"
+    )
+
+
 async def show_tree_concurrency(sftp: Session, source: str, workdir: Path) -> None:
     """The same idea for a whole tree, where the fan-out is not yours to write.
 
-    A task group over `get` is right for a list of files you already have. A tree is different
-    in one way that matters: **you do not have the list**, the server does, and its size is the
+    `get_many` is right for a list of files you already have. A tree is different in one way
+    that matters: **you do not have the list**, the server does, and its size is the
     server's choice. `group.start_soon(...)` inside the walk creates a task per entry, so a peer
     answering with a million names creates a million tasks -- which is why `concurrency=` feeds a
     bounded worker pool from the walk instead, and the walk blocks while every worker is busy.
@@ -211,6 +259,7 @@ async def main() -> None:
                 open_session(transport) as sftp,
             ):
                 await run(sftp, remotes, workdir)
+                await show_list_transfers(sftp, remotes, workdir)
                 await show_tree_concurrency(sftp, str(source_dir), workdir)
         else:
             if remote_dir is None:

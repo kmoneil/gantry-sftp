@@ -41,7 +41,7 @@ from pathlib import Path
 
 import anyio
 
-from gantry_sftp import SFTPPath, StateError, UnsafePathError
+from gantry_sftp import SFTPPath, StateError, UnsafePathError, local_child
 from gantry_sftp.session import Session, open_session
 from gantry_sftp.transport import open_local_server_transport, open_ssh_transport
 
@@ -132,7 +132,10 @@ async def use_it(sftp: Session, base: bytes, destination: Path) -> None:
     matched: list[SFTPPath] = []
     async for found in root.glob("2026/*.csv"):
         matched.append(found)
-        local = destination / os.fsdecode(found.name)
+        # `local_child` and not `destination / os.fsdecode(found.name)`: the remote half of
+        # this path was validated by `glob`, and the *local* half is a second check with a
+        # wider rule -- a name that cleared the remote one can still be `..\evil` or `CON`.
+        local = local_child(destination, found.name)
         result = await found.download(local)
         print(f"  {found.name!r:<20} -> {local.name!r} ({result.transferred} bytes)")
 
