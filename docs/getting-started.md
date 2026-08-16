@@ -167,9 +167,12 @@ Four things to know about the thread boundary:
   the same thing when you enter it, read from it or advance it. Leaving one's `with` block is
   the exception and is quiet: the handle went with the connection, so there is nothing to
   release, and raising on the way out would replace whatever error you were already handling.
-- **`with_reconnect` has no blocking form yet.** It takes a callable that receives a session,
-  so a blocking version has to run _your_ function on the portal's thread and therefore needs a
-  third thread to re-enter from. That is a mechanism decision rather than a wrapper, and not one
-  to half-build. The async form is unaffected.
+- **`with_reconnect` runs your function on a third thread.** It has to: it hands you a session,
+  and the portal's own thread is the one thread that cannot use one. That thread is borrowed
+  from anyio's pool rather than started per call, and an exception you raise there comes back
+  as itself. Its `connect` argument is the **async** transport recipe, because a transport is
+  opened per attempt on the portal's loop — passing the blocking twin of the same name is
+  refused with a `TypeError` that says so. See
+  [Reconnecting and timeouts](reliability.md#the-blocking-form).
 
 Runnable: `examples/blocking.py`.
