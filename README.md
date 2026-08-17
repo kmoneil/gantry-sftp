@@ -79,7 +79,7 @@ $ python -m gantry_sftp doctor
 gantry-sftp doctor
 
 local
-  library                 0.5.0 (filexfer v3)
+  library                 0.5.1 (filexfer v3)
   ssh executable          ssh -- a bare name, so PATH decides at spawn time
   ssh version             OpenSSH_10.0p2 Debian-7+deb13u4, OpenSSL 3.5.6 7 Apr 2026
   transfers               supported
@@ -181,15 +181,15 @@ performance, and it writes its figures to a report rather than to this file.
 
 ## Status
 
-**0.5.0, and beta rather than alpha: the feature set is complete and the API can still change.**
+**0.5.1, and beta rather than alpha: the feature set is complete and the API can still change.**
 While the major version is `0` a breaking change lands in the minor version, so a patch release is
-always safe to take. `0.5.0` is a minor release because it **adds API and breaks nothing** —
-nothing was removed, no signature changed, no default moved, so unlike `0.4.0` there is no handler
-anywhere that stops catching. It adds transferring an explicit list of files, `get_many` and
-`put_many`, on both the async and the blocking surface and with results in the order you asked for
-them; and a blocking form of `with_reconnect`, which the async side had and the blocking side did
-not. See [`CHANGELOG.md`](CHANGELOG.md) for both, and for the one thing `doctor` was telling you
-backwards.
+always safe to take. `0.5.1` is a patch because it **changes no API at all** — no signature moved,
+nothing was removed, no default changed. It fixes two things a program can observe: a concurrent
+transfer that hit several failures reported one of them and said nothing about the rest, and
+`with_reconnect` claimed every attempt was retryable even when the failure that stopped it was
+not. The release before it, `0.5.0`, was a minor because it **added API and broke nothing** —
+transferring an explicit list of files with `get_many` and `put_many` on both surfaces, and a
+blocking form of `with_reconnect`. See [`CHANGELOG.md`](CHANGELOG.md) for all of it.
 
 The protocol layer is complete: all 27 filexfer v3 packet types, encoded and decoded, each with a
 byte-level fixture asserted in **both** directions, checked against `draft-ietf-secsh-filexfer-02`
