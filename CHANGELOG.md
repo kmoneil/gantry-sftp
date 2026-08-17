@@ -3,6 +3,65 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## 0.5.0 — 2026-08-17
+
+**A minor bump because it adds API, and for no other reason — nothing here breaks.** Two public
+surfaces arrive: transferring an explicit list of files, on both the async and the blocking side,
+and a blocking form of `with_reconnect`. Under this project's `0.x` rule the minor version is
+also where a break would land, and this release has none: nothing was removed, no signature
+changed, and no default moved. Calling it `0.4.1` would understate it, since a bug-fix release
+does not grow the API.
+
+**The rest of what landed since 0.4.0 does not appear below, and that is deliberate.** Four of
+the seven changes are tests — mutation-lane work that pinned defaults nothing was asserting and
+pinned the compatibility report finding for finding. They changed no behaviour a program can
+observe, so they are not notable changes to a *user*; the one defect that work uncovered is under
+Fixed.
+
+### Added
+
+- **`Session.get_many(paths, directory)` and `Session.put_many(paths, directory)`, with the
+  blocking twins `SyncSession.get_many` / `SyncSession.put_many`** (D-26). Transfer an explicit
+  list of files into one directory, with `concurrency=` and per-file results returned **in the
+  order you asked for them** rather than in completion order.
+
+  **The reason this is a method and not three lines of task group is the local name.** Each
+  destination is *derived* from a path you supplied, and the remote and local name rules are not
+  the same rule — `..\evil`, `C:evil` and `CON` all clear a remote check while containing no `/`
+  at all. Deriving the name here means one place checks it instead of every call site.
+
+  **A list flattens where a tree does not**, so `a/x.csv` and `b/x.csv` are two files in a tree
+  and one name here. Byte-identical basenames are refused **up front, from the arguments, before
+  anything moves** — deliberately unlike `get_tree`, which cannot know the set until it has
+  walked. The remote direction cannot have that check at all, because a server's folding rules
+  are its own, so `put_many` refuses only what it can prove and the asymmetry is documented.
+
+- **`gantry_sftp.sync.with_reconnect`** (D-85). The blocking form of the reconnect-and-retry
+  helper, which the async surface has had and the blocking one had not. It hands your function a
+  session, and the portal's own thread is the one thread that cannot use one — so the blocking
+  form runs it on a borrowed pool worker rather than a thread per call. An exception raised there
+  comes back as itself and flat, so the retry classifier still sees it.
+
+  The invariant this closes is *anything added to the async surface is not done until the
+  blocking one has it*, and the gate asserting it could not see this function: the parity check
+  derived from classes, and `with_reconnect` is a module-level callable. It now covers those too,
+  and discriminates by whether a function is a coroutine rather than by whether its name appears
+  on both surfaces.
+
+### Fixed
+
+- **`doctor` told you the wrong hazard about a case-folding server** (D-193). The compatibility
+  battery's case finding, when it establishes that **the server folds case**, described the
+  consequence as "a recursive download from a case-sensitive server can overwrite its own
+  output". That sentence is true and it is about the opposite server: one that folds cannot hold
+  two names differing only in case, so it can never present both in a listing and cannot make a
+  download merge them. What follows from a folding server is the mirror — **an upload of two
+  local names differing only in case lands as one file, the second overwriting the first**.
+
+  Both branches now carry the hazard that belongs to them; the download warning moved to the
+  case-*sensitive* finding, where it is what bites a `get_tree` onto macOS or Windows. Only the
+  prose a reader acts on was wrong, so no verdict changed and no exit code moved.
+
 ## 0.4.0 — 2026-08-14
 
 **A minor bump, and it would be one for either half of what follows.** Under this project's `0.x`
