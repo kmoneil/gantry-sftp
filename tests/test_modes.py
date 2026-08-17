@@ -767,6 +767,47 @@ async def test_an_integer_mode_on_a_tree_applies_to_files_only(tmp_path: Path):
     assert bits(destination / "nested") != PRIVATE
 
 
+async def test_a_list_takes_a_mode_and_by_default_sets_none(tmp_path: Path):
+    """D-191. Both halves, because the default is the one nothing was watching.
+
+    `get_many` and `put_many` shipped with `mode=None` pinned by nothing at all -- the same
+    hole as `preserve_times`, found by the same mutation run. The explicit half is here so the
+    default half cannot pass against a method that ignores `mode=` outright.
+
+    The two directions disagree about what "no mode" means and that is deliberate, not an
+    inconsistency: an upload creates the far-side file through the server's `open(2)`, so it
+    lands at the server's default, while a download creates a local file this library owns and
+    starts it private. `test_a_download_is_private_by_default_and_takes_an_explicit_mode`
+    states the same pair for one file.
+    """
+    needs_real_server()
+    sources = []
+    for index, name in enumerate(("a.bin", "b.bin")):
+        directory = tmp_path / f"src{index}"
+        directory.mkdir()
+        _ = (directory / name).write_bytes(b"payload")
+        sources.append(directory / name)
+    remotes = [str(source).encode() for source in sources]
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        default_up = await sftp.put_many(sources, str(tmp_path / "up").encode())
+        _ = await sftp.put_many(sources, str(tmp_path / "up-private").encode(), mode=PRIVATE)
+        default_down = await sftp.get_many(remotes, tmp_path / "down")
+        _ = await sftp.get_many(remotes, tmp_path / "down-shared", mode=GROUP_READABLE)
+
+    assert bits(tmp_path / "up" / "a.bin") == server_default_mode()
+    assert bits(tmp_path / "up-private" / "a.bin") == PRIVATE
+    assert bits(tmp_path / "down" / "a.bin") == PRIVATE
+    assert bits(tmp_path / "down-shared" / "a.bin") == GROUP_READABLE
+    # `None` is the honest per-file answer for the default: nothing was set. Asserted on every
+    # result rather than the first, because a list is where "the first one is right" hides.
+    assert [result.mode for result in default_up] == [None, None]
+    assert [result.mode for result in default_down] == [None, None]
+
+
 @pytest.mark.parametrize("direction", ["upload", "download"])
 async def test_preserve_carries_directory_modes_in_both_directions(tmp_path: Path, direction: str):
     needs_real_server()

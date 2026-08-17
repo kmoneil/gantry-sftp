@@ -379,6 +379,79 @@ async def test_by_default_neither_tree_preserves_timestamps(tmp_path: Path):
     assert int((source / "a.txt").stat().st_mtime) == KNOWN_MTIME
 
 
+def build_list(root: Path) -> list[Path]:
+    """Flat, stamped, and in separate directories so only the basenames meet at the far end."""
+    made = []
+    for index, name in enumerate(("a.txt", "b.txt")):
+        directory = root / f"d{index}"
+        directory.mkdir(parents=True)
+        made.append(stamped(directory / name, bytes([index]) * (index + 1)))
+    return made
+
+
+async def test_put_many_and_get_many_preserve_times_when_asked(tmp_path: Path):
+    """The list half of the same promise, and the row the default test below leans on.
+
+    Written first and deliberately: a test that only asserts *not preserved by default* passes
+    just as well against a method that ignores `preserve_times` altogether, so the default is
+    only worth pinning once something proves the argument is wired at all.
+    """
+    needs_real_server()
+    sources = build_list(tmp_path / "src")
+    uploaded = tmp_path / "up"
+    downloaded = tmp_path / "down"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        _ = await sftp.put_many(sources, str(uploaded).encode(), preserve_times=True)
+        _ = await sftp.get_many(
+            [str(source).encode() for source in sources], downloaded, preserve_times=True
+        )
+
+    for base in (uploaded, downloaded):
+        for name in ("a.txt", "b.txt"):
+            assert int((base / name).stat().st_mtime) == KNOWN_MTIME, (
+                f"{base.name}/{name} lost its timestamp"
+            )
+
+
+async def test_by_default_neither_list_preserves_timestamps(tmp_path: Path):
+    """D-191. `get_many` and `put_many` shipped with all five defaults unpinned.
+
+    The mutation lane found it rather than a test: `get_many__mutmut_1` flips this argument's
+    default from `False` to `True` and survived a full run, because every row in
+    `tests/test_many.py` exercises the defaults and asserts nothing about them.
+
+    The consequence is `test_by_default_neither_tree_preserves_timestamps`'s, reached by the
+    other entry point -- a landing zone whose consumer collects "modified since X" quietly
+    stops seeing the files this library delivers.
+    """
+    needs_real_server()
+    sources = build_list(tmp_path / "src")
+    uploaded = tmp_path / "up"
+    downloaded = tmp_path / "down"
+
+    async with (
+        open_local_server_transport(cwd=tmp_path) as transport,
+        open_session(transport) as sftp,
+    ):
+        _ = await sftp.put_many(sources, str(uploaded).encode())
+        # From the stamped sources, not from what the upload just landed. The tree twin
+        # documents why: reading the uploaded copy makes "not the known time" true whether or
+        # not the download preserved anything, and the mutant survives a test that cannot fail.
+        _ = await sftp.get_many([str(source).encode() for source in sources], downloaded)
+
+    for base in (uploaded, downloaded):
+        for name in ("a.txt", "b.txt"):
+            assert int((base / name).stat().st_mtime) != KNOWN_MTIME, (
+                f"{base.name}/{name} was stamped with the source's time without being asked"
+            )
+    # And the sources are untouched, so this is a fact about the copies.
+    assert int(sources[0].stat().st_mtime) == KNOWN_MTIME
+
+
 async def test_neither_tree_stamps_the_root_the_caller_named(tmp_path: Path):
     # Restamping a directory the caller already had is a side effect on something they did
     # not ask to have modified. Stated as a test because "we only touch what we create" is

@@ -34,6 +34,17 @@ difference -- `test_by_default_neither_tree_preserves_timestamps` in `tests/test
 and `test_check_file_offers_the_algorithms_this_library_actually_supports` in
 `tests/test_content_verification.py` are the two this slice added. A default worth defending gets
 both: the value written down here, and something that watches it from the outside.
+
+**D-191 is what the second half looks like when it is missing.** `get_many` and `put_many`
+reached a release with all five of their defaults unpinned in either sense -- no row here, and
+nothing anywhere calling them with an argument omitted -- and the mutation lane reported it
+months later. The four that watch them from the outside now:
+`test_by_default_neither_list_preserves_timestamps` (`tests/test_timestamps.py`),
+`test_a_list_takes_a_mode_and_by_default_sets_none` (`tests/test_modes.py`), and
+`test_a_list_download_resumes_only_when_asked` plus the `default` row of
+`test_the_results_come_back_in_the_order_they_were_asked_for` (`tests/test_many.py`). Each was
+confirmed by flipping the default in `src/` and watching that row fail, rather than by being
+written and assumed.
 """
 
 from __future__ import annotations
@@ -119,6 +130,37 @@ SESSION_DEFAULTS: dict[str, dict[str, Any]] = {
         "mode": None,
         "progress": None,
         "resume": False,
+        "concurrency": 1,
+    },
+    # D-191. These three landed without entries and nothing objected, which is the finding --
+    # see `test_the_table_covers_every_transfer_entry_point` below for the guard that was
+    # supposed to catch it and could not. The values are the tree ones for the same reasons:
+    # a list and a manifest-driven sync are transfers, so `preserve_times` off, `mode` left to
+    # the server, `resume` opt-in, and one file at a time until asked otherwise.
+    "get_many": {
+        "progress": None,
+        "preserve_times": False,
+        "mode": None,
+        "resume": False,
+        "concurrency": 1,
+    },
+    "put_many": {
+        "publish": None,
+        "progress": None,
+        "preserve_times": False,
+        "mode": None,
+        "resume": False,
+        "concurrency": 1,
+    },
+    # `sync_tree` has no `resume`: it is resumption, so the argument would name the whole
+    # method. `manifest` is required rather than defaulted for the same reason `journal` is
+    # `None` on `Publish` -- durable state on the caller's disk has nowhere to default to.
+    "sync_tree": {
+        "max_depth": None,
+        "publish": None,
+        "preserve_times": False,
+        "mode": None,
+        "progress": None,
         "concurrency": 1,
     },
     "check_file": {
@@ -213,16 +255,91 @@ def test_the_tunables_are_the_numbers_the_docs_quote():
     assert CHECK_FILE_BLOCK_SIZE == 65536
 
 
+# A method carrying any of these is a transfer, by construction rather than by opinion. They
+# are the arguments that decide what a transfer *does* to the bytes and to the destination, so
+# nothing that takes one is a predicate, an attribute call or a directory operation.
+#
+# `progress` and `mode` are deliberately **not** here even though every transfer takes one:
+# `mode` reaches `open_file` and `chmod`, `progress` reaches the handle-level `download_into`,
+# and a marker that also selects the plumbing is a marker that has to be pruned by hand -- which
+# is the failure this whole test exists to stop.
+TRANSFER_POLICY_ARGUMENTS = frozenset({"preserve_times", "resume", "concurrency", "publish"})
+
+# Transfers that predate the policy arguments and take none of them, so the derivation below
+# cannot see them. Named here rather than in the set above because each is a real entry point
+# whose defaults are documented promises; this is the list that has to be maintained by hand,
+# and it is two entries long on purpose.
+TRANSFERS_WITHOUT_POLICY_ARGUMENTS = frozenset({"check_file", "open_file"})
+
+
+def transfer_entry_points() -> set[str]:
+    """Every public `Session` method that takes a transfer-policy argument.
+
+    Derived rather than listed. The version of this that shipped as a set literal is the
+    reason D-191 exists.
+
+    **The mangled names have to go, and that is a known family rather than a special case.**
+    Under mutmut every mutated function is replaced by a trampoline and the class also carries
+    one member per mutant -- `xǁSessionǁget_many__mutmut_1` and friends, well over a hundred
+    for this method alone -- each a copy of the real signature, so each matches the predicate
+    below and none is in the table. `test_sync_facade.py` (D-131) and `test_layer_discipline.py`
+    (D-118) both hit this, and both fixes were to make the check see through the trampoline
+    rather than to add the file to mutmut's ignore list: an ignored file kills no mutants, so
+    exempting this one would take the whole of `test_defaults.py` out of the lane to spare a
+    two-token filter. `ǁ` is U+01C1, which mutmut uses precisely because no identifier anyone
+    writes contains it.
+    """
+    found = set()
+    for name, member in inspect.getmembers(Session, callable):
+        if name.startswith("_") or "ǁ" in name or "__mutmut" in name:
+            continue
+        parameters = set(inspect.signature(member).parameters)
+        if parameters & TRANSFER_POLICY_ARGUMENTS:
+            found.add(name)
+    return found | set(TRANSFERS_WITHOUT_POLICY_ARGUMENTS)
+
+
 def test_the_table_covers_every_transfer_entry_point():
     """Guards the guard: a new public transfer method must land in the table above.
 
     Without this, adding `get_range()` with a `resume=True` default would be invisible here --
     the table would simply not mention it, and every test above would still pass.
+
+    **This test failed at its job once and the reason was its own shape** (D-191). It carried
+    the six names it was written with as a set literal, so when `get_many` and `put_many`
+    landed it went on comparing the same six against a table that still held them, and passed.
+    Two public transfer methods reached a release with all five of their defaults unpinned, and
+    the only thing that reported it was a mutation run months later.
+
+    So the set is derived from `Session` now. A hand-maintained index of what exists cannot be
+    audited by reading it -- what is missing is exactly what is not there to read.
     """
-    transfers = {"get", "put", "get_tree", "put_tree", "check_file", "open_file"}
+    transfers = transfer_entry_points()
     assert transfers <= set(SESSION_DEFAULTS), (
-        f"not in the defaults table: {sorted(transfers - set(SESSION_DEFAULTS))}"
+        f"not in the defaults table: {sorted(transfers - set(SESSION_DEFAULTS))}. Every public "
+        f"transfer gets its defaults written down here; see this file's docstring for why the "
+        f"row is necessary and why it is not sufficient."
     )
+
+
+def test_the_derivation_still_finds_the_transfers_it_was_written_for():
+    """Guards the guard's guard, because the derivation can now fail silently in the other way.
+
+    A predicate that selects nothing passes the test above vacuously. Pinning the known members
+    means a rename of a policy argument -- `preserve_times` to `times=`, say -- fails here
+    rather than quietly emptying the set it feeds.
+    """
+    assert transfer_entry_points() == {
+        "get",
+        "put",
+        "get_tree",
+        "put_tree",
+        "get_many",
+        "put_many",
+        "sync_tree",
+        "check_file",
+        "open_file",
+    }
 
 
 # --- the defaults an exception carries, which are read by *constructing* it ---------------------
