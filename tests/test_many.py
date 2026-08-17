@@ -187,9 +187,16 @@ async def test_a_list_of_remote_files_lands_in_one_directory(tmp_path: Path):
     assert (destination / "b.csv").read_bytes() == bytes([1]) * 20
 
 
-@pytest.mark.parametrize("concurrency", [1, 4])
+@pytest.mark.parametrize(
+    ("options", "sequential"),
+    [
+        pytest.param({}, True, id="default"),
+        pytest.param({"concurrency": 1}, True, id="one"),
+        pytest.param({"concurrency": 4}, False, id="four"),
+    ],
+)
 async def test_the_results_come_back_in_the_order_they_were_asked_for(
-    tmp_path: Path, concurrency: int
+    tmp_path: Path, options: dict[str, int], sequential: bool
 ):
     """The claim `get_many` makes that a fan-out of `get` does not.
 
@@ -199,6 +206,12 @@ async def test_the_results_come_back_in_the_order_they_were_asked_for(
     half the matrix was asserting nothing. A descending delay per input position makes the
     completion order the exact reverse of the caller's on any backend, and `completed` is
     asserted too: if the two orders ever agreed, this row would pass without the sort existing.
+
+    **The `default` case is the point of the parametrisation** (D-191). This test passed
+    `concurrency=` on every row, so `concurrency: int = 1` was pinned by nothing and a mutant
+    raising it survived a full lane. Omitting the argument and asserting the *sequential* order
+    is what makes the shipped default a tested one -- and the `four` row is what stops that
+    assertion being satisfiable by a method that ignores the argument.
     """
     needs_real_server()
     root = tmp_path / "srv"
@@ -221,13 +234,13 @@ async def test_the_results_come_back_in_the_order_they_were_asked_for(
 
         sftp.get = delayed_get  # type: ignore[method-assign]
         try:
-            results = await sftp.get_many(remotes, tmp_path / "dest", concurrency=concurrency)
+            results = await sftp.get_many(remotes, tmp_path / "dest", **options)
         finally:
             sftp.get = downloaded  # type: ignore[method-assign]
 
     assert [result.transferred for result in results] == list(sizes.values())
     # The other half: prove the orders differed, so the assertion above is doing work.
-    assert completed == (list(reversed(remotes)) if concurrency > 1 else remotes)
+    assert completed == (remotes if sequential else list(reversed(remotes)))
 
 
 async def test_a_list_of_local_files_is_uploaded_into_one_directory(tmp_path: Path):
@@ -404,3 +417,50 @@ async def test_an_empty_list_transfers_nothing_and_says_so(tmp_path: Path):
     ):
         assert await sftp.get_many([], tmp_path / "dest") == ()
         assert await sftp.put_many([], os.fsencode(root / "drop")) == ()
+
+
+# --- the defaults, which are only tested by omitting them (D-191) -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("options", "resumes"),
+    [pytest.param({}, False, id="default"), pytest.param({"resume": True}, True, id="asked")],
+)
+async def test_a_list_download_resumes_only_when_asked(
+    tmp_path: Path, options: dict[str, bool], resumes: bool
+):
+    """`resume: bool = False` was pinned by nothing, so a mutant flipping it survived a lane.
+
+    **Observed through the file's content rather than by counting `READ`s**, which is what lets
+    this run against a real server instead of a scripted one. The destination is pre-filled with
+    the right *length* and the wrong *bytes*: resumption decides it is complete on size alone and
+    leaves the lie in place, and a download that does not resume overwrites it with the truth.
+    `test_a_resumed_download_does_not_re_read_a_file_it_already_has` asserts the same behaviour
+    from the packet side for a tree.
+
+    The `asked` row is not decoration -- without it the default row passes against a `get_many`
+    that has no working `resume=` at all.
+    """
+    needs_real_server()
+    root = tmp_path / "srv"
+    root.mkdir()
+    remotes = _remote_files(root, {"a.csv": 10, "b.csv": 20})
+    destination = tmp_path / "dest"
+    destination.mkdir()
+    # Same length as the remote, so a size check calls it complete; different bytes, so
+    # whether it was re-read is readable afterwards.
+    _ = (destination / "a.csv").write_bytes(b"?" * 10)
+
+    async with (
+        open_local_server_transport(cwd=root) as transport,
+        open_session(transport) as sftp,
+    ):
+        _ = await sftp.get_many(remotes, destination, **options)
+
+    landed = (destination / "a.csv").read_bytes()
+    if resumes:
+        assert landed == b"?" * 10, "resume=True re-read a file it had already downloaded"
+    else:
+        assert landed == bytes([0]) * 10, (
+            "the default re-used a partial local file: get_many() resumed without being asked"
+        )
