@@ -470,6 +470,126 @@ def test_the_link_check_is_not_vacuous():
     assert "servers-whose-namespace-is-not-rooted-at-" in heading_slugs(DOCS / "transfers.md")
 
 
+def repository_prefixes() -> frozenset[str]:
+    """Every top-level directory a document could be citing something inside.
+
+    Derived from the tree rather than listed, for the reason D-191 records about a set
+    literal: a directory added later would otherwise sit outside the check with nothing
+    saying so. Being *too* broad costs nothing here -- a prefix nobody cites contributes no
+    paths to resolve -- while being too narrow is the failure this exists to prevent.
+    """
+    return frozenset(entry.name for entry in ROOT.iterdir() if entry.is_dir())
+
+
+def cited_paths(page: Path) -> list[str]:
+    """Repository paths a page quotes as inline code, as opposed to linking.
+
+    A path inside backticks is not a Markdown link, so ``test_every_internal_link_resolves``
+    never looks at it -- which is how ``docs/security.md`` came to cite ``tests/test_describe.py``
+    for as long as it had (D-196). Matched by prefix so an *illustrative* absolute path stays
+    out: ``/var/lib/myjob/uploads.journal`` in the reliability guide names no file here and is
+    not supposed to.
+
+    Two shapes are deliberately kept and one is deliberately dropped.
+
+    **A pytest node id is kept whole** -- ``tests/test_transport.py::test_something`` -- because
+    the half after ``::`` is the part most likely to go stale: a renamed test leaves the file
+    resolving and the citation pointing at nothing, which is D-196's own failure one level down.
+    :func:`unresolved` checks both halves.
+
+    **A placeholder is dropped.** ``benchmarks/instructions-<arch>.json`` is a filename pattern
+    rather than a file, and ``<`` is what says so -- no path in this tree contains one.
+    """
+    prefixes = repository_prefixes()
+    found: list[str] = []
+    for match in re.finditer(r"`([^`\s]+)`", page.read_text(encoding="utf-8")):
+        candidate = match.group(1).rstrip(".,;:")
+        head, separator, _ = candidate.partition("/")
+        if not (separator and head in prefixes) or "<" in candidate:
+            continue
+        if Path(candidate.partition("::")[0]).suffix:
+            found.append(candidate)
+    return found
+
+
+def unresolved(cited: str) -> str | None:
+    """Why a cited path does not resolve, or ``None`` if it does.
+
+    Returns:
+        A phrase naming which half failed, so a failure says whether the file moved or the test
+        inside it was renamed. Those want different fixes and the message should not make the
+        reader work it out.
+    """
+    relative, _, node = cited.partition("::")
+    target = ROOT / relative
+    if not target.exists():
+        return f"{cited} (no such file)"
+    # `node in text` is what this did first and it is not enough: a renamed
+    # `..._produce_a_control_character` cited as `..._produce_a_control_char` is a *substring*
+    # of the name that replaced it, so the stale citation resolved against the very rename it
+    # was supposed to catch. Matching a definition is what makes the name mean the whole name.
+    defined = re.compile(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(node)}\b", re.MULTILINE)
+    if node and not defined.search(target.read_text(encoding="utf-8")):
+        return f"{cited} (the file exists; nothing in it is named {node!r})"
+    return None
+
+
+@pytest.mark.parametrize(
+    "page",
+    [*markdown_documents(), ROOT / "CHANGELOG.md"],
+    ids=lambda p: f"{p.parent.name}/{p.name}",
+)
+def test_every_repository_path_a_document_cites_exists(page: Path):
+    """D-196. The other half of the link check, and the half nothing was looking at.
+
+    ``docs/security.md``'s proof table -- the one under *"Documentation is not evidence, so
+    every control above has a test"* -- named ``tests/test_describe.py`` for the escaping of
+    server-chosen names. There is no such file, and the coverage was in the file beside it in
+    the same cell. So the one row a reviewer follows to check a CWE-117 claim dead-ended, and
+    every check here passed, because the citation is inline code rather than a link.
+
+    That is not a docs-only hazard: ``src/`` docstrings cite test files and probe scripts too,
+    and `CHANGELOG.md` cites modules. Anything quoting a path is quoting something a reader
+    will try to open.
+    """
+    broken = [reason for cited in cited_paths(page) if (reason := unresolved(cited))]
+    assert not broken, f"{page.name} cites nothing: " + "; ".join(broken)
+
+
+def test_the_cited_path_check_is_not_vacuous():
+    """Guards the guard. A prefix set that lost its entries, or a regex matching no inline
+    code, would make every page above pass while resolving nothing -- and the failure mode is
+    silent in both directions.
+    """
+    assert {"src", "tests", "docs", "examples"} <= repository_prefixes()
+    # The page the finding was on, and it has to keep citing something resolvable for the row
+    # above to mean anything there.
+    assert len(cited_paths(DOCS / "security.md")) > 5
+    # And the illustrative absolute path stays out, which is the half an over-eager matcher
+    # would get wrong -- it would fail a guide for naming a file on somebody else's machine.
+    assert not [cited for cited in cited_paths(DOCS / "reliability.md") if cited.startswith("/")]
+    # Both halves of the resolver, on inputs built here rather than found in the tree: a
+    # citation that resolves has to be admitted, and each way of failing has to be caught and
+    # to say which one it was.
+    assert unresolved("tests/test_packaging.py") is None
+    assert (
+        unresolved(f"tests/test_packaging.py::{test_the_cited_path_check_is_not_vacuous.__name__}")
+        is None
+    )
+    assert "no such file" in str(unresolved("tests/test_nothing_like_this.py"))
+    # Assembled rather than written out, and the first draft was written out and passed for the
+    # wrong reason: a literal node name in *this* file is a substring of this file, so
+    # `unresolved` found it and answered None. The check for a renamed test cannot use a name
+    # that appears where it is checking.
+    absent = "test_" + "no_row_is" + "_called_this"
+    assert "nothing in it is named" in str(unresolved(f"tests/test_packaging.py::{absent}"))
+    # A *prefix* of a real name, which is the case the first draft of `unresolved` admitted --
+    # `node in text` is true for it, so a citation of the name a test used to have resolved
+    # against the rename it exists to catch. Truncating a real row here must be caught.
+    truncated = test_the_cited_path_check_is_not_vacuous.__name__[:-4]
+    assert "nothing in it is named" in str(unresolved(f"tests/test_packaging.py::{truncated}"))
+
+
 def test_the_readme_and_pyproject_agree_on_the_python_floor():
     """Two hand-maintained copies of the same number, and one of them is the first thing a
     reader sees. `requires-python` is what actually refuses an install; the README line is what

@@ -150,7 +150,7 @@ if you doubt the prose:
 | Destination policy and the URL form | `tests/test_destination.py`, `tests/test_fsspec.py` |
 | Local path containment and collisions | `tests/test_localpath.py`, `tests/test_localtree.py` |
 | Credential redaction | `tests/test_askpass.py`, `tests/test_observability.py` |
-| Escaping of server-chosen names | `tests/test_observability.py`, `tests/test_describe.py` |
+| Escaping of server-chosen names | `tests/test_observability.py`, and `tests/test_observability.py::test_no_arbitrary_server_bytes_produce_a_control_character` for the fuzzed half |
 | Behaviour against a real server | `live-tests/`, and `tests/server_contract.py` for what a fake is allowed to claim |
 
 The suite runs with no network and no keys against the genuine OpenSSH `sftp-server` over a pipe;
