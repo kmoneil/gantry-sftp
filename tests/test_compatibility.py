@@ -39,7 +39,11 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from gantry_sftp.codec import (
+    EXTENSION_CHECK_FILE,
+    EXTENSION_FSYNC,
     EXTENSION_LIMITS,
+    EXTENSION_LSETSTAT,
+    EXTENSION_POSIX_RENAME,
     IMPLEMENTED_EXTENSIONS,
     Attrs,
     OpenFlag,
@@ -581,13 +585,50 @@ def test_the_case_probe_asks_for_the_uppercase_of_the_name_it_created():
     assert found.verdict is Verdict.NO
 
 
-def test_a_folding_server_is_reported_as_a_download_hazard():
-    """The `yes` branch names the consequence, because the verdict alone is not actionable."""
+def test_a_folding_server_is_reported_as_an_upload_hazard():
+    """The `yes` branch names the consequence, because the verdict alone is not actionable.
+
+    **D-193: it named the wrong one, and this test's previous name and assertion carried the
+    error rather than catching it.** It asserted the substring "overwrite its own output" and
+    was called `..._is_reported_as_a_download_hazard`, so the direction -- the part that was
+    wrong -- was the one thing not being checked.
+
+    The reasoning, written out so a reader can check it rather than trust it. `verdict=YES`
+    means **this server folds case**, established by creating `…-case-aA` and finding
+    `…-CASE-AA`. A server that folds cannot hold two names differing only in case, so it can
+    never present two such names in a listing -- which means a download cannot merge two remote
+    names into one local file *because of this server*. The direction that does bite is the
+    mirror: two local files differing only in case land as one file on the way up, the second
+    overwriting the first.
+
+    The download hazard is real and belongs to the **other** branch -- it needs a
+    case-*sensitive* server, so both names can exist, plus a local filesystem that folds, as
+    macOS and Windows do by default. `_probe_case_folding`'s own docstring names both directions
+    correctly; only the prose a user reads had them swapped.
+    """
     session = StubSession()  # stat returns None rather than raising: the name was found
 
     found = _probe_case_folding(session, scratch())  # type: ignore[arg-type]
 
     assert found.verdict is Verdict.YES
+    assert "an upload of two local names differing only in case" in found.answer
+    # Both directions, because the defect was a true sentence about the wrong case: asserting
+    # only the new clause would still pass with the old one left beside it.
+    assert "download" not in found.answer
+
+
+def test_a_case_sensitive_server_is_reported_as_the_download_hazard():
+    """The other half of the same correction, and the reason it is a move rather than a cut.
+
+    The clause deleted above is true and worth telling a user -- of a server that does *not*
+    fold. Dropping it would have traded a misplaced warning for a missing one.
+    """
+    session = StubSession(stat=refusal(StatusCode.NO_SUCH_FILE, b"No such file"))
+
+    found = _probe_case_folding(session, scratch())  # type: ignore[arg-type]
+
+    assert found.verdict is Verdict.NO
+    assert "recursive download onto a filesystem that folds case" in found.answer
     assert "overwrite its own output" in found.answer
 
 
@@ -1277,3 +1318,235 @@ def test_joining_never_produces_a_doubled_separator(directory: bytes, name: str)
 
     assert b"//" not in joined[: len(directory.rstrip(b"/")) + 1]
     assert joined.endswith(name.encode("ascii"))
+
+
+# --- the golden report ------------------------------------------------------------------------
+#
+# **Every test above runs all twelve probes and asserts on one finding** (D-193). They select it
+# with `next(f for f in findings if ...)` and let the other eleven be computed and discarded, so a
+# mutation in probe X survives unless some row happens to pick X's finding *and* assert the aspect
+# the mutation touched. That single shape produced the largest survivor cluster in the repository
+# -- 287, more than `session/_session.py` -- and better than half of it is the report's own prose,
+# which is the one thing this module exists to emit.
+#
+# So this is the report pinned whole: every fact, verdict, answer and evidence line for one known
+# server, in both directions. It is `tests/fixtures/`'s golden-frame discipline applied to the
+# report instead of to packets, and it is the only artifact here that fails when a probe's wording
+# drifts.
+#
+# **The golden was generated and then read, which is not the same as generated.** An expectation
+# computed with the code under test encodes whatever that code does, including its bugs -- and
+# this one did: reviewing the twelve lines found `_probe_case_folding`'s YES branch naming the
+# hazard of the NO case, fixed in the same change and regression-tested below. Generating without
+# reading would have made the defect the expected value and locked it in permanently.
+
+
+PROBE_DIRECTORY = b"/incoming/scratch"
+
+
+def capable_stub() -> StubSession:
+    """A server that advertises every extension this library implements, and answers.
+
+    Chosen over a refusing stub because it reaches the most probes: a refusal short-circuits a
+    probe into one line of evidence, and what needs pinning is the prose each one emits when it
+    has something to say. `readlink` answers with the lsetstat probe's own target so that probe
+    reaches its judgement rather than failing on the link.
+    """
+    session = StubSession(
+        readlink=PROBE_DIRECTORY + b"/" + PROBE_PREFIX.encode() + b"t0ken-lsetstat-target"
+    )
+    session.advertised.update(
+        {
+            EXTENSION_POSIX_RENAME,
+            EXTENSION_FSYNC,
+            EXTENSION_LSETSTAT,
+            EXTENSION_CHECK_FILE,
+            EXTENSION_LIMITS,
+        }
+    )
+    return session
+
+
+GOLDEN_WRITE_BATTERY: tuple[Finding, ...] = (
+    Finding(
+        fact="REALPATH canonicalises a path that does not exist",
+        verdict=Verdict.YES,
+        answer="a name that does not exist can be resolved to where it would be",
+        evidence=("REALPATH b'/home/probe/gantry-probe-t0ken-absent' -> b'/home/probe'",),
+    ),
+    Finding(
+        fact="the root of this server's namespace is /",
+        verdict=Verdict.NO,
+        answer=(
+            "/ resolves to something else, so this server rewrites absolute paths and a path "
+            "built by joining strings will not mean what it looks like"
+        ),
+        evidence=("REALPATH b'/' -> b'/home/probe'",),
+    ),
+    Finding(
+        fact="a refusal carries a message that says more than its status code",
+        verdict=Verdict.UNDETERMINED,
+        answer=(
+            "this server accepted a request where a refusal was expected, so there was no pair of "
+            "refusals to read"
+        ),
+        evidence=("STAT b'/home/probe/gantry-probe-t0ken-absent' -> accepted",),
+    ),
+    Finding(
+        fact="limits@openssh.com answers with a usable maximum",
+        verdict=Verdict.NO,
+        answer=(
+            "the extension was advertised and answered every field with no limit, so this "
+            "session's request size is this library's conservative default rather than anything "
+            "the server agreed to"
+        ),
+        evidence=(
+            "limits@openssh.com max_packet_length -> no limit stated",
+            "limits@openssh.com max_read_length -> no limit stated",
+            "limits@openssh.com max_write_length -> no limit stated",
+            "limits@openssh.com max_open_handles -> no limit stated",
+        ),
+    ),
+    Finding(
+        fact="this server folds case in names",
+        verdict=Verdict.YES,
+        answer=(
+            "the same file answered to a different case, so remote names that differ only in case "
+            "will collide here -- and an upload of two local names differing only in case lands "
+            "as one file, the second overwriting the first"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-case-aA'",
+            "STAT b'/incoming/scratch/GANTRY-PROBE-T0KEN-CASE-AA' -> found",
+        ),
+    ),
+    Finding(
+        fact="RENAME replaces an existing target",
+        verdict=Verdict.YES,
+        answer=(
+            "RENAME silently replaced an existing file, which the draft does not allow. Treat any "
+            "rename here as destructive"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-rename-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-rename-target'"
+            ),
+            "RENAME -> OK, the target was replaced",
+        ),
+    ),
+    Finding(
+        fact="a file's timestamps survive being set",
+        verdict=Verdict.YES,
+        answer="the mtime that was set is the mtime that came back",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-times'",
+            "SETSTAT ACMODTIME=1000000000 -> OK",
+            "STAT -> mtime=1000000000",
+        ),
+    ),
+    Finding(
+        fact="posix-rename@openssh.com actually renames",
+        verdict=Verdict.YES,
+        answer="the target was replaced in one step, which is what atomic publish needs",
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-posix-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-posix-target'"
+            ),
+            "posix-rename -> OK",
+            "STAT b'/incoming/scratch/gantry-probe-t0ken-posix-source' -> gone",
+        ),
+    ),
+    Finding(
+        fact="fsync@openssh.com actually flushes",
+        verdict=Verdict.YES,
+        answer="the server flushed the handle, so a durable upload can be asked for here",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-fsync'",
+            "fsync -> OK",
+        ),
+    ),
+    Finding(
+        fact="lsetstat@openssh.com actually changes a symlink's own mode",
+        verdict=Verdict.NO,
+        answer=(
+            "the server answered OK and neither mode changed, so the request was accepted and "
+            "discarded. That is worse than the refusal OpenSSH gives on the same kernel: a caller "
+            "is told their permission change happened when it did not"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-lsetstat-target' at 0o600 and "
+                "symlink b'/incoming/scratch/gantry-probe-t0ken-lsetstat-link' -> it"
+            ),
+            "lsetstat PERMISSIONS -> OK",
+            "LSTAT of the link -> 0o777",
+            "STAT of the target -> 0o600",
+        ),
+    ),
+    Finding(
+        fact="check-file actually hashes the bytes the server has",
+        verdict=Verdict.YES,
+        answer=(
+            "the server's sha256 digest of the bytes it holds matches the one computed here, so "
+            "content verification can be done without moving the file back"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-check-file' with 29 bytes",
+            "check-file -> algorithm 'sha256', 1 digest(s)",
+            "first digest matches the locally computed one",
+        ),
+    ),
+    Finding(
+        fact="a request as large as this session would send is accepted",
+        verdict=Verdict.YES,
+        answer="a request of the size this session's transfers use was accepted whole",
+        evidence=(
+            "WRITE of 4096 bytes -> 4096 bytes written",
+            (
+                "the size was derived from this server's own limits, for "
+                "b'/incoming/scratch/gantry-probe-t0ken-largest-request'"
+            ),
+        ),
+    ),
+)
+
+
+def golden_report() -> CompatibilityReport:
+    """The report `GOLDEN_WRITE_BATTERY` describes, built the way a caller would build one."""
+    return compatibility_report(
+        capable_stub(),  # type: ignore[arg-type]
+        request_bytes=4096,
+        write_directory=PROBE_DIRECTORY,
+        run_id="t0ken",
+    )
+
+
+def fact_id(finding: Finding) -> str:
+    """A pytest id that is ASCII and has no spaces.
+
+    The facts are sentences with apostrophes, slashes and `@` in them, and mutmut aborts the
+    whole lane on an exotic parametrize id rather than skipping the row -- so the ids are
+    slugged here instead of being the facts themselves.
+    """
+    return "".join(c if c.isalnum() else "-" for c in finding.fact.lower()).strip("-")[:44]
+
+
+def test_the_golden_names_exactly_the_findings_the_battery_produces():
+    """Both directions and the order, because a golden that only checks its own rows is blind.
+
+    A probe added to `_EXTENSION_PROBES` and not here would leave every row below passing, and a
+    probe deleted would leave a row here asserting about a finding nobody produces.
+    """
+    produced = [finding.fact for finding in golden_report().findings]
+
+    assert produced == [finding.fact for finding in GOLDEN_WRITE_BATTERY]
+
+
+@pytest.mark.parametrize("expected", GOLDEN_WRITE_BATTERY, ids=fact_id)
+def test_the_report_matches_the_golden_finding_for_finding(expected: Finding):
+    """Compared whole rather than field by field, so evidence order and count are pinned too."""
+    produced = {finding.fact: finding for finding in golden_report().findings}
+
+    assert produced[expected.fact] == expected
