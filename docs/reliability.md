@@ -91,6 +91,20 @@ into three slow ones. That is still true of `is_retryable()` and of `with_reconn
 reconnect a whole operation; a narrower rule that repeats a *single request* on the session you
 already have is described under [A refusal that clears](#a-refusal-that-clears) below.
 
+**When it gives up it says which of the two things happened**, as a note on the exception it
+raises — so it prints in any traceback without being asked for. A first-and-only failure carries
+no note, because there is nothing to say about one attempt:
+
+```
+gave up after 3 of 3 attempt(s), all retryable
+stopped after 2 of 3 attempt(s): this failure is not retryable, so the remaining attempt(s) were not spent
+```
+
+The difference is worth reading before you reach for the link. The first means the failure kept
+being one a reconnect could fix and it ran out of tries; the second means it stopped early
+because nothing about reconnecting would help — a permission problem, a missing path — and the
+attempts you allowed were not spent.
+
 **A status code v3 has no name for also arrives as `FAILURE`**, and that is a decision rather
 than a coincidence. A server answering an extension from the v6-era draft may legally reply with
 a v6-era code — `SSH_FX_FILE_IS_A_DIRECTORY` is 24, and filexfer v3 stops at 8. Some servers map

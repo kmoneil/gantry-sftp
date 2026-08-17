@@ -252,6 +252,49 @@ async def test_the_second_attempt_is_already_enough_to_carry_the_note():
     assert exc.value.__notes__ == ["gave up after 2 of 2 attempt(s), all retryable"]
 
 
+async def test_a_terminal_failure_after_a_retryable_one_says_the_attempts_were_not_spent(
+    tmp_path: Path,
+):
+    """D-195. The other exit from the same `if`, which had been wearing the first one's words.
+
+    Two conditions reach `_note_attempts` -- `not is_retryable(error)` and
+    `attempt >= attempts` -- and there was one sentence for both. On this path it made two
+    false claims: that the attempts had run out, when one of three remained, and that every
+    failure was retryable, when the one that stopped the loop was a permission problem. A
+    reader chasing "all retryable" goes looking at the link.
+
+    The exact note text rather than a substring, and deliberately: `"gave up after"` and
+    `"attempt(s)"` both survive the correction verbatim, so a substring assertion here would
+    have passed against the defect.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    attempted: list[int] = []
+
+    async def retryable_then_terminal(_sftp: Session) -> None:
+        attempted.append(len(attempted) + 1)
+        if len(attempted) == 1:
+            raise ConnectError("the link dropped")
+        raise PermissionDeniedError(
+            "server returned PERMISSION_DENIED",
+            code=int(StatusCode.PERMISSION_DENIED),
+            message=b"Permission denied",
+        )
+
+    recipe = Recipe(partial(open_local_server_transport, cwd=tmp_path))
+
+    with pytest.raises(PermissionDeniedError) as exc, anyio.fail_after(DEADLINE):
+        _ = await with_reconnect(recipe, retryable_then_terminal, attempts=3, backoff=0)
+
+    assert attempted == [1, 2], "the terminal failure did not stop the loop where it should"
+    assert recipe.calls == 2, "an attempt was spent after the terminal failure"
+    assert exc.value.__notes__ == [
+        "stopped after 2 of 3 attempt(s): this failure is not retryable, so the remaining "
+        "attempt(s) were not spent"
+    ]
+
+
 async def test_the_session_tunables_reach_the_session_each_attempt(tmp_path: Path):
     """`request_timeout`, `idle_timeout` and `depth` are documented as forwarded. Proven here.
 
