@@ -11,6 +11,7 @@ so they skip with a reason where it is absent rather than failing.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,45 @@ EXAMPLES = sorted(p for p in Path(__file__).parent.glob("*.py") if p.name != Pat
 def test_there_are_examples_to_run():
     # Guards the guard: an empty directory would make the parametrised test below vacuous.
     assert EXAMPLES, "no examples found -- this file would prove nothing"
+
+
+def tabled_examples() -> set[str]:
+    """Every example named in a table row of `examples/README.md`.
+
+    Rows only, not the whole file: the *how to run* lists near the top already name every
+    example as a command line, so matching anywhere would report an example as documented on
+    the strength of a line that says how to start it and not what it shows.
+    """
+    readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
+    return set(re.findall(r"^\|\s*`([a-z_]+\.py)`", readme, re.MULTILINE))
+
+
+def test_every_example_has_a_row_saying_what_it_demonstrates():
+    """The table is an index of work, and an index cannot be audited by reading it.
+
+    `compatibility.py` and `crash_resume.py` were shipped, runnable, driven by
+    `test_an_example_runs_clean`, and named in this README's *how to run* list -- and neither had
+    a row in the table saying what it shows. Nothing noticed, because the way to notice is to
+    resolve the table against the directory, which no check did.
+
+    Both directions, and the second is not decoration: a row for a file that was renamed or
+    deleted is an index pointing at nothing, which is the same defect from the other side and
+    the one D-196 found in `docs/security.md`.
+    """
+    present = {p.name for p in EXAMPLES}
+    tabled = tabled_examples()
+    assert not (present - tabled), (
+        f"examples with no row in examples/README.md: {sorted(present - tabled)}"
+    )
+    assert not (tabled - present), (
+        f"examples/README.md has rows for files that do not exist: {sorted(tabled - present)}"
+    )
+
+
+def test_the_example_table_check_is_not_vacuous():
+    # A regex that matched no rows would make the test above pass while comparing two empty
+    # sets against each other, which is how a derived check goes quiet.
+    assert len(tabled_examples()) > 25
 
 
 def run_example(example: Path) -> tuple[int, str, str]:
