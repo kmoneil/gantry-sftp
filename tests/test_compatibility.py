@@ -298,8 +298,19 @@ class StubSession:
         return name in self.advertised
 
     def realpath(self, path: bytes | str = b".") -> bytes:
+        """Canonicalise, with the answer scripted as a constant **or as a function of the path**.
+
+        The callable form exists because a constant cannot express a realistic namespace
+        (D-193, slice 3). A server "rooted at `/`" answers `/` for `/` and *echoes* anything
+        else; scripting the constant `b"/"` makes it answer `/` for every path, which drives
+        `_probe_realpath_of_a_missing_path` to `YES` under an answer that reads "resolved to
+        where it would be" over evidence showing it resolved to the root. That sentence does not
+        follow from that evidence, and a golden would have frozen it.
+        """
         self.calls.append(("realpath", path))
         answer = self._answer("realpath", b"/home/probe")
+        if callable(answer):
+            answer = answer(path if isinstance(path, bytes) else path.encode())
         assert isinstance(answer, bytes)
         return answer
 
@@ -1340,6 +1351,78 @@ def test_joining_never_produces_a_doubled_separator(directory: bytes, name: str)
 
 PROBE_DIRECTORY = b"/incoming/scratch"
 
+LSETSTAT_APPLIED_MODE = 0o640
+"""What `lstat` reports for a symlink whose own mode the server *did* change.
+
+The stub's default is `0o777`, which on Linux is what a symlink's mode always reads as and
+therefore means "lsetstat did nothing". This is the other answer, and it is not hypothetical:
+macOS and the BSDs have `lchmod`, so the permissions branch succeeds there. It is
+`_LSETSTAT_PROBE_MODE`'s value in `compatibility.py`, because the probe asks for exactly this
+and a server that honoured the request reports back what it was given.
+"""
+
+SHORT_WRITE_BYTES = 1024
+"""Bytes a short-writing server reports accepting, against the 4096 the probe sends.
+
+Not a refusal -- the write is *answered*, with a smaller number. That is the shape
+`_probe_largest_request` exists to notice, and no refusing portrait can produce it.
+"""
+
+SHA256_DIGEST_SIZE = 32
+
+ABSENT_SUFFIX = b"-absent"
+"""Tail of the name `_probe_realpath_of_a_missing_path` asks about.
+
+Matched on rather than spelled whole because the probe derives the name from `run_id`, so a
+literal here would be a second copy of a path this file does not own."""
+
+STATED_LIMITS = ServerLimits(
+    max_packet_length=32768,
+    max_read_length=16384,
+    max_write_length=16384,
+    max_open_handles=64,
+)
+"""A `limits@openssh.com` answer with every field populated.
+
+The stub's default is `ServerLimits()`, which is all-`None` -- *advertised and useless*, and what
+all four earlier portraits carry. `_probe_limits` answers `NO` for that, so its `YES` branch had
+no server. These are OpenSSH's own defaults rather than invented numbers.
+"""
+
+
+def _rooted_namespace(path: bytes) -> bytes:
+    """`realpath` for a server whose namespace root really is `/`.
+
+    Three answers, and each was put here by reading the report it produced rather than by
+    designing it up front:
+
+    * `/` canonicalises to **itself**, which is the whole point of this portrait and the one
+      thing the other four cannot show -- they answer `/home/probe` to everything, so `/`
+      resolves elsewhere and the root finding is `NO` in all of them.
+    * `.` resolves to an **absolute** home. Echoing it made the probe paths relative
+      (`./gantry-probe-t0ken-absent`), which no server does: `realpath` exists to canonicalise,
+      and a canonical path is absolute.
+    * anything else is echoed, which is what canonicalising a name that does not exist means.
+
+    A constant `b"/"` was the first draft, and it is a different server: one answering `/` for
+    *everything*, which drove the missing-path probe to `YES` under prose reading "resolved to
+    where it would be" over evidence showing it resolved to the root.
+    """
+    if path == b"/":
+        return b"/"
+    if path in (b".", b""):
+        return ROOTED_HOME
+    return path if path.startswith(b"/") else ROOTED_HOME + b"/" + path
+
+
+ROOTED_HOME = b"/home/probe"
+"""Where `.` resolves on the rooted portrait -- the same home the other four use.
+
+Deliberately identical, so the *only* axis this portrait varies is what `/` answers. A different
+home would move every probe path in the golden and make the diff against the other portraits
+unreadable for no gain."""
+
+
 LSETSTAT_LINK_TARGET = PROBE_DIRECTORY + b"/" + PROBE_PREFIX.encode() + b"t0ken-lsetstat-target"
 """What `readlink` answers so the lsetstat probe reaches its judgement rather than failing.
 
@@ -1417,11 +1500,104 @@ def silent_stub() -> StubSession:
     )
 
 
+def rooted_stub() -> StubSession:
+    """A server rooted at `/` whose `lsetstat` genuinely works, stating real limits.
+
+    **The four portraits above vary one axis between them -- what a server does when it
+    refuses -- and share everything else** (D-193, slice 3). All four answer `realpath` with
+    `/home/probe`, report a symlink's mode as the `0o777` that means *nothing changed*, and
+    carry a zeroed `ServerLimits`. So six probes saw an identical server four times, and 88 of
+    the 136 survivors after slice 2 were in them.
+
+    This is the other axis, and it is a real server rather than a bag of settings: **macOS and
+    the BSDs have `lchmod`**, so `lsetstat`'s permissions branch actually changes a symlink's own
+    mode there, which is the case `session/_operations.py` documents and which Linux cannot
+    produce. A namespace rooted at `/` and a `limits@openssh.com` answer with usable maxima go
+    with it.
+
+    Measured before it was built: `realpath` alone moves three findings, the `lstat` pair one and
+    the limits one, and combining them moves exactly those five rather than interacting.
+
+    **`realpath` is a function of the path rather than a constant**, and the first draft was the
+    constant. See :meth:`StubSession.realpath` for the sentence that produced.
+    """
+    session = _advertising(
+        readlink=LSETSTAT_LINK_TARGET,
+        realpath=_rooted_namespace,
+        lstat=attrs(mode=LSETSTAT_APPLIED_MODE),
+    )
+    session.limits = STATED_LIMITS
+    return session
+
+
+def mismatching_stub() -> StubSession:
+    """A server that answers everything and whose answers are wrong.
+
+    The hazard class this battery exists for, and the one a *refusing* server cannot depict: a
+    refusal at least says so. Here `check-file` returns a digest of bytes that are not the bytes
+    we wrote, and a `write_at` reports fewer bytes accepted than it was given. Both are
+    "answered OK and did something else", which is worse than a refusal because nothing in the
+    status code says to look.
+
+    Kept apart from :func:`rooted_stub` deliberately: a portrait is read top to bottom as one
+    server's whole report, so a server that is both well-behaved and lying is not a portrait, it
+    is two.
+    """
+    return _advertising(
+        readlink=LSETSTAT_LINK_TARGET,
+        check_file=(b"sha256", (bytes(SHA256_DIGEST_SIZE),)),
+        write_at=SHORT_WRITE_BYTES,
+    )
+
+
+def _strict_namespace(path: bytes) -> bytes:
+    """`realpath` for a server that will not canonicalise a name it does not have.
+
+    Common, and the reason `_probe_realpath_of_a_missing_path` exists: an appliance often
+    refuses rather than answering where a name *would* be, which means a caller has to create
+    the path before it can be resolved. Every other path resolves normally -- **only** the
+    absent name refuses, which is what a constant refusal could not express. Scripting
+    `realpath` as a whole refusal collapses the report instead: it moves 13 findings, because
+    the battery uses `realpath` to establish its own scratch directory, and depicts a server
+    nothing can be probed on rather than a strict one.
+    """
+    if path.endswith(ABSENT_SUFFIX):
+        raise refusal(StatusCode.NO_SUCH_FILE, b"No such file")
+    return ROOTED_HOME if path in (b".", b"") else path
+
+
+def strict_stub() -> StubSession:
+    """An appliance that refuses what it is not obliged to do.
+
+    Two refusals, and each reaches a branch the six other portraits do not:
+
+    * **`REALPATH` of a name that does not exist** -- refused, so a caller must create a path
+      before resolving it.
+    * **`lsetstat`'s permission change** -- advertised and refused, which is what OpenSSH on
+      Linux does *unconditionally*: the kernel has no `lchmod`, so `fchmodat(AT_SYMLINK_NOFOLLOW)`
+      answers `ENOTSUP`. That is the report a reader is most likely to meet in the field and it
+      had no portrait.
+
+    Measured before it was built, and one candidate was **dropped** on the measurement: a
+    refused `symlink` adds *nothing*, because the six already reach that finding by another
+    route. Building it would have been a portrait that depicts a real server and pins no new
+    line.
+    """
+    return _advertising(
+        readlink=LSETSTAT_LINK_TARGET,
+        realpath=_strict_namespace,
+        chmod=refusal(StatusCode.FAILURE, b"Failure"),
+    )
+
+
 SERVERS = {
     "capable": capable_stub,
     "restating": restating_stub,
     "informative": informative_stub,
     "silent": silent_stub,
+    "rooted": rooted_stub,
+    "mismatching": mismatching_stub,
+    "strict": strict_stub,
 }
 
 

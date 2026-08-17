@@ -1,11 +1,18 @@
 """The reports four known servers produce, pinned finding for finding (D-193).
 
-**Why four and not one.** The first golden depicted a server that advertises every extension and
+**Why seven and not one.** The first golden depicted a server that advertises every extension and
 answers yes to everything, which is the report a reader most wants to see and the one that
 reaches the fewest branches: a probe only emits its refusal prose when something refuses. Measured
-rather than guessed -- the four configurations here produce **27 distinct findings between them**,
-where the capable server alone produces twelve, and no three of them reach all twenty-seven. What
-remained after the first golden was not a shortage of assertions but a shortage of *servers*.
+rather than guessed -- the first four produce **27 distinct findings between them**, where the
+capable server alone produces twelve, and no three of them reach all twenty-seven. What remained
+after the first golden was not a shortage of assertions but a shortage of *servers*.
+
+**And the four were themselves one axis.** They vary what a server does when it *refuses* and
+share everything else -- the same `realpath`, the same all-`None` `ServerLimits`, the same
+symlink mode, the same `check-file`, the same short-write-free `write_at`. So six probes saw an
+identical server four times, and 88 of the 136 survivors after that slice were in them. `ROOTED`
+and `MISMATCHING` vary those answers instead. Same rule as before: the axis was measured -- one
+scripted answer at a time, diffed against the baseline -- before either was written.
 
 **Why the duplication is deliberate.** Several findings are byte-identical across two portraits --
 a case-sensitive server says the same thing about case whether its refusals are informative or
@@ -32,6 +39,17 @@ The servers, and what each is for:
   only way to reach that judgement's `yes`.
 * `SILENT` -- refuses with no message at all, `_judge_messages`'s third branch. Legal and common:
   v3 `FAILURE` frequently carries nothing.
+* `ROOTED` -- a namespace whose root really is `/`, a symlink whose own mode the server *did*
+  change, and a `limits@openssh.com` answer with real maxima. The macOS/BSD shape: those
+  platforms have `lchmod`, so `lsetstat`'s permissions branch succeeds where Linux refuses it.
+  The only portrait reaching the `YES` branch of the root, limits and lsetstat probes.
+* `MISMATCHING` -- answers everything, and its answers are wrong: a `check-file` digest of bytes
+  it does not hold, and a `write_at` reporting fewer bytes stored than it was sent. The hazard a
+  refusing server cannot depict, because a refusal at least says so.
+* `STRICT` -- an appliance that refuses what it is not obliged to do: `REALPATH` of a name that
+  does not exist, and `lsetstat`'s permission change. The second is what OpenSSH on Linux does
+  *unconditionally* -- no `lchmod` in the kernel -- so it is the report a reader is most likely
+  to meet in the field, and it had no portrait until the survivor count said so.
 
 `run_id` is fixed at `t0ken` in every one, because the probe names are derived from it and a
 generated id would make every path here a fresh string.
@@ -624,11 +642,447 @@ SILENT: tuple[Finding, ...] = (
 )
 
 
+ROOTED: tuple[Finding, ...] = (
+    Finding(
+        fact="REALPATH canonicalises a path that does not exist",
+        verdict=Verdict.YES,
+        answer="a name that does not exist can be resolved to where it would be",
+        evidence=(
+            (
+                "REALPATH b'/home/probe/gantry-probe-t0ken-absent' -> b'/home/probe/gantry-"
+                "probe-t0ken-absent'"
+            ),
+        ),
+    ),
+    Finding(
+        fact="the root of this server's namespace is /",
+        verdict=Verdict.YES,
+        answer="/ canonicalises to itself, as on a POSIX filesystem",
+        evidence=("REALPATH b'/' -> b'/'",),
+    ),
+    Finding(
+        fact="a refusal carries a message that says more than its status code",
+        verdict=Verdict.UNDETERMINED,
+        answer=(
+            "this server accepted a request where a refusal was expected, so there was no "
+            "pair of refusals to read"
+        ),
+        evidence=("STAT b'/home/probe/gantry-probe-t0ken-absent' -> accepted",),
+    ),
+    Finding(
+        fact="limits@openssh.com answers with a usable maximum",
+        verdict=Verdict.YES,
+        answer="the extension was advertised, was answered, and named at least one maximum",
+        evidence=(
+            "limits@openssh.com max_packet_length -> 32768",
+            "limits@openssh.com max_read_length -> 16384",
+            "limits@openssh.com max_write_length -> 16384",
+            "limits@openssh.com max_open_handles -> 64",
+        ),
+    ),
+    Finding(
+        fact="this server folds case in names",
+        verdict=Verdict.YES,
+        answer=(
+            "the same file answered to a different case, so remote names that differ only "
+            "in case will collide here -- and an upload of two local names differing only "
+            "in case lands as one file, the second overwriting the first"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-case-aA'",
+            "STAT b'/incoming/scratch/GANTRY-PROBE-T0KEN-CASE-AA' -> found",
+        ),
+    ),
+    Finding(
+        fact="RENAME replaces an existing target",
+        verdict=Verdict.YES,
+        answer=(
+            "RENAME silently replaced an existing file, which the draft does not allow. "
+            "Treat any rename here as destructive"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-rename-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-rename-target'"
+            ),
+            "RENAME -> OK, the target was replaced",
+        ),
+    ),
+    Finding(
+        fact="a file's timestamps survive being set",
+        verdict=Verdict.YES,
+        answer="the mtime that was set is the mtime that came back",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-times'",
+            "SETSTAT ACMODTIME=1000000000 -> OK",
+            "STAT -> mtime=1000000000",
+        ),
+    ),
+    Finding(
+        fact="posix-rename@openssh.com actually renames",
+        verdict=Verdict.YES,
+        answer="the target was replaced in one step, which is what atomic publish needs",
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-posix-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-posix-target'"
+            ),
+            "posix-rename -> OK",
+            "STAT b'/incoming/scratch/gantry-probe-t0ken-posix-source' -> gone",
+        ),
+    ),
+    Finding(
+        fact="fsync@openssh.com actually flushes",
+        verdict=Verdict.YES,
+        answer="the server flushed the handle, so a durable upload can be asked for here",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-fsync'",
+            "fsync -> OK",
+        ),
+    ),
+    Finding(
+        fact="lsetstat@openssh.com actually changes a symlink's own mode",
+        verdict=Verdict.YES,
+        answer=(
+            "the link's own mode is what was asked for, so this server's platform has "
+            "lchmod and follow_symlinks=False means what it says here"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-lsetstat-target' at 0o600 and "
+                "symlink b'/incoming/scratch/gantry-probe-t0ken-lsetstat-link' -> it"
+            ),
+            "lsetstat PERMISSIONS -> OK",
+            "LSTAT of the link -> 0o640",
+            "STAT of the target -> 0o600",
+        ),
+    ),
+    Finding(
+        fact="check-file actually hashes the bytes the server has",
+        verdict=Verdict.YES,
+        answer=(
+            "the server's sha256 digest of the bytes it holds matches the one computed "
+            "here, so content verification can be done without moving the file back"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-check-file' with 29 bytes",
+            "check-file -> algorithm 'sha256', 1 digest(s)",
+            "first digest matches the locally computed one",
+        ),
+    ),
+    Finding(
+        fact="a request as large as this session would send is accepted",
+        verdict=Verdict.YES,
+        answer="a request of the size this session's transfers use was accepted whole",
+        evidence=(
+            "WRITE of 4096 bytes -> 4096 bytes written",
+            (
+                "the size was derived from this server's own limits, for "
+                "b'/incoming/scratch/gantry-probe-t0ken-largest-request'"
+            ),
+        ),
+    ),
+)
+
+MISMATCHING: tuple[Finding, ...] = (
+    Finding(
+        fact="REALPATH canonicalises a path that does not exist",
+        verdict=Verdict.YES,
+        answer="a name that does not exist can be resolved to where it would be",
+        evidence=("REALPATH b'/home/probe/gantry-probe-t0ken-absent' -> b'/home/probe'",),
+    ),
+    Finding(
+        fact="the root of this server's namespace is /",
+        verdict=Verdict.NO,
+        answer=(
+            "/ resolves to something else, so this server rewrites absolute paths and a "
+            "path built by joining strings will not mean what it looks like"
+        ),
+        evidence=("REALPATH b'/' -> b'/home/probe'",),
+    ),
+    Finding(
+        fact="a refusal carries a message that says more than its status code",
+        verdict=Verdict.UNDETERMINED,
+        answer=(
+            "this server accepted a request where a refusal was expected, so there was no "
+            "pair of refusals to read"
+        ),
+        evidence=("STAT b'/home/probe/gantry-probe-t0ken-absent' -> accepted",),
+    ),
+    Finding(
+        fact="limits@openssh.com answers with a usable maximum",
+        verdict=Verdict.NO,
+        answer=(
+            "the extension was advertised and answered every field with no limit, so this "
+            "session's request size is this library's conservative default rather than "
+            "anything the server agreed to"
+        ),
+        evidence=(
+            "limits@openssh.com max_packet_length -> no limit stated",
+            "limits@openssh.com max_read_length -> no limit stated",
+            "limits@openssh.com max_write_length -> no limit stated",
+            "limits@openssh.com max_open_handles -> no limit stated",
+        ),
+    ),
+    Finding(
+        fact="this server folds case in names",
+        verdict=Verdict.YES,
+        answer=(
+            "the same file answered to a different case, so remote names that differ only "
+            "in case will collide here -- and an upload of two local names differing only "
+            "in case lands as one file, the second overwriting the first"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-case-aA'",
+            "STAT b'/incoming/scratch/GANTRY-PROBE-T0KEN-CASE-AA' -> found",
+        ),
+    ),
+    Finding(
+        fact="RENAME replaces an existing target",
+        verdict=Verdict.YES,
+        answer=(
+            "RENAME silently replaced an existing file, which the draft does not allow. "
+            "Treat any rename here as destructive"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-rename-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-rename-target'"
+            ),
+            "RENAME -> OK, the target was replaced",
+        ),
+    ),
+    Finding(
+        fact="a file's timestamps survive being set",
+        verdict=Verdict.YES,
+        answer="the mtime that was set is the mtime that came back",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-times'",
+            "SETSTAT ACMODTIME=1000000000 -> OK",
+            "STAT -> mtime=1000000000",
+        ),
+    ),
+    Finding(
+        fact="posix-rename@openssh.com actually renames",
+        verdict=Verdict.YES,
+        answer="the target was replaced in one step, which is what atomic publish needs",
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-posix-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-posix-target'"
+            ),
+            "posix-rename -> OK",
+            "STAT b'/incoming/scratch/gantry-probe-t0ken-posix-source' -> gone",
+        ),
+    ),
+    Finding(
+        fact="fsync@openssh.com actually flushes",
+        verdict=Verdict.YES,
+        answer="the server flushed the handle, so a durable upload can be asked for here",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-fsync'",
+            "fsync -> OK",
+        ),
+    ),
+    Finding(
+        fact="lsetstat@openssh.com actually changes a symlink's own mode",
+        verdict=Verdict.NO,
+        answer=(
+            "the server answered OK and neither mode changed, so the request was accepted "
+            "and discarded. That is worse than the refusal OpenSSH gives on the same "
+            "kernel: a caller is told their permission change happened when it did not"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-lsetstat-target' at 0o600 and "
+                "symlink b'/incoming/scratch/gantry-probe-t0ken-lsetstat-link' -> it"
+            ),
+            "lsetstat PERMISSIONS -> OK",
+            "LSTAT of the link -> 0o777",
+            "STAT of the target -> 0o600",
+        ),
+    ),
+    Finding(
+        fact="check-file actually hashes the bytes the server has",
+        verdict=Verdict.NO,
+        answer=(
+            "the server answered with 1 sha256 digest(s) that do not match the bytes that "
+            "were uploaded, so this extension must not be trusted here"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-check-file' with 29 bytes",
+            "check-file -> algorithm 'sha256', 1 digest(s)",
+            "first digest differs from the locally computed one",
+        ),
+    ),
+    Finding(
+        fact="a request as large as this session would send is accepted",
+        verdict=Verdict.NO,
+        answer=(
+            "the server accepted the request and stored fewer bytes than it was sent, which"
+            " no exception would have reported"
+        ),
+        evidence=("WRITE of 4096 bytes -> 1024 bytes written",),
+    ),
+)
+
+STRICT: tuple[Finding, ...] = (
+    Finding(
+        fact="REALPATH canonicalises a path that does not exist",
+        verdict=Verdict.NO,
+        answer=(
+            "this server refuses to canonicalise a name that does not exist, so a path has "
+            "to be created before it can be resolved"
+        ),
+        evidence=(
+            (
+                "REALPATH b'/home/probe/gantry-probe-t0ken-absent' -> NO_SUCH_FILE, server said "
+                "'No such file'"
+            ),
+        ),
+    ),
+    Finding(
+        fact="the root of this server's namespace is /",
+        verdict=Verdict.YES,
+        answer="/ canonicalises to itself, as on a POSIX filesystem",
+        evidence=("REALPATH b'/' -> b'/'",),
+    ),
+    Finding(
+        fact="a refusal carries a message that says more than its status code",
+        verdict=Verdict.UNDETERMINED,
+        answer=(
+            "this server accepted a request where a refusal was expected, so there was no "
+            "pair of refusals to read"
+        ),
+        evidence=("STAT b'/home/probe/gantry-probe-t0ken-absent' -> accepted",),
+    ),
+    Finding(
+        fact="limits@openssh.com answers with a usable maximum",
+        verdict=Verdict.NO,
+        answer=(
+            "the extension was advertised and answered every field with no limit, so this "
+            "session's request size is this library's conservative default rather than "
+            "anything the server agreed to"
+        ),
+        evidence=(
+            "limits@openssh.com max_packet_length -> no limit stated",
+            "limits@openssh.com max_read_length -> no limit stated",
+            "limits@openssh.com max_write_length -> no limit stated",
+            "limits@openssh.com max_open_handles -> no limit stated",
+        ),
+    ),
+    Finding(
+        fact="this server folds case in names",
+        verdict=Verdict.YES,
+        answer=(
+            "the same file answered to a different case, so remote names that differ only "
+            "in case will collide here -- and an upload of two local names differing only "
+            "in case lands as one file, the second overwriting the first"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-case-aA'",
+            "STAT b'/incoming/scratch/GANTRY-PROBE-T0KEN-CASE-AA' -> found",
+        ),
+    ),
+    Finding(
+        fact="RENAME replaces an existing target",
+        verdict=Verdict.YES,
+        answer=(
+            "RENAME silently replaced an existing file, which the draft does not allow. "
+            "Treat any rename here as destructive"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-rename-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-rename-target'"
+            ),
+            "RENAME -> OK, the target was replaced",
+        ),
+    ),
+    Finding(
+        fact="a file's timestamps survive being set",
+        verdict=Verdict.YES,
+        answer="the mtime that was set is the mtime that came back",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-times'",
+            "SETSTAT ACMODTIME=1000000000 -> OK",
+            "STAT -> mtime=1000000000",
+        ),
+    ),
+    Finding(
+        fact="posix-rename@openssh.com actually renames",
+        verdict=Verdict.YES,
+        answer="the target was replaced in one step, which is what atomic publish needs",
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-posix-source' and "
+                "b'/incoming/scratch/gantry-probe-t0ken-posix-target'"
+            ),
+            "posix-rename -> OK",
+            "STAT b'/incoming/scratch/gantry-probe-t0ken-posix-source' -> gone",
+        ),
+    ),
+    Finding(
+        fact="fsync@openssh.com actually flushes",
+        verdict=Verdict.YES,
+        answer="the server flushed the handle, so a durable upload can be asked for here",
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-fsync'",
+            "fsync -> OK",
+        ),
+    ),
+    Finding(
+        fact="lsetstat@openssh.com actually changes a symlink's own mode",
+        verdict=Verdict.NO,
+        answer=(
+            "advertised and refused. On a Linux server this is unconditional and is not a "
+            "misconfiguration: the kernel has no lchmod, a symlink's own mode is ignored "
+            "there, and the times and owner of a link can still be set"
+        ),
+        evidence=(
+            (
+                "created b'/incoming/scratch/gantry-probe-t0ken-lsetstat-target' at 0o600 and "
+                "symlink b'/incoming/scratch/gantry-probe-t0ken-lsetstat-link' -> it"
+            ),
+            "lsetstat PERMISSIONS -> FAILURE, server said 'Failure'",
+        ),
+    ),
+    Finding(
+        fact="check-file actually hashes the bytes the server has",
+        verdict=Verdict.YES,
+        answer=(
+            "the server's sha256 digest of the bytes it holds matches the one computed "
+            "here, so content verification can be done without moving the file back"
+        ),
+        evidence=(
+            "created b'/incoming/scratch/gantry-probe-t0ken-check-file' with 29 bytes",
+            "check-file -> algorithm 'sha256', 1 digest(s)",
+            "first digest matches the locally computed one",
+        ),
+    ),
+    Finding(
+        fact="a request as large as this session would send is accepted",
+        verdict=Verdict.YES,
+        answer="a request of the size this session's transfers use was accepted whole",
+        evidence=(
+            "WRITE of 4096 bytes -> 4096 bytes written",
+            (
+                "the size was derived from this server's own limits, for "
+                "b'/incoming/scratch/gantry-probe-t0ken-largest-request'"
+            ),
+        ),
+    ),
+)
+
+
 REPORTS: dict[str, tuple[Finding, ...]] = {
     "capable": CAPABLE,
     "restating": RESTATING,
     "informative": INFORMATIVE,
     "silent": SILENT,
+    "rooted": ROOTED,
+    "mismatching": MISMATCHING,
+    "strict": STRICT,
 }
 """Every portrait, so the test file iterates rather than naming them one at a time.
 
