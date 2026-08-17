@@ -38,6 +38,7 @@ import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
+from compatibility_goldens import REPORTS
 from gantry_sftp.codec import (
     EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
@@ -1320,41 +1321,42 @@ def test_joining_never_produces_a_doubled_separator(directory: bytes, name: str)
     assert joined.endswith(name.encode("ascii"))
 
 
-# --- the golden report ------------------------------------------------------------------------
+# --- the golden reports -----------------------------------------------------------------------
 #
 # **Every test above runs all twelve probes and asserts on one finding** (D-193). They select it
 # with `next(f for f in findings if ...)` and let the other eleven be computed and discarded, so a
 # mutation in probe X survives unless some row happens to pick X's finding *and* assert the aspect
-# the mutation touched. That single shape produced the largest survivor cluster in the repository
-# -- 287, more than `session/_session.py` -- and better than half of it is the report's own prose,
-# which is the one thing this module exists to emit.
+# the mutation touched. That shape produced the largest survivor cluster in the repository.
 #
-# So this is the report pinned whole: every fact, verdict, answer and evidence line for one known
-# server, in both directions. It is `tests/fixtures/`'s golden-frame discipline applied to the
-# report instead of to packets, and it is the only artifact here that fails when a probe's wording
-# drifts.
+# The first golden pinned one server's report whole and took the cluster from 287 to 175. What was
+# left was not a shortage of assertions but **a shortage of servers**: a probe only emits its
+# refusal prose when something refuses, and one capable server refuses nothing. The four portraits
+# in `compatibility_goldens.py` produce 27 distinct findings between them, and no three of them
+# reach all 27 -- measured, not guessed.
 #
-# **The golden was generated and then read, which is not the same as generated.** An expectation
-# computed with the code under test encodes whatever that code does, including its bugs -- and
-# this one did: reviewing the twelve lines found `_probe_case_folding`'s YES branch naming the
-# hazard of the NO case, fixed in the same change and regression-tested below. Generating without
-# reading would have made the defect the expected value and locked it in permanently.
+# Each stub below is paired with a portrait by name, and `test_every_portrait_has_a_server` fails
+# if either side gains an entry the other lacks.
 
 
 PROBE_DIRECTORY = b"/incoming/scratch"
 
+LSETSTAT_LINK_TARGET = PROBE_DIRECTORY + b"/" + PROBE_PREFIX.encode() + b"t0ken-lsetstat-target"
+"""What `readlink` answers so the lsetstat probe reaches its judgement rather than failing.
 
-def capable_stub() -> StubSession:
-    """A server that advertises every extension this library implements, and answers.
+A stub that answered anything else would send that probe down its `UNDETERMINED` path, and the
+capable portrait would then be depicting a server whose lsetstat could not be assessed rather
+than one whose lsetstat is broken -- a different fact, and the less interesting of the two.
+"""
 
-    Chosen over a refusing stub because it reaches the most probes: a refusal short-circuits a
-    probe into one line of evidence, and what needs pinning is the prose each one emits when it
-    has something to say. `readlink` answers with the lsetstat probe's own target so that probe
-    reaches its judgement rather than failing on the link.
+
+def _advertising(**scripted: object) -> StubSession:
+    """A stub advertising every extension the write battery can verify.
+
+    Shared by all four portraits: the point of varying them is what the server *answers*, and
+    an unadvertised extension is skipped rather than answered, which would vary the probe set
+    instead of the verdicts.
     """
-    session = StubSession(
-        readlink=PROBE_DIRECTORY + b"/" + PROBE_PREFIX.encode() + b"t0ken-lsetstat-target"
-    )
+    session = StubSession(**scripted)
     session.advertised.update(
         {
             EXTENSION_POSIX_RENAME,
@@ -1367,156 +1369,66 @@ def capable_stub() -> StubSession:
     return session
 
 
-GOLDEN_WRITE_BATTERY: tuple[Finding, ...] = (
-    Finding(
-        fact="REALPATH canonicalises a path that does not exist",
-        verdict=Verdict.YES,
-        answer="a name that does not exist can be resolved to where it would be",
-        evidence=("REALPATH b'/home/probe/gantry-probe-t0ken-absent' -> b'/home/probe'",),
-    ),
-    Finding(
-        fact="the root of this server's namespace is /",
-        verdict=Verdict.NO,
-        answer=(
-            "/ resolves to something else, so this server rewrites absolute paths and a path "
-            "built by joining strings will not mean what it looks like"
-        ),
-        evidence=("REALPATH b'/' -> b'/home/probe'",),
-    ),
-    Finding(
-        fact="a refusal carries a message that says more than its status code",
-        verdict=Verdict.UNDETERMINED,
-        answer=(
-            "this server accepted a request where a refusal was expected, so there was no pair of "
-            "refusals to read"
-        ),
-        evidence=("STAT b'/home/probe/gantry-probe-t0ken-absent' -> accepted",),
-    ),
-    Finding(
-        fact="limits@openssh.com answers with a usable maximum",
-        verdict=Verdict.NO,
-        answer=(
-            "the extension was advertised and answered every field with no limit, so this "
-            "session's request size is this library's conservative default rather than anything "
-            "the server agreed to"
-        ),
-        evidence=(
-            "limits@openssh.com max_packet_length -> no limit stated",
-            "limits@openssh.com max_read_length -> no limit stated",
-            "limits@openssh.com max_write_length -> no limit stated",
-            "limits@openssh.com max_open_handles -> no limit stated",
-        ),
-    ),
-    Finding(
-        fact="this server folds case in names",
-        verdict=Verdict.YES,
-        answer=(
-            "the same file answered to a different case, so remote names that differ only in case "
-            "will collide here -- and an upload of two local names differing only in case lands "
-            "as one file, the second overwriting the first"
-        ),
-        evidence=(
-            "created b'/incoming/scratch/gantry-probe-t0ken-case-aA'",
-            "STAT b'/incoming/scratch/GANTRY-PROBE-T0KEN-CASE-AA' -> found",
-        ),
-    ),
-    Finding(
-        fact="RENAME replaces an existing target",
-        verdict=Verdict.YES,
-        answer=(
-            "RENAME silently replaced an existing file, which the draft does not allow. Treat any "
-            "rename here as destructive"
-        ),
-        evidence=(
-            (
-                "created b'/incoming/scratch/gantry-probe-t0ken-rename-source' and "
-                "b'/incoming/scratch/gantry-probe-t0ken-rename-target'"
-            ),
-            "RENAME -> OK, the target was replaced",
-        ),
-    ),
-    Finding(
-        fact="a file's timestamps survive being set",
-        verdict=Verdict.YES,
-        answer="the mtime that was set is the mtime that came back",
-        evidence=(
-            "created b'/incoming/scratch/gantry-probe-t0ken-times'",
-            "SETSTAT ACMODTIME=1000000000 -> OK",
-            "STAT -> mtime=1000000000",
-        ),
-    ),
-    Finding(
-        fact="posix-rename@openssh.com actually renames",
-        verdict=Verdict.YES,
-        answer="the target was replaced in one step, which is what atomic publish needs",
-        evidence=(
-            (
-                "created b'/incoming/scratch/gantry-probe-t0ken-posix-source' and "
-                "b'/incoming/scratch/gantry-probe-t0ken-posix-target'"
-            ),
-            "posix-rename -> OK",
-            "STAT b'/incoming/scratch/gantry-probe-t0ken-posix-source' -> gone",
-        ),
-    ),
-    Finding(
-        fact="fsync@openssh.com actually flushes",
-        verdict=Verdict.YES,
-        answer="the server flushed the handle, so a durable upload can be asked for here",
-        evidence=(
-            "created b'/incoming/scratch/gantry-probe-t0ken-fsync'",
-            "fsync -> OK",
-        ),
-    ),
-    Finding(
-        fact="lsetstat@openssh.com actually changes a symlink's own mode",
-        verdict=Verdict.NO,
-        answer=(
-            "the server answered OK and neither mode changed, so the request was accepted and "
-            "discarded. That is worse than the refusal OpenSSH gives on the same kernel: a caller "
-            "is told their permission change happened when it did not"
-        ),
-        evidence=(
-            (
-                "created b'/incoming/scratch/gantry-probe-t0ken-lsetstat-target' at 0o600 and "
-                "symlink b'/incoming/scratch/gantry-probe-t0ken-lsetstat-link' -> it"
-            ),
-            "lsetstat PERMISSIONS -> OK",
-            "LSTAT of the link -> 0o777",
-            "STAT of the target -> 0o600",
-        ),
-    ),
-    Finding(
-        fact="check-file actually hashes the bytes the server has",
-        verdict=Verdict.YES,
-        answer=(
-            "the server's sha256 digest of the bytes it holds matches the one computed here, so "
-            "content verification can be done without moving the file back"
-        ),
-        evidence=(
-            "created b'/incoming/scratch/gantry-probe-t0ken-check-file' with 29 bytes",
-            "check-file -> algorithm 'sha256', 1 digest(s)",
-            "first digest matches the locally computed one",
-        ),
-    ),
-    Finding(
-        fact="a request as large as this session would send is accepted",
-        verdict=Verdict.YES,
-        answer="a request of the size this session's transfers use was accepted whole",
-        evidence=(
-            "WRITE of 4096 bytes -> 4096 bytes written",
-            (
-                "the size was derived from this server's own limits, for "
-                "b'/incoming/scratch/gantry-probe-t0ken-largest-request'"
-            ),
-        ),
-    ),
-)
+def capable_stub() -> StubSession:
+    """Advertises everything and answers yes. The happy path."""
+    return _advertising(readlink=LSETSTAT_LINK_TARGET)
 
 
-def golden_report() -> CompatibilityReport:
-    """The report `GOLDEN_WRITE_BATTERY` describes, built the way a caller would build one."""
+def restating_stub() -> StubSession:
+    """Refuses, with messages that spell out their own status code.
+
+    This is OpenSSH, measured: `'No such file'` for `NO_SUCH_FILE`, `'Bad message'` for
+    `BAD_MESSAGE`, `'Failure'` for the v3 catch-all. It is what drives `_judge_messages` to
+    *no* by the second of its three routes -- the text is a constant function of the code.
+    """
+    return _advertising(
+        stat=refusal(StatusCode.NO_SUCH_FILE, b"No such file"),
+        readlink=refusal(StatusCode.BAD_MESSAGE, b"Bad message"),
+        rename=refusal(StatusCode.FAILURE, b"Failure"),
+        posix_rename=False,
+        fsync=False,
+    )
+
+
+def informative_stub() -> StubSession:
+    """Refuses with a message its status code did not carry, which is the only route to *yes*.
+
+    `PERMISSION_DENIED` plus "quota exceeded" is the shape worth depicting: the code says the
+    request was refused and the text says why, which is the difference between a report a user
+    can act on and one that repeats the enum.
+    """
+    return _advertising(
+        stat=refusal(StatusCode.PERMISSION_DENIED, b"quota exceeded on /vol1, contact ops"),
+        readlink=refusal(StatusCode.BAD_MESSAGE, b"Bad message"),
+        posix_rename=False,
+        fsync=False,
+    )
+
+
+def silent_stub() -> StubSession:
+    """Refuses with no message at all -- `_judge_messages`'s third branch.
+
+    Legal and common rather than pathological: v3's `FAILURE` frequently carries nothing, and a
+    server whose refusals are empty leaves the status code as the only thing to route on.
+    """
+    return _advertising(
+        stat=refusal(StatusCode.NO_SUCH_FILE, b""),
+        readlink=refusal(StatusCode.BAD_MESSAGE, b""),
+    )
+
+
+SERVERS = {
+    "capable": capable_stub,
+    "restating": restating_stub,
+    "informative": informative_stub,
+    "silent": silent_stub,
+}
+
+
+def report_of(name: str) -> CompatibilityReport:
+    """One portrait's report, built the way a caller would build one."""
     return compatibility_report(
-        capable_stub(),  # type: ignore[arg-type]
+        SERVERS[name](),  # type: ignore[arg-type]
         request_bytes=4096,
         write_directory=PROBE_DIRECTORY,
         run_id="t0ken",
@@ -1533,20 +1445,54 @@ def fact_id(finding: Finding) -> str:
     return "".join(c if c.isalnum() else "-" for c in finding.fact.lower()).strip("-")[:44]
 
 
-def test_the_golden_names_exactly_the_findings_the_battery_produces():
+def test_every_portrait_has_a_server():
+    """Both sides of the pairing, because either can gain an entry alone.
+
+    A portrait with no stub would never be compared against anything and would sit here looking
+    like coverage; a stub with no portrait would run twelve probes and assert nothing about them.
+    """
+    assert set(REPORTS) == set(SERVERS)
+
+
+@pytest.mark.parametrize("name", sorted(REPORTS))
+def test_a_portrait_names_exactly_the_findings_its_server_produces(name: str):
     """Both directions and the order, because a golden that only checks its own rows is blind.
 
-    A probe added to `_EXTENSION_PROBES` and not here would leave every row below passing, and a
-    probe deleted would leave a row here asserting about a finding nobody produces.
+    A probe added to `_EXTENSION_PROBES` and not to the portraits would leave every row below
+    passing, and a probe deleted would leave rows asserting about a finding nobody produces.
     """
-    produced = [finding.fact for finding in golden_report().findings]
+    produced = [finding.fact for finding in report_of(name).findings]
 
-    assert produced == [finding.fact for finding in GOLDEN_WRITE_BATTERY]
+    assert produced == [finding.fact for finding in REPORTS[name]]
 
 
-@pytest.mark.parametrize("expected", GOLDEN_WRITE_BATTERY, ids=fact_id)
-def test_the_report_matches_the_golden_finding_for_finding(expected: Finding):
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [(name, finding) for name in sorted(REPORTS) for finding in REPORTS[name]],
+    ids=lambda value: value if isinstance(value, str) else fact_id(value),
+)
+def test_a_report_matches_its_portrait_finding_for_finding(name: str, expected: Finding):
     """Compared whole rather than field by field, so evidence order and count are pinned too."""
-    produced = {finding.fact: finding for finding in golden_report().findings}
+    produced = {finding.fact: finding for finding in report_of(name).findings}
 
     assert produced[expected.fact] == expected
+
+
+def test_the_portraits_reach_branches_no_single_server_can():
+    """The reason there are four, asserted rather than left in a comment.
+
+    Written as a property of the *set*: the portraits must disagree, and by more than one
+    finding, or one of them is not paying for itself. Pinning 27 as a literal would make this a
+    second place to state what the goldens already say, so it counts them instead.
+    """
+    distinct = {
+        (finding.fact, finding.verdict, finding.answer, finding.evidence)
+        for portrait in REPORTS.values()
+        for finding in portrait
+    }
+    largest = max(len(portrait) for portrait in REPORTS.values())
+
+    assert len(distinct) > largest * 2, (
+        f"four portraits produced only {len(distinct)} distinct findings against a largest "
+        f"single report of {largest}; they are depicting the same server"
+    )
