@@ -100,9 +100,18 @@ Python reimplementation of the handshake, about a handshake it was performing it
 Stated here rather than left for you to discover, because choosing a library on an incomplete
 picture is worse than choosing a different one.
 
-- **asyncssh implements SSH in Python and therefore ships things this design cannot reach**:
-  `statvfs`, `hardlink` and `copy-data` are on its surface and not on ours. If you need one of
-  them, it is the better fit.
+- **asyncssh ships extensions this library has not built**: `statvfs`, `hardlink` and `copy-data`
+  are on its surface and not on ours. If you need one of them today, it is the better fit.
+
+  **This entry used to say the design *could not reach* them, and that was wrong** — worth
+  correcting in place rather than quietly, because a self-imposed gap described as an
+  architectural one is a gap nobody reconsiders. All three are ordinary `SSH_FXP_EXTENDED`
+  requests. Implementing SSH in Python is not what gives asyncssh them; building them is.
+  Measured rather than reasoned about: sending `hardlink@openssh.com` and `statvfs@openssh.com`
+  through this library's existing codec against the same OpenSSH `sftp-server` the suite uses
+  returns a real hard link and a real filesystem block, with no change to the library at all.
+  What is missing is the ergonomics layer, the fallback each one owes, and the tests — which is
+  work, and is a different sentence from *cannot*.
 - **Transfers refuse on Windows, by design.** The data path uses `os.pread`/`os.pwrite`, which is
   a POSIX constraint rather than an unfinished port. The byte-range surface and everything that
   does not place bytes in a local file work there.

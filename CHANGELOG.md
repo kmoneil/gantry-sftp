@@ -7,6 +7,18 @@ and while the major version is `0` the minor version is where a breaking change 
 
 ### Fixed
 
+- **The page saying where this library is behind gave a false reason for one of its four
+  entries** (D-197). *Where this library is behind* said asyncssh implements SSH in Python and
+  **therefore** ships things "this design cannot reach", naming `statvfs`, `hardlink` and
+  `copy-data`. The *therefore* does not hold: all three are ordinary `SSH_FXP_EXTENDED` requests,
+  and sending two of them through this library's existing codec returns a real hard link and a
+  real filesystem block with no change to the library at all.
+
+  They are unbuilt, not unreachable, and the entry now says so. It matters more than a wording
+  slip on that page in particular: a self-imposed gap described as an architectural one is a gap
+  nobody reconsiders, and that page exists for readers choosing between libraries. The other
+  three entries — Windows, connection latency, CPU — were checked and stand as written.
+
 - **A concurrent transfer that hit several failures at once reported one of them and said
   nothing about the rest** (D-194). `get_tree`, `put_tree`, `get_many`, `put_many` and
   `sync_tree` flatten the `ExceptionGroup` an `anyio` task group raises, so that
