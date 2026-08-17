@@ -30,7 +30,12 @@ from gantry_sftp.codec import (
     PacketType,
     Read,
 )
-from gantry_sftp.exceptions import ConnectError, _flatten_exception_group
+from gantry_sftp.exceptions import (
+    _MAX_NOTE_CHARS,
+    _SIBLINGS_NAMED,
+    ConnectError,
+    _flatten_exception_group,
+)
 from gantry_sftp.transport import (
     ASKPASS_ARMING_VARIABLES,
     StderrBuffer,
@@ -954,6 +959,89 @@ async def test_the_group_is_flattened_all_the_way_down():
 def test_flattening_leaves_a_plain_exception_alone():
     error = ConnectError("not a group")
     assert _flatten_exception_group(error) is error
+
+
+# --- D-194: what happens to the failures that are not returned ----------------------------
+# Flattening is what keeps `except ConnectError` matching, and until D-194 it also discarded
+# every other member of the group. Every call site raises `from None`, which sets
+# `__suppress_context__`, so the group left on `__context__` is invisible to `traceback`,
+# `logging.exception`, pytest and every crash reporter: four concurrent files failing reported
+# one of them and nothing said the other three existed.
+#
+# Asserted on the helper directly, for the reason the nesting row above gives and for a second
+# one that is measured: driving a four-member group through `for_each_bounded` yields four
+# members on asyncio and **one** on trio, which cancels the siblings at their pending `sleep`
+# before they raise. A both-backends integration row would assert nothing on half the matrix.
+# The wiring is pinned in `tests/test_pool.py`; the property is pinned here.
+
+
+def test_the_other_members_of_a_group_are_named_on_the_one_returned():
+    first = ConnectError("the one that is raised")
+    group = BaseExceptionGroup("four at once", [first, ConnectError("b"), ConnectError("c")])
+
+    assert _flatten_exception_group(group) is first
+    assert first.__notes__ == [
+        "2 other failure(s) happened concurrently and are not this exception: "
+        "ConnectError: 'b'; ConnectError: 'c'"
+    ]
+
+
+def test_a_nested_group_contributes_its_leaves_rather_than_itself():
+    # A task group inside a task group nests the groups, so `exceptions[1:]` at the outer level
+    # can hold a *group*. Naming that renders `ExceptionGroup: outer (2 sub-exceptions)`, where
+    # the reader needs the two failures inside it -- which is why `_leaves` recurses instead of
+    # reading one level.
+    first = ConnectError("outer leaf")
+    inner = BaseExceptionGroup("inner", [ConnectError("buried one"), ConnectError("buried two")])
+    group = BaseExceptionGroup("outer", [first, inner])
+
+    assert _flatten_exception_group(group) is first
+    assert "buried one" in first.__notes__[0]
+    assert "buried two" in first.__notes__[0]
+    assert "sub-exception" not in first.__notes__[0]
+
+
+def test_the_note_names_a_bounded_number_and_counts_the_rest():
+    # `concurrency` is the caller's and a note is rendered into every traceback, so the named
+    # examples are bounded -- but the *total* is always stated, because "one file failed" and
+    # "forty did" call for different responses and the count is what says which happened.
+    over = _SIBLINGS_NAMED + 3
+    first = ConnectError("raised")
+    group = BaseExceptionGroup("many", [first, *(ConnectError(f"other {n}") for n in range(over))])
+
+    note = _flatten_exception_group(group).__notes__[0]
+
+    assert note.startswith(f"{over} other failure(s) happened concurrently")
+    assert note.endswith(f"and {over - _SIBLINGS_NAMED} more")
+    assert "other 0" in note
+    assert f"other {_SIBLINGS_NAMED - 1}" in note
+    assert f"other {_SIBLINGS_NAMED}" not in note
+
+
+def test_a_long_message_is_capped_and_says_how_much_it_dropped():
+    # A failure's message carries a remote path and a remote path is the server's choice, so
+    # this is the same bound `codec.MAX_FIELD_BYTES` puts on a frame dump, for the same reason.
+    overflow = 12
+    first = ConnectError("raised")
+    group = BaseExceptionGroup("two", [first, ConnectError("x" * (_MAX_NOTE_CHARS + overflow))])
+
+    note = _flatten_exception_group(group).__notes__[0]
+
+    assert note.endswith(f"+{overflow}c")
+    assert "x" * _MAX_NOTE_CHARS in note
+    assert "x" * (_MAX_NOTE_CHARS + 1) not in note
+
+
+def test_a_sibling_message_cannot_forge_a_log_line():
+    # The note reaches a log sink, and a server-chosen name reaching one unescaped is log
+    # forging -- the same reason `_logging.fields_of` reprs every value it carries.
+    first = ConnectError("raised")
+    group = BaseExceptionGroup("two", [first, ConnectError("tidy\nERROR forged line")])
+
+    note = _flatten_exception_group(group).__notes__[0]
+
+    assert "\n" not in note
+    assert "\\n" in note
 
 
 # --- passwords: where the secret goes, and what a refusal says ----------------------------

@@ -157,3 +157,68 @@ async def test_a_concurrency_below_one_is_refused(concurrency: int):
     with pytest.raises(ValueError) as caught:
         await for_each_bounded(counting(1), handle, concurrency=concurrency)
     assert caught.value.args[0] == f"concurrency must be at least 1, got {concurrency}"
+
+
+# --- D-194: the failures that are not the one raised ---------------------------------------
+# The flat exception is what calling code is written against, and it used to be the *only*
+# thing a caller was told. `raise ... from None` sets `__suppress_context__`, so the group that
+# still sits on `__context__` is hidden from `traceback`, `logging.exception`, pytest and every
+# crash reporter -- four files failing together reported one of them, and nothing said the
+# other three had happened.
+#
+# The note itself is pinned on `_flatten_exception_group` in `tests/test_transport.py`, where
+# a multi-member group is *constructed* and the assertion is deterministic. These two rows are
+# the wiring: that the pool reaches that function, and that the common path stays quiet.
+
+
+async def test_a_lone_failure_carries_no_note_at_all():
+    # The common path, and the one `from None` was added for. A note here would put a sentence
+    # about concurrency on every single-file failure in the library.
+    async def boom(item: int) -> None:
+        raise ValueError(f"item {item} failed")
+
+    with pytest.raises(ValueError) as caught:
+        await for_each_bounded(counting(1), boom, concurrency=4)
+
+    assert not getattr(caught.value, "__notes__", [])
+
+
+def test_concurrent_failures_are_named_on_the_one_the_caller_catches():
+    """The end-to-end wiring, on the one backend where the group actually holds four.
+
+    **Deliberately not a both-backends row, and the measurement is the reason.** With four
+    workers each sleeping and then raising, the group that reaches `_flatten_exception_group`
+    holds **4 members on asyncio and 1 on trio**: trio delivers the first failure's
+    cancellation to the three siblings while they are still parked in `sleep`, so they never
+    reach their own `raise`. Running this on both backends would therefore assert the property
+    on one and assert nothing at all on the other -- green, and vacuous for half the matrix,
+    which is the failure mode this repository has already paid for once.
+
+    So the backend is named here rather than taken from the fixture, and it is `anyio.run`
+    rather than a fixture override because the pin belongs to this one row.
+    """
+
+    async def boom(item: int) -> None:
+        # The delay is load-bearing: with `checkpoint()` the first worker raises before the
+        # others are scheduled and the group holds one member even on asyncio, so this row
+        # would pass against the unfixed code.
+        await anyio.sleep(0.05)
+        raise ValueError(f"item {item} failed")
+
+    async def drive() -> BaseException:
+        with pytest.raises(ValueError) as caught:
+            await for_each_bounded(counting(4), boom, concurrency=4)
+        return caught.value
+
+    error = anyio.run(drive, backend="asyncio")
+
+    assert not isinstance(error, BaseExceptionGroup)
+    notes = getattr(error, "__notes__", [])
+    assert len(notes) == 1, f"expected exactly one note, got {notes!r}"
+    assert notes[0].startswith("3 other failure(s) happened concurrently")
+    # Every one of them by name. The count alone would not distinguish "three more of the same"
+    # from "one of those three was a permission error".
+    for item in range(4):
+        rendered = f"item {item} failed"
+        if rendered != error.args[0]:
+            assert rendered in notes[0], f"{rendered!r} is missing from {notes[0]!r}"

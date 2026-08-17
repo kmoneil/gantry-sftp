@@ -102,6 +102,32 @@ Two things it will not do, both deliberate:
   `1` the transfer order is not the walk's, so a failure part-way leaves an unpredictable
   subset transferred.
 
+### What a failure reports when several happen at once
+
+The first failure cancels the other workers and is raised **flat** — `except TransferError`
+matches, and you do not need `except*`. That is the point of the pool doing its own unwrapping.
+
+Files already in flight can fail before the cancellation reaches them, so more than one failure
+can be real. You are told about all of them: the exception that is raised is one of them, and it
+carries a **note** naming the rest.
+
+```
+gantry_sftp.exceptions.TransferError: /incoming/b.csv: permission denied (after 0 bytes at offset 0)
+2 other failure(s) happened concurrently and are not this exception:
+  TransferError: '/incoming/c.csv: permission denied (after 0 bytes at offset 0)';
+  TransferError: '/incoming/d.csv: permission denied (after 0 bytes at offset 0)'
+```
+
+Notes print in every traceback, so `logging.exception` and any crash reporter show them without
+being asked. The note names a bounded number of examples and always states the true total —
+"one file failed" and "forty did" are different situations, and the count is what tells them
+apart.
+
+**Which one is raised is not meaningful.** It is whichever the task group listed first, not the
+earliest or the worst. Do not branch on it as though it were the primary cause; if you need to
+handle each failure separately, transfer with `concurrency=1`, or fan out with your own task
+group and `except*`, which keeps the group intact.
+
 ### `concurrency=` bounds one call, and you own the product
 
 `concurrency=` is the bound for _that call_. It does not compose, and nothing anywhere adds the

@@ -3,6 +3,25 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## Unreleased
+
+### Fixed
+
+- **A concurrent transfer that hit several failures at once reported one of them and said
+  nothing about the rest** (D-194). `get_tree`, `put_tree`, `get_many`, `put_many` and
+  `sync_tree` flatten the `ExceptionGroup` an `anyio` task group raises, so that
+  `except TransferError` keeps matching — and the flattening discarded every member but the
+  first. Because each call site re-raises `from None`, the group left on `__context__` was
+  suppressed from `traceback`, `logging.exception`, pytest and every crash reporter, so four
+  files failing together were reported as one with no way to learn of the other three.
+
+  The exception is still raised flat; the others are now named in a **note**, which prints in
+  every traceback without a caller asking. The note names a bounded number of examples and
+  always states the true total, since "one file failed" and "forty did" call for different
+  responses. **Which failure is raised remains arbitrary** — it is whichever the task group
+  listed first, not the earliest or the worst — and that is now written down where a user
+  reads it rather than left to be inferred.
+
 ## 0.5.0 — 2026-08-17
 
 **A minor bump because it adds API, and for no other reason — nothing here breaks.** Two public

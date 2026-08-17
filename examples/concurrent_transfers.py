@@ -118,6 +118,35 @@ async def show_how_a_failure_arrives(sftp: Session, good: str, into: Path) -> No
             print("  (your group wraps it -- catch with `except*`, or fan out one level down)")
 
 
+async def show_what_several_failures_at_once_report(sftp: Session, into: Path) -> None:
+    """A concurrent transfer raises one exception, and it tells you about the others.
+
+    The pool cancels the remaining workers on the first failure, but transfers already in
+    flight can fail before that reaches them -- so more than one failure is genuinely real.
+    The raised exception is still **flat**, which is what keeps `except NoSuchFileError`
+    matching; the others are named in a note, and notes print in every traceback, so
+    `logging.exception` and any crash reporter show them without being asked.
+
+    **Which one is raised is not meaningful** -- it is whichever the task group listed first,
+    not the earliest or the worst. Branching on it as though it were the primary cause is the
+    mistake this demonstration exists to prevent.
+    """
+    try:
+        _ = await sftp.get_many(
+            [f"/definitely/not/there/{n}.bin" for n in range(4)], into, concurrency=4
+        )
+    except NoSuchFileError as error:
+        print(f"  four at once, one raised:  {type(error).__name__}: {error}")
+        notes = getattr(error, "__notes__", [])
+        # Asserted rather than printed and hoped for: an example that cannot fail the way it
+        # describes is a paragraph with a shebang. The *count* is deliberately not asserted --
+        # how many workers get their refusal before the cancellation reaches them is the
+        # scheduler's business, and pinning it here would make this file flaky by design.
+        assert notes, "the other concurrent failures were not reported"
+        for note in notes:
+            print(f"  and the rest, on a note:   {note}")
+
+
 async def run(sftp: Session, remotes: list[str], workdir: Path) -> None:
     one_at_a_time = workdir / "sequential"
     all_at_once = workdir / "concurrent"
@@ -145,6 +174,11 @@ async def run(sftp: Session, remotes: list[str], workdir: Path) -> None:
 
     print("\nand when one of them fails:")
     await show_how_a_failure_arrives(sftp, remotes[0], workdir)
+
+    print("\nand when several fail at once:")
+    several = workdir / "several"
+    several.mkdir()
+    await show_what_several_failures_at_once_report(sftp, several)
 
 
 async def show_list_transfers(sftp: Session, remotes: list[str], workdir: Path) -> None:
