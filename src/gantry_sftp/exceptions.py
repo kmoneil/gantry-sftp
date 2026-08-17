@@ -567,6 +567,72 @@ class CapabilityError(SFTPError):
         return " ".join(parts).replace(" )", ")")
 
 
+_SIBLINGS_NAMED = 5
+"""How many other failures a flattened group's note names before it only counts them.
+
+Bounded because ``concurrency`` is the caller's and a note is rendered into every traceback,
+every log record and every crash report. The **total** is always stated, because that is the
+fact that changes what an operator does -- "one file failed" and "forty did" call for different
+responses, and five examples are texture rather than the finding.
+"""
+
+_MAX_NOTE_CHARS = 200
+"""Characters of one named sibling the note carries before it says how many it dropped.
+
+**Deliberately larger than :data:`gantry_sftp.codec.MAX_FIELD_BYTES` and
+:data:`gantry_sftp._logging.MAX_VALUE_CHARS`, which are both 96**, and the difference is what
+is being capped rather than a different opinion about length. Those bound **one field** -- a
+path, a value. This bounds a **whole rendered exception**, which for a
+:class:`ServerError` is already a summary, a status name, a server message *and* a path.
+
+96 was tried first and was measured cutting the path out of a real
+``NoSuchFileError`` -- ``…No such file path=b'/incoming/1.bi``+10c -- which defeats the note:
+naming *which* transfers failed is the entire reason it exists. At 200 a realistic refusal
+survives whole, five of them bound the note at about a kilobyte, and a server that sends a
+4 KiB path is still cut and still told about.
+"""
+
+
+def _leaves(error: BaseException) -> list[BaseException]:
+    """Every non-group exception inside a possibly-nested group, in wire order.
+
+    Recursive rather than a loop over the top level, because a task group inside a task group
+    nests the groups: ``exceptions[1:]`` at the outer level can hold *groups*, and rendering
+    one of those into a note would print ``ExceptionGroup: outer (2 sub-exceptions)`` where the
+    reader needs the two failures inside it.
+    """
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for child in error.exceptions for leaf in _leaves(child)]
+    return [error]
+
+
+def _sibling_note(siblings: list[BaseException]) -> str:
+    """Name the failures that are being dropped, and count the ones that are not named.
+
+    Rendered with ``repr`` rather than ``str``, which is the same decision
+    :func:`gantry_sftp._logging.fields_of` records for the same input: these messages carry
+    server-chosen names, ``repr`` of a string is pure ASCII, and a note reaches a log sink where
+    an unescaped control character is log forging.
+    """
+    named = [
+        f"{type(sibling).__name__}: {_capped(str(sibling))}"
+        for sibling in siblings[:_SIBLINGS_NAMED]
+    ]
+    if len(siblings) > _SIBLINGS_NAMED:
+        named.append(f"and {len(siblings) - _SIBLINGS_NAMED} more")
+    return (
+        f"{len(siblings)} other failure(s) happened concurrently and are not this exception: "
+        + "; ".join(named)
+    )
+
+
+def _capped(message: str) -> str:
+    """One sibling's message, escaped and honest about what it dropped."""
+    if len(message) <= _MAX_NOTE_CHARS:
+        return repr(message)
+    return f"{message[:_MAX_NOTE_CHARS]!r}+{len(message) - _MAX_NOTE_CHARS}c"
+
+
 def _flatten_exception_group(error: BaseException) -> BaseException:
     """Reduce an ``ExceptionGroup`` to the first thing that actually went wrong.
 
@@ -584,13 +650,32 @@ def _flatten_exception_group(error: BaseException) -> BaseException:
     outside ``async with open_ssh_transport(...)`` -- the natural spelling, and the one the
     documentation shows -- never matched.
 
+    **The other failures are named in a note, and until D-194 they were discarded** -- which is
+    the half this function did quietly. Every call site raises the result ``from None``, and
+    ``from None`` sets ``__suppress_context__``, so the group still sitting on ``__context__``
+    is hidden from ``traceback``, ``logging.exception``, pytest and every crash reporter. Four
+    files failing together in a ``get_tree`` reported one of them and nothing said the other
+    three existed. The note is what makes the flat ladder -- which is the whole point of this
+    function -- cost no information.
+
+    ``from None`` **stays**, and the two alternatives were costed. Dropping it prints the group
+    under *"During handling of the above exception, another exception occurred"*, which is
+    backwards: the leaf is a member of the group, not something raised while handling it. And
+    ``raise flat from group`` prints every sibling's whole traceback, which is more than a
+    reader needs and asserts a causal relationship that does not hold.
+
     Args:
         error: The exception to unwrap. Anything that is not a group is returned unchanged.
 
     Returns:
         The first leaf exception, or ``error`` itself if it is not a group. Nesting is followed
-        all the way down, since a task group inside a task group nests the groups too.
+        all the way down, since a task group inside a task group nests the groups too. When the
+        group held more than one leaf, the returned exception carries a note naming the rest --
+        so a caller who catches it flat is still told what else failed.
     """
-    while isinstance(error, BaseExceptionGroup) and error.exceptions:
-        error = error.exceptions[0]
-    return error
+    if not isinstance(error, BaseExceptionGroup):
+        return error
+    first, *siblings = _leaves(error) or [error]
+    if siblings:
+        first.add_note(_sibling_note(siblings))
+    return first

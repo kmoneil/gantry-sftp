@@ -148,6 +148,12 @@ def test_the_concurrency_example_shows_transfers_actually_overlapping():
     # And the error section has to keep telling the truth about where the exception lands.
     assert "one call, on its own:  NoSuchFileError" in stdout
     assert "inside your task group: NoSuchFileError" in stdout
+    # D-194: and about the failures that are *not* the one raised. The example asserts the note
+    # exists; this asserts it reached stdout carrying a path, because a note that named no file
+    # would satisfy the example's own assertion and tell a reader nothing.
+    assert "and the rest, on a note:" in stdout
+    assert "other failure(s) happened concurrently" in stdout
+    assert "/definitely/not/there/" in stdout.split("and the rest, on a note:")[1]
 
 
 def test_the_cancellation_example_shows_a_prompt_unwind_and_no_litter():
