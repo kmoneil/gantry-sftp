@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from functools import partial
 from pathlib import Path
 
@@ -87,6 +87,39 @@ def show_classification() -> None:
         print(f"  {verdict}  {type(error).__name__}")
     print("  ^ AuthenticationError and HostKeyError are ConnectError subclasses, and are")
     print("    excluded on purpose: OpenSSH 9.8+ locks out the source address on repeats.")
+
+
+async def show_why_it_stopped(
+    recipe: Callable[[], AbstractAsyncContextManager[Transport]], base: str
+) -> None:
+    """The mixed case, which is the one whose note is worth reading.
+
+    The link drops, it reconnects, and *then* the operation hits something no reconnect can
+    fix. It stops there rather than spending the third attempt -- and the note says which of
+    the two reasons ended the loop, so a reader is not sent looking at the link for a failure
+    that was never about the link. It used to say `"all retryable"` here, about the one
+    failure that was not.
+    """
+    attempted = 0
+
+    async def drops_then_refuses(sftp: Session) -> object:
+        nonlocal attempted
+        attempted += 1
+        if attempted == 1:
+            raise ConnectError("the link dropped")
+        return await sftp.stat(f"{base}/definitely-not-here.bin")
+
+    try:
+        _ = await with_reconnect(recipe, drops_then_refuses, attempts=3, backoff=0.1)
+    except NoSuchFileError as mixed:
+        print(f"\nRetryable, then terminal: {type(mixed).__name__}")
+        print(f"  attempts run: {attempted} of 3")
+        # Asserted rather than printed and hoped for -- an example that cannot fail the way it
+        # describes is a paragraph with a shebang.
+        (note,) = mixed.__notes__
+        if "not retryable" not in note:
+            raise AssertionError(f"the note does not say why it stopped: {note!r}") from mixed
+        print(f"  note: {note}")
 
 
 async def main() -> None:
@@ -151,6 +184,10 @@ async def main() -> None:
             _ = await with_reconnect(recipe, missing, attempts=3, backoff=5)
         except NoSuchFileError as terminal:
             print(f"\nTerminal error, one connection and no backoff: {terminal}")
+        print(f"  connections spent: {connections - before}")
+
+        before = connections
+        await show_why_it_stopped(recipe, base)
         print(f"  connections spent: {connections - before}")
 
     print("\nA retry is an at-least-once execution. Resumable or idempotent, or neither.")

@@ -172,6 +172,24 @@ def test_the_cancellation_example_shows_a_prompt_unwind_and_no_litter():
     assert "the session still works" in stdout
 
 
+def test_the_retry_example_says_why_it_stopped_and_not_only_how_often():
+    # D-195. The two exits from the retry loop need different sentences, and until they had
+    # them the mixed path -- a link that drops, then a refusal no reconnect can fix -- claimed
+    # the attempts were spent and that every failure was retryable. Both were false, and both
+    # send a reader to look at the link for a permission problem.
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "retry.py")
+    assert returncode == 0
+    assert "Retryable, then terminal: NoSuchFileError" in stdout
+    assert "attempts run: 2 of 3" in stdout
+    # The note itself, not just its presence: "stopped after" and "not retryable" are the two
+    # halves the old sentence got wrong, and "gave up after" survives in the *other* branch, so
+    # asserting that alone would pass against the defect.
+    assert "stopped after 2 of 3 attempt(s): this failure is not retryable" in stdout
+
+
 def test_the_connect_errors_example_classifies_rather_than_guesses():
     # The example exists to show that the failure reaches you as a *class*. With no arguments
     # it connects to a closed port, which is deliberately one of the cases we refuse to

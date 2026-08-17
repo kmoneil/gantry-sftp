@@ -22,6 +22,14 @@ and while the major version is `0` the minor version is where a breaking change 
   listed first, not the earliest or the worst — and that is now written down where a user
   reads it rather than left to be inferred.
 
+- **`with_reconnect` claimed every attempt was retryable even when the failure that stopped it
+  was not** (D-195). Two conditions end the loop — a terminal failure, or the attempts running
+  out — and both wrote the same note. On a link that dropped and then hit a permission problem
+  it read `gave up after 2 of 3 attempt(s), all retryable`, which says the attempts were spent
+  when one remained, and that every failure was retryable when the one that stopped the loop was
+  not. It sends a reader to look at the link for a failure that was never about the link. The
+  two exits now say which one happened.
+
 ## 0.5.0 — 2026-08-17
 
 **A minor bump because it adds API, and for no other reason — nothing here breaks.** Two public

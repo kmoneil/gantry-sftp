@@ -239,7 +239,11 @@ async def with_reconnect[T](
             # must not be retried. anyio's cancelled exception derives from BaseException on
             # both backends, so this is the line that keeps a cancelled transfer cancelled.
             if not is_retryable(error) or attempt >= attempts:
-                _note_attempts(error, attempt, attempts)
+                # `is_retryable` a second time rather than threading a flag out of the
+                # condition above: the note has to say *which* of the two exits was taken, and
+                # a reader can see that here without holding the negation in their head. The
+                # predicate is pure, so asking twice costs nothing.
+                _note_attempts(error, attempt, attempts, exhausted=is_retryable(error))
                 raise
             # The library's only WARNING, and the reason it is one: this failure is about to be
             # swallowed. Every other error in this package reaches the caller as a typed
@@ -269,13 +273,35 @@ async def with_reconnect[T](
         delay = min(delay * 2, backoff_max)
 
 
-def _note_attempts(error: BaseException, attempt: int, attempts: int) -> None:
-    """Say how many attempts were made, but only when more than one was.
+def _note_attempts(error: BaseException, attempt: int, attempts: int, *, exhausted: bool) -> None:
+    """Say how many attempts were made and why they stopped, but only when more than one was.
 
     A note on a first-and-only failure would be noise on every terminal error -- and the
     common case for this helper is an operation that succeeds immediately. When it *did*
     retry, the count is the thing a reader needs: "failed" and "failed three times over
     ninety seconds" call for different responses.
+
+    **Two exits reach here and they need different sentences** (D-195). Until then there was
+    one, `"gave up after N of M attempt(s), all retryable"`, and it described only the exit
+    where the attempts ran out. On the other -- a retryable failure followed by a terminal one
+    -- it made two false claims in a sentence: that the attempts were spent, when one remained,
+    and that every failure was retryable, when the one that stopped the loop was not. It
+    pointed a reader at the link when the answer was a permission problem.
+
+    Args:
+        error: The failure about to be raised. The note goes on this one.
+        attempt: Which attempt it was, counting from 1.
+        attempts: The total this call was allowed.
+        exhausted: Whether the loop stopped because the attempts ran out, rather than because
+            this failure is one no reconnect can fix. Computed by the caller from
+            :func:`is_retryable`, which is the same question the loop's own condition asked.
     """
-    if attempt > 1:
+    if attempt <= 1:
+        return
+    if exhausted:
         error.add_note(f"gave up after {attempt} of {attempts} attempt(s), all retryable")
+    else:
+        error.add_note(
+            f"stopped after {attempt} of {attempts} attempt(s): this failure is not "
+            f"retryable, so the remaining attempt(s) were not spent"
+        )
