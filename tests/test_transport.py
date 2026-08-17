@@ -1001,10 +1001,36 @@ def test_a_nested_group_contributes_its_leaves_rather_than_itself():
     assert "sub-exception" not in first.__notes__[0]
 
 
+def test_the_two_bounds_are_the_values_that_were_measured():
+    """The values as literals, because every other row here derives from the constants.
+
+    Written after the rows below were found to pass at **any** value -- `_SIBLINGS_NAMED` at 4,
+    6 or 8, and `_MAX_NOTE_CHARS` back at the 96 that was *measured wrong*, cutting the path out
+    of a real `NoSuchFileError`. Deriving the expectation from the constant under test proves
+    the arithmetic is self-consistent and says nothing about the number, which is
+    the register's *an expectation computed with the code under test*.
+
+    So this is the `tests/test_defaults.py` shape applied to two constants: the value written
+    down in one place a reviewer has to edit and explain, and the behavioural rows below
+    watching that the bound is applied at all. Neither alone is enough, and the pair is what
+    D-105's twelfth slice established.
+
+    200 rather than the 96 its two siblings use is the one worth defending, and the reason is on
+    the constant: `MAX_FIELD_BYTES` and `MAX_VALUE_CHARS` bound one *field*, this bounds a whole
+    rendered exception, and 96 cut the path -- which is the one thing the note exists to carry.
+    """
+    assert _SIBLINGS_NAMED == 5
+    assert _MAX_NOTE_CHARS == 200
+
+
 def test_the_note_names_a_bounded_number_and_counts_the_rest():
     # `concurrency` is the caller's and a note is rendered into every traceback, so the named
     # examples are bounded -- but the *total* is always stated, because "one file failed" and
     # "forty did" call for different responses and the count is what says which happened.
+    #
+    # Derived from the constant on purpose: this row is about the *arithmetic* -- that the
+    # cut lands in the right place and the remainder is counted -- and it stays correct if the
+    # bound moves. What it cannot do is defend the value, which is why the row above exists.
     over = _SIBLINGS_NAMED + 3
     first = ConnectError("raised")
     group = BaseExceptionGroup("many", [first, *(ConnectError(f"other {n}") for n in range(over))])
