@@ -3,7 +3,17 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
-## Unreleased
+## 0.5.1 — 2026-08-17
+
+**A patch release, and the version number is the claim: nothing here changes API.** No signature
+moved, nothing was removed, no default changed, and the two constants the first fix introduced are
+private by spelling and absent from every `__all__`. Under this project's `0.x` rule a break lands
+in the minor version, so this is always safe to take.
+
+**Two of the three entries are behaviour a program can observe; the third is a document.** Six
+other changes landed since 0.5.0 and do not appear below, for the reason 0.5.0's own notes give:
+they are tests and a documentation index, and they change nothing a user's program can see. The
+mutation-lane work behind them is in the repository's history rather than here.
 
 ### Fixed
 
