@@ -152,9 +152,16 @@ repos:
       # The baseline is not a file-level exclusion and that is what makes it safe to have: it
       # is keyed by (file, hashed secret, line), so a genuine secret added to an
       # already-listed file still fails -- proved by dropping an AWS key into
-      # `tests/test_fsspec.py`, which the hook refused with the baseline in place. Regenerate
-      # with `.venv/bin/detect-secrets scan $(git ls-files) > .secrets.baseline` when a
-      # fixture moves, and read the diff rather than trusting it.
+      # `tests/test_fsspec.py`, which the hook refused with the baseline in place. Update it
+      # with `.venv/bin/detect-secrets scan --baseline .secrets.baseline` when a fixture
+      # moves, and read the diff rather than trusting it.
+      #
+      # **The `--baseline` form is load-bearing and the redirect form was wrong** (D-193). This
+      # line used to say `scan $(git ls-files) > .secrets.baseline`, which builds a *fresh*
+      # baseline: it drops the `filters_used` block the file already carries, including
+      # `detect_secrets.filters.common.is_baseline_file`, so the baseline stops being excluded
+      # from its own scan. Caught by doing what the last sentence says -- the diff carried one
+      # expected addition and one silent deletion.
       - id: detect-secrets
         name: no new secrets (detect-secrets)
         entry: .venv/bin/detect-secrets-hook --baseline .secrets.baseline

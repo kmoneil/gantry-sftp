@@ -671,7 +671,8 @@ def _probe_case_folding(sftp: SyncSession, scratch: _Scratch) -> Finding:
             verdict=Verdict.NO,
             answer=(
                 "names are case-sensitive here, so two names differing only in case are two "
-                "separate files"
+                "separate files -- and a recursive download onto a filesystem that folds "
+                "case, as macOS and Windows do by default, can overwrite its own output"
             ),
             evidence=(f"created {path!r}", f"STAT {folded!r} -> {_refusal(refusal)}"),
         )
@@ -680,8 +681,8 @@ def _probe_case_folding(sftp: SyncSession, scratch: _Scratch) -> Finding:
         verdict=Verdict.YES,
         answer=(
             "the same file answered to a different case, so remote names that differ only in "
-            "case will collide here -- and a recursive download from a case-sensitive server "
-            "can overwrite its own output"
+            "case will collide here -- and an upload of two local names differing only in "
+            "case lands as one file, the second overwriting the first"
         ),
         evidence=(f"created {path!r}", f"STAT {folded!r} -> found"),
     )
