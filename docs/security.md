@@ -131,13 +131,14 @@ it claims to come from — an attestation is the stronger answer.** It is a sign
 the file to the workflow and repository that produced it, verifiable by the index. An SBOM is an
 unsigned self-report of what went in. One can be checked without trusting us; the other cannot.
 
-Two honest caveats, because a decision resting on unstated things is not a decision. PyPI's
-attestation support is still labelled experimental by the publishing action that generates it — so
-`release.yml` sets `attestations: true` explicitly rather than inheriting the default, and a test
-pins that line, since this paragraph depends on it. And if you are here because a procurement
-process requires an SBOM regardless of dependency count, that is a fair reason to want one: open an
-issue, because "a consumer actually needs this" is the evidence that would change the answer, and
-nothing else on this page is waiting for it.
+Two honest caveats, because a decision resting on unstated things is not a decision. An attestation
+is only an answer while one is actually produced, and it is produced because `release.yml` asks for
+it by name: `attestations: true` restates the publishing action's own default rather than inheriting
+it, since a default nobody wrote down is one a later edit can turn off with nothing reading as
+changed. `tests/test_lanes.py` pins that line, because this paragraph depends on it. And if you are
+here because a procurement process requires an SBOM regardless of dependency count, that is a fair
+reason to want one: open an issue, because "a consumer actually needs this" is the evidence that
+would change the answer, and nothing else on this page is waiting for it.
 
 ## How each control is proved
 
@@ -152,6 +153,7 @@ if you doubt the prose:
 | Credential redaction | `tests/test_askpass.py`, `tests/test_observability.py` |
 | Escaping of server-chosen names | `tests/test_observability.py`, and `tests/test_observability.py::test_no_arbitrary_server_bytes_produce_a_control_character` for the fuzzed half |
 | Behaviour against a real server | `live-tests/`, and `tests/server_contract.py` for what a fake is allowed to claim |
+| Supply chain: pinned actions, `--frozen`, the attestation, the publish path | `tests/test_lanes.py`, `tests/test_audit_deps.py` |
 
 The suite runs with no network and no keys against the genuine OpenSSH `sftp-server` over a pipe;
 [Development](development.md) covers the lanes and what each one exists to catch.
