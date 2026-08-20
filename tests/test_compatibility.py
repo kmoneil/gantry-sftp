@@ -38,7 +38,7 @@ import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
-from compatibility_goldens import REPORTS
+from compatibility_goldens import EXCHANGES, REPORTS
 from gantry_sftp.codec import (
     EXTENSION_CHECK_FILE,
     EXTENSION_FSYNC,
@@ -1672,3 +1672,65 @@ def test_the_portraits_reach_branches_no_single_server_can():
         f"four portraits produced only {len(distinct)} distinct findings against a largest "
         f"single report of {largest}; they are depicting the same server"
     )
+
+
+# ---------------------------------------------------------------------------
+# The call side. `REPORTS` above pins what each portrait's battery *said*; these pin what it
+# *asked*, which is the half a stub cannot be made to notice on its own (D-193).
+# ---------------------------------------------------------------------------
+
+
+def exchange_of(name: str) -> list[tuple[str, object]]:
+    """One portrait's battery run for its calls rather than its report.
+
+    Deliberately not folded into `report_of`, which builds its stub inline and drops it: the
+    two ask different questions of the same run and a caller of either should not have to
+    discard half an answer.
+    """
+    session = SERVERS[name]()
+    compatibility_report(
+        session,  # type: ignore[arg-type]
+        request_bytes=4096,
+        write_directory=PROBE_DIRECTORY,
+        run_id="t0ken",
+    )
+    return session.calls
+
+
+def test_every_exchange_has_a_server():
+    """Both sides of the pairing, on the same grounds as `test_every_portrait_has_a_server`.
+
+    An exchange with no stub is compared against nothing; a stub with no exchange runs the
+    whole battery with its arguments unread, which is the state this golden exists to end.
+    """
+    assert set(EXCHANGES) == set(SERVERS)
+
+
+@pytest.mark.parametrize("name", sorted(EXCHANGES), ids=lambda name: name)
+def test_an_exchange_matches_its_portrait_call_for_call(name: str):
+    """Compared whole, so argument values, call order and call count are all pinned.
+
+    This is the assertion that reaches the arguments. `StubSession` answers from its script
+    regardless of what it is handed, so a probe asking the wrong question still gets the right
+    answer and still produces a byte-identical finding -- `REPORTS` cannot fail on it, and no
+    additional portrait would help. Comparing the recorded calls is the only thing that can.
+    """
+    assert [tuple(call) for call in exchange_of(name)] == list(EXCHANGES[name])
+
+
+def test_the_exchanges_are_less_varied_than_the_reports():
+    """Seven portraits, four distinct exchanges -- stated rather than left to be discovered.
+
+    `restating`, `informative` and `silent` differ only in how a refusal is *worded*, which
+    changes the report and not the questions. That is worth asserting in both directions: if
+    the exchanges ever became as varied as the reports, one of these portraits would have
+    started asking something new and this file should say so; and if they collapsed further,
+    a portrait would have stopped reaching a probe it used to reach.
+    """
+    distinct = {tuple(map(repr, exchange)) for exchange in EXCHANGES.values()}
+
+    assert len(distinct) == 4, (
+        f"{len(distinct)} distinct exchanges across {len(EXCHANGES)} portraits, not 4; a "
+        f"portrait has started or stopped asking something and the goldens need regenerating"
+    )
+    assert len(distinct) < len({fact_id(f) for p in REPORTS.values() for f in p})
