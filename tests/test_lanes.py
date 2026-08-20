@@ -602,6 +602,46 @@ def test_only_the_publishing_job_may_mint_a_token() -> None:
     assert "id-token: write" in after
 
 
+def _job_body(job: str) -> str:
+    """One job's YAML, from its `<job>:` line to the next job at the same indentation.
+
+    Read from the uncommented file. Every comment block in `release.yml` quotes the spelling
+    it argues about -- the `publish` guard's own comment names `refs/tags/v` three times -- so
+    a search over the raw text finds the prose and passes while the job runs unguarded.
+    """
+    body = _uncommented(RELEASE_TEXT).partition(f"\n  {job}:\n")[2]
+    return re.split(r"^  \w+:$", body, maxsplit=1, flags=re.MULTILINE)[0]
+
+
+@pytest.mark.parametrize("job", ["publish", "announce"], ids=lambda name: name)
+def test_only_a_version_tag_may_reach_an_irreversible_job(job: str) -> None:
+    """D-198. The ref condition on the publish path is stated in the file, not only in Settings.
+
+    `test_only_the_publishing_job_may_mint_a_token` proves *which job* may mint the upload
+    credential. This is the neighbouring question nothing asked: *which ref may reach that
+    job*. It went unasserted because the answer was correct for a reason no test can see --
+    the `pypi` environment's deployment branch policy allows one pattern, `v*`, of type tag,
+    and refuses a branch `workflow_dispatch` at the gate. That rule lives in repository
+    settings: `git` does not track it, review cannot see it, and nothing fails if it changes.
+
+    So this does not assert the enforcement, which is not reachable from here. It asserts the
+    *restatement* -- that the file says what the environment enforces -- which is the only half
+    a test can hold, and is what makes the header's description of the environment checkable
+    prose rather than a claim about a system nobody can query from a test run.
+
+    `announce` is parametrized alongside deliberately: it has carried this condition since it
+    was written, so it is the control proving the assertion matches the spelling already in
+    use, and it would fail if a refactor changed the spelling in one job and not the other.
+    """
+    body = _job_body(job)
+    assert body, f"no {job} job in release.yml"
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in body, (
+        f"`{job}` has no ref guard; a workflow_dispatch against a branch would enter it with "
+        f"the `pypi` environment's tag policy as the only thing in the way -- and that policy "
+        f"is in repository settings, where no review and no test can see it"
+    )
+
+
 def test_the_release_holds_no_long_lived_credential() -> None:
     # Trusted publishing (OIDC) is the whole point: a `PYPI_API_TOKEN` in repository secrets
     # is exfiltrable by any workflow that runs untrusted code. Read over the uncommented file,

@@ -21,8 +21,23 @@
 #     Repository        : gantry-sftp
 #     Workflow          : release.yml
 #     Environment       : pypi
-# Then create a `pypi` environment in the repository settings. Protect it with a required
-# reviewer if you want a human gate between the tag and the upload.
+# **The `pypi` environment exists and carries two protection rules. Both are load-bearing and
+# neither is in this repository** (D-198) -- they are configured in repository settings, so
+# `git` does not track them, a review cannot see them and no test can read them. Recorded here
+# because a guard nobody can find is one a future change removes without noticing:
+#
+#   deployment branch policy : one pattern, `v*`, of type **tag** -- this is what refuses a
+#                              `workflow_dispatch` against a branch, at the environment gate,
+#                              before the publish step runs
+#   required reviewers       : kmoneil -- the human gate between the tag and the upload
+#
+# Read them back with:
+#   gh api repos/kmoneil/gantry-sftp/environments/pypi
+#   gh api repos/kmoneil/gantry-sftp/environments/pypi/deployment-branch-policies
+#
+# The `publish` job below restates the tag half as an `if:`. That restatement is not what
+# enforces it -- the environment is -- and the job's own comment says why it is written out
+# anyway.
 #
 # Third-party actions are pinned to a commit SHA with the tag in a trailing comment, matching
 # `ci.yml`, and for the reason stated there: a floating tag is a mutable reference to somebody
@@ -123,6 +138,12 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - run: uv sync --frozen --group build
 
+      # **Both refusals below are tag-guarded, and that is only safe because `publish` is too**
+      # (D-198). They read `GITHUB_REF_NAME` as a version, which on a branch dispatch is a
+      # branch name -- so they cannot run unconditionally, and skipping them would leave an
+      # unchecked artifact for something downstream to upload. With the guard on `publish`
+      # matching theirs the invariant is closed and worth stating: **the only ref that reaches
+      # `publish` is a `v*` tag, and on that ref both of these are armed.**
       - name: Refuse a tag that disagrees with the packaged version
         # The version is single-sourced from `src/gantry_sftp/__init__.py`, so a `v0.1.1` tag on
         # a tree that still says `0.1.0` would publish 0.1.0 a second time and fail at the
@@ -164,6 +185,22 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     needs: build
+    # **Restates the `pypi` environment's tag policy, and is not what enforces it** (D-198).
+    # Enforcement is the environment's deployment branch policy -- one pattern, `v*`, of type
+    # tag -- so a `workflow_dispatch` against a branch is refused at the gate whether or not
+    # this line is here. It is here because that rule lives in repository *settings*: `git`
+    # does not track it, a review cannot see it, no test can read it, and nothing fails if it
+    # is changed. Written out, the condition is in the file the reader is holding and
+    # `tests/test_lanes.py` can pin it -- the same argument `attestations:` and
+    # `digest-mismatch:` below are written out for (D-149), applied to the one thing in this
+    # job that decides whether an upload happens at all.
+    #
+    # `announce` has carried this exact condition since it was written, guarding a
+    # `gh release create`; the job guarding an irreversible PyPI upload did not.
+    #
+    # It costs the documented dispatch-to-retry path nothing: that dispatches against a *tag*
+    # ref, where `github.ref` is `refs/tags/vX.Y.Z` and this is true.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
