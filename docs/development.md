@@ -198,6 +198,15 @@ maintainer cannot approve their own pull request, so any positive number blocks 
 And it has **no bypass actor**, so there is no override — a change that CI cannot pass reaches
 `main` by editing the ruleset in Settings, visibly, rather than by forcing past it.
 
+One parameter is recorded because GitHub enforces it, not because it does anything here.
+`require_extra_approval_for_unattributed_changes` has been `true` since the ruleset was created,
+and it asks for one approval more than the configured count when Copilot opens a pull request that
+is not attributed to a person. The count here is zero and the setting has no effect at zero, so it
+is inert, and it stops being inert the moment that count moves, which is a second reason the
+paragraph above is load-bearing. It is committed anyway: a file that omits part of what GitHub
+enforces is not something a change to the ruleset can be reviewed against, and this one omitted it
+from the day it was written until 2026-08-28.
+
 The committed JSON is the intended configuration and GitHub holds the enforced one; nothing
 syncs them, because a test that read the API would need the network and would fail on an outage
 rather than on a defect. Re-export to compare:
