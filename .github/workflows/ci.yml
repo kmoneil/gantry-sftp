@@ -75,6 +75,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The belt to the `forbid-session-trailer` commit-msg hook, which only runs where
+      # somebody ran `pre-commit install` and which `--no-verify` walks past. This reads the
+      # messages GitHub received. It is a step in this job rather than a job of its own on
+      # purpose: a new job is a new required status check, and adding one means patching the
+      # enforced ruleset while the pull request is open and green, which `docs/development.md`
+      # calls the dangerous edit. The step's `if:` is step-level, so it does not make `gates`
+      # a guarded job -- `tests/test_lanes.py` reads job-level guards to decide what gates,
+      # and asserts `gates` still does.
+      #
+      # First, so it fails before four minutes of toolchain setup. It needs no `uv sync`.
+      - name: no Claude session link in any commit message
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/check_pr_commit_messages.sh
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
