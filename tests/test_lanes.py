@@ -1200,6 +1200,20 @@ def test_the_guarded_step_did_not_stop_gates_from_gating() -> None:
     assert "gates" in contexts_a_pull_request_reports()
 
 
+def test_the_pr_message_check_avoids_a_bash_4_builtin() -> None:
+    """Named for the bug rather than for the rule, because the rule has one instance here.
+
+    `mapfile` is a bash 4 builtin. macOS ships bash 3.2 as /bin/bash, which is what is on PATH
+    on the macOS runner, so the first spelling of this script exited 127 there under `set -e`
+    while passing locally on bash 5. Local green is partial for anything that shells out, and
+    this is the cheap half of that lesson: the expensive half is a CI round trip.
+    """
+    # Over the uncommented script: the comment above the loop names `mapfile` to explain what
+    # it is avoiding, and a raw search fails on that explanation rather than on a builtin.
+    body = _uncommented(PR_MESSAGES_SCRIPT.read_text(encoding="utf-8"))
+    assert "mapfile" not in body
+
+
 def test_a_pull_request_of_clean_messages_passes(tmp_path: Path) -> None:
     done = _pr_check(tmp_path, {"aaa111": "Fix the thing\n\nAn ordinary body.\n"})
     assert done.returncode == 0

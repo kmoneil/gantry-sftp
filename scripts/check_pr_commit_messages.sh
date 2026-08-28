@@ -24,7 +24,16 @@ pull_request="${PR_NUMBER:?PR_NUMBER is unset}"
 workdir="${RUNNER_TEMP:-/tmp}"
 guard="$(dirname "$0")/forbid_session_trailer.sh"
 
-mapfile -t shas < <(
+# A `while read` loop rather than `mapfile`, which is a bash 4 builtin. macOS ships bash 3.2 as
+# /bin/bash and that is what is on PATH on the macOS runner, where `mapfile` is not found and the
+# script exits 127 under `set -e` -- which is how this was found, on the `fast (macos-latest)`
+# lane, after passing locally on bash 5.
+shas=()
+while IFS= read -r sha; do
+  if [ -n "$sha" ]; then
+    shas+=("$sha")
+  fi
+done < <(
   gh api --paginate "repos/${repository}/pulls/${pull_request}/commits" --jq '.[].sha'
 )
 
