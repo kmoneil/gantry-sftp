@@ -7,7 +7,7 @@ How to run the suite and the lanes, and what each lane exists to catch.
 ```bash
 export UV_CACHE_DIR=/workspace/.uv-cache   # the default cache is root-owned here
 uv sync
-.venv/bin/pre-commit install               # sets up pre-commit and pre-push
+.venv/bin/pre-commit install               # pre-commit, pre-push and commit-msg
 ```
 
 Every proof this project has is a **lane**, and `scripts/lanes.py` is the one place they are
@@ -115,6 +115,30 @@ sitting idle waiting for an answer look identical from outside, the worktree it 
 mentions it: `git status` in the main checkout is clean whatever is parked next door. It says
 nothing when nothing is parked. It is marked `verbose` in `.pre-commit-config.yaml` because
 pre-commit shows the output of a *failing* hook only, and this one never fails.
+
+One hook checks the **commit message** rather than the tree, and it is also the only one of
+those: `forbid-session-trailer` refuses a message carrying a `Claude-Session:` trailer line or a
+`claude.ai/code/session` URL. Both are written by the tool rather than by a person, and a commit
+message cannot be edited once pushed without rewriting history. Three commits on `main` carried
+one until 2026-08-28; removing them cost a rewrite, an unlocked branch ruleset and a force-push,
+and the old objects stayed reachable by SHA on a public repository regardless. The cheap moment
+to refuse it is before the object exists, so this gates.
+
+The trailer check is anchored to the start of a line and the URL check is not. That asymmetry is
+deliberate: a line that *is* the trailer is a tool artefact, while a message must still be able
+to discuss the trailer in prose, which the commit adding the hook had to do. Text below the
+scissors line `git commit -v` writes, and `#` comment lines git strips before storing, are not
+scanned, because refusing on either would reject a commit for text that never becomes part of
+it, starting with a staged diff of the guard itself.
+
+What stops the trailer being written at all is `"attribution": { "commit": "", "pr": "",
+"sessionUrl": false }` in `~/.claude/settings.json`, which is per-machine and outside this
+repository, so it protects the machine it is on and nothing else. The hook is the half that
+travels with the code. It runs at the `commit-msg` stage, which is why `commit-msg` is listed in
+`default_install_hook_types` and why `tests/test_lanes.py` asserts those two together: `pre-commit
+install` writes only the hook types named there, so a hook declared for a stage nobody installs is
+configured, wired to nothing, and indistinguishable from one that passes. **If you installed the
+hooks before this landed, run `.venv/bin/pre-commit install` again.**
 
 `tests/` and `examples/` need no network and are what `fast` runs. Every example is executed
 as a subprocess, because an example that has drifted out of sync with the library is a
