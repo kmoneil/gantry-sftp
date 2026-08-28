@@ -5,7 +5,7 @@
 # Install once:  .venv/bin/pre-commit install
 # Never commit with --no-verify.
 
-default_install_hook_types: [pre-commit, pre-push]
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
 default_stages: [pre-commit]
 
 repos:
@@ -139,6 +139,17 @@ repos:
         entry: bash scripts/forbid_exec_bit.sh
         language: system
         pass_filenames: false
+
+      # The only `commit-msg` hook, and the only gate here aimed at the message rather than the
+      # tree. A session link in a commit is a tool artefact that cannot be edited out once
+      # pushed without rewriting history, which this repository paid for once. `commit-msg` is
+      # listed in `default_install_hook_types` above; without it the hook is configured, wired
+      # to nothing, and silent -- so `tests/test_lanes.py` asserts the two together.
+      - id: forbid-session-trailer
+        name: no Claude session link in the commit message
+        entry: bash scripts/forbid_session_trailer.sh
+        language: system
+        stages: [commit-msg]
 
       # Runs on every file type rather than on Python, because a credential lands in a YAML, a
       # TOML or a Markdown snippet at least as easily as in a module.

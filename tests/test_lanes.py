@@ -234,6 +234,7 @@ def test_the_consumer_gate_waives_exactly_the_three_packages_it_documents() -> N
 # ---------------------------------------------------------------------------
 
 PARKED_SCRIPT = REPO_ROOT / "scripts" / "warn_parked_worktrees.sh"
+SESSION_TRAILER_SCRIPT = REPO_ROOT / "scripts" / "forbid_session_trailer.sh"
 
 GIT_ENV = {
     # `~/.gitconfig` is a read-only host mount here and a developer's own config anywhere else,
@@ -1003,3 +1004,116 @@ def test_a_change_reaches_main_only_through_a_pull_request_that_rebases() -> Non
     # effect at zero. Pinned because the file went from its first commit to 2026-08-28 without it,
     # so a re-export that drops it again fails here rather than reading as a tidy-up.
     assert parameters["require_extra_approval_for_unattributed_changes"] is True
+
+
+# ---------------------------------------------------------------------------
+# The commit-msg gate: no Claude session link in a commit message
+# ---------------------------------------------------------------------------
+
+
+def _forbid(tmp_path: Path, message: str) -> subprocess.CompletedProcess[str]:
+    """Run the guard over a message file, the way `commit-msg` hands it one."""
+    message_file = tmp_path / "COMMIT_EDITMSG"
+    message_file.write_text(message, encoding="utf-8")
+    return subprocess.run(
+        ["bash", str(SESSION_TRAILER_SCRIPT), str(message_file)],
+        capture_output=True,
+        text=True,
+        # The return code is the assertion: it is the whole of what a commit-msg hook says.
+        check=False,
+    )
+
+
+def test_the_session_trailer_hook_runs_a_script_that_exists() -> None:
+    assert "bash scripts/forbid_session_trailer.sh" in PRECOMMIT_TEXT
+    assert SESSION_TRAILER_SCRIPT.is_file()
+
+
+def test_the_session_trailer_hook_is_wired_to_a_hook_type_that_gets_installed() -> None:
+    """Two settings in two places, and the hook is inert unless both are right.
+
+    `stages: [commit-msg]` says when it runs; `default_install_hook_types` decides whether
+    `pre-commit install` writes a `.git/hooks/commit-msg` at all. Default is pre-commit only,
+    so a hook declared for a stage nobody installs is configured, listed, and never invoked --
+    which looks exactly like a hook that is passing.
+    """
+    assert "stages: [commit-msg]" in _hook_block("forbid-session-trailer")
+    types = re.search(r"^default_install_hook_types: \[(.+)\]$", PRECOMMIT_TEXT, re.MULTILINE)
+    assert types is not None
+    assert "commit-msg" in {name.strip() for name in types.group(1).split(",")}
+
+
+def test_no_other_hook_claims_the_commit_msg_stage() -> None:
+    # The control for the assertion above: if `_hook_block` returned the whole file, the stage
+    # would appear on every hook and the test would pass without wiring anything.
+    assert "commit-msg" not in _hook_block("forbid-exec-bit")
+
+
+def test_a_message_with_no_session_link_commits(tmp_path: Path) -> None:
+    done = _forbid(tmp_path, "Fix the thing\n\nAn ordinary body.\n")
+    assert done.returncode == 0
+    assert done.stderr == ""
+
+
+def test_a_trailer_line_is_refused(tmp_path: Path) -> None:
+    done = _forbid(
+        tmp_path,
+        "Fix the thing\n\nBody.\n\nClaude-Session: https://claude.ai/code/session_01ABC\n",
+    )
+    assert done.returncode == 1
+    assert "carries a Claude Code session link" in done.stderr
+    # The remedy is named, because the person reading this has a rejected commit in hand and
+    # the setting that stops it recurring is in a file this repository does not contain.
+    assert '"sessionUrl": false' in done.stderr
+
+
+def test_a_session_url_anywhere_in_the_body_is_refused(tmp_path: Path) -> None:
+    """Not anchored, unlike the trailer check: the URL is the payload, wherever it sits."""
+    done = _forbid(tmp_path, "Fix\n\nSee https://claude.ai/code/session_01ABC for why.\n")
+    assert done.returncode == 1
+    assert "a claude.ai session URL" in done.stderr
+
+
+def test_a_message_may_still_discuss_the_trailer(tmp_path: Path) -> None:
+    """The reason the trailer check is anchored to the line start.
+
+    A gate nobody can describe in the commit that adds it is a gate that gets worked around,
+    and this file's own history needed to name the thing being forbidden.
+    """
+    done = _forbid(tmp_path, "Fix\n\nRefuses a Claude-Session: trailer, mid-sentence.\n")
+    assert done.returncode == 0
+
+
+def test_a_commented_line_is_not_part_of_the_message(tmp_path: Path) -> None:
+    # git strips these before storing, so refusing on one rejects a commit for text that was
+    # never going to be in it.
+    done = _forbid(tmp_path, "Fix\n\n# Claude-Session: https://claude.ai/code/session_01ABC\n")
+    assert done.returncode == 0
+
+
+def test_the_diff_git_commit_v_appends_is_not_scanned(tmp_path: Path) -> None:
+    """The case that would make this hook unusable in this repository.
+
+    `git commit -v` puts the staged diff below a scissors line in the same file. The tests
+    above are staged text containing exactly what the guard refuses, so a guard that read past
+    the scissors would block every commit that touches itself.
+    """
+    done = _forbid(
+        tmp_path,
+        "Fix\n\n# ------------------------ >8 ------------------------\n"
+        "diff --git a/x b/x\n+Claude-Session: https://claude.ai/code/session_01ABC\n",
+    )
+    assert done.returncode == 0
+
+
+def test_a_missing_message_file_is_an_error_rather_than_a_pass(tmp_path: Path) -> None:
+    # The third state of the predicate. A guard that cannot read its input must not report the
+    # same thing as one that read it and found nothing.
+    done = subprocess.run(
+        ["bash", str(SESSION_TRAILER_SCRIPT), str(tmp_path / "absent")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert "no commit message file" in done.stderr
