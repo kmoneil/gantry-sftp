@@ -235,6 +235,7 @@ def test_the_consumer_gate_waives_exactly_the_three_packages_it_documents() -> N
 
 PARKED_SCRIPT = REPO_ROOT / "scripts" / "warn_parked_worktrees.sh"
 SESSION_TRAILER_SCRIPT = REPO_ROOT / "scripts" / "forbid_session_trailer.sh"
+PR_MESSAGES_SCRIPT = REPO_ROOT / "scripts" / "check_pr_commit_messages.sh"
 
 GIT_ENV = {
     # `~/.gitconfig` is a read-only host mount here and a developer's own config anywhere else,
@@ -1117,3 +1118,141 @@ def test_a_missing_message_file_is_an_error_rather_than_a_pass(tmp_path: Path) -
     )
     assert done.returncode == 1
     assert "no commit message file" in done.stderr
+
+
+# ---------------------------------------------------------------------------
+# The CI belt: the same refusal, over the messages GitHub actually received
+# ---------------------------------------------------------------------------
+
+_GH_STUB = """#!/usr/bin/env bash
+# Answers the two call shapes the script makes, and nothing else.
+for arg in "$@"; do
+  case "$arg" in
+    */pulls/*/commits) cat "$STUB_ROOT/shas"; exit 0 ;;
+    */commits/*) cat "$STUB_ROOT/${arg##*/}"; exit 0 ;;
+  esac
+done
+echo "stub gh: unexpected call: $*" >&2
+exit 1
+"""
+
+
+def _pr_check(tmp_path: Path, messages: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Run the CI check against a stubbed `gh`, keyed by commit sha.
+
+    The stub stands in for the network and nothing else: the script under test does its own
+    argument building, its own iteration and its own delegation, and a stub that answered the
+    *decision* would be testing itself.
+    """
+    stub_root = tmp_path / "stub"
+    stub_root.mkdir()
+    (stub_root / "shas").write_text("".join(f"{sha}\n" for sha in messages), encoding="utf-8")
+    for sha, message in messages.items():
+        (stub_root / sha).write_text(message, encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "gh"
+    stub.write_text(_GH_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+
+    return subprocess.run(
+        ["bash", str(PR_MESSAGES_SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "STUB_ROOT": str(stub_root),
+            "GITHUB_REPOSITORY": "owner/repo",
+            "PR_NUMBER": "1",
+            "RUNNER_TEMP": str(tmp_path),
+        },
+    )
+
+
+def test_the_workflow_runs_the_pr_message_check_and_the_script_exists() -> None:
+    assert "bash scripts/check_pr_commit_messages.sh" in _uncommented(WORKFLOW_TEXT)
+    assert PR_MESSAGES_SCRIPT.is_file()
+
+
+def test_the_pr_message_check_runs_only_on_a_pull_request() -> None:
+    """A step-level guard, and the assertion reads the uncommented file.
+
+    There is no pull request number on a push or a schedule, so the step has to be guarded or
+    it fails on every other event. The comment above it argues about `if:` and would satisfy a
+    search over the raw text.
+    """
+    block = job_blocks()["gates"]
+    assert "if: github.event_name == 'pull_request'" in _uncommented(block)
+
+
+def test_the_guarded_step_did_not_stop_gates_from_gating() -> None:
+    """The hazard this change actually carries.
+
+    `contexts_a_pull_request_reports` classifies a job by whether it has an `if:`, and a job it
+    reads as guarded drops out of the required set -- which would leave the repository's whole
+    lint, type and complexity gate merging unenforced. The guard added here is on a *step*, and
+    this is what proves the distinction survives.
+    """
+    assert job_guard(job_blocks()["gates"]) == ""
+    assert "gates" in contexts_a_pull_request_reports()
+
+
+def test_a_pull_request_of_clean_messages_passes(tmp_path: Path) -> None:
+    done = _pr_check(tmp_path, {"aaa111": "Fix the thing\n\nAn ordinary body.\n"})
+    assert done.returncode == 0
+    assert "checked 1 commit message(s)" in done.stdout
+
+
+def test_every_commit_is_examined_not_only_the_first(tmp_path: Path) -> None:
+    """A loop that stopped at the first clean message would pass this pull request."""
+    done = _pr_check(
+        tmp_path,
+        {
+            "aaa111": "Clean\n",
+            "bbb222": "Dirty\n\nClaude-Session: https://claude.ai/code/session_01ABC\n",
+        },
+    )
+    assert done.returncode == 1
+    assert "bbb222" in done.stderr
+
+
+def test_the_offending_commit_is_named(tmp_path: Path) -> None:
+    # The person reading a red lane has to know which commit to reword, and a rebase is the
+    # only way to fix it, so "somewhere in this branch" is not an actionable failure.
+    done = _pr_check(
+        tmp_path, {"ccc333": "Bad\n\nClaude-Session: https://claude.ai/code/session_01ABC\n"}
+    )
+    assert done.returncode == 1
+    assert "in commit ccc333" in done.stderr
+    assert "carries a Claude Code session link" in done.stderr
+
+
+def test_examining_no_commits_fails_rather_than_passes(tmp_path: Path) -> None:
+    """The third state, and the one a green lane would hide.
+
+    A wrong pull request number, a renamed field or an empty answer all land here. Every one of
+    them examines nothing, and a check that reports success on nothing is the failure mode this
+    repository keeps finding in its own gates.
+    """
+    done = _pr_check(tmp_path, {})
+    assert done.returncode == 1
+    assert "reported no commits, so nothing was examined" in done.stderr
+
+
+@pytest.mark.parametrize("missing", ["GITHUB_REPOSITORY", "PR_NUMBER"])
+def test_a_missing_environment_variable_is_an_error(tmp_path: Path, missing: str) -> None:
+    # Refusing loudly rather than building `repos//pulls//commits` and asking about it.
+    environment = {**os.environ, "GITHUB_REPOSITORY": "owner/repo", "PR_NUMBER": "1"}
+    del environment[missing]
+    done = subprocess.run(
+        ["bash", str(PR_MESSAGES_SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    assert done.returncode != 0
+    assert missing in done.stderr

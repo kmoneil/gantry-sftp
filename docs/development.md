@@ -22,7 +22,7 @@ python scripts/lanes.py -n benchmarks   # print the argv it would run, run nothi
 
 | lane                  | what it proves                                                                                  | needs, beyond `uv sync`        |
 | --------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------ |
-| `lanes.py gates`      | ruff, mypy `--strict` over `src` and a weaker mypy over the two API-consuming directories, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit, the secrets scan | nothing; POSIX only            |
+| `lanes.py gates`      | ruff, mypy `--strict` over `src` and a weaker mypy over the two API-consuming directories, ty, complexipy, the deprecation check, the `uv.lock` check, the exec bit, the secrets scan. The `gates` **job** adds one step the runner has no equivalent for: on a pull request only, that no commit message carries a session link | nothing; POSIX only            |
 | `lanes.py audit`      | known advisories against the versions `uv.lock` pins                                           | `uv sync --group audit`, network |
 | `lanes.py fast`       | unit tests, the real `sftp-server` rows, every example as a subprocess                          | `openssh-server` for some rows |
 | `lanes.py leaks`      | the unit tests again, failing the one that left a transport, session or child process alive     | `openssh-server` for some rows |
@@ -130,6 +130,21 @@ to discuss the trailer in prose, which the commit adding the hook had to do. Tex
 scissors line `git commit -v` writes, and `#` comment lines git strips before storing, are not
 scanned, because refusing on either would reject a commit for text that never becomes part of
 it, starting with a staged diff of the guard itself.
+
+**CI carries the same refusal**, because the hook only runs where somebody ran `pre-commit
+install` and `git commit --no-verify` walks past it. A step in the `gates` job reads the messages
+GitHub actually received and delegates each one to the same script, so the pattern has a single
+definition. It asks the API rather than running `git log`, which is why no checkout here needs
+`fetch-depth: 0`: a depth-1 clone has no history to walk, and deepening every job to gain one grep
+is the expensive way to answer this.
+
+Three things about that step are deliberate. It is a step rather than a job, because a new job is a
+new required status check and adding one means patching the enforced ruleset while the pull request
+is open and green, which the section below calls the dangerous edit. Its `if:` is **step**-level:
+`tests/test_lanes.py` decides what gates by reading *job*-level guards, so a job-level one here
+would quietly drop the repository's whole lint and type gate out of the required set, and a test
+asserts it did not. And it fails when it examined **no** commits, because a wrong number or a
+renamed field otherwise reports the same green as a pull request that was read and found clean.
 
 What stops the trailer being written at all is `"attribution": { "commit": "", "pr": "",
 "sessionUrl": false }` in `~/.claude/settings.json`, which is per-machine and outside this
