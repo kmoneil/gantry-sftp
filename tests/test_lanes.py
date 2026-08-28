@@ -998,3 +998,8 @@ def test_a_change_reaches_main_only_through_a_pull_request_that_rebases() -> Non
     # Zero approvals required, and that is not an oversight: a solo maintainer cannot approve
     # their own pull request, so any positive number blocks every merge permanently.
     assert parameters["required_approving_review_count"] == 0
+    # Recorded because GitHub enforces it, not because it does anything: it asks for one approval
+    # more than the count above when Copilot opens an unattributed pull request, and it has no
+    # effect at zero. Pinned because the file went from its first commit to 2026-08-28 without it,
+    # so a re-export that drops it again fails here rather than reading as a tidy-up.
+    assert parameters["require_extra_approval_for_unattributed_changes"] is True
