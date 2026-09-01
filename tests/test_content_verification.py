@@ -1063,8 +1063,11 @@ async def test_a_settled_unsupported_refuses_the_next_call_without_asking_again(
     What nothing pinned is what the caller is handed the second time: the message, and the
     `code` that makes `except UnsupportedError` mean `OP_UNSUPPORTED` rather than "some
     refusal". Both could be nulled or deleted with the round-trip assertion still passing.
+
+    `advertises=False` since D-205: the answer is settled only when it came from a server that
+    never claimed the extension. The advertising case is the next test.
     """
-    server = HashingServer(holds=b"payload", advertises=True, implements=False)
+    server = HashingServer(holds=b"payload", advertises=False, implements=False)
 
     async with open_session(server) as sftp:  # type: ignore[arg-type]
         handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
@@ -1081,6 +1084,26 @@ async def test_a_settled_unsupported_refuses_the_next_call_without_asking_again(
     # The first came from the server's own STATUS and the second from the cache, so they are
     # different code paths reaching the same class -- and only the second is this method's own.
     assert first.value.code == StatusCode.OP_UNSUPPORTED
+
+
+async def test_an_advertised_check_file_that_declines_is_asked_again():
+    """D-205. A server that advertised `check-file` and answers `OP_UNSUPPORTED` is declining
+    this request, so nothing is settled: the second call is a second round trip, both refusals
+    are the server's own, and `refuses()` never becomes true.
+    """
+    server = HashingServer(holds=b"payload", advertises=True, implements=False)
+
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        handle = await sftp.open(b"/incoming/file.bin", OpenFlag.READ)
+        for _ in range(2):
+            with pytest.raises(UnsupportedError) as declined:
+                _ = await sftp.check_file(handle)
+            assert declined.value.args[0] != (
+                "this server has already answered OP_UNSUPPORTED for check-file"
+            )
+        assert not sftp.refuses("check-file")
+
+    assert len(server.checks) == 2, "the second call was answered from a cache"
 
 
 async def test_a_check_file_answered_with_the_wrong_packet_names_what_was_expected():

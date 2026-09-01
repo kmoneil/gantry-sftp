@@ -27,6 +27,7 @@ from gantry_sftp.codec import (
     EXTENSION_LSETSTAT,
     MAX_V3_TIMESTAMP,
     Attrs,
+    Extended,
     FSetStat,
     Handle,
     Init,
@@ -49,6 +50,7 @@ from gantry_sftp.exceptions import (
     NoSuchFileError,
     ProtocolError,
     ServerError,
+    UnsupportedError,
 )
 from gantry_sftp.session import open_session
 from gantry_sftp.transport import find_sftp_server, open_local_server_transport
@@ -1267,3 +1269,133 @@ async def test_the_degrading_spellings_answer_false_and_remember_it(call: str):
         assert await getattr(sftp, call)(*arguments) is False
 
     assert server.asked == 1, "the second call asked again rather than reading the cache"
+
+
+# --- an OP_UNSUPPORTED from a server that advertised the extension (D-205) ------------------
+
+
+def _answer_unsupported(packet, reason: bytes = b"") -> bytes:
+    return encode(Status(packet.request_id, StatusCode.OP_UNSUPPORTED, reason))
+
+
+@pytest.mark.parametrize(
+    "call", ["fsync_if_supported", "posix_rename_if_supported"], ids=["fsync", "posix-rename"]
+)
+async def test_the_degrading_spellings_ask_again_when_an_advertised_server_declines(call: str):
+    """The same answer from a server that *advertised* the extension is not remembered.
+
+    Advertisement is the server saying it implements the extension, so an `OP_UNSUPPORTED`
+    from it is about this handle or this rename rather than about the server, and remembering
+    it would answer every later call from a cache the server never spoke to. The cost is one
+    round trip per declined call, counted so a version that cached it fails here.
+    """
+    server = _ScriptedServer(
+        _answer_unsupported,
+        extensions=((b"fsync@openssh.com", b"1"), (b"posix-rename@openssh.com", b"1")),
+    )
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        arguments = (b"\x00\x00\x00\x00",) if call == "fsync_if_supported" else (b"/a", b"/b")
+        assert await getattr(sftp, call)(*arguments) is False
+        assert await getattr(sftp, call)(*arguments) is False
+        assert not sftp.refuses("fsync@openssh.com")
+        assert not sftp.refuses("posix-rename@openssh.com")
+
+    assert server.asked == 2, "the second call read a cache for an answer about one request"
+
+
+def _asyncssh_with_its_827_fix() -> _ScriptedServer:
+    """asyncssh's server with the #827 patch applied, as measured by hand on 2026-09-01.
+
+    It advertises `lsetstat@openssh.com`. A mode change on the symlink `/link` is declined with
+    `OP_UNSUPPORTED` and a reason naming the attribute; the same request on a regular file, and
+    the times of the same link, are performed. Nothing on the wire says "extension absent"
+    except the code, which is exactly what a client keyed on the code got wrong.
+    """
+
+    def answer(packet) -> bytes:
+        if isinstance(packet, Extended) and packet.name == EXTENSION_LSETSTAT.encode("ascii"):
+            request = LSetStat.from_extended(packet)
+            if request.attrs.permissions is not None and request.path == b"/link":
+                return _answer_unsupported(packet, b"setting permissions on a symlink")
+        return encode(Status(packet.request_id, StatusCode.OK))
+
+    return _ScriptedServer(answer, extensions=((EXTENSION_LSETSTAT.encode("ascii"), b"1"),))
+
+
+DECLINED_NOTE = (
+    "this server advertises lsetstat@openssh.com and declined the chmod of this path without "
+    "following it; that is an answer about this request rather than about the server, so it is "
+    "not remembered, and the other attribute flags and other paths are still attempted"
+)
+
+
+async def test_a_server_that_advertises_lsetstat_and_declines_the_mode_still_sets_the_times():
+    """D-205, the client half. Filed from reviewing the maintainer's patch on asyncssh#827.
+
+    Keyed by extension, the first `chmod` of a link recorded `lsetstat` as refused and every
+    later `utime` on a link was refused from the cache with no round trip, though the server
+    performs it -- and so was `chmod` on a regular file, which keying by *flag* would not have
+    fixed either. The rule that does: an `OP_UNSUPPORTED` from a server that advertised the
+    extension is about the request. It propagates as the server's own refusal, carrying the
+    reason the server gave and a note saying what kind of answer it is, and nothing is
+    remembered. Every request below is a round trip, and the count is the assertion that
+    none of them read a cache.
+    """
+    server = _asyncssh_with_its_827_fix()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        with pytest.raises(UnsupportedError) as declined:
+            await sftp.chmod(b"/link", 0o600, follow_symlinks=False)
+        assert declined.value.args[0] == (
+            "server returned OP_UNSUPPORTED: setting permissions on a symlink"
+        )
+        assert declined.value.code == StatusCode.OP_UNSUPPORTED
+        assert declined.value.message == b"setting permissions on a symlink"
+        assert declined.value.path == b"/link"
+        assert declined.value.__notes__ == [DECLINED_NOTE]
+        assert not sftp.refuses(EXTENSION_LSETSTAT)
+
+        # The flags the same server performs, on the same link and on a regular file.
+        await sftp.utime(b"/link", KNOWN_ATIME, KNOWN_MTIME, follow_symlinks=False)
+        await sftp.chmod(b"/regular", 0o600, follow_symlinks=False)
+        # And the declined one again: declined again, by the server rather than by a cache.
+        with pytest.raises(UnsupportedError):
+            await sftp.chmod(b"/link", 0o600, follow_symlinks=False)
+        assert not sftp.refuses(EXTENSION_LSETSTAT)
+
+    assert server.asked == 4, "a call was answered from a cache rather than by the server"
+
+
+async def test_the_outcome_does_not_depend_on_which_flag_was_sent_first():
+    """The ordering proof the card asked for: times-then-mode ends where mode-then-times did.
+
+    Before the fix a session that happened to chmod a link first lost `utime` on links for the
+    rest of its life, and one that happened to utime first kept it. Same server, both orders,
+    same end state: the times are set and the mode is declined, each answered by the server.
+    """
+    server = _asyncssh_with_its_827_fix()
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        await sftp.utime(b"/link", KNOWN_ATIME, KNOWN_MTIME, follow_symlinks=False)
+        with pytest.raises(UnsupportedError):
+            await sftp.chmod(b"/link", 0o600, follow_symlinks=False)
+        await sftp.utime(b"/link", KNOWN_ATIME, KNOWN_MTIME, follow_symlinks=False)
+
+    assert server.asked == 3
+
+
+async def test_an_unadvertised_lsetstat_answering_unsupported_is_remembered():
+    """The half that must not change: a server without the extension is asked once.
+
+    The control for the rows above. Same code on the wire, no advertisement, and the answer is
+    about the server: a `CapabilityError` naming what is missing, and the second call costs no
+    round trip. A rule that stopped caching altogether would pass every row above and fail
+    here.
+    """
+    server = _ScriptedServer(_answer_unsupported)
+    async with open_session(server) as sftp:  # type: ignore[arg-type]
+        for _ in range(2):
+            with pytest.raises(CapabilityError) as refusal:
+                await sftp.chmod(b"/link", 0o600, follow_symlinks=False)
+        assert refusal.value.missing == (EXTENSION_LSETSTAT,)
+        assert sftp.refuses(EXTENSION_LSETSTAT)
+
+    assert server.asked == 1, "an unadvertised server's OP_UNSUPPORTED was asked twice"

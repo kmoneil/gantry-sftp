@@ -523,7 +523,14 @@ class PermissionDeniedError(ServerError):
 
 
 class UnsupportedError(ServerError):
-    """``SSH_FX_OP_UNSUPPORTED``. The server does not implement this operation.
+    """``SSH_FX_OP_UNSUPPORTED``. Not implemented by the server, or declined for this request.
+
+    The second reading is the one the remembering logic turns on (D-205). An ``OP_UNSUPPORTED``
+    for an extension the server never advertised is a fact about the server and is cached for
+    the session; the same answer from a server that *advertised* the extension is a fact about
+    the request, arrives here with whatever reason the server gave, and is not remembered.
+    asyncssh's ``lsetstat`` is the live example: it declines the mode of a symlink on a
+    platform with no ``lchmod`` and performs the times flag on the same link.
 
     Expected rather than exceptional: it is the answer to probing for an extension a server
     does not have, and the whole reason capability detection can be done by asking.
