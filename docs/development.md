@@ -114,7 +114,17 @@ sitting idle waiting for an answer look identical from outside, the worktree it 
 `locked` because the keep-or-remove prompt never runs for it, and nothing else in the repository
 mentions it: `git status` in the main checkout is clean whatever is parked next door. It says
 nothing when nothing is parked. It is marked `verbose` in `.pre-commit-config.yaml` because
-pre-commit shows the output of a *failing* hook only, and this one never fails.
+pre-commit shows the output of a *failing* hook only, and this one never fails. That includes a
+`git` that cannot answer: the hook says the check was skipped, shows what git said, and still
+exits 0. It ran under `set -e` until 2026-09-01, so a transient ownership flap on the
+`fakeowner` mount took it down with exit 128 and pre-commit reported the one hook that never
+gates as a failed gate.
+
+Every hook script is written for **bash 3.2**, the `/bin/bash` macOS ships and what a hook runs
+under there. `mapfile` is a bash 4 builtin, and its first appearance exited 127 on the macOS lane
+with a message naming nothing about what the script checks. `tests/test_lanes.py` runs each
+script as a subprocess, so the macOS `fast` lane executes them, and sweeps every shell script
+under `scripts/` for the bash 4 spellings.
 
 One hook checks the **commit message** rather than the tree, and it is also the only one of
 those: `forbid-session-trailer` refuses a message carrying a `Claude-Session:` trailer line or a

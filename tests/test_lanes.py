@@ -234,6 +234,8 @@ def test_the_consumer_gate_waives_exactly_the_three_packages_it_documents() -> N
 # ---------------------------------------------------------------------------
 
 PARKED_SCRIPT = REPO_ROOT / "scripts" / "warn_parked_worktrees.sh"
+EXEC_BIT_SCRIPT = REPO_ROOT / "scripts" / "forbid_exec_bit.sh"
+HOOK_SCRIPTS = sorted((REPO_ROOT / "scripts").glob("*.sh"))
 SESSION_TRAILER_SCRIPT = REPO_ROOT / "scripts" / "forbid_session_trailer.sh"
 PR_MESSAGES_SCRIPT = REPO_ROOT / "scripts" / "check_pr_commit_messages.sh"
 
@@ -286,11 +288,11 @@ def _repository(tmp_path: Path) -> Path:
     return repo
 
 
-def _warn(cwd: Path) -> subprocess.CompletedProcess[str]:
+def _warn(cwd: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", str(PARKED_SCRIPT)],
         cwd=cwd,
-        env={**os.environ, **GIT_ENV},
+        env={**os.environ, **GIT_ENV, **(extra_env or {})},
         capture_output=True,
         text=True,
         # The return code is the assertion in every test below -- it is what proves the hook
@@ -387,6 +389,98 @@ def test_a_registration_whose_directory_is_gone_is_still_reported(tmp_path: Path
     assert done.returncode == 0
     assert ".claude/worktrees/parked" in done.stdout
     assert "directory is gone" in done.stdout
+
+
+def test_a_directory_that_is_not_a_repository_does_not_gate(tmp_path: Path) -> None:
+    """D-207. The third state of the predicate: git cannot answer.
+
+    Every row above builds a healthy repository and asks what the hook says about it. This one
+    runs it where git refuses, which is the state a transient `fakeowner` ownership flap put a
+    real commit in -- exit 128 and a failed gate, from the hook whose whole design is that it
+    never fails. The flap was the trigger; the bug was that any git failure reached the same
+    line under `set -e`. Exit 0 is the contract, and the note is what stops "could not check"
+    from reading as "nothing parked".
+    """
+    elsewhere = tmp_path / "not-a-repository"
+    elsewhere.mkdir()
+
+    done = _warn(elsewhere)
+
+    assert done.returncode == 0
+    assert "parked-worktree check skipped" in done.stdout
+    assert "not a git repository" in done.stdout
+    assert "parked worktree(s)" not in done.stdout
+
+
+def test_a_git_that_cannot_read_the_repository_does_not_gate(tmp_path: Path) -> None:
+    """The same state reached from inside a healthy checkout, by breaking the environment.
+
+    `GIT_DIR` pointed at nothing is the cheapest stand-in for a `.git` git cannot read, and it
+    is a real git refusing rather than a stub of one -- a stubbed `git` would prove the stub.
+    """
+    repo = _repository(tmp_path)
+
+    done = _warn(repo, extra_env={"GIT_DIR": str(tmp_path / "nowhere")})
+
+    assert done.returncode == 0
+    assert "parked-worktree check skipped" in done.stdout
+    assert "parked worktree(s)" not in done.stdout
+
+
+# --- the exec-bit hook, run rather than read ------------------------------------------------
+
+
+def _exec_bit_check(repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(EXEC_BIT_SCRIPT)],
+        cwd=repo,
+        env={**os.environ, **GIT_ENV},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_the_exec_bit_hook_passes_a_clean_index(tmp_path: Path) -> None:
+    done = _exec_bit_check(_repository(tmp_path))
+    assert done.returncode == 0
+    assert done.stderr == ""
+
+
+def test_the_exec_bit_hook_refuses_an_index_entry_marked_executable(tmp_path: Path) -> None:
+    """D-208. The first time anything has run this script rather than read its config.
+
+    Every earlier assertion about `forbid-exec-bit` was over `.pre-commit-config.yaml`, and CI
+    executed the script only inside the ubuntu-only gates lane -- so the one platform whose
+    `/bin/bash` lacks `mapfile` was the one platform it never ran on. Driven as a subprocess so
+    the macOS `fast` lane runs it under bash 3.2. The mode is set in the *index*: the check is
+    index-based because the `fakeowner` mount reports every file executable, and so is the
+    fixture.
+    """
+    repo = _repository(tmp_path)
+    (repo / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
+    _git(repo, "add", "tool")
+    _git(repo, "update-index", "--chmod=+x", "tool")
+
+    done = _exec_bit_check(repo)
+
+    assert done.returncode == 1
+    assert "files are marked executable in the git index:" in done.stderr
+    assert "  tool\n" in done.stderr
+    assert "git update-index --chmod=-x" in done.stderr
+
+
+def test_the_exec_bit_hook_names_a_path_with_a_space_whole(tmp_path: Path) -> None:
+    """The old `awk '{ print $4 }'` split on whitespace, so such a path was reported cut short."""
+    repo = _repository(tmp_path)
+    (repo / "tool with space").write_text("#!/bin/sh\n", encoding="utf-8")
+    _git(repo, "add", "tool with space")
+    _git(repo, "update-index", "--chmod=+x", "tool with space")
+
+    done = _exec_bit_check(repo)
+
+    assert done.returncode == 1
+    assert "  tool with space\n" in done.stderr
 
 
 def test_the_ide_checker_treats_an_untyped_dependency_as_untyped() -> None:
@@ -1200,18 +1294,33 @@ def test_the_guarded_step_did_not_stop_gates_from_gating() -> None:
     assert "gates" in contexts_a_pull_request_reports()
 
 
-def test_the_pr_message_check_avoids_a_bash_4_builtin() -> None:
-    """Named for the bug rather than for the rule, because the rule has one instance here.
+BASH_4_SPELLINGS = ("mapfile", "readarray", "declare -A", "|&", "coproc")
+"""Builtins and syntax bash 3.2 does not have, as they would appear in a script body."""
+
+
+def test_there_are_hook_scripts_to_sweep() -> None:
+    # Guards the guard: an empty glob would make the sweep below pass over nothing.
+    assert len(HOOK_SCRIPTS) >= 4
+
+
+@pytest.mark.parametrize("script", HOOK_SCRIPTS, ids=lambda p: p.name)
+def test_no_hook_script_uses_a_bash_4_spelling(script: Path) -> None:
+    """Named for the rule now, because the bug has had two instances.
 
     `mapfile` is a bash 4 builtin. macOS ships bash 3.2 as /bin/bash, which is what is on PATH
-    on the macOS runner, so the first spelling of this script exited 127 there under `set -e`
-    while passing locally on bash 5. Local green is partial for anything that shells out, and
-    this is the cheap half of that lesson: the expensive half is a CI round trip.
+    on the macOS runner, so the first spelling of `check_pr_commit_messages.sh` exited 127 there
+    under `set -e` while passing locally on bash 5. `forbid_exec_bit.sh` carried the identical
+    call and nothing had ever run it on macOS (D-208), which is what turned a one-script guard
+    into a sweep. Local green is partial for anything that shells out; this is the cheap half of
+    that lesson, and the subprocess rows above are the half that actually runs each script.
     """
-    # Over the uncommented script: the comment above the loop names `mapfile` to explain what
-    # it is avoiding, and a raw search fails on that explanation rather than on a builtin.
-    body = _uncommented(PR_MESSAGES_SCRIPT.read_text(encoding="utf-8"))
-    assert "mapfile" not in body
+    # Over the uncommented script: the comments explaining what a script avoids name the very
+    # spelling it avoids, and a raw search fails on that explanation rather than on a builtin.
+    body = _uncommented(script.read_text(encoding="utf-8"))
+    for spelling in BASH_4_SPELLINGS:
+        assert spelling not in body, f"{script.name} uses {spelling!r}, which bash 3.2 lacks"
+    # `${var^^}` and `${var,,}` case conversion, bash 4 as well.
+    assert re.search(r"\$\{[A-Za-z_]+(\^\^|,,)", body) is None, script.name
 
 
 def test_a_pull_request_of_clean_messages_passes(tmp_path: Path) -> None:

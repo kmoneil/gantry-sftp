@@ -23,9 +23,27 @@
 # into a void and the hook looks installed while telling nobody anything. The quiet case is
 # genuinely quiet -- nothing is printed when nothing is parked -- so it costs the one status
 # line pre-commit prints for each hook regardless.
-set -euo pipefail
+#
+# `set -u` and `pipefail` but deliberately not `-e`. This hook must never fail, and under `-e`
+# a `git` that could not answer took the whole hook down: a transient ownership flap on the
+# `fakeowner` mount made `git rev-parse` exit 128 and pre-commit reported a failed gate (D-207).
+# The flap was the trigger, not the bug -- a corrupt index or an unreadable `.git` reached the
+# same line. A git that cannot answer is the predicate's third state, and it is reported below
+# as "could not check" rather than as "nothing parked", which would be the silent lie, or as a
+# failure, which is the one thing this hook must never be.
+set -uo pipefail
 
-here=$(git rev-parse --show-toplevel)
+if ! here=$(git rev-parse --show-toplevel 2>&1) || [[ ! -d "$here" ]]; then
+  echo "note: parked-worktree check skipped, git could not read this repository (warns, never fails):"
+  sed 's/^/  /' <<< "$here"
+  exit 0
+fi
+
+if ! listing=$(git worktree list --porcelain 2>&1); then
+  echo "note: parked-worktree check skipped, git could not list worktrees (warns, never fails):"
+  sed 's/^/  /' <<< "$listing"
+  exit 0
+fi
 
 parked_paths=()
 parked_labels=()
@@ -76,7 +94,7 @@ while IFS= read -r line; do
     "branch "*) branch=${line#branch refs/heads/} ;;
     "locked"*) locked="yes" ;;
   esac
-done < <(git worktree list --porcelain)
+done <<< "$listing"
 flush
 
 if ((${#parked_paths[@]} == 0)); then
