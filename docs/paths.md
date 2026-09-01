@@ -288,8 +288,11 @@ if not await sftp.posix_rename_if_supported(staged, target):
 Use these when a fallback exists and you want it, and `fsync` / `posix_rename` when it does not
 and you want the error. Both are attempted whether or not the server advertised the extension —
 advertisement is a claim and an answer is a fact, and the endpoints most likely to
-under-advertise are the ones where these matter. An `OP_UNSUPPORTED` is remembered for the
-session, so a tree of a thousand files asks once.
+under-advertise are the ones where these matter. An `OP_UNSUPPORTED` from a server that did
+not advertise the extension is remembered for the session, so a tree of a thousand files asks
+once. From a server that *did* advertise it, the same answer is about that one request and is
+not remembered: it said it implements the extension, so it is declining this handle or this
+rename, and the next call asks again.
 
 ### These follow symlinks by default
 
@@ -302,11 +305,22 @@ await sftp.utime("/remote/current", atime, mtime, follow_symlinks=False)
 ```
 
 `follow_symlinks=False` uses `lsetstat@openssh.com`, and **where the server will not do it the
-call is refused** with a `CapabilityError` rather than quietly doing the following version.
-That is the opposite of how every other extension here degrades, and the reason is that there
-is nothing to degrade _to_: v3 has no non-following spelling, so the fallback would be to
-perform a different operation, on the target the caller was trying to avoid. OpenSSH and
-asyncssh advertise it; paramiko does not.
+call is refused** rather than quietly doing the following version. That is the opposite of how
+every other extension here degrades, and the reason is that there is nothing to degrade _to_:
+v3 has no non-following spelling, so the fallback would be to perform a different operation,
+on the target the caller was trying to avoid. OpenSSH and asyncssh advertise it; paramiko does
+not.
+
+The refusal has two spellings, and which one you get says what kind of answer it was. A server
+that does not have the extension, meaning it never advertised it and answered `OP_UNSUPPORTED`,
+raises `CapabilityError` naming what is missing, and that answer is remembered for the session.
+A server that **advertises** the extension and still answers `OP_UNSUPPORTED` is declining that
+one request, and it arrives as `UnsupportedError` carrying the server's own reason, with a note
+saying so. That is asyncssh's behaviour once its fix for
+[#827](https://github.com/ronf/asyncssh/issues/827) lands: it declines the mode of a symlink,
+`setting permissions on a symlink`, on a platform with no `lchmod`, and performs the times of the
+same link and the mode of a regular file. Nothing is remembered from it, because a session that
+remembered it would refuse those from a cache the server never spoke to.
 
 **`chmod(follow_symlinks=False)` cannot work against a Linux server**, and the extension being
 present does not change that. Linux has no `lchmod`: `fchmodat(AT_SYMLINK_NOFOLLOW)` answers

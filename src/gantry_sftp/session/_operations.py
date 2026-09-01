@@ -151,14 +151,23 @@ class _SessionOperations(_SessionCore):
         matters at the call site rather than here:
 
         * it already answered ``OP_UNSUPPORTED`` this session -- no round trip is made;
-        * it answers ``OP_UNSUPPORTED`` now -- recorded, so the next call is free;
+        * it answers ``OP_UNSUPPORTED`` now, **for an extension it did not advertise** --
+          recorded, so the next call is free;
         * it refused for some other reason **while not advertising** the extension -- in which
           case we do not know what we just asked of it, so the fallback stands and nothing is
           cached, because that answer was not definitive.
 
-        A refusal from a server that *did* advertise the extension propagates instead. It is
-        telling us about this operation -- the path, the permissions -- and falling through to
-        a fallback that will fail the same way only buries the explanation.
+        A refusal from a server that *did* advertise the extension propagates instead, and
+        **that now includes** ``OP_UNSUPPORTED`` (D-205). Advertisement is the server saying it
+        implements the extension, so a refusal from it is about this request -- the path, the
+        flag -- rather than about the server, and remembering it would refuse every later
+        request through a cache. The case that proved it: asyncssh's fix for #827 answers
+        ``OP_UNSUPPORTED`` to ``lsetstat`` carrying the mode of a *symlink* on a platform with no
+        ``lchmod``, and performs the same request on a regular file and the times flag on the
+        same link. Keyed by extension, one chmod of a link disabled all of those for the rest of
+        the session; keyed by flag it would still have disabled the regular file. Not caching an
+        advertised server's refusal costs one round trip per refused call and gives the right
+        answer to every other one.
 
         Args:
             extension: Wire name of the extension being attempted.
@@ -168,7 +177,9 @@ class _SessionOperations(_SessionCore):
             Whether the server performed it.
 
         Raises:
-            ServerError: For a non-``OP_UNSUPPORTED`` refusal of an advertised extension.
+            UnsupportedError: If a server that advertised the extension answered
+                ``OP_UNSUPPORTED`` -- to this request, carrying whatever reason it gave.
+            ServerError: For any other refusal of an advertised extension.
         """
         if self.refuses(extension):
             return False
@@ -176,6 +187,8 @@ class _SessionOperations(_SessionCore):
         try:
             _ = await attempt()
         except UnsupportedError:
+            if advertised:
+                raise
             self._unsupported.add(extension.encode("ascii"))
             return False
         except ServerError:
@@ -260,7 +273,14 @@ class _SessionOperations(_SessionCore):
         second call in the same session costs no round trip.
 
         Raises:
-            CapabilityError: If ``follow_symlinks=False`` and the server will not do it.
+            CapabilityError: If ``follow_symlinks=False`` and the server does not have the
+                extension -- it did not advertise it and answered ``OP_UNSUPPORTED``, now or
+                earlier this session.
+            UnsupportedError: If ``follow_symlinks=False`` and a server that *advertises* the
+                extension declined this one request with ``OP_UNSUPPORTED``. That is an answer
+                about this flag on this path, not about the server -- asyncssh does it for the
+                mode of a symlink where the platform has no ``lchmod`` -- so it is not
+                remembered, and the other flags stay available (D-205).
             NoSuchFileError: If the path does not exist.
             PermissionDeniedError: If the server will not change it.
             ServerError: For any other refusal.
@@ -275,6 +295,19 @@ class _SessionOperations(_SessionCore):
                     LSetStat(self._next(), path, attrs).to_extended(), path=path
                 ),
             )
+        except UnsupportedError as declined:
+            # D-205. Only reachable from a server that advertised the extension -- an
+            # unadvertised one's OP_UNSUPPORTED is swallowed into `performed=False` above. Say
+            # so, because the code alone reads as "extension absent" to anyone who knows what
+            # OP_UNSUPPORTED usually means here, and the remedy is different: nothing to
+            # install, and the other flags still work.
+            declined.add_note(
+                f"this server advertises {EXTENSION_LSETSTAT} and declined the {operation} "
+                f"of this path without following it; that is an answer about this request "
+                f"rather than about the server, so it is not remembered, and the other "
+                f"attribute flags and other paths are still attempted"
+            )
+            raise
         except ServerError as refusal:
             # OpenSSH's FAILURE carries no message worth reading -- five distinct conditions
             # all render as "Failure" -- and for this one flag there is a specific, common and
@@ -560,11 +593,15 @@ class _SessionOperations(_SessionCore):
         optional in the field and absent from most of the endpoints DESIGN.md 7 lists, so a
         caller who wants durability *where it is available* would otherwise write the
         catch-and-remember themselves — and the remembering is the part worth sharing: an
-        ``OP_UNSUPPORTED`` is cached for the session, so the second call costs no round trip.
+        ``OP_UNSUPPORTED`` from a server that did not advertise the extension is cached for the
+        session, so the second call costs no round trip.
 
         **Attempted whether or not the server advertised it** (D-51). Advertisement is a claim
         and an answer is a fact, and the endpoints most likely to under-advertise are exactly
-        the ones where this is worth having.
+        the ones where this is worth having. The claim still decides one thing (D-205): a
+        server that advertised the extension and answers ``OP_UNSUPPORTED`` is declining *this*
+        request, so that answer is ``False`` without being remembered, and the next call asks
+        again.
 
         Returns:
             ``True`` if the server performed it. ``False`` if it will not — which is not an
@@ -575,7 +612,10 @@ class _SessionOperations(_SessionCore):
                 other than ``OP_UNSUPPORTED``. That refusal is about this handle rather than
                 about the server, so it propagates instead of degrading.
         """
-        return await self._attempt_extension(EXTENSION_FSYNC, lambda: self.fsync(handle))
+        try:
+            return await self._attempt_extension(EXTENSION_FSYNC, lambda: self.fsync(handle))
+        except UnsupportedError:
+            return False
 
     async def posix_rename_if_supported(self, old_path: bytes | str, new_path: bytes | str) -> bool:
         """Rename, replacing the destination atomically, and say whether the server did it.
@@ -584,8 +624,10 @@ class _SessionOperations(_SessionCore):
         on: v3's own ``RENAME`` is specified to *fail* when the destination exists, so replacing
         a file needs either this extension or a remove-then-rename with a window in it.
 
-        Attempted whether or not it was advertised, and an ``OP_UNSUPPORTED`` is cached, so a
-        tree of a thousand files asks once.
+        Attempted whether or not it was advertised, and an ``OP_UNSUPPORTED`` from a server
+        that did not advertise it is cached, so a tree of a thousand files asks once. From a
+        server that *did* advertise it the same answer is about this one rename and is not
+        remembered (D-205); see :meth:`_attempt_extension`.
 
         Returns:
             ``True`` if the server performed the atomic rename. ``False`` if it will not, which
@@ -596,9 +638,12 @@ class _SessionOperations(_SessionCore):
             ServerError: If a server that advertised the extension refuses for some reason other
                 than ``OP_UNSUPPORTED`` -- a permission, a missing parent, a cross-device move.
         """
-        return await self._attempt_extension(
-            EXTENSION_POSIX_RENAME, lambda: self.posix_rename(old_path, new_path)
-        )
+        try:
+            return await self._attempt_extension(
+                EXTENSION_POSIX_RENAME, lambda: self.posix_rename(old_path, new_path)
+            )
+        except UnsupportedError:
+            return False
 
     async def fstat(self, handle: bytes) -> Attrs:
         """Attributes of an open handle.
@@ -1291,10 +1336,17 @@ class _SessionOperations(_SessionCore):
             block_size=block_size,
         )
         reply = await self.request(request.to_extended())
-        if isinstance(reply, Status) and reply.code is StatusCode.OP_UNSUPPORTED:
+        if (
+            isinstance(reply, Status)
+            and reply.code is StatusCode.OP_UNSUPPORTED
+            and not self.supports(EXTENSION_CHECK_FILE)
+        ):
             # Recorded here rather than by catching the exception `_unexpected` raises two
             # lines down: the status is the definitive answer, and reading it where it arrives
             # keeps the recording next to the fact rather than next to the error handling.
+            # Only from a server that did not advertise the extension, for the reason
+            # `_attempt_extension` gives (D-205): an advertised server's OP_UNSUPPORTED is
+            # about this request, and the exception below carries it to the caller as such.
             self._unsupported.add(EXTENSION_CHECK_FILE.encode("ascii"))
         if not isinstance(reply, ExtendedReplyPacket):
             raise _unexpected(reply, expected="EXTENDED_REPLY")

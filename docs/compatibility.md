@@ -90,8 +90,11 @@ looks at both the link and its target.
 The second row is reported upstream as
 [asyncssh#827](https://github.com/ronf/asyncssh/issues/827), where it is narrower than the table
 has room for: only the permissions flag is discarded, and the timestamp flag over the same request
-works. If that is fixed the row becomes a refusal rather than a silent success, and this page is
-where to correct it.
+works. The maintainer's fix, posted in that thread, answers `OP_UNSUPPORTED` with a reason naming
+the attribute; when it ships the row becomes a refusal rather than a silent success, and this page
+is where to correct it. This client passes that refusal through as `UnsupportedError` with the
+server's words and does not remember it: a server that advertises an extension and declines one
+request is answering about the request, so the times of the same link still work.
 
 **The fix under discussion there changes what a failing `SETSTAT` means, which is worth knowing
 before it lands.** One request carries several attribute flags and v3 answers all of them with a

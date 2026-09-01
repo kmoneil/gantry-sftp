@@ -61,9 +61,12 @@ keep the old spelling working: a type that lies about what it is turns every dow
 
 **Every extension is attempted rather than assumed absent**, because endpoints under-advertise
 and the answer is worth more than the claim. The cost of asking is one round trip and it is paid
-once: `OP_UNSUPPORTED` is a definitive answer and is remembered for the session, so the second
-upload does not ask again. `sftp.refuses(name)` is that memory, next to `sftp.supports(name)`,
-which is still only what the server _said_.
+once: `OP_UNSUPPORTED` from a server that did not advertise the extension is a definitive answer
+and is remembered for the session, so the second upload does not ask again. `sftp.refuses(name)`
+is that memory, next to `sftp.supports(name)`, which is still only what the server _said_. The
+claim decides one thing: a server that advertised an extension and answers `OP_UNSUPPORTED` is
+declining that request, not disowning the extension, so that answer is not remembered and the
+next call asks again.
 
 `require_atomic` is the exception, and the reason is that `posix-rename` cannot be probed. You
 do not discover rename support by renaming something, so a demand for that guarantee is answered
