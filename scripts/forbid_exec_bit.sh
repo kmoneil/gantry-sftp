@@ -12,11 +12,26 @@
 # at connect time instead of shipping an executable. Nothing in the distribution needs the bit,
 # so no file needs an exception -- and there is no fixed path on disk for another process owned
 # by this user to find. Keep it empty unless something genuinely has to ship executable.
+#
+# Written for bash 3.2, which is the /bin/bash macOS ships and what this hook runs under there.
+# The first spelling used `mapfile`, a bash 4 builtin, and nothing had ever run this script on
+# macOS: the identical call in `check_pr_commit_messages.sh` exited 127 on the macOS lane with a
+# message naming nothing about executable bits (D-208). `tests/test_lanes.py` now runs this as a
+# subprocess and sweeps every script here for bash 4 spellings.
 set -euo pipefail
 
 ALLOWED=()
 
-mapfile -t executables < <(git ls-files --stage | awk '$1 == "100755" { print $4 }')
+# `git ls-files --stage -z` prints `<mode> <object> <stage><TAB><path>`, NUL-terminated, and the
+# entry is split in the shell. The earlier `awk '{ print $4 }'` split on whitespace, so a path
+# with a space in it was reported truncated.
+tab=$'\t'
+executables=()
+while IFS= read -r -d '' entry; do
+  if [[ "${entry%% *}" == "100755" ]]; then
+    executables+=("${entry#*"$tab"}")
+  fi
+done < <(git ls-files --stage -z)
 
 violations=()
 for file in "${executables[@]:-}"; do
