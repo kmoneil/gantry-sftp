@@ -24,9 +24,10 @@ from pathlib import Path
 
 import anyio
 import pytest
-from sshd import SSHServer, scrubbed_ssh_env
+from sshd import SSHServer, running_sshd, scrubbed_ssh_env
 
 from conftest import connect
+from gantry_sftp import DestinationNotAllowedError, allowed_hosts
 from gantry_sftp.session import open_session
 
 pytestmark = pytest.mark.anyio
@@ -116,6 +117,26 @@ def wait_for_socket(socket_path: Path, process: subprocess.Popen[bytes]) -> None
         # process, so there is nothing for an event loop to do meanwhile.
         time.sleep(0.05)
     raise AssertionError(f"the ssh master never created {socket_path}")
+
+
+def wait_for_socket_matching(
+    directory: Path, pattern: str, process: subprocess.Popen[bytes]
+) -> Path:
+    """:func:`wait_for_socket` for a path `ssh` expands, where the exact name is its to choose.
+
+    A `ControlPath` carrying `%C` becomes a hash on the way to the filesystem, so the test
+    that hands one to the master cannot know the socket's name in advance -- and computing it
+    here would be reimplementing `ssh`'s expansion, then asserting that the copy agrees.
+    """
+    for _ in range(200):
+        found = sorted(directory.glob(pattern))
+        if found:
+            return found[0]
+        assert process.poll() is None, (
+            f"the ssh master exited {process.returncode} before it began listening"
+        )
+        time.sleep(0.05)
+    raise AssertionError(f"the ssh master never created a socket matching {pattern} in {directory}")
 
 
 async def test_an_existing_master_is_reused_because_controlpath_is_untouched(
@@ -225,3 +246,100 @@ async def test_asking_for_a_master_gets_one(ssh_server: SSHServer, short_socket_
             stderr=subprocess.DEVNULL,
             check=False,
         )
+
+
+# --- D-202: a ControlPath the destination cannot bind ---------------------------------------
+
+
+async def test_a_controlpath_the_destination_cannot_bind_carries_the_session_to_the_master(
+    ssh_server: SSHServer, short_socket_dir: Path, tmp_path: Path
+) -> None:
+    """D-202, both halves: the hazard, and the allowlist refusing it.
+
+    Two `sshd`s. A master to server A at a socket path carrying no destination token, then a
+    connection aimed at server B with B's port, B's identity file and B's `known_hosts` -- and
+    the same `ControlPath`. Server B never authenticates anybody: the session went down the
+    existing socket to A, and everything that named B was ignored. That is `ssh`'s behaviour
+    and this library inherits it, which is why it is measured rather than argued -- the
+    instrument is the one the rows above use, because a session down an existing socket is
+    not a network connection and produces no `Accepted publickey` line anywhere.
+
+    Then the same connection under a policy. `127.0.0.1` is allowed, so the pattern half
+    passes; the refusal is the second half, and neither server sees a connection.
+    """
+    socket_path = control_path(short_socket_dir)
+    (tmp_path / "b").mkdir()
+    with running_sshd(tmp_path / "b") as server_b:
+        master = start_master(ssh_server, socket_path)
+        try:
+            wait_for_socket(socket_path, master)
+            after_master = authentications(ssh_server)
+            before_b = authentications(server_b)
+
+            async with (
+                connect(server_b, options={"ControlPath": str(socket_path)}) as transport,
+                open_session(transport) as sftp,
+            ):
+                await sftp.realpath(b".")
+
+            assert authentications(server_b) == before_b, (
+                "server B authenticated a connection, so the session did not go down the "
+                "master's socket -- the hazard this test documents does not exist here"
+            )
+            assert authentications(ssh_server) == after_master, (
+                "server A saw a new authentication, so the session was not multiplexed either"
+            )
+
+            with allowed_hosts(["127.0.0.1"]), pytest.raises(DestinationNotAllowedError) as exc:
+                async with connect(server_b, options={"ControlPath": str(socket_path)}):
+                    pass
+            assert exc.value.control_path == str(socket_path)
+            assert exc.value.effective_host == "127.0.0.1"
+            assert authentications(server_b) == before_b, "the refused connection reached B"
+            assert authentications(ssh_server) == after_master, "the refused connection reached A"
+        finally:
+            master.terminate()
+            master.wait(timeout=10)
+
+
+async def test_a_controlpath_keyed_on_the_destination_binds_and_still_multiplexes(
+    ssh_server: SSHServer, short_socket_dir: Path, tmp_path: Path
+) -> None:
+    """The fix the refusal names, proved to keep what it claims to keep.
+
+    A master to server A at `cm-%C`, and the same path handed to two connections under a
+    policy: one to A, which goes down the socket and authenticates nobody, and one to B, which
+    hashes to a different socket, finds no master there, and authenticates on its own. Both
+    are allowed, because the path moves with the destination -- so the check costs a keyed
+    deployment neither its allowlist nor its multiplexing.
+    """
+    keyed = short_socket_dir / "cm-%C"
+    (tmp_path / "b").mkdir()
+    with running_sshd(tmp_path / "b") as server_b:
+        master = start_master(ssh_server, keyed)
+        try:
+            wait_for_socket_matching(short_socket_dir, "cm-*", master)
+            after_master = authentications(ssh_server)
+            before_b = authentications(server_b)
+
+            with allowed_hosts(["127.0.0.1"]):
+                async with (
+                    connect(ssh_server, options={"ControlPath": str(keyed)}) as transport,
+                    open_session(transport) as sftp,
+                ):
+                    await sftp.realpath(b".")
+                async with (
+                    connect(server_b, options={"ControlPath": str(keyed)}) as transport,
+                    open_session(transport) as sftp,
+                ):
+                    await sftp.realpath(b".")
+
+            assert authentications(ssh_server) == after_master, (
+                "the connection to A authenticated, so the keyed path did not find the master"
+            )
+            assert authentications(server_b) == before_b + 1, (
+                "the connection to B did not authenticate, so it went somewhere else"
+            )
+        finally:
+            master.terminate()
+            master.wait(timeout=10)

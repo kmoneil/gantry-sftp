@@ -11,7 +11,7 @@ chose where. That is server-side request forgery, and this library did not restr
 0.11 -- `build_ssh_argv` refuses a host that could be reparsed as an `ssh` flag, which is
 argument injection and a different problem entirely.
 
-Four things this example exists to make visible.
+Five things this example exists to make visible.
 
 **The policy is ambient, not an argument.** It is set for a block or for a process, because a
 deployment knows its policy and a call site does not -- and because `pd.read_parquet(url)` has
@@ -29,6 +29,11 @@ The fourth section builds exactly that config and watches the refusal name both 
 
 **Off by default, and free when off.** No policy means no probe: nothing is spawned and nothing
 is checked.
+
+**A `ControlPath` has to change with the destination.** An existing multiplexing master is found
+by its socket path alone, so a path that is the same for every host carries the session to
+whichever host that master was opened to -- and `ssh -G` reports the named destination
+regardless. The fifth section shows the refusal, and the keyed spelling that passes.
 """
 
 from __future__ import annotations
@@ -91,6 +96,18 @@ async def show_the_config_rewrite(scratch: Path) -> None:
     print("    -- the name is allowlisted; the destination is the cloud metadata endpoint")
 
 
+async def show_the_controlpath_check(scratch: Path) -> None:
+    print("\na ControlPath that is the same for every destination is refused under a policy:")
+    with allowed_hosts(["*.corp.example.com"]):
+        for name in ("cm", "cm-%C"):
+            path = scratch / name
+            answer = await refuse(
+                "sftp.corp.example.com", config_file=os.devnull, options={"ControlPath": str(path)}
+            )
+            print(f"    ControlPath=…/{name:6} {answer}")
+    print("    -- a master already open at the first path would carry the session to its host")
+
+
 async def show_the_environment_variable() -> None:
     print("\nfor a whole process, which is the only spelling a URL-driven caller can use:")
     print(f"    export {ALLOWED_HOSTS_ENV}='*.corp.example.com'")
@@ -109,6 +126,7 @@ async def main() -> None:
         await show_a_scope()
         await show_that_layers_only_narrow()
         await show_the_config_rewrite(Path(scratch))
+        await show_the_controlpath_check(Path(scratch))
         await show_the_environment_variable()
 
     print(

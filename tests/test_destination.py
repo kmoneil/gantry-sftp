@@ -41,6 +41,7 @@ from gantry_sftp.transport._destination import (
     _normalize_patterns,
     _probe_argv,
     _reported_hostname,
+    _reported_keyword,
     active_layers,
     allowed_hosts,
     check_destination,
@@ -270,6 +271,7 @@ async def test_a_disallowed_host_is_refused_and_the_error_carries_the_policy():
     assert exc.value.host == "evil.net"
     assert exc.value.effective_host == "evil.net"
     assert exc.value.layers == (("*.corp.example.com",),)
+    assert exc.value.control_path is None
     assert exc.value.args[0] == (
         "'evil.net' is not an allowed destination; it matches no pattern in 1 of the 1 active "
         "allowlist layers ('*.corp.example.com'). Layers narrow and never widen, so a host "
@@ -562,6 +564,169 @@ async def test_a_refusal_names_every_pattern_in_the_layer_that_refused():
 )
 def test_which_hostname_the_probe_output_yields(output: str, expected: str | None):
     assert _reported_hostname(output) == expected
+
+
+# --- a ControlPath the destination cannot bind (D-202) --------------------------------------
+
+
+async def test_a_controlpath_that_does_not_change_with_the_destination_is_refused(
+    tmp_path: Path,
+):
+    """D-202. ``ControlMaster=no`` still *uses* a master, so a fixed socket carries the session
+    to whichever host that master was opened to, and ``ssh -G`` reports the named destination
+    regardless. The allowlist would approve a host the session never reaches; it refuses.
+
+    A real ``ssh`` throughout: ``-G`` expands the tokens, so the check is a second probe with a
+    different destination rather than a read of the path, and a fake would only confirm what
+    its author believed ``-G`` prints.
+    """
+    fixed = tmp_path / "cm"
+    probe = argv_for("sftp.corp.example.com", options={"ControlPath": str(fixed)})
+    with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "sftp.corp.example.com", environ={})
+    assert exc.value.args[0] == (
+        f"cannot check whether 'sftp.corp.example.com' is an allowed destination: ControlPath "
+        f"{str(fixed)!r} does not change when the destination does, so an existing multiplexing "
+        f"master at that socket would carry this session to whichever host it was opened to, "
+        f"and the allowlist cannot bind it. Key the path on the destination "
+        f"(ControlPath=~/.ssh/cm-%C) or set ControlPath=none; refusing the connection rather "
+        f"than allowing an unverified destination"
+    )
+    assert exc.value.host == "sftp.corp.example.com"
+    assert exc.value.effective_host == "sftp.corp.example.com"
+    assert exc.value.control_path == str(fixed)
+    assert exc.value.layers == (("*.corp.example.com",),)
+
+
+@pytest.mark.parametrize("token", ["%C", "%r@%h:%p", "%h"])
+async def test_a_controlpath_keyed_on_the_destination_passes(token: str, tmp_path: Path):
+    """The two spellings ssh_config(5) recommends, and the bare token they share."""
+    probe = argv_for(
+        "sftp.corp.example.com", options={"ControlPath": str(tmp_path / f"cm-{token}")}
+    )
+    with allowed_hosts(["*.corp.example.com"]):
+        await check_destination(probe, "sftp.corp.example.com", environ={})
+
+
+@pytest.mark.parametrize("token", ["%p", "%r", "%n", "%k"])
+async def test_a_controlpath_keyed_on_anything_but_the_host_is_refused(token: str, tmp_path: Path):
+    """Port and user are not the destination; ``%n`` and ``%k`` are, and are refused anyway.
+
+    The last two are the documented limit: they key on the name as typed rather than on the
+    resolved host, which the sentinel ``Hostname`` cannot move, so the instrument reports them
+    as fixed. Pinned so the docs' statement of the limit stays true rather than aspirational --
+    and so an instrument that one day *can* see them changes this test by name.
+    """
+    probe = argv_for(
+        "sftp.corp.example.com", options={"ControlPath": str(tmp_path / f"cm-{token}")}
+    )
+    with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "sftp.corp.example.com", environ={})
+    assert "does not change when the destination does" in exc.value.args[0]
+
+
+async def test_a_controlpath_from_the_config_file_is_seen(tmp_path: Path):
+    """The check reads what ``ssh -G`` resolved, not the ``options=`` the caller passed.
+
+    A path set in the config is the common case -- it is how a master run by hand is found --
+    and a check over ``options=`` alone would miss every one of them.
+    """
+    config = tmp_path / "cm.conf"
+    _ = config.write_text(f"Host allowed.example.com\n  ControlPath {tmp_path / 'cm'}\n")
+    probe = argv_for("allowed.example.com", config_file=str(config))
+    with allowed_hosts(["allowed.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "allowed.example.com", environ={})
+    assert exc.value.control_path == str(tmp_path / "cm")
+
+
+async def test_a_controlpath_the_config_scopes_to_the_destination_passes(tmp_path: Path):
+    """``Match host`` is evaluated against the resolved host, so the sentinel un-matches it.
+
+    The second probe then reports no ``controlpath`` at all, and that counts as changing: in
+    this configuration no other destination reaches the socket. The question the check asks is
+    whether the socket moves with the destination, and here it does -- by disappearing.
+    """
+    config = tmp_path / "scoped.conf"
+    _ = config.write_text(f"Match host allowed.example.com\n  ControlPath {tmp_path / 'cm'}\n")
+    probe = argv_for("allowed.example.com", config_file=str(config))
+    with allowed_hosts(["allowed.example.com"]):
+        await check_destination(probe, "allowed.example.com", environ={})
+
+
+async def test_controlpath_none_is_no_controlpath():
+    """``ssh -G`` prints no ``controlpath`` line for ``none``, so there is nothing to bind."""
+    probe = argv_for("sftp.corp.example.com", options={"ControlPath": "none"})
+    with allowed_hosts(["*.corp.example.com"]):
+        await check_destination(probe, "sftp.corp.example.com", environ={})
+
+
+async def test_a_disallowed_host_is_refused_for_its_pattern_before_its_controlpath(
+    tmp_path: Path,
+):
+    """The pattern refusal is the more useful message and costs no second probe.
+
+    The path is still carried, because an operator fixing the first problem should not have
+    to rediscover the second.
+    """
+    probe = argv_for("evil.net", options={"ControlPath": str(tmp_path / "cm")})
+    with allowed_hosts(["*.corp.example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "evil.net", environ={})
+    assert exc.value.args[0].startswith("'evil.net' is not an allowed destination")
+    assert exc.value.control_path == str(tmp_path / "cm")
+
+
+async def test_a_second_probe_that_fails_refuses_and_carries_what_the_first_read(tmp_path: Path):
+    """The errored third state of the second predicate, driven with a real process.
+
+    The stand-in answers the first probe like a healthy ``ssh`` and refuses the second -- the
+    one carrying the sentinel -- so this reaches the branch a working ``ssh`` cannot. The
+    refusal names the exit code and keeps stderr verbatim, and it carries the hostname and
+    path the first probe established rather than nulling them.
+    """
+    fake = broken_ssh(
+        tmp_path,
+        "second-probe-fails",
+        'case "$*" in *gantry-sftp-controlpath-probe.invalid*)'
+        " echo 'the second probe was refused' >&2; exit 7;; esac\n"
+        f"echo hostname example.com\necho controlpath {tmp_path / 'cm'}\n",
+    )
+    probe = argv_for(
+        "example.com", ssh_executable=str(fake), options={"ControlPath": str(tmp_path / "cm")}
+    )
+    with allowed_hosts(["example.com"]), pytest.raises(DestinationNotAllowedError) as exc:
+        await check_destination(probe, "example.com", environ={})
+    assert exc.value.args[0] == (
+        "cannot check whether 'example.com' is an allowed destination: 'ssh -G' exited 7; "
+        "refusing the connection rather than allowing an unverified destination"
+    )
+    assert exc.value.returncode == 7
+    assert exc.value.stderr == "the second probe was refused\n"
+    assert exc.value.effective_host == "example.com"
+    assert exc.value.control_path == str(tmp_path / "cm")
+    assert exc.value.argv[:3] == (
+        str(fake),
+        "-o",
+        "Hostname=gantry-sftp-controlpath-probe.invalid",
+    )
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("hostname a.example.com\ncontrolpath /run/ssh/cm\n", "/run/ssh/cm"),
+        ("hostname a.example.com\n", None),
+        ("CONTROLPATH /run/ssh/cm\n", "/run/ssh/cm"),
+        ("controlpath\n", None),
+        ("controlpath   \n", None),
+        ("controlpath /run/ssh/first\ncontrolpath /run/ssh/second\n", "/run/ssh/second"),
+        # Unlike the hostname, the path is compared rather than matched, so it is not folded:
+        # a socket path is case-sensitive and `/run/ssh/CM` is not `/run/ssh/cm`.
+        ("controlpath /run/ssh/CM\n", "/run/ssh/CM"),
+        ("controlpath /run/ssh/with space\n", "/run/ssh/with space"),
+    ],
+)
+def test_which_controlpath_the_probe_output_yields(output: str, expected: str | None):
+    assert _reported_keyword(output, "controlpath") == expected
 
 
 # --- the class, and where it sits in the ladder ---------------------------------------------

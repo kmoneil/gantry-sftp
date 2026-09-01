@@ -55,6 +55,32 @@ Two more non-goals, in the API's own docstring rather than only here: this does 
 rebinding, because the name is resolved by ``ssh`` inside the subprocess and this library
 resolves nothing (see D-121 for why pinning an address is not available to us); and it is not a
 substitute for network egress control, which is the only thing that binds the socket.
+
+A ``ControlPath`` the destination cannot bind
+---------------------------------------------
+D-202. ``ControlMaster=no`` ships, and an existing master at the resolved ``ControlPath`` is
+still used -- so a path that does not change with the destination carries the session to
+whichever host that master was opened to, and ``port=``, ``identity_file=`` and the destination
+itself are all ignored on the way. Reproduced end to end against two ``sshd``s: the second
+server's ``Accepted publickey`` count never moved. ``ssh -G`` reports the *named* destination
+regardless, so the allowlist approved a host the session never reached.
+
+The card proposed reading the tokens off the ``controlpath`` line, and that instrument does not
+exist: ``-G`` **expands** them, measured against OpenSSH 10.0p2 -- ``%C`` comes back as a hash
+and ``%h`` as the name, so a literal ``/tmp/cm`` and a keyed ``/tmp/cm-%h`` are
+indistinguishable by inspection. What can be measured is whether the path *changes when the
+destination does*: the probe is run a second time with ``-o Hostname=<sentinel>`` placed first
+on the command line, where ``ssh``'s first-wins rule makes it beat any ``Hostname`` the caller
+or the config supplied, and the two ``controlpath`` lines are compared. ``%h`` and ``%C``
+change; a literal path, ``%p`` and ``%r`` do not; and a path the config scopes to the
+destination with ``Match host`` is absent from the second answer, which counts as changing,
+because in that configuration no other destination reaches the socket.
+
+**Two limits, stated.** ``%n`` and ``%k`` key on the name as typed rather than on the resolved
+host, which the sentinel cannot move, so a path keyed on either alone is refused with the same
+message -- fail closed, and the message names ``%C``. And the check runs only when a policy is
+active, because no policy means no probe, a documented and tested property; without one the
+hazard is documented in ``docs/connecting.md`` and nothing measures it.
 """
 
 from __future__ import annotations
@@ -64,7 +90,7 @@ import os
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Final
+from typing import Final, NamedTuple
 
 import anyio
 
@@ -93,6 +119,13 @@ connection rather than hang it.
 """
 
 _layers: ContextVar[tuple[tuple[str, ...], ...]] = ContextVar("gantry_sftp_allowed_hosts")
+
+_PROBE_HOSTNAME: Final = "gantry-sftp-controlpath-probe.invalid"
+"""The destination the second probe substitutes, to see whether ``ControlPath`` moves with it.
+
+Under ``.invalid`` (RFC 2606) so nothing resolves it -- and nothing is dialled either way, since
+``-G`` prints configuration and exits.
+"""
 
 _SUBSYSTEM_REQUEST_LENGTH: Final = 4
 """How many trailing argv entries ``build_ssh_argv`` spends on the subsystem request.
@@ -226,6 +259,11 @@ def allowed_hosts(patterns: Iterable[str]) -> Generator[None]:
     ``anyio`` did not start with the context -- set :data:`ALLOWED_HOSTS_ENV` when the policy
     has to hold process-wide regardless of who spawns what.
 
+    A ``ControlPath`` that does not change when the destination does is refused while a policy
+    is active: an existing master at that socket would carry the session to whichever host it
+    was opened to, and the allowlist could not see it. Key the path on the destination
+    (``ControlPath=~/.ssh/cm-%C``) or set ``ControlPath=none``.
+
     Args:
         patterns: Host patterns, matched by :func:`host_matches`. At least one.
 
@@ -279,6 +317,99 @@ def _probe_argv(argv: Sequence[str], host: str) -> list[str]:
     return [*head, "-G", "--", host]
 
 
+class _Resolution(NamedTuple):
+    """What one ``ssh -G`` probe says about the connection an argv describes."""
+
+    hostname: str
+    """The destination, folded by :func:`normalize_host`."""
+    control_path: str | None
+    """The ``ControlPath`` with its tokens expanded, or ``None`` when ``ssh`` printed no line --
+    which is what it does for an unset path and for ``ControlPath=none`` alike."""
+
+
+def _unverified(
+    reason: str,
+    *,
+    host: str,
+    probe: Sequence[str],
+    resolved: _Resolution | None,
+    stderr: str = "",
+    returncode: int | None = None,
+) -> DestinationNotAllowedError:
+    """The refusal for a probe whose answer cannot be read.
+
+    One constructor for every way a probe fails, so the message family and the state carried
+    with it cannot drift apart between the sites. ``resolved`` is what an earlier probe already
+    established: a second probe that fails still tells the operator what the first one read.
+    """
+    return DestinationNotAllowedError(
+        f"cannot check whether {host!r} is an allowed destination: {reason}; refusing the "
+        f"connection rather than allowing an unverified destination",
+        host=host,
+        effective_host=None if resolved is None else resolved.hostname,
+        layers=active_layers(),
+        control_path=None if resolved is None else resolved.control_path,
+        stderr=stderr,
+        argv=tuple(probe),
+        returncode=returncode,
+    )
+
+
+async def _probe_output(
+    probe: Sequence[str], host: str, *, resolved: _Resolution | None = None
+) -> str:
+    """Run one ``ssh -G`` probe and return what it printed.
+
+    Args:
+        probe: The probe argv, from :func:`_probe_argv`.
+        host: The host as the caller gave it, for the message.
+        resolved: What an earlier probe established, carried into any refusal raised here.
+
+    Returns:
+        The probe's standard output, decoded with replacement so a stray byte cannot turn a
+        readable answer into an exception of a different class.
+
+    Raises:
+        DestinationNotAllowedError: If the probe cannot be spawned, times out, or exits
+            non-zero. **Refusing on an unreadable answer is deliberate**: the third state of
+            this predicate is "errored", and treating it as "allowed" would make any way of
+            breaking the probe into a way of defeating the allowlist.
+    """
+    try:
+        with anyio.fail_after(ALLOWED_HOSTS_PROBE_TIMEOUT):
+            completed = await anyio.run_process(probe, check=False)
+    except OSError as failure:
+        # Both failures of this probe arrive as an `OSError`, and the timeout is the one that
+        # does not look like it: `fail_after` raises the builtin `TimeoutError`, which **is**
+        # an `OSError` subclass, so naming it alongside would be redundant rather than
+        # documentary. Do not narrow this to a spawn error -- the timeout has to keep landing
+        # here, because the whole point of the branch is that a probe nobody can read refuses.
+        raise _unverified(
+            f"the 'ssh -G' probe failed ({failure!r})", host=host, probe=probe, resolved=resolved
+        ) from failure
+
+    if completed.returncode != 0:
+        raise _unverified(
+            f"'ssh -G' exited {completed.returncode}",
+            host=host,
+            probe=probe,
+            resolved=resolved,
+            stderr=completed.stderr.decode("utf-8", "replace"),
+            returncode=completed.returncode,
+        )
+    return completed.stdout.decode("utf-8", "replace")
+
+
+async def _resolve(argv: Sequence[str], host: str) -> _Resolution:
+    """Ask ``ssh -G`` where this argv dials and which ``ControlPath`` it would use."""
+    probe = _probe_argv(argv, host)
+    output = await _probe_output(probe, host)
+    reported = _reported_hostname(output)
+    if reported is None:
+        raise _unverified("'ssh -G' reported no hostname", host=host, probe=probe, resolved=None)
+    return _Resolution(reported, _reported_keyword(output, "controlpath"))
+
+
 async def effective_host(argv: Sequence[str], host: str) -> str:
     """Ask ``ssh`` which host this argv actually dials.
 
@@ -299,65 +430,102 @@ async def effective_host(argv: Sequence[str], host: str) -> str:
             predicate is "errored", and treating it as "allowed" would make any way of breaking
             the probe into a way of defeating the allowlist.
     """
+    return (await _resolve(argv, host)).hostname
+
+
+async def _control_path_binds(argv: Sequence[str], host: str, resolved: _Resolution) -> bool:
+    """Whether the resolved ``ControlPath`` changes when the destination does.
+
+    ``ssh -G`` expands the tokens, so the path cannot be read for a ``%h`` or ``%C``; what can
+    be read is the *answer to a different destination*. The probe is repeated with
+    ``-o Hostname=<sentinel>`` inserted **first**, because ``ssh`` resolves a repeated keyword to
+    the first ``-o`` on the line and the caller's own ``Hostname`` override, if any, must lose
+    to it. A path that comes back unchanged is one every destination shares.
+
+    A second answer with **no** ``controlpath`` line counts as changed: that is a path the config
+    scopes to this destination with ``Match host``, and in that configuration no other
+    destination reaches the socket.
+
+    Args:
+        argv: The connection's own argv.
+        host: The host as the caller gave it, kept on the command line so ``Host`` blocks
+            still match exactly as they will for the connection.
+        resolved: The first probe's answer.
+
+    Returns:
+        True if the path moved with the destination.
+
+    Raises:
+        DestinationNotAllowedError: If the second probe fails, exactly as for the first.
+    """
     probe = _probe_argv(argv, host)
-    try:
-        with anyio.fail_after(ALLOWED_HOSTS_PROBE_TIMEOUT):
-            completed = await anyio.run_process(probe, check=False)
-    except OSError as failure:
-        # Both failures of this probe arrive as an `OSError`, and the timeout is the one that
-        # does not look like it: `fail_after` raises the builtin `TimeoutError`, which **is**
-        # an `OSError` subclass, so naming it alongside would be redundant rather than
-        # documentary. Do not narrow this to a spawn error -- the timeout has to keep landing
-        # here, because the whole point of the branch is that a probe nobody can read refuses.
-        raise DestinationNotAllowedError(
-            f"cannot check whether {host!r} is an allowed destination: the 'ssh -G' probe "
-            f"failed ({failure!r}); refusing the connection rather than allowing an "
-            f"unverified destination",
-            host=host,
-            effective_host=None,
-            layers=active_layers(),
-            argv=tuple(probe),
-        ) from failure
-
-    if completed.returncode != 0:
-        raise DestinationNotAllowedError(
-            f"cannot check whether {host!r} is an allowed destination: 'ssh -G' exited "
-            f"{completed.returncode}; refusing the connection rather than allowing an "
-            f"unverified destination",
-            host=host,
-            effective_host=None,
-            layers=active_layers(),
-            stderr=completed.stderr.decode("utf-8", "replace"),
-            argv=tuple(probe),
-            returncode=completed.returncode,
-        )
-
-    reported = _reported_hostname(completed.stdout.decode("utf-8", "replace"))
-    if reported is None:
-        raise DestinationNotAllowedError(
-            f"cannot check whether {host!r} is an allowed destination: 'ssh -G' reported no "
-            f"hostname; refusing the connection rather than allowing an unverified destination",
-            host=host,
-            effective_host=None,
-            layers=active_layers(),
-            argv=tuple(probe),
-        )
-    return reported
+    probe[1:1] = ["-o", f"Hostname={_PROBE_HOSTNAME}"]
+    output = await _probe_output(probe, host, resolved=resolved)
+    return _reported_keyword(output, "controlpath") != resolved.control_path
 
 
-def _reported_hostname(output: str) -> str | None:
-    """The ``hostname`` line of ``ssh -G`` output, folded.
+def _reported_keyword(output: str, keyword: str) -> str | None:
+    """The value of one keyword in ``ssh -G`` output, or ``None`` if it printed no such line.
 
     ``ssh`` prints ``keyword value`` a line at a time with the keyword lowercased. The **last**
     occurrence is taken rather than the first: the format does not promise uniqueness, and for
     a control the conservative reading is the one that cannot be shadowed by an earlier line.
+    The value is everything after the first space, so one carrying a space is kept whole.
     """
     found: str | None = None
     for line in output.splitlines():
-        keyword, separator, value = line.partition(" ")
-        if separator and keyword.strip().lower() == "hostname" and value.strip():
-            found = normalize_host(value)
+        name, separator, value = line.partition(" ")
+        if separator and name.strip().lower() == keyword and value.strip():
+            found = value.strip()
     return found
+
+
+def _reported_hostname(output: str) -> str | None:
+    """The ``hostname`` line of ``ssh -G`` output, folded."""
+    reported = _reported_keyword(output, "hostname")
+    return None if reported is None else normalize_host(reported)
+
+
+def _not_allowed(
+    host: str,
+    resolved: _Resolution,
+    layers: tuple[tuple[str, ...], ...],
+    refusing: Sequence[tuple[str, ...]],
+) -> DestinationNotAllowedError:
+    """The refusal for a destination some layer does not admit."""
+    rewritten = (
+        ""
+        if resolved.hostname == normalize_host(host)
+        else f" (which ssh_config rewrites to {resolved.hostname!r})"
+    )
+    return DestinationNotAllowedError(
+        f"{host!r}{rewritten} is not an allowed destination; it matches no pattern in "
+        f"{len(refusing)} of the {len(layers)} active allowlist layers "
+        f"({', '.join(repr(pattern) for layer in refusing for pattern in layer)}). Layers "
+        f"narrow and never widen, so a host must satisfy every one of them",
+        host=host,
+        effective_host=resolved.hostname,
+        layers=layers,
+        control_path=resolved.control_path,
+    )
+
+
+def _cannot_bind(
+    host: str, resolved: _Resolution, layers: tuple[tuple[str, ...], ...]
+) -> DestinationNotAllowedError:
+    """The refusal for a ``ControlPath`` every destination would share."""
+    return DestinationNotAllowedError(
+        f"cannot check whether {host!r} is an allowed destination: ControlPath "
+        f"{resolved.control_path!r} does not change when the destination does, so an existing "
+        f"multiplexing master at that socket would carry this session to whichever host it was "
+        f"opened to, and the allowlist cannot bind it. Key the path on the destination "
+        f"(ControlPath=~/.ssh/cm-%C) or set ControlPath=none; refusing the connection rather "
+        f"than allowing an unverified destination",
+        host=host,
+        effective_host=resolved.hostname,
+        layers=layers,
+        control_path=resolved.control_path,
+    )
 
 
 async def check_destination(
@@ -368,35 +536,28 @@ async def check_destination(
     Does nothing at all -- and spawns nothing -- when no policy is active, which is the default
     and is why this costs an unrestricted caller no round trip and no process.
 
+    Two questions, in this order: does every layer admit the destination ``ssh -G`` reports,
+    and -- only when a ``ControlPath`` is in play -- does that path change when the destination
+    does. The second costs one more probe, so it is asked only of a connection the first has
+    already allowed, and it is asked at all because the answer to the first is not binding
+    without it (see the module docstring).
+
     Args:
         argv: The connection's argv, used verbatim for the probe.
         host: The host as the caller gave it, for the message.
         environ: Environment to read the policy layer from. Injectable for tests.
 
     Raises:
-        DestinationNotAllowedError: If any layer refuses, or the destination cannot be
-            determined.
+        DestinationNotAllowedError: If any layer refuses, if the destination cannot be
+            determined, or if the ``ControlPath`` is one every destination would share.
     """
     layers = active_layers(environ)
     if not layers:
         return
 
-    destination = await effective_host(argv, host)
-    refusing = [layer for layer in layers if not host_matches(destination, layer)]
-    if not refusing:
-        return
-
-    rewritten = (
-        ""
-        if destination == normalize_host(host)
-        else f" (which ssh_config rewrites to {destination!r})"
-    )
-    raise DestinationNotAllowedError(
-        f"{host!r}{rewritten} is not an allowed destination; it matches no pattern in "
-        f"{len(refusing)} of the {len(layers)} active allowlist layers "
-        f"({', '.join(repr(pattern) for layer in refusing for pattern in layer)}). Layers "
-        f"narrow and never widen, so a host must satisfy every one of them",
-        host=host,
-        effective_host=destination,
-        layers=layers,
-    )
+    resolved = await _resolve(argv, host)
+    refusing = [layer for layer in layers if not host_matches(resolved.hostname, layer)]
+    if refusing:
+        raise _not_allowed(host, resolved, layers, refusing)
+    if resolved.control_path is not None and not await _control_path_binds(argv, host, resolved):
+        raise _cannot_bind(host, resolved, layers)

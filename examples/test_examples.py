@@ -130,6 +130,22 @@ def test_the_publish_example_reports_the_mechanism_it_used():
 
 
 @needs_non_utf8_names
+def test_the_allowed_hosts_example_shows_the_controlpath_refusal():
+    """D-202. The section exists to show one path refused and the keyed one allowed.
+
+    Both lines are asserted, because a section that printed two refusals -- or two passes --
+    would still run clean and would demonstrate the opposite of what its heading says.
+    """
+    if find_sftp_server() is None:
+        pytest.skip("sftp-server not installed (ships in openssh-server)")
+
+    returncode, stdout, _ = run_example(Path(__file__).parent / "allowed_hosts.py")
+    assert returncode == 0
+    lines = {line.split()[0]: line for line in stdout.splitlines() if "ControlPath=" in line}
+    assert "REFUSED" in lines["ControlPath=…/cm"]
+    assert "allowed by the policy" in lines["ControlPath=…/cm-%C"]
+
+
 def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
     # The example is only worth having if it demonstrates the awkward case. A directory of
     # tidy ASCII names would prove nothing that a docstring could not claim.

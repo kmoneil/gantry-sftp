@@ -86,9 +86,23 @@ command will really dial and checks the answer, so the rewrite is caught and the
 both halves. It also means a legitimate `ssh_config` alias works: you allowlist the destination,
 not the nickname.
 
+**It refuses a `ControlPath` that does not change with the destination.** `ControlMaster=no`
+ships, and an existing master at your `ControlPath` is still used (see
+[connection reuse](#connection-reuse-and-why-the-master-is-not-ours-to-start)), so a socket path
+that is the same for every host carries the session to whichever host that master was opened
+to, with `port=`, `identity_file=` and the destination itself all ignored on the way. `ssh -G`
+reports the *named* destination regardless, so an allowlist that stopped there would approve a
+host the session never reaches. Measured against two `sshd`s: the second server's
+`Accepted publickey` count never moved. The check cannot read the path for a token, because
+`ssh -G` expands them; it asks `ssh -G` a second time with a different destination and refuses
+if the path came back unchanged. Key the path on the destination, `ControlPath ~/.ssh/cm-%C` or
+`%r@%h:%p` as `ssh_config(5)` recommends, and it passes. `%n` and `%k` key on the name as typed,
+which that instrument cannot move, so a path keyed on either alone is refused too. Without a
+policy nothing checks this, because no policy means no probe.
+
 A refusal is a `DestinationNotAllowedError`, which is a `ConnectError` — so `except ConnectError`
 does not start missing failures because a policy was switched on. It carries `host`,
-`effective_host` and the layers that refused it.
+`effective_host`, `control_path` and the layers that refused it.
 
 Three things it deliberately does not do, because a control that overstates itself is worse than
 an absent one:
@@ -235,16 +249,17 @@ a packet moves — and `ControlMaster` multiplexing is the fix for a workload th
 It is worth stating exactly what you get, because **one shipped default changes the answer**.
 
 `ControlMaster=no` is on every command line, and `-o` beats the config file. Measured against
-OpenSSH 10.0p2 with a config that asks for multiplexing:
+OpenSSH 10.0p2 with a config that asks for multiplexing at `ControlPath /tmp/cm-%r@%h:%p`, run
+as `bob` (`-G` prints the path with its tokens already expanded):
 
 ```console
 $ ssh -F cm.conf -G host | grep -i '^controlmaster\|^controlpath'
 controlmaster auto
-controlpath /tmp/cm-%r@%h:%p
+controlpath /tmp/cm-bob@host:22
 
 $ ssh -o ControlMaster=no -F cm.conf -G host | grep -i '^controlmaster\|^controlpath'
 controlmaster false
-controlpath /tmp/cm-%r@%h:%p
+controlpath /tmp/cm-bob@host:22
 ```
 
 So `ControlPath` survives and `ControlMaster` does not. Concretely:
@@ -255,6 +270,14 @@ So `ControlPath` survives and `ControlMaster` does not. Concretely:
 - **This library will not create one.** So if the only `ssh` on the machine is ours, setting
   `ControlMaster auto` in `~/.ssh/config` and changing nothing else buys **nothing**: the first
   connection declines to host the master, and there is never one for the second to reuse.
+- **The path has to name the destination.** A master is found by its socket path alone, so a
+  `ControlPath` that is the same for every host, `/tmp/cm` rather than `/tmp/cm-%C`, carries
+  every later connection to whichever host that master was opened to: `port=`, `identity_file=`
+  and the destination itself are all ignored, and the transfer reports success against the wrong
+  server. That is `ssh`'s behaviour and this library inherits it; measured against two `sshd`s,
+  the second never saw a connection. Key the path with `%C` or `%r@%h:%p`, as `ssh_config(5)`
+  recommends. Under [an allowlist](#restricting-where-a-connection-may-go) a path that does not
+  change with the destination is refused; without one nothing checks it.
 
 That default is deliberate rather than an oversight. Becoming a master means leaving a listening
 socket behind that outlives the process and accepts further connections to that host — a side

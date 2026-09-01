@@ -234,10 +234,19 @@ class DestinationNotAllowedError(ConnectError):
     would name a host that is not the one being refused. ``effective_host`` is ``None`` when the
     probe never got that far.
 
+    The third refusal (D-202) is a ``ControlPath`` that does not change when the destination
+    does. ``ControlMaster=no`` still *uses* an existing master, so such a path would carry the
+    session to whichever host that master was opened to, and ``ssh -G`` -- which reports the
+    named destination without connecting -- cannot see it. The allowlist would then approve a
+    host the session never reaches, so it refuses instead.
+
     Attributes:
         host: The destination as the caller supplied it.
         effective_host: What ``ssh -G`` reported, or ``None`` if it could not be read.
         layers: Every allowlist layer that was in force, outermost first.
+        control_path: The ``ControlPath`` ``ssh -G`` resolved for the connection, tokens
+            expanded, or ``None`` when none was in play or the probe never got that far. A
+            refusal about multiplexing names a socket the operator has to go and find.
     """
 
     def __init__(
@@ -247,6 +256,7 @@ class DestinationNotAllowedError(ConnectError):
         host: str,
         effective_host: str | None,
         layers: tuple[tuple[str, ...], ...],
+        control_path: str | None = None,
         stderr: str = "",
         argv: tuple[str, ...] = (),
         returncode: int | None = None,
@@ -259,6 +269,7 @@ class DestinationNotAllowedError(ConnectError):
         self.host = host
         self.effective_host = effective_host
         self.layers = layers
+        self.control_path = control_path
 
 
 class UnsafePathError(SFTPError):
