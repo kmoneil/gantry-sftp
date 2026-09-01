@@ -39,6 +39,7 @@ are not — see [the URL form](integrations.md#the-url-form).
 | A password reaching argv, a log, a frame dump or a traceback | [Passwords](connecting.md#passwords), [Credentials](observability.md#credentials) | [CWE-522](https://cwe.mitre.org/data/definitions/522.html) |
 | An `ssh_config` you do not control rewriting the destination | [When the `ssh_config` is not yours](connecting.md#when-the-ssh_config-is-not-yours) | — |
 | A connection going somewhere the program never meant to reach | [Restricting where a connection may go](connecting.md#restricting-where-a-connection-may-go) | [CWE-918](https://cwe.mitre.org/data/definitions/918.html) |
+| An existing multiplexing master carrying the session to the host it was opened to | [Connection reuse, and why the master is not ours to start](connecting.md#connection-reuse-and-why-the-master-is-not-ours-to-start) | — |
 | A delivered file being world-readable between creation and `chmod` | [The mode is on the file before anything can open it by name](transfers.md#the-mode-is-on-the-file-before-anything-can-open-it-by-name) | [CWE-732](https://cwe.mitre.org/data/definitions/732.html) |
 | An operation following a symlink somebody planted | [Changing attributes, and links](paths.md#changing-attributes-and-links) | [CWE-59](https://cwe.mitre.org/data/definitions/59.html) |
 | A local file this library creates beside one you named being planted at first | [Where to put the journal](reliability.md#where-to-put-the-journal) | [CWE-59](https://cwe.mitre.org/data/definitions/59.html) |
@@ -55,6 +56,10 @@ places where that is easy to get backwards and is deliberately not:
 - The destination allowlist refuses when its `ssh -G` probe cannot run, rather than allowing an
   unverified destination. A probe that fails to spawn, exits non-zero, times out, or reports no
   hostname all land there.
+- The same allowlist refuses a `ControlPath` that does not change with the destination, because
+  an existing master at that socket would carry the session to whichever host it was opened to
+  and `ssh -G` reports the named destination regardless. Refused rather than warned: a wrong-host
+  transfer that reports success is the worst failure this library has.
 
 ## What is not defended
 
@@ -92,6 +97,11 @@ one.
 **The allowlist does not pin a resolved address.** This library never resolves DNS — OpenSSH does —
 so the allowlist matches the destination as written and cannot guarantee the name it approved still
 resolves the same way at connect time. A documented limit of the control rather than a defect in it.
+
+**A multiplexing master opened to another host, with no policy active.** No policy means no
+`ssh -G` probe, so nothing inspects the `ControlPath` unless `allowed_hosts()` or the environment
+variable is in force. The hazard and the fix are on the
+[connecting page](connecting.md#connection-reuse-and-why-the-master-is-not-ours-to-start).
 
 **Deliberately weakening a default.** Setting `StrictHostKeyChecking=no` yourself raises
 `InsecureOptionWarning` and then does what you asked.
