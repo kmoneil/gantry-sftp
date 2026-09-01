@@ -129,7 +129,6 @@ def test_the_publish_example_reports_the_mechanism_it_used():
     assert "mechanism=in-place" in stdout
 
 
-@needs_non_utf8_names
 def test_the_allowed_hosts_example_shows_the_controlpath_refusal():
     """D-202. The section exists to show one path refused and the keyed one allowed.
 
@@ -146,6 +145,7 @@ def test_the_allowed_hosts_example_shows_the_controlpath_refusal():
     assert "allowed by the policy" in lines["ControlPath=…/cm-%C"]
 
 
+@needs_non_utf8_names
 def test_the_listing_example_shows_a_name_that_is_not_valid_utf8():
     # The example is only worth having if it demonstrates the awkward case. A directory of
     # tidy ASCII names would prove nothing that a docstring could not claim.
