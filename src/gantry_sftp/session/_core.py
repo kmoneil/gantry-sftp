@@ -352,10 +352,12 @@ class _SessionCore:
 
         The *definitive* half of capability detection, and the reason it exists separately
         from :meth:`supports`: an advertisement is a claim, and this is an answer. Only
-        ``OP_UNSUPPORTED`` lands here. A refusal for any other reason -- permissions, a
-        read-only directory, a file it does not like -- is a fact about one request rather
-        than about the server, and caching it would turn one bad path into a capability this
-        session never tries again.
+        ``OP_UNSUPPORTED`` lands here, and only from a server that did **not** advertise the
+        extension (D-205). A refusal for any other reason -- permissions, a read-only
+        directory, a file it does not like -- is a fact about one request rather than about
+        the server, and caching it would turn one bad path into a capability this session
+        never tries again; an ``OP_UNSUPPORTED`` from a server that advertised the extension
+        is the same kind of fact, and is handed to the caller rather than recorded here.
 
         Cached per session because there is nowhere else to put it: extensions are negotiated
         per connection, and a new connection has to ask again.
