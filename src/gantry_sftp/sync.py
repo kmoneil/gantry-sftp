@@ -583,7 +583,7 @@ class SyncSession:
         return self._session.supports(extension)
 
     def refuses(self, extension: bytes | str) -> bool:
-        """Whether an extension has been tried and answered ``OP_UNSUPPORTED``."""
+        """Whether a server that did not advertise an extension has answered ``OP_UNSUPPORTED``."""
         return self._session.refuses(extension)
 
     def sizes_for(self, handle: bytes) -> TransferSizes:

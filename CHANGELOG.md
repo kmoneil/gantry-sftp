@@ -3,6 +3,53 @@
 Notable changes, newest first. This project follows [semantic versioning](https://semver.org),
 and while the major version is `0` the minor version is where a breaking change lands.
 
+## Unreleased
+
+**Two behaviour changes a program can observe, and neither moves a signature.** One attribute is
+added to an exception; nothing is removed and no default changes. Two other changes landed in the
+same days and do not appear below for the reason 0.5.1's notes give: they are the repository's own
+commit hooks, and change nothing a user's program can see.
+
+### Security
+
+- **A `ControlPath` that does not change with the destination is refused while an allowlist is
+  active** (D-202). `ControlMaster=no` ships, and an existing multiplexing master at your
+  `ControlPath` is still used, so a socket path that is the same for every host carried the
+  session to whichever host that master was opened to, with `port=`, `identity_file=` and the
+  destination all ignored on the way. `ssh -G` reports the *named* destination without
+  connecting, so `allowed_hosts()` approved a host the session never reached: a control that read
+  as binding and was not. Reproduced end to end against two servers, the second of which never
+  saw a connection.
+
+  The check cannot read the path for a token, because `ssh -G` prints them expanded; it asks
+  `ssh -G` a second time with a different destination and refuses if the path came back unchanged.
+  A path keyed on the destination, `%C` or `%r@%h:%p` as `ssh_config(5)` recommends, passes and
+  still multiplexes. `%n` and `%k` key on the name as typed, which that instrument cannot move,
+  so a path keyed on either alone is refused too; the message names the fix. **Without a policy
+  nothing checks this**, because no policy means no probe, and the hazard is documented on the
+  connecting page instead. `DestinationNotAllowedError` gains `control_path`.
+
+### Fixed
+
+- **An `OP_UNSUPPORTED` from a server that advertises the extension is no longer remembered for
+  the session** (D-205). It was cached per extension as a fact about the server. asyncssh's fix
+  for [#827](https://github.com/ronf/asyncssh/issues/827) answers it per request: the mode of a
+  symlink is declined where the platform has no `lchmod`, with a reason naming the attribute, while
+  the times of the same link and the mode of a regular file are performed. Measured with that fix
+  applied, one `chmod` of a link left this library refusing `utime` on links *and* `chmod` on
+  regular files for the rest of the session, both without a round trip and both things the server
+  does.
+
+  The rule now: from a server that **advertised** the extension, `OP_UNSUPPORTED` is an answer
+  about that request. It arrives as `UnsupportedError` carrying the server's reason and a note
+  saying so, and nothing is remembered; `fsync_if_supported` and `posix_rename_if_supported` keep
+  their `bool` and answer `False` for a declined request without remembering it. From a server
+  that did not advertise the extension it stays a fact about the server and is cached as before,
+  so a tree of a thousand files still asks once. **No released server produced the changed
+  answer**: stock asyncssh answers OK and discards, OpenSSH refuses the mode with `FAILURE`, and
+  paramiko does not advertise `lsetstat`, so nothing observable changes against any of them until
+  asyncssh ships its fix.
+
 ## 0.5.1 — 2026-08-17
 
 **A patch release, and the version number is the claim: nothing here changes API.** No signature

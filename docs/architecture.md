@@ -134,7 +134,9 @@ your `ssh` can do it, so can this:
   `ControlPath` is untouched. Hosting one is opt-in: this library ships `ControlMaster=no`, so a
   config line alone buys nothing when the only `ssh` on the machine is this one. For
   connection-heavy work it is still the fix rather than an optimisation, because connecting is this
-  library's weak spot — it just needs to be asked for. See
+  library's weak spot — it just needs to be asked for. The path has to name the destination: a
+  `ControlPath` that is the same for every host carries the session to whichever host the master
+  was opened to, and under an allowlist that is refused. See
   [Connection reuse](connecting.md#connection-reuse-and-why-the-master-is-not-ours-to-start).
 - **Host keys signed by a CA**, and an agent with more than one key in it.
 - **Reaching a host through a proxy or a bastion**: `ProxyJump`, and `ProxyCommand` for SOCKS. Port
