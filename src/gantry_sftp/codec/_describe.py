@@ -143,7 +143,7 @@ def _request_fields(packet: _ShapedRequest) -> str:
         case Open():
             fields = (
                 f"filename={render_field(packet.filename)} "
-                f"pflags={packet.pflags.name or '0'} attrs={_attrs(packet.attrs)}"
+                f"pflags={_pflags(packet)} attrs={_attrs(packet.attrs)}"
             )
         case Read():
             fields = (
@@ -213,6 +213,21 @@ def _message(message: bytes) -> str:
     optional, and a field that is empty on every real server is noise on every line.
     """
     return f" message={render_field(message)}" if message else ""
+
+
+def _pflags(packet: Open) -> str:
+    """OPEN's ``pflags`` as flag names, with any bits v3 does not define appended as a number.
+
+    Before D-209 the undefined bits were rendered by the enum, which spelled ``0x100`` alone as
+    ``0`` -- an OPEN that asked for something reading as one that asked for nothing. The
+    arithmetic here stays in plain ``int`` on purpose: masking with an ``OpenFlag`` would build
+    an enum member for the undefined bits, and CPython keeps every one it builds.
+    """
+    names = packet.pflags.name
+    if packet.raw_pflags is None:
+        return names or "0"
+    undefined = f"{packet.raw_pflags & ~int(packet.pflags):#x}"
+    return f"{names}|{undefined}" if names else undefined
 
 
 def _first(name: Name) -> str:

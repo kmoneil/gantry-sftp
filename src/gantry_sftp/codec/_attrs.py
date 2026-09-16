@@ -28,13 +28,21 @@ from typing import NamedTuple
 
 from gantry_sftp.codec._constants import AttrFlag
 from gantry_sftp.codec._wire import WireReader, WireWriter
-from gantry_sftp.exceptions import ProtocolError
 
 __all__ = ["MAX_V3_TIMESTAMP", "Attrs", "Owner", "Times", "decode_attrs", "encode_attrs"]
 
-_KNOWN_FLAGS = (
+_KNOWN_FLAGS = int(
     AttrFlag.SIZE | AttrFlag.UIDGID | AttrFlag.PERMISSIONS | AttrFlag.ACMODTIME | AttrFlag.EXTENDED
 )
+"""The flag bits v3 defines, as a plain ``int`` and not as an ``AttrFlag``.
+
+That difference is the point (D-209). ``IntFlag`` arithmetic builds a member for its result,
+and CPython caches every member it builds on the class for the life of the process, including
+one carrying bits the enum does not define. So masking a wire value with an ``AttrFlag`` kept
+one cache entry per distinct undefined-bit pattern a server sent, about half a kilobyte each,
+across every connection. Plain ``int`` arithmetic caches nothing. Masking with a *defined*
+flag is harmless: its result can only be that flag or zero.
+"""
 
 
 class Owner(NamedTuple):
@@ -107,6 +115,18 @@ carries an ATTRS it almost never uses.
 """
 
 
+MIN_ATTRS_LENGTH = 4
+"""The fewest bytes an ATTRS occupies: the ``uint32`` flags word with no bit set.
+
+Every other field is present only under a flag (``draft-ietf-secsh-filexfer-02`` 5). A count
+of structures that each carry an ATTRS is bounded with this (D-209).
+"""
+
+_MIN_EXTENDED_PAIR_LENGTH = 8
+"""The fewest bytes one ``extended_type``/``extended_data`` pair occupies: two empty
+``string`` fields, each a zero ``uint32`` length (``draft-ietf-secsh-filexfer-02`` 5)."""
+
+
 MAX_V3_TIMESTAMP = 0xFFFFFFFF
 """The largest instant filexfer v3 can carry: 2106-02-07T06:28:15Z.
 
@@ -177,9 +197,9 @@ def decode_attrs(reader: WireReader) -> Attrs:
     flags = reader.read_uint32()
     unknown = flags & ~_KNOWN_FLAGS
     if unknown:
-        raise ProtocolError(
+        raise reader.refusal(
             f"ATTRS sets undefined flag bits 0x{unknown:08x}; filexfer v3 defines only "
-            f"0x{int(_KNOWN_FLAGS):08x}, and an unknown bit means a field of unknown width"
+            f"0x{_KNOWN_FLAGS:08x}, and an unknown bit means a field of unknown width"
         )
 
     size = reader.read_uint64() if flags & AttrFlag.SIZE else None
@@ -191,9 +211,10 @@ def decode_attrs(reader: WireReader) -> Attrs:
 
     extended: tuple[tuple[bytes, bytes], ...] = ()
     if flags & AttrFlag.EXTENDED:
-        count = reader.read_uint32()
-        # Not pre-allocated on `count`: a hostile count is bounded by the frame, because
-        # the first read past the end raises rather than looping.
+        # A count the rest of the frame cannot hold is refused before any pair is built
+        # (D-209). One that fits can still overstate, since a pair may be longer than the
+        # minimum, and the reads below refuse that -- so nothing is pre-allocated on it.
+        count = reader.read_count(_MIN_EXTENDED_PAIR_LENGTH, item="ATTRS extended pair")
         pairs = []
         for _ in range(count):
             ext_type = bytes(reader.read_string())

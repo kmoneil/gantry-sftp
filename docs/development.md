@@ -502,6 +502,31 @@ them, because a detector nobody has watched fail is a decoration. Adding a new t
 adding it to `WATCHED_TYPES`; a test asserts that list covers every `Transport` the package
 exports, so a new one cannot go unwatched silently.
 
+### What the codec may allocate
+
+The codec must not crash, hang, or over-allocate on arbitrary bytes, and until D-209 only the
+first two were tested. `tests/allocation.py` measures the third, in the `fast` lane, as two
+quantities. **Peak**, the most a call holds at once, is bounded by a multiple of the input,
+because a well-formed reply costs more than its bytes. **Retained**, what outlives a call once
+its result is dropped, is bounded by noise, because anything that survives a decode and grows
+with what a server sent is memory the server controls. The first bound comes from the densest
+*legal* frame and the second from nothing at all, and each is re-derived by a test on whichever
+interpreter runs the suite: CI runs 3.14, and object sizes differ from 3.13's by a few per cent.
+
+**This thresholds `tracemalloc` bytes, which the leak lane above found impossible, and the
+difference is the size of the block.** The leak lane measures whole tests, where unrelated
+first-call caching is the noise. Here the block is a pure decode with its inputs built
+beforehand, and three things the instrument does make the noise disappear. It builds every enum
+member the codec is entitled to cache before measuring, using values the test does not use. It
+ends with a *full* collection, because CPython parks freed tuples and dicts on free lists and a
+generation-0 collection leaves them looking retained. And it runs that collection with
+`gc.callbacks` removed, because hypothesis installs one that allocates.
+
+It knows which mutation pass it is in. mutmut's coverage pass (`MUTANT_UNDER_TEST=stats`)
+records every new call edge in sets that last the whole run, so the instrument runs its block
+there and then reports the test as skipped. Every other pass measures normally, so a mutant that
+allocates is still caught.
+
 ### The netem lane
 
 `live-tests/test_netem_pipelining.py` is where every claim about pipelining is made, because

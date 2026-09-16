@@ -6,6 +6,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from allocation import peak_allocation
 from gantry_sftp.codec import DEFAULT_MAX_FRAME_LENGTH, FrameSplitter
 from gantry_sftp.codec._framing import _COMPACT_THRESHOLD
 from gantry_sftp.exceptions import ProtocolError
@@ -212,6 +213,27 @@ def test_the_buffer_is_reused_when_no_view_is_outstanding():
     for frame in s.feed(framed(b"\x02two")):
         bytes(frame)
     assert s._buf is buffer_before, "buffer was needlessly replaced"  # noqa: SLF001
+
+
+def test_moving_to_a_fresh_buffer_copies_the_remainder_once():
+    """D-209: the move copied every buffered byte twice, and held both copies at once.
+
+    ``bytearray(self._buf[self._start :])`` -- slicing a ``bytearray`` already makes a new one, so
+    the wrapper was a second full copy. It sits on the path this module calls the common one,
+    since any caller still holding a frame takes it on the next feed, and it scales with the
+    unparsed remainder: a partial frame the size of the ceiling was held three times over.
+    """
+    remainder = 1024 * 1024
+    s = FrameSplitter()
+    partial = remainder.to_bytes(4, "big") + b"\x65" + bytes(remainder - 5)
+    (held,) = s.feed(framed(b"\x02held") + partial)
+    assert s.buffered == remainder
+    with peak_allocation() as peak:
+        assert s.feed(b"\x00") == []
+    # One copy is the remainder once, plus the growth `+=` asks for; two copies is twice it.
+    assert peak.bytes < remainder * 3 // 2, f"moving {remainder} bytes held {peak.bytes}"
+    assert s.buffered == remainder + 1
+    assert bytes(held) == b"\x02held"
 
 
 def test_holding_a_frame_never_copies_the_payload():

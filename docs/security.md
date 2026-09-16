@@ -17,6 +17,7 @@ made under. Everything a server sends is attacker-chosen input:
 
 - Every filename from `READDIR`, `READLINK` and `REALPATH`.
 - Every `STATUS` message.
+- Every frame's shape: its length, the counts inside it and the flag bits it sets.
 - The banner OpenSSH prints on our standard error, which reaches
   `ConnectError.stderr`.
 
@@ -43,6 +44,7 @@ are not — see [the URL form](integrations.md#the-url-form).
 | A delivered file being world-readable between creation and `chmod` | [The mode is on the file before anything can open it by name](transfers.md#the-mode-is-on-the-file-before-anything-can-open-it-by-name) | [CWE-732](https://cwe.mitre.org/data/definitions/732.html) |
 | An operation following a symlink somebody planted | [Changing attributes, and links](paths.md#changing-attributes-and-links) | [CWE-59](https://cwe.mitre.org/data/definitions/59.html) |
 | A local file this library creates beside one you named being planted at first | [Where to put the journal](reliability.md#where-to-put-the-journal) | [CWE-59](https://cwe.mitre.org/data/definitions/59.html) |
+| A server reply making the client keep memory it chose, or spend it on a reply it refuses | [The failures this prevents](architecture.md#the-failures-this-prevents) | [CWE-770](https://cwe.mitre.org/data/definitions/770.html), [CWE-401](https://cwe.mitre.org/data/definitions/401.html) |
 | A predicate answering "no" when it means "I could not tell" | *below* | [CWE-636](https://cwe.mitre.org/data/definitions/636.html) |
 
 ### Controls fail closed
@@ -162,6 +164,7 @@ if you doubt the prose:
 | Local path containment and collisions | `tests/test_localpath.py`, `tests/test_localtree.py` |
 | Credential redaction | `tests/test_askpass.py`, `tests/test_observability.py` |
 | Escaping of server-chosen names | `tests/test_observability.py`, and `tests/test_observability.py::test_no_arbitrary_server_bytes_produce_a_control_character` for the fuzzed half |
+| Hostile frames: no crash, hang, over-allocation or retained memory | `tests/test_packets.py`, `tests/test_codec.py`, and `tests/allocation.py` for how memory is measured |
 | Behaviour against a real server | `live-tests/`, and `tests/server_contract.py` for what a fake is allowed to claim |
 | Supply chain: pinned actions, `--frozen`, the attestation, the publish path | `tests/test_lanes.py`, `tests/test_audit_deps.py` |
 

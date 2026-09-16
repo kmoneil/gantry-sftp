@@ -126,8 +126,10 @@ class FrameSplitter:
         except BufferError:
             # Frames from an earlier feed are still referenced, so this buffer belongs to
             # the caller now. Move the unparsed remainder into a fresh one and leave theirs
-            # intact -- their views keep working, and the stream keeps moving.
-            self._buf = bytearray(self._buf[self._start :])
+            # intact -- their views keep working, and the stream keeps moving. A slice of a
+            # bytearray is already a fresh bytearray, so this is the remainder's one copy;
+            # wrapping it in bytearray() again copied it twice until D-209.
+            self._buf = self._buf[self._start :]
             self._start = 0
             self._buf += data
 

@@ -5,12 +5,36 @@ and while the major version is `0` the minor version is where a breaking change 
 
 ## Unreleased
 
-**Two behaviour changes a program can observe, and neither moves a signature.** One attribute is
-added to an exception; nothing is removed and no default changes. Two other changes landed in the
-same days and do not appear below for the reason 0.5.1's notes give: they are the repository's own
-commit hooks, and change nothing a user's program can see.
+**Behaviour changes a program can observe, and additions only.** One attribute is added to an
+exception, one field to the codec's `Open`, and three methods to its `WireReader`; nothing is
+removed and no default changes. Two other changes landed in the same days and do not appear below
+for the reason 0.5.1's notes give: they are the repository's own commit hooks, and change nothing
+a user's program can see.
 
 ### Security
+
+- **A server can no longer make this process keep memory** (D-209). Python keeps every `IntFlag`
+  value it builds for the life of the process, including one carrying bits the enum does not
+  define, and the codec built one from wire bits in two places: masking an ATTRS flags word before
+  refusing its undefined bits, and reading an OPEN's `pflags`. Each distinct value a server sent
+  stayed behind, a few hundred bytes each, one per connection and across every connection the
+  process made. Both now use plain integers.
+
+  An OPEN's undefined `pflags` bits therefore arrive in the new `Open.raw_pflags`, which holds the
+  whole wire value, and `Open.pflags` holds only the six bits v3 defines: the shape
+  `Status.raw_code` already has. `describe()` renders them as a number after the flag names,
+  `READ|0x100`, where it used to spell `0x100` alone as `0`. A client never legitimately receives
+  an OPEN, but the codec decodes one before refusing it.
+- **A reply claiming more entries than its frame holds is refused before any is decoded**
+  (D-209). A NAME whose entry count, or an ATTRS whose extended-pair count, needs more bytes than
+  are left in the frame now fails on the claim, and the message names the count, where it was and
+  what the frame had left. It used to fail on the first read past the end, after building an entry
+  for every twelve bytes the frame did hold: an order of magnitude more memory than the frame, for
+  a reply that was then refused. It was a `ProtocolError` and still is; the message changed.
+
+  **What a well-formed reply can cost is unchanged**, and that is not an oversight: a frame packed
+  with minimal entries costs as much as the lying one did, because every entry is returned. That
+  cost scales with the frame ceiling.
 
 - **A `ControlPath` that does not change with the destination is refused while an allowlist is
   active** (D-202). `ControlMaster=no` ships, and an existing multiplexing master at your
@@ -49,6 +73,24 @@ commit hooks, and change nothing a user's program can see.
   answer**: stock asyncssh answers OK and discards, OpenSSH refuses the mode with `FAILURE`, and
   paramiko does not advertise `lsetstat`, so nothing observable changes against any of them until
   asyncssh ships its fix.
+- **A decode error after a request id names the request, in every packet type** (D-209).
+  `ProtocolError.request_id` was filled in for STATUS alone, so a truncated NAME or a refused count
+  said which packet type had failed but not which request it answered. Every type that carries an
+  id now records it as soon as it is read. The refusal of an undefined ATTRS flag bit carried none
+  of the frame's state at all, and now carries the packet type, request id and frame like the rest.
+- **Holding a frame no longer makes the next feed copy the unread bytes twice** (D-209). When a
+  caller still holds a frame, `FrameSplitter` moves what it has not parsed into a fresh buffer, and
+  it copied that twice with both copies alive at once. Observable only as memory.
+
+### Added
+
+- **`WireReader.read_count()`, `read_request_id()` and `refusal()`** (D-209), for code building a
+  decoder on the public codec layer. `read_count(item_length, item=...)` reads a count and refuses
+  one the rest of the frame cannot hold at `item_length` bytes an item; `read_request_id()` reads
+  an id and attaches it to every later error; `refusal(message)` builds a `ProtocolError` carrying
+  the packet type, request id and frame, for a field that was read and is not accepted.
+- **`Open.raw_pflags`** (D-209): the whole wire `pflags` value when it sets bits v3 does not
+  define, `None` otherwise. See Security above for why.
 
 ## 0.5.1 — 2026-08-17
 

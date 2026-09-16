@@ -75,7 +75,14 @@ class WireReader:
         """Record the request id for error reporting, once it has been read."""
         self._request_id = request_id
 
-    def _fail(self, message: str) -> ProtocolError:
+    def refusal(self, message: str) -> ProtocolError:
+        """Build the error for a frame this reader's caller refuses, carrying the frame's state.
+
+        Returned rather than raised, so a call site reads ``raise reader.refusal(...)`` and
+        static analysis can see the control flow. The packet type, the request id once
+        :meth:`read_request_id` has read it, and the frame itself are attached here, so a
+        decoder refusing a field it has read cannot forget them.
+        """
         return ProtocolError(
             message,
             packet_type=self._packet_type,
@@ -85,7 +92,7 @@ class WireReader:
 
     def _take(self, n: int) -> memoryview:
         if n > self.remaining:
-            raise self._fail(
+            raise self.refusal(
                 f"truncated frame: need {n} more bytes at offset {self._pos}, "
                 f"{self.remaining} available"
             )
@@ -104,6 +111,62 @@ class WireReader:
     def read_uint64(self) -> int:
         """Read a big-endian 64-bit unsigned integer."""
         return int.from_bytes(self._take(8), "big")
+
+    def read_request_id(self) -> int:
+        """Read a ``uint32`` request id, and name it in any error raised after it.
+
+        Every decoder reads its id first, so a failure in any later field -- a truncated path,
+        a count the frame cannot hold -- says which request the frame answered rather than only
+        which packet type it was.
+        """
+        request_id = self.read_uint32()
+        self._request_id = request_id
+        return request_id
+
+    def read_count(self, item_length: int, *, item: str) -> int:
+        """Read a ``uint32`` item count, refusing one the rest of the frame cannot hold.
+
+        A count is a claim about the bytes after it, like a ``string``'s length, and is checked
+        the same way: against what is actually there, before anything is built for it. Until
+        D-209 nothing checked it, so a count of four billion drove the decode loop through every
+        item the frame *did* hold, building Python objects for each, until the first read past
+        the end refused the frame. That spent an order of magnitude more memory than the frame
+        on a reply that was then thrown away.
+
+        **This does not lower what one frame can cost.** A well-formed frame packed with
+        minimal items costs as much as the lying one did, or more, because every item is
+        returned. That cost is the price of the reply and scales with the frame ceiling. What
+        the check removes is paying it for a frame that is refused anyway.
+
+        ``item_length`` is the fewest bytes one item can occupy, so a count that passes can
+        still overstate, because an item may be longer. The reads that follow refuse that, and
+        every item decoded before they do was really in the frame.
+
+        Args:
+            item_length: The fewest wire bytes one item can occupy. At least 1, since a count of
+                zero-length items would always fit.
+            item: What is counted, as the error message names it.
+
+        Returns:
+            The count, which is at most the bytes left after it divided by ``item_length``.
+
+        Raises:
+            ProtocolError: If ``count * item_length`` is more than the bytes left after the
+                count. The position stays at the count, as it does for any failed read.
+            ValueError: If ``item_length`` is below 1.
+        """
+        if item_length < 1:
+            raise ValueError(f"item_length must be at least 1, got {item_length}")
+        offset = self._pos
+        count = self.read_uint32()
+        available = self.remaining
+        if count * item_length > available:
+            self._pos = offset
+            raise self.refusal(
+                f"{item} count {count} at offset {offset} cannot fit in the frame: each takes "
+                f"at least {item_length} bytes and {available} remain after the count"
+            )
+        return count
 
     def read_bytes(self, n: int) -> memoryview:
         """Read exactly ``n`` raw bytes as a view, without copying."""

@@ -11,10 +11,21 @@ from __future__ import annotations
 import contextlib
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from allocation import (
+    DECODE_PEAK_PER_BYTE,
+    FIXED_OVERHEAD,
+    RETAINED_NOISE,
+    decode_quietly,
+    empty_free_lists,
+    peak_allocation,
+    retained_allocation,
+    warm_enum_caches,
+)
 from gantry_sftp.codec import (
+    DEFAULT_MAX_FRAME_LENGTH,
     Attrs,
     AttrsReply,
     Close,
@@ -53,7 +64,7 @@ from gantry_sftp.codec import (
     decode,
     encode,
 )
-from gantry_sftp.codec._packets import _DECODERS
+from gantry_sftp.codec._packets import _DECODERS, _MIN_NAME_ENTRY_LENGTH
 from gantry_sftp.exceptions import ProtocolError
 
 # The codec neither knows nor needs this -- it is what `session/` will actually put in a
@@ -427,6 +438,66 @@ def test_encoding_a_status_is_canonical_even_when_the_decoded_one_was_terse():
     )
 
 
+# --- OPEN: bits v3 does not define ----------------------------------------------------
+#
+# D-209. Kept whole as a number rather than built into an `OpenFlag`, because CPython keeps every
+# flag member it builds and a peer choosing the bits would choose how much memory stayed behind.
+
+
+def open_frame(pflags: int) -> bytes:
+    """An OPEN of ``/a`` by request 5, carrying ``pflags`` and no attributes."""
+    return (
+        bytes([PacketType.OPEN])
+        + b"\x00\x00\x00\x05"
+        + b"\x00\x00\x00\x02/a"
+        + pflags.to_bytes(4, "big")
+        + b"\x00\x00\x00\x00"
+    )
+
+
+def test_an_open_setting_undefined_pflags_keeps_the_wire_value_whole():
+    frame = open_frame(0x101)
+    packet = decode(frame)
+    assert packet == Open(5, b"/a", OpenFlag.READ, Attrs(), raw_pflags=0x101)
+    assert encode(packet)[4:] == frame, "the bits it could not name must survive a re-encode"
+
+
+def test_undefined_pflags_alone_set_no_defined_flag():
+    packet = decode(open_frame(0x40))
+    assert (packet.pflags, packet.raw_pflags) == (OpenFlag(0), 0x40)
+
+
+@pytest.mark.parametrize("pflags", [0x00, 0x01, 0x1A, 0x3F])
+def test_an_open_with_only_defined_pflags_carries_no_raw_value(pflags: int):
+    # 0x3F is every defined bit at once: the widest value that is still ordinary.
+    packet = decode(open_frame(pflags))
+    assert (packet.pflags, packet.raw_pflags) == (OpenFlag(pflags), None)
+
+
+@given(wire=st.integers(min_value=0, max_value=0xFFFFFFFF))
+def test_any_pflags_value_survives_decode_and_encode_byte_for_byte(wire: int):
+    frame = open_frame(wire)
+    packet = decode(frame)
+    assert encode(packet)[4:] == frame
+    assert packet.pflags == wire & 0x3F
+    assert packet.raw_pflags == (wire if wire > 0x3F else None)
+
+
+def test_decoding_undefined_pflags_keeps_nothing_afterwards():
+    """D-209: a thousand different ``pflags`` values leave the process as they found it.
+
+    A client never legitimately receives an OPEN, and ``decode`` reads one anyway before the codec
+    refuses it -- so building the whole value into an ``OpenFlag`` let any server leave an enum
+    member behind per connection, kept for the life of the process.
+    """
+    warm_enum_caches()
+    frames = [open_frame((n + 2) << 8) for n in range(1000)]
+    with retained_allocation() as kept:
+        for frame in frames:
+            decode_quietly(frame)
+    assert kept.bytes <= RETAINED_NOISE, f"{kept.bytes} bytes outlived 1000 decodes"
+
+
 # --- the framing exception --------------------------------------------------------------
 
 
@@ -490,6 +561,124 @@ def test_a_frame_with_only_a_type_byte_is_rejected():
         decode_frame(b"\x00\x00\x00\x01\x05")
 
 
+# Every type with a field after its request id, so a refusal there can name it. EXTENDED_REPLY has
+# none -- its data runs to the end of the frame -- and INIT and VERSION carry a version instead.
+REFUSABLE_AFTER_THE_ID = sorted(
+    set(PacketType) - {PacketType.INIT, PacketType.VERSION, PacketType.EXTENDED_REPLY}
+)
+
+
+@pytest.mark.parametrize("packet_type", REFUSABLE_AFTER_THE_ID, ids=lambda t: t.name)
+def test_a_refusal_after_the_request_id_names_the_request(packet_type: PacketType):
+    frame = bytes([packet_type]) + b"\x00\x00\x30\x39"
+    with pytest.raises(ProtocolError) as exc:
+        decode(frame)
+    assert (exc.value.packet_type, exc.value.request_id) == (packet_type, 12345)
+
+
+def test_an_extended_reply_cannot_be_refused_after_its_id():
+    # Why the list above leaves it out, asserted rather than asserted about.
+    assert decode(bytes([PacketType.EXTENDED_REPLY]) + b"\x00\x00\x30\x39") == ExtendedReply(
+        12345, b""
+    )
+
+
+# --- what a frame costs (D-209) ---------------------------------------------------------
+
+
+def name_frame(count: int, entries: int, *, name: bytes = b"") -> bytes:
+    """A NAME answering request 7: ``entries`` entries named ``name`` twice, under ``count``."""
+    string = len(name).to_bytes(4, "big") + name
+    entry = string + string + b"\x00\x00\x00\x00"
+    head = bytes([PacketType.NAME]) + b"\x00\x00\x00\x07" + count.to_bytes(4, "big")
+    return head + entry * entries
+
+
+def test_the_smallest_name_entry_is_twelve_bytes():
+    # 12 = an empty filename (4) + an empty longname (4) + an ATTRS with no flag set (4), from
+    # draft-ietf-secsh-filexfer-02 7 and 5. The encoder is the independent check.
+    assert _MIN_NAME_ENTRY_LENGTH == 12
+    entry = NameEntry(b"", b"", Attrs())
+    assert len(encode(Name(1, (entry, entry)))) - len(encode(Name(1, (entry,)))) == 12
+
+
+def test_a_count_of_minimal_entries_filling_the_frame_decodes_and_one_more_is_refused():
+    # Sixteen entries, more than an entry has bytes, so a minimum one short would still fail
+    # to refuse the second frame on its claim.
+    assert decode(name_frame(count=16, entries=16)) == Name(7, (NameEntry(b"", b"", Attrs()),) * 16)
+    with pytest.raises(ProtocolError) as exc:
+        decode(name_frame(count=17, entries=16))
+    assert exc.value.args[0] == (
+        "NAME entry count 17 at offset 5 cannot fit in the frame: each takes at least 12 bytes "
+        "and 192 remain after the count"
+    )
+
+
+def test_a_hostile_name_count_is_refused_before_any_entry_is_decoded():
+    """D-209: a NAME claiming four billion entries is refused on the claim, and costs nothing.
+
+    The shape the card was filed on: the largest frame the splitter admits, packed with the
+    smallest legal entries, under a count no frame could hold. The refusal was always correct. It
+    came from the first read past the end, after an entry had been built for every twelve bytes,
+    which held an order of magnitude more memory than the frame.
+    """
+    frame = name_frame(count=0xFFFFFFFF, entries=(DEFAULT_MAX_FRAME_LENGTH - 9) // 12)
+    peaks = []
+    for wire in (name_frame(count=0xFFFFFFFF, entries=64), frame):
+        decode_quietly(wire)
+        with peak_allocation() as peak:
+            decode_quietly(wire)
+        peaks.append(peak.bytes)
+    assert peaks[1] <= peaks[0] + 1024, f"refusing grew with the frame: {peaks}"
+    assert peaks[1] <= FIXED_OVERHEAD
+
+    with pytest.raises(ProtocolError) as exc:
+        decode(frame)
+    assert exc.value.args[0] == (
+        "NAME entry count 4294967295 at offset 5 cannot fit in the frame: each takes at least "
+        f"12 bytes and {len(frame) - 9} remain after the count"
+    )
+    assert (exc.value.packet_type, exc.value.request_id) == (PacketType.NAME, 7)
+    assert exc.value.raw_frame == frame[: ProtocolError.max_frame_excerpt]
+
+
+# The shapes that cost the most per wire byte. One-byte names are the densest because an empty
+# `bytes` is a shared singleton and a one-byte one is not; the owner and times pairs add a tuple
+# and two large integers each for eight bytes.
+BIG = 0xFFFFFFF0
+DENSE_ENTRIES = [
+    NameEntry(b"n", b"n", Attrs()),
+    NameEntry(b"n", b"n", Attrs(owner=Owner(BIG, BIG))),
+    NameEntry(b"n", b"n", Attrs(owner=Owner(BIG, BIG), times=Times(BIG, BIG))),
+    NameEntry(b"", b"", Attrs()),
+]
+
+
+def test_the_decode_bound_is_derived_from_the_densest_legal_frame():
+    """``DECODE_PEAK_PER_BYTE`` sits just above the costliest well-formed reply.
+
+    Above it, because the property below quantifies over legal frames too, and a bound below a
+    legal reply refuses a server doing nothing wrong. Within a quarter of it, because a bound that
+    has drifted far above the real worst case stops noticing a decoder that got more expensive.
+    Measured here rather than recorded, since the interpreter moves it: 3.14 costs a few per cent
+    more than 3.13 for the same frame.
+    """
+    ratios = {}
+    for entry in DENSE_ENTRIES:
+        frame = encode(Name(1, (entry,) * 4096))[4:]
+        decode_quietly(frame)
+        empty_free_lists()
+        with peak_allocation() as peak:
+            decode_quietly(frame)
+        ratios[entry] = peak.bytes / len(frame)
+    densest = max(ratios.values())
+    assert densest <= DECODE_PEAK_PER_BYTE, f"a legal frame holds {densest:.2f} per byte"
+    assert densest >= DECODE_PEAK_PER_BYTE * 0.75, (
+        f"the bound is {DECODE_PEAK_PER_BYTE} and the densest legal frame holds {densest:.2f} "
+        f"per byte; lower the bound to match"
+    )
+
+
 # --- the decoder table is complete ------------------------------------------------------
 
 
@@ -534,6 +723,14 @@ attrs = st.builds(
     ),
 )
 
+
+def open_as_decoded(request_id: int, filename: bytes, wire_pflags: int, attrs: Attrs) -> Open:
+    """An OPEN as a decoder builds one from ``wire_pflags``: the six defined bits typed, and the
+    value kept whole when it sets any other."""
+    raw_pflags = wire_pflags if wire_pflags > 0x3F else None
+    return Open(request_id, filename, OpenFlag(wire_pflags & 0x3F), attrs, raw_pflags)
+
+
 packets = st.one_of(
     st.builds(
         Init,
@@ -546,10 +743,10 @@ packets = st.one_of(
         extensions=st.lists(st.tuples(paths, paths), max_size=3).map(tuple),
     ),
     st.builds(
-        Open,
+        open_as_decoded,
         request_id=ids,
         filename=paths,
-        pflags=st.integers(min_value=0, max_value=0x3F).map(OpenFlag),
+        wire_pflags=st.one_of(st.integers(min_value=0, max_value=0x3F), u32),
         attrs=attrs,
     ),
     st.builds(Close, request_id=ids, handle=handles),
@@ -616,6 +813,79 @@ def test_arbitrary_frames_decode_or_raise_protocol_error(data: bytes):
         return
     with contextlib.suppress(ProtocolError):
         decode(data)
+
+
+@st.composite
+def packed_frames(draw: st.DrawFn) -> bytes:
+    """A NAME, ATTRS or VERSION packed with small items under a count that may lie, maybe cut.
+
+    The regime the blob fuzzers above never reach (D-209). A few hundred arbitrary bytes rarely
+    spell a NAME with more than a handful of entries, and a reply costs the most per byte when
+    every item is as small as it can be.
+    """
+    kind = draw(st.sampled_from([PacketType.NAME, PacketType.ATTRS, PacketType.VERSION]))
+    items = draw(
+        st.one_of(
+            st.integers(min_value=0, max_value=64), st.integers(min_value=256, max_value=4096)
+        )
+    )
+    name = b"n" * draw(st.integers(min_value=0, max_value=2))
+    string = len(name).to_bytes(4, "big") + name
+    count = draw(st.one_of(st.just(items), u32)).to_bytes(4, "big")
+    if kind is PacketType.NAME:
+        attrs = draw(st.sampled_from([b"\x00\x00\x00\x00", b"\x00\x00\x00\x02" + bytes(8)]))
+        body = b"\x00\x00\x00\x01" + count + (string + string + attrs) * items
+    elif kind is PacketType.ATTRS:
+        body = b"\x00\x00\x00\x01\x80\x00\x00\x00" + count + (string + string) * items
+    else:
+        body = b"\x00\x00\x00\x03" + (string + string) * items
+    frame = bytes([kind]) + body
+    whole = st.just(len(frame))
+    return frame[: draw(st.one_of(whole, st.integers(min_value=1, max_value=len(frame))))]
+
+
+hostile_frames = st.one_of(
+    st.binary(max_size=4096),
+    packets.map(lambda packet: encode(packet)[4:]),
+    packed_frames(),
+)
+
+
+# No deadline on the two below: tracemalloc slows every allocation, and the packed frames are
+# the point. A hang is what the deadline would catch, and the property above still catches it.
+@settings(deadline=None)
+@given(frame=hostile_frames)
+def test_decoding_holds_at_most_a_fixed_multiple_of_the_frame(frame: bytes):
+    """D-209: the third leg of the codec's invariant, over arbitrary bytes.
+
+    Measured on a second decode, so a cache the first one filled is not charged to the frame --
+    what a decode keeps is the next property's business. The bound is a multiple rather than the
+    frame itself because a legal reply costs more than its bytes; see ``DECODE_PEAK_PER_BYTE``.
+    """
+    decode_quietly(frame)
+    with peak_allocation() as peak:
+        decode_quietly(frame)
+    assert peak.bytes <= DECODE_PEAK_PER_BYTE * len(frame) + FIXED_OVERHEAD, (
+        f"{peak.bytes} bytes held decoding a {len(frame)}-byte frame"
+    )
+
+
+# Fewer examples, each a batch: a retention reading needs a full collection, which costs tens of
+# milliseconds over this suite's heap.
+@settings(deadline=None, max_examples=25)
+@given(frames=st.lists(hostile_frames, min_size=1, max_size=16))
+def test_decoding_arbitrary_frames_keeps_nothing_afterwards(frames: list[bytes]):
+    """D-209: once a decode's result is dropped, nothing it built is left.
+
+    With the enum caches warm -- every member the codec is entitled to build, built -- anything
+    left over grows with what a peer sent and outlives the connection it arrived on. The
+    ``IntFlag`` cache was exactly that, and this is the instrument that found it.
+    """
+    warm_enum_caches()
+    with retained_allocation() as kept:
+        for frame in frames:
+            decode_quietly(frame)
+    assert kept.bytes <= RETAINED_NOISE, f"{kept.bytes} bytes outlived {len(frames)} decodes"
 
 
 # --- non-UTF-8 paths --------------------------------------------------------------------

@@ -326,6 +326,24 @@ def test_no_open_flags_renders_as_zero_rather_than_as_none():
     assert "pflags=0" in describe(Open(1, b"/a", OpenFlag(0)))
 
 
+def test_open_flags_v3_does_not_define_render_as_a_number_after_the_names():
+    """D-209: undefined ``pflags`` bits are named as a number, and never by building a flag.
+
+    The enum used to render them, and it spelled ``0x100`` alone as ``0`` -- an OPEN that asked for
+    something, dumped as one that asked for nothing -- while keeping a member for every value it
+    was shown. ``tests/test_packets.py`` holds the second half.
+    """
+    assert describe(Open(1, b"/a", OpenFlag.READ, raw_pflags=0x101)) == (
+        "OPEN id=1 filename=b'/a' pflags=READ|0x100 attrs=-"
+    )
+    assert describe(Open(1, b"/a", OpenFlag(0), raw_pflags=0x100)) == (
+        "OPEN id=1 filename=b'/a' pflags=0x100 attrs=-"
+    )
+    assert describe(Open(1, b"/a", OpenFlag.WRITE | OpenFlag.CREAT, raw_pflags=0x8000000A)) == (
+        "OPEN id=1 filename=b'/a' pflags=WRITE|CREAT|0x80000000 attrs=-"
+    )
+
+
 def test_attrs_render_only_the_fields_the_server_actually_sent():
     """Absent is not zero -- a server reporting no size has told you nothing about the size."""
     rendered = describe(
