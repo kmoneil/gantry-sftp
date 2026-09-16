@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import itertools
 import struct
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from allocation import (
+    BUFFER_REGROWTH_PER_BYTE,
+    FIXED_OVERHEAD,
+    RECEIVE_PEAK_PER_BYTE,
+    empty_free_lists,
+    peak_allocation,
+    warm_enum_caches,
+)
 from gantry_sftp.codec import (
     Attrs,
     AttrsReply,
@@ -16,6 +25,7 @@ from gantry_sftp.codec import (
     CodecState,
     Completed,
     Data,
+    ExtendedReply,
     Handle,
     Init,
     Name,
@@ -625,3 +635,158 @@ def test_a_conformant_v6_era_status_over_v3_no_longer_kills_the_connection():
     codec.send(second)
     codec.receive(encode(Status(second.request_id, StatusCode.OK)))
     assert codec.state is CodecState.READY
+
+
+# --- the composed stack (D-209) ---------------------------------------------------------
+#
+# Framing, decoding and correlation were each fuzzed on their own, and nothing drove them as one
+# stream. These do, with chunks cut anywhere -- including through a frame -- and frames large
+# enough that a chunk rarely holds a whole one.
+
+
+def reply_to(request_id: int) -> st.SearchStrategy[bytes]:
+    """Any reply this client can receive, answering ``request_id``, as a complete frame."""
+    listing = st.integers(min_value=0, max_value=2048).map(
+        lambda entries: Name(request_id, (NameEntry(b"n", b"n", Attrs()),) * entries)
+    )
+    return st.one_of(
+        st.builds(Status, st.just(request_id), st.sampled_from(StatusCode), st.binary(max_size=16)),
+        st.builds(Handle, st.just(request_id), st.binary(max_size=8)),
+        st.builds(Data, st.just(request_id), st.binary(max_size=4096).map(memoryview)),
+        st.builds(AttrsReply, st.just(request_id), st.just(Attrs(size=request_id))),
+        st.builds(ExtendedReply, st.just(request_id), st.binary(max_size=32)),
+        listing,
+    ).map(encode)
+
+
+def lying_listing(request_id: int) -> bytes:
+    """A NAME that claims four billion entries and holds a hundred, as a complete frame."""
+    body = struct.pack(">BII", PacketType.NAME, request_id, 0xFFFFFFFF) + bytes(12) * 100
+    return len(body).to_bytes(4, "big") + body
+
+
+@settings(deadline=None)
+@given(data=st.data())
+def test_receive_survives_any_stream_cut_anywhere(data: st.DataObject):
+    """Totality, correlation and the allocation bound, over the whole receive path at once.
+
+    Every call either returns completions that each pair a request with its own reply, exactly
+    once, or raises ``ProtocolError`` and leaves the codec finished. A stream made of nothing but
+    replies to requests that are waiting completes all of them, in wire order, however it is cut.
+    And no call holds more than ``RECEIVE_PEAK_PER_BYTE`` for each byte it could reach, plus what
+    growing the splitter's buffer costs (``BUFFER_REGROWTH_PER_BYTE``).
+    """
+    warm_enum_caches()
+    codec = negotiated_codec()
+    sent = {}
+    for _ in range(data.draw(st.integers(min_value=0, max_value=8), label="requests")):
+        request = Stat(codec.allocate_request_id(), b"/x")
+        codec.send(request)
+        sent[request.request_id] = request
+
+    answered = data.draw(st.permutations(sorted(sent)), label="order")
+    answered = answered[: data.draw(st.integers(min_value=0, max_value=len(answered)))]
+    segments = [data.draw(reply_to(request_id)) for request_id in answered]
+    expected: list[int] | None = list(answered)
+    if data.draw(st.booleans(), label="spoiled"):
+        spoiler = data.draw(
+            st.one_of(
+                st.binary(min_size=1, max_size=256),
+                st.integers(min_value=100, max_value=200).flatmap(reply_to),
+                st.sampled_from(answered or [1]).map(lying_listing),
+            ),
+            label="spoiler",
+        )
+        segments.insert(data.draw(st.integers(min_value=0, max_value=len(segments))), spoiler)
+        expected = None
+    stream = b"".join(segments)
+
+    cuts = data.draw(st.lists(st.integers(min_value=0, max_value=len(stream)), max_size=12))
+    bounds = sorted({0, len(stream), *cuts})
+    chunks = [stream[start:end] for start, end in itertools.pairwise(bounds)]
+
+    completed: list[int] = []
+    failed = False
+    splitter = codec._splitter  # noqa: SLF001  # the budget depends on what it holds
+    for chunk in chunks:
+        reachable = splitter.buffered + len(chunk)
+        buffer = len(splitter._buf) + len(chunk)  # noqa: SLF001  # consumed prefix included
+        with peak_allocation() as peak:
+            try:
+                events = codec.receive(chunk)
+            except ProtocolError:
+                failed = True
+                events = []
+        budget = (
+            RECEIVE_PEAK_PER_BYTE * reachable + BUFFER_REGROWTH_PER_BYTE * buffer + FIXED_OVERHEAD
+        )
+        assert peak.bytes <= budget, (
+            f"{peak.bytes} bytes held receiving {len(chunk)}, with {reachable} reachable and a "
+            f"{buffer}-byte buffer"
+        )
+        for event in events:
+            assert isinstance(event, Completed)
+            assert event.request is sent[event.response.request_id]
+            assert event.request.request_id not in completed, "a request completed twice"
+            completed.append(event.request.request_id)
+        if failed:
+            break
+
+    if failed:
+        assert expected is None, "a stream of replies to waiting requests was refused"
+        assert codec.state is CodecState.FAILED
+        for refused in (lambda: codec.receive(b""), lambda: codec.send(Stat(99, b"/"))):
+            with pytest.raises(ProtocolError) as exc:
+                refused()
+            assert exc.value.args[0] == (
+                "codec is in a failed state; the connection is not recoverable"
+            )
+        return
+    assert codec.outstanding == len(sent) - len(completed)
+    if expected is not None:
+        assert completed == expected
+
+
+def test_the_receive_bound_is_derived_from_the_densest_stream():
+    """``RECEIVE_PEAK_PER_BYTE`` sits just above the costliest chunk, from both sides.
+
+    Two shapes compete, and both are costly for the same reason: the splitter slices every frame
+    of a chunk before the first is decoded, and a slice is an object far larger than a small
+    frame. A chunk of the smallest frames the splitter admits is refused at the first of them,
+    after all of them were sliced; a chunk of the smallest DATA replies is accepted, and each
+    reply also keeps a slice of its own. The bound holds the worse of the two within a quarter.
+    """
+    request_count = 65536 // 13
+
+    def waiting() -> Codec:
+        codec = negotiated_codec()
+        for request_id in range(1, request_count + 1):
+            codec.send(Read(request_id, b"h", 0, 1))
+        return codec
+
+    shapes = {
+        "one-byte frames": (negotiated_codec(), b"\x00\x00\x00\x01\x65" * (65536 // 5)),
+        "empty DATA replies": (
+            waiting(),
+            b"".join(
+                encode(Data(request_id, memoryview(b"")))
+                for request_id in range(1, request_count + 1)
+            ),
+        ),
+    }
+    warm_enum_caches()
+    ratios = {}
+    for label, (codec, chunk) in shapes.items():
+        empty_free_lists()
+        with peak_allocation() as peak:
+            try:
+                events = codec.receive(chunk)
+            except ProtocolError:
+                events = []
+        ratios[label] = peak.bytes / len(chunk)
+        del events
+    densest = max(ratios.values())
+    assert densest <= RECEIVE_PEAK_PER_BYTE, f"a chunk holds {ratios}"
+    assert densest >= RECEIVE_PEAK_PER_BYTE * 0.75, (
+        f"the bound is {RECEIVE_PEAK_PER_BYTE} and the densest chunk holds {ratios}; lower it"
+    )

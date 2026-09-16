@@ -9,17 +9,27 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from allocation import (
+    FIXED_OVERHEAD,
+    RETAINED_NOISE,
+    peak_allocation,
+    retained_allocation,
+    warm_enum_caches,
+)
 from gantry_sftp.codec import (
     MAX_V3_TIMESTAMP,
     AttrFlag,
     Attrs,
     Owner,
+    PacketType,
     Times,
     WireReader,
     WireWriter,
+    decode,
     decode_attrs,
     encode_attrs,
 )
+from gantry_sftp.codec._attrs import _MIN_EXTENDED_PAIR_LENGTH
 from gantry_sftp.exceptions import ProtocolError
 
 
@@ -164,10 +174,65 @@ def test_extended_count_is_the_number_of_pairs():
 
 
 def test_a_hostile_extended_count_is_bounded_by_the_frame():
-    # A count of four billion must fail on the first read past the end, not spin.
+    # A count of four billion must neither spin nor build anything. Until D-209 it was refused
+    # by the first read past the end, after a pair for every byte the frame held; now the claim
+    # itself is refused, which the message says.
     wire = b"\x80\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x01a"
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ProtocolError) as exc:
         decode_attrs(WireReader(wire))
+    assert exc.value.args[0] == (
+        "ATTRS extended pair count 4294967295 at offset 4 cannot fit in the frame: each takes "
+        "at least 8 bytes and 5 remain after the count"
+    )
+
+
+def extended_frame(count: int, pairs: int) -> bytes:
+    """An ATTRS carrying only extended pairs: ``pairs`` empty ones under a claim of ``count``."""
+    return b"\x80\x00\x00\x00" + count.to_bytes(4, "big") + b"\x00" * 8 * pairs
+
+
+def refuse_quietly(wire: bytes) -> None:
+    with contextlib.suppress(ProtocolError):
+        decode_attrs(WireReader(wire))
+
+
+def test_the_smallest_extended_pair_is_two_empty_strings():
+    # 8 = a uint32 length of zero, twice (draft-ietf-secsh-filexfer-02 5). The encoder is the
+    # independent check: one more empty pair is exactly that many bytes on the wire.
+    assert _MIN_EXTENDED_PAIR_LENGTH == 8
+    one = encoded(Attrs(extended=((b"", b""),)))
+    two = encoded(Attrs(extended=((b"", b""), (b"", b""))))
+    assert len(two) - len(one) == _MIN_EXTENDED_PAIR_LENGTH
+
+
+def test_a_count_of_minimal_pairs_filling_the_frame_decodes_and_one_more_is_refused():
+    # Sixteen pairs, not two: with fewer items than bytes per item, a minimum one byte short
+    # would still refuse the lie below, and this row is what pins the minimum.
+    attrs = decode_attrs(WireReader(extended_frame(count=16, pairs=16)))
+    assert attrs.extended == ((b"", b""),) * 16
+
+    with pytest.raises(ProtocolError) as exc:
+        decode_attrs(WireReader(extended_frame(count=17, pairs=16)))
+    assert exc.value.args[0] == (
+        "ATTRS extended pair count 17 at offset 4 cannot fit in the frame: each takes at least "
+        "8 bytes and 128 remain after the count"
+    )
+
+
+def test_a_refused_extended_count_costs_nothing_the_frame_holds():
+    # D-209, and the reason a refusal is checked on the claim: it was correct before too, and it
+    # built a pair for every eight bytes the frame held first. Sixty-four times the frame must not
+    # cost more than a small one does, and neither may cost more than a refusal of nothing.
+    small = extended_frame(count=0xFFFFFFFF, pairs=128)
+    large = extended_frame(count=0xFFFFFFFF, pairs=128 * 64)
+    peaks = []
+    for wire in (small, large):
+        refuse_quietly(wire)
+        with peak_allocation() as peak:
+            refuse_quietly(wire)
+        peaks.append(peak.bytes)
+    assert peaks[1] <= peaks[0] + 1024, f"refusing grew with the frame: {peaks}"
+    assert peaks[1] <= FIXED_OVERHEAD
 
 
 # --- unknown flags ----------------------------------------------------------------------
@@ -182,6 +247,35 @@ def test_an_undefined_flag_bit_is_rejected_rather_than_ignored():
         "ATTRS sets undefined flag bits 0x00000010; filexfer v3 defines only 0x8000000f, "
         "and an unknown bit means a field of unknown width"
     )
+
+
+def test_an_undefined_flag_bit_refusal_names_the_reply_it_arrived_in():
+    # A refusal carries the frame's state (Definition of Done 3). It used to be built without the
+    # reader and named nothing; it now comes from the reader, which knows all three.
+    frame = bytes([PacketType.ATTRS]) + b"\x00\x00\x00\x09" + b"\x00\x00\x00\x20"
+    with pytest.raises(ProtocolError) as exc:
+        decode(frame)
+    assert exc.value.args[0] == (
+        "ATTRS sets undefined flag bits 0x00000020; filexfer v3 defines only 0x8000000f, "
+        "and an unknown bit means a field of unknown width"
+    )
+    assert (exc.value.packet_type, exc.value.request_id, exc.value.raw_frame) == (105, 9, frame)
+
+
+def test_refusing_undefined_flag_bits_keeps_nothing_afterwards():
+    """D-209: a thousand different undefined bit patterns leave the process as they found it.
+
+    The mask used to be an ``AttrFlag``, so each pattern built an enum member for the bits it was
+    about to refuse, and CPython keeps every member it builds, on the class, for the life of the
+    process. A server choosing the bits chose how much memory stayed behind, one connection at a
+    time, because the refusal ends the connection and the entry does not go with it.
+    """
+    warm_enum_caches()
+    patterns = [((n + 2) << 8).to_bytes(4, "big") for n in range(1000)]
+    with retained_allocation() as kept:
+        for wire in patterns:
+            refuse_quietly(wire)
+    assert kept.bytes <= RETAINED_NOISE, f"{kept.bytes} bytes outlived 1000 refusals"
 
 
 def test_the_extended_high_bit_is_not_treated_as_unknown():

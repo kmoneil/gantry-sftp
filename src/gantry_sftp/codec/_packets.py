@@ -26,7 +26,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple, Self
 
-from gantry_sftp.codec._attrs import EMPTY_ATTRS, Attrs, decode_attrs, encode_attrs
+from gantry_sftp.codec._attrs import (
+    EMPTY_ATTRS,
+    MIN_ATTRS_LENGTH,
+    Attrs,
+    decode_attrs,
+    encode_attrs,
+)
 from gantry_sftp.codec._constants import PROTOCOL_VERSION, OpenFlag, PacketType, StatusCode
 from gantry_sftp.codec._wire import WireReader, WireWriter
 from gantry_sftp.exceptions import ProtocolError
@@ -90,7 +96,7 @@ class _PathRequest:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        return cls(request_id=reader.read_uint32(), path=bytes(reader.read_string()))
+        return cls(request_id=reader.read_request_id(), path=bytes(reader.read_string()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +114,7 @@ class _HandleRequest:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        return cls(request_id=reader.read_uint32(), handle=bytes(reader.read_string()))
+        return cls(request_id=reader.read_request_id(), handle=bytes(reader.read_string()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +135,7 @@ class _PathAttrsRequest:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             path=bytes(reader.read_string()),
             attrs=decode_attrs(reader),
         )
@@ -209,9 +215,38 @@ def _decode_extension_pairs(reader: WireReader) -> tuple[tuple[bytes, bytes], ..
 # --- file requests ----------------------------------------------------------------------
 
 
+_DEFINED_PFLAGS = sum(flag.value for flag in OpenFlag)
+"""Every ``pflags`` bit v3 defines, as a plain ``int``. Derived from :class:`OpenFlag` so a new
+member cannot be left out of it."""
+
+
 @dataclass(frozen=True, slots=True)
 class Open:
-    """Open a file. ``pflags`` selects the access mode; ``attrs`` is usually empty."""
+    """Open a file. ``pflags`` selects the access mode; ``attrs`` is usually empty.
+
+    **A value setting bits v3 does not define is kept whole in :attr:`raw_pflags`, and
+    :attr:`pflags` holds only the defined ones** (D-209). Building an :class:`OpenFlag` from
+    the whole wire value used to work, and it cost memory for the life of the process: CPython
+    caches every ``IntFlag`` member it builds, including one with undefined bits, so each
+    distinct value a peer sent stayed on the class. A client never legitimately receives an
+    OPEN, but :func:`decode` reads one before the codec refuses it, so any server could add an
+    entry per connection.
+
+    Refusing the bits instead was declined. They desynchronise nothing, since the field is
+    fixed-width, and OpenSSH's ``sftp-server`` ignores bits it does not know
+    (``flags_from_portable``), so a decoder serving that role must not be stricter. This is the
+    shape :class:`Status` already takes for a code v3 cannot name (D-145): the defined part is
+    typed and the wire value is kept.
+
+    Attributes:
+        request_id: Correlates the reply.
+        filename: The path to open.
+        pflags: The access-mode bits v3 defines.
+        attrs: Attributes for a file the open creates.
+        raw_pflags: What the wire carried, when it set bits v3 does not define. ``None`` on
+            every ordinary OPEN, so :meth:`encode_body` reproduces the frame it decoded rather
+            than dropping the bits it could not name.
+    """
 
     packet_type: ClassVar[PacketType] = PacketType.OPEN
 
@@ -219,23 +254,59 @@ class Open:
     filename: bytes
     pflags: OpenFlag
     attrs: Attrs = EMPTY_ATTRS
+    raw_pflags: int | None = None
 
     def encode_body(self, writer: WireWriter) -> None:
         """Append this packet's body, excluding the type byte."""
         writer.write_uint32(self.request_id)
         writer.write_string(self.filename)
-        writer.write_uint32(self.pflags)
+        writer.write_uint32(_open_wire_pflags(self.pflags, self.raw_pflags))
         encode_attrs(writer, self.attrs)
 
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
+        request_id = reader.read_request_id()
+        filename = bytes(reader.read_string())
+        pflags, raw_pflags = _split_pflags(reader.read_uint32())
         return cls(
-            request_id=reader.read_uint32(),
-            filename=bytes(reader.read_string()),
-            pflags=OpenFlag(reader.read_uint32()),
+            request_id=request_id,
+            filename=filename,
+            pflags=pflags,
             attrs=decode_attrs(reader),
+            raw_pflags=raw_pflags,
         )
+
+
+def _split_pflags(wire: int) -> tuple[OpenFlag, int | None]:
+    """Split a wire ``pflags`` value into the bits v3 names and, when there are others, itself.
+
+    A module-level function for the reason :func:`_status_wire_code` gives: mutmut does not
+    instrument a method of a decorated class, and this is the one branch in OPEN's decode.
+
+    Args:
+        wire: The ``uint32`` the frame carried.
+
+    Returns:
+        The defined bits as an :class:`OpenFlag`, which can take one of only 64 values and so
+        adds nothing to the enum's cache after the first of each, and ``wire`` itself when it
+        sets any other bit, else ``None``.
+    """
+    return OpenFlag(wire & _DEFINED_PFLAGS), (wire if wire & ~_DEFINED_PFLAGS else None)
+
+
+def _open_wire_pflags(pflags: OpenFlag, raw_pflags: int | None) -> int:
+    """The number an OPEN writes for its ``pflags``, module-level for the same reason.
+
+    Args:
+        pflags: The defined bits.
+        raw_pflags: What the wire carried when it set others, else ``None``.
+
+    Returns:
+        ``raw_pflags`` when there is one, so an OPEN decoded with undefined bits re-encodes to
+        the bytes it arrived as.
+    """
+    return pflags if raw_pflags is None else raw_pflags
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +342,7 @@ class Read:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             handle=bytes(reader.read_string()),
             offset=reader.read_uint64(),
             length=reader.read_uint32(),
@@ -309,7 +380,7 @@ class Write:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             handle=bytes(reader.read_string()),
             offset=reader.read_uint64(),
             data=bytes(reader.read_string()),
@@ -357,7 +428,7 @@ class FSetStat:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             handle=bytes(reader.read_string()),
             attrs=decode_attrs(reader),
         )
@@ -446,7 +517,7 @@ class Rename:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             oldpath=bytes(reader.read_string()),
             newpath=bytes(reader.read_string()),
         )
@@ -494,7 +565,7 @@ class SymLink:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             targetpath=bytes(reader.read_string()),
             linkpath=bytes(reader.read_string()),
         )
@@ -526,7 +597,7 @@ class Extended:
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
         return cls(
-            request_id=reader.read_uint32(),
+            request_id=reader.read_request_id(),
             name=bytes(reader.read_string()),
             data=bytes(reader.read_remaining()),
         )
@@ -595,8 +666,7 @@ class Status:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        request_id = reader.read_uint32()
-        reader.set_request_id(request_id)
+        request_id = reader.read_request_id()
         raw_code = reader.read_uint32()
         try:
             code = StatusCode(raw_code)
@@ -682,7 +752,12 @@ class Data:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        return cls(request_id=reader.read_uint32(), data=reader.read_string())
+        return cls(request_id=reader.read_request_id(), data=reader.read_string())
+
+
+_MIN_NAME_ENTRY_LENGTH = 4 + 4 + MIN_ATTRS_LENGTH
+"""The fewest bytes one NAME entry occupies: an empty ``filename``, an empty ``longname`` and
+an ATTRS with no flag set (``draft-ietf-secsh-filexfer-02`` 7)."""
 
 
 class NameEntry(NamedTuple):
@@ -720,10 +795,11 @@ class Name:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        request_id = reader.read_uint32()
-        count = reader.read_uint32()
-        # Not pre-allocated on `count`: a hostile count is bounded by the frame, since the
-        # first read past the end raises rather than spinning.
+        request_id = reader.read_request_id()
+        # A count the rest of the frame cannot hold is refused before any entry is built
+        # (D-209). One that fits can still overstate, since an entry may be longer than the
+        # minimum, and the reads below refuse that -- so nothing is pre-allocated on it.
+        count = reader.read_count(_MIN_NAME_ENTRY_LENGTH, item="NAME entry")
         entries = []
         for _ in range(count):
             filename = bytes(reader.read_string())
@@ -753,7 +829,7 @@ class AttrsReply:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        return cls(request_id=reader.read_uint32(), attrs=decode_attrs(reader))
+        return cls(request_id=reader.read_request_id(), attrs=decode_attrs(reader))
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,7 +853,7 @@ class ExtendedReply:
     @classmethod
     def decode_body(cls, reader: WireReader) -> Self:
         """Read this packet's body, with the type byte already consumed."""
-        return cls(request_id=reader.read_uint32(), data=bytes(reader.read_remaining()))
+        return cls(request_id=reader.read_request_id(), data=bytes(reader.read_remaining()))
 
 
 # --- the union and the dispatch table ----------------------------------------------------

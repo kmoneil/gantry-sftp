@@ -269,6 +269,121 @@ def test_a_failed_read_does_not_advance_the_position():
     assert r.read_uint8() == 1
 
 
+def test_read_request_id_names_the_id_in_every_later_refusal():
+    # The spelling every decoder uses since D-209, so a count refusal or a truncated path names
+    # the request a frame answered rather than only its packet type.
+    r = WireReader(b"\x00\x00\x00\x07\x00", packet_type=104)
+    assert r.read_request_id() == 7
+    assert r.position == 4
+    with pytest.raises(ProtocolError) as exc:
+        r.read_uint32()
+    assert exc.value.request_id == 7
+    assert exc.value.packet_type == 104
+
+
+def test_a_refusal_carries_everything_the_reader_knows():
+    # The one way a decoder builds an error for a field it has read and does not accept -- an
+    # undefined ATTRS flag bit is the caller -- so the state comes along without being repeated.
+    frame = b"\x00\x00\x00\x09\x00\x00\x00\x10"
+    r = WireReader(frame, packet_type=105)
+    r.read_request_id()
+    refusal = r.refusal("not this one")
+    assert isinstance(refusal, ProtocolError)
+    assert refusal.args[0] == "not this one"
+    assert (refusal.packet_type, refusal.request_id, refusal.raw_frame) == (105, 9, frame)
+
+
+# --- counts ----------------------------------------------------------------------------
+#
+# D-209. A count is a claim about the bytes after it, checked before anything is built for it.
+# "item" is the noun the error message uses, and 4 is the fewest bytes one of them occupies.
+
+
+def test_a_count_the_frame_can_hold_is_returned_and_only_the_count_is_consumed():
+    r = WireReader(b"\x00\x00\x00\x02" + bytes(9))
+    assert r.read_count(4, item="item") == 2
+    assert (r.position, r.remaining) == (4, 9)
+
+
+def test_a_count_that_exactly_fills_the_frame_is_accepted():
+    # The boundary. Three minimal items in exactly twelve bytes is a frame, not a lie, and a
+    # refusal at `>=` would turn away every reply whose entries are all the minimum size.
+    r = WireReader(b"\x00\x00\x00\x03" + bytes(12))
+    assert r.read_count(4, item="item") == 3
+
+
+def test_a_count_one_item_past_the_frame_is_refused_on_the_claim():
+    frame = b"\x00\x00\x00\x2a" + b"\x00\x00\x00\x04" + bytes(12)
+    r = WireReader(frame, packet_type=104)
+    r.read_request_id()
+    with pytest.raises(ProtocolError) as exc:
+        r.read_count(4, item="item")
+    assert exc.value.args[0] == (
+        "item count 4 at offset 4 cannot fit in the frame: each takes at least 4 bytes and "
+        "12 remain after the count"
+    )
+    assert (exc.value.packet_type, exc.value.request_id, exc.value.raw_frame) == (104, 42, frame)
+    assert r.position == 4, "a refused count must leave the position at the count"
+
+
+def test_a_count_of_four_billion_is_refused_without_reading_on():
+    r = WireReader(b"\xff\xff\xff\xff" + bytes(12))
+    with pytest.raises(ProtocolError) as exc:
+        r.read_count(12, item="NAME entry")
+    assert exc.value.args[0] == (
+        "NAME entry count 4294967295 at offset 0 cannot fit in the frame: each takes at least "
+        "12 bytes and 12 remain after the count"
+    )
+    assert r.position == 0
+
+
+def test_a_count_of_zero_needs_nothing_after_it():
+    r = WireReader(b"\x00\x00\x00\x00")
+    assert r.read_count(12, item="item") == 0
+    assert r.at_end
+
+
+def test_a_truncated_count_is_the_ordinary_truncation():
+    r = WireReader(b"\x00\x00\x01")
+    with pytest.raises(ProtocolError) as exc:
+        r.read_count(4, item="item")
+    assert exc.value.args[0] == "truncated frame: need 4 more bytes at offset 0, 3 available"
+
+
+@pytest.mark.parametrize("item_length", [0, -1])
+def test_an_item_length_below_one_is_refused(item_length: int):
+    # A zero-length item makes every count fit, which is the check doing nothing while looking
+    # like it ran. Refused before the count is read, so the reader is untouched.
+    r = WireReader(b"\xff\xff\xff\xff")
+    with pytest.raises(ValueError) as exc:
+        r.read_count(item_length, item="item")
+    assert exc.value.args[0] == f"item_length must be at least 1, got {item_length}"
+    assert r.position == 0
+
+
+def test_an_item_length_of_one_is_the_smallest_accepted():
+    r = WireReader(b"\x00\x00\x00\x02ab")
+    assert r.read_count(1, item="item") == 2
+
+
+@given(
+    count=st.integers(min_value=0, max_value=UINT32_MAX),
+    item_length=st.integers(min_value=1, max_value=64),
+    tail=st.integers(min_value=0, max_value=512),
+)
+def test_a_count_is_accepted_exactly_when_its_items_could_fit(
+    count: int, item_length: int, tail: int
+):
+    r = WireReader(count.to_bytes(4, "big") + bytes(tail))
+    if count * item_length <= tail:
+        assert r.read_count(item_length, item="item") == count
+        assert r.position == 4
+    else:
+        with pytest.raises(ProtocolError):
+            r.read_count(item_length, item="item")
+        assert r.position == 0
+
+
 # --- cursor ----------------------------------------------------------------------------
 
 
