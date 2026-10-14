@@ -511,7 +511,10 @@ because a well-formed reply costs more than its bytes. **Retained**, what outliv
 its result is dropped, is bounded by noise, because anything that survives a decode and grows
 with what a server sent is memory the server controls. The first bound comes from the densest
 *legal* frame and the second from nothing at all, and each is re-derived by a test on whichever
-interpreter runs the suite: CI runs 3.14, and object sizes differ from 3.13's by a few per cent.
+interpreter runs the suite. CI runs the newest release, which `ci.yml` does not pin, and object
+sizes move between releases: 3.14's by a few per cent over 3.13's, and 3.15's further the other
+way. One peak bound has to hold across that whole range, so it sits above the dearest interpreter
+and within a quarter of the cheapest.
 
 **This thresholds `tracemalloc` bytes, which the leak lane above found impossible, and the
 difference is the size of the block.** The leak lane measures whole tests, where unrelated
