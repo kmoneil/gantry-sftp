@@ -661,7 +661,8 @@ def test_the_decode_bound_is_derived_from_the_densest_legal_frame():
     legal reply refuses a server doing nothing wrong. Within a quarter of it, because a bound that
     has drifted far above the real worst case stops noticing a decoder that got more expensive.
     Measured here rather than recorded, since the interpreter moves it: 3.14 costs a few per cent
-    more than 3.13 for the same frame.
+    more than 3.13 for the same frame, and 3.15 enough less to fall below the floor of a bound
+    set for 3.14. One bound has to pass at both ends of that range.
     """
     ratios = {}
     for entry in DENSE_ENTRIES:

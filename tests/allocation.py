@@ -17,8 +17,10 @@ Over-allocation has two shapes, so there are two instruments:
 Both read ``tracemalloc``, which counts the bytes Python asked its allocators for. That depends
 on the code and the interpreter, not on the machine or its load, so the bounds are not timing
 bounds and do not flake under contention. The interpreter is what moves them: the suite runs on
-3.13 locally and 3.14 in CI, and the two disagree by a few per cent. Each bound is therefore
-re-derived by a test on whatever interpreter runs it, rather than stated as a figure here.
+3.13 locally and on the newest release in CI, which ``ci.yml`` does not pin, and releases
+disagree. 3.14 costs a few per cent more than 3.13, and 3.15 costs less than either by enough to
+move a bound. Each bound is therefore re-derived by a test on whatever interpreter runs it,
+rather than stated as a figure here.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import pytest
 from gantry_sftp.codec import AttrFlag, OpenFlag, PacketType, decode, describe
 from gantry_sftp.exceptions import ProtocolError
 
-DECODE_PEAK_PER_BYTE = 20
+DECODE_PEAK_PER_BYTE = 18
 """The most :func:`~gantry_sftp.codec.decode` may hold per byte of frame, over the fixed cost.
 
 Derived from the densest *legal* frame and not from a hostile one, because the property using it
@@ -49,6 +51,10 @@ each: an empty ``bytes`` is a shared singleton and a one-byte one is not, so two
 more than the two wire bytes they add. ``tests/test_packets.py`` measures that frame and holds
 this constant within a quarter of it, so it can neither go stale below a real reply nor drift
 far enough above one to stop meaning anything.
+
+One value has to pass that on every interpreter the suite runs on, so it sits above the dearest
+of them and within a quarter of the cheapest. It was 20 until CI reached 3.15, whose densest
+frame fell below that bound's floor.
 """
 
 RECEIVE_PEAK_PER_BYTE = 48
